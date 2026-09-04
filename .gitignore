@@ -1,1 +1,70 @@
-/target
+# =========================
+# SKYNET // NETWORK CORE
+# .gitignore
+# =========================
+
+# -------------------------
+# Rust / Cargo
+# -------------------------
+target/
+debug/
+release/
+**/*.rs.bk
+*.pdb
+
+# Keep Cargo.lock for this bot application
+# Cargo.lock
+
+# -------------------------
+# Secrets / Environment
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# Common secret/config variants
+*.secret
+*.secrets
+secrets.toml
+config.local.*
+*.local
+
+# -------------------------
+# Databases / runtime data
+# -------------------------
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# Optional runtime folders
+data/
+tmp/
+temp/
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+logs/
+*.out
+
+# -------------------------
+# Editors / IDEs
+# -------------------------
+.vscode/
+.idea/
+*.iml
+
+# Vim / Neovim / generic swap files
+*.swp
+*.swo
+*~
+
+# -------------------------
+# OS junk
+# -------------------------
+.DS_Store
