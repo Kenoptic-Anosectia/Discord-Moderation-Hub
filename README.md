@@ -1,6 +1,6 @@
-# SKYNET // NETWORK CORE
+# Discord // Moderation Hub
 
-SKYNET // NETWORK CORE is a custom Discord bot built for a specific private server environment using Rust, [Poise](https://github.com/serenity-rs/poise), and [Serenity](https://github.com/serenity-rs/serenity). It handles moderation logging, role workflows, age-verification support tools, reaction roles, and other server-specific utility systems.
+Discord // Moderation Hub is a custom Discord bot built for a specific private server environment using Rust, [Poise](https://github.com/serenity-rs/poise), and [Serenity](https://github.com/serenity-rs/serenity). It handles moderation logging, role workflows, age-verification support tools, reaction roles, and other server-specific utility systems.
 
 ## Important
 
