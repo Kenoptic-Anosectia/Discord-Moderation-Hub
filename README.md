@@ -49,7 +49,7 @@ Several systems are tightly integrated with the structure of the target server, 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/discord-moderation-hub.git
+git clone https://github.com/Kenoptic-Anosectia/Discord-Moderation-Hub
 cd discord-moderation-hub
 ```
 
