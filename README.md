@@ -49,8 +49,8 @@ Several systems are tightly integrated with the structure of the target server, 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/skynet-network-core.git
-cd skynet-network-core
+git clone https://github.com/yourusername/discord-moderation-hub.git
+cd discord-moderation-hub
 ```
 
 ### 2. Create a `.env`
