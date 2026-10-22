@@ -1,9 +1,9 @@
 [package]
-name = "skynet-network-core"
+name = "discord-moderation-hub"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your@email.com>"]
-description = "SKYNET // NETWORK CORE is a custom Discord bot built specifically for a private server, handling moderation, logging, reaction roles, and server-specific workflows."
+description = "Discord // Moderation Hub is a custom Discord bot built specifically for a private server, handling moderation, logging, reaction roles, and server-specific workflows."
 license = "MIT"
 repository = "https://github.com/Kenoptic-Anosectia/skynet-network-core"
 homepage = "https://github.com/Kenoptic-Anosectia/skynet-network-core"
