@@ -33,3 +33,20 @@ RED: with an always-erroring stub (same signatures), `cargo test --locked --offl
 - Allow-list reflects current Discord CDN URL shapes (`attachments`, `ephemeral-attachments`); new shapes need deliberate addition. `ex/is/hm` signing is not verified, only preserved.
 - A07 must call these functions rather than re-implementing them; original filenames belong in a manifest as display data only.
 - The module is not `mod`-declared in `main.rs` (forbidden by scope), so it is exercised only through the integration test; A07 will add the `mod` line.
+
+## Review fix 1 (changes requested on e33ab57)
+
+Defect: `https:////:@cdn.discordapp.com/...` and `https:////@cdn.discordapp.com/...` returned Ok
+because raw-authority extraction (`split_once("://")`) left a leading `/` and saw an empty
+authority, while `url::Url` normalises extra slashes and empty userinfo away.
+
+Fix: `validate_attachment_url` now requires the raw text to start with `https://`
+(case-insensitive) followed by a non-slash authority; any other introducer form
+(`https:////`, `https:/@`, `https:@`, ...) is rejected (`InvalidUrl`/`UserInfoNotAllowed`).
+The parsed-host allow-list, signed-query preservation, case-insensitive scheme/host and
+explicit `:443` behaviour are unchanged (asserted as controls).
+
+RED (fix reverted, new test only): `rejects_noncanonical_authority_introducers_with_empty_userinfo` FAILED (0 passed, 1 failed).
+GREEN: `cargo test --locked --offline`: 14 unit + 30 archive_input_safety + 7 logger pass.
+New meaningful tests total: 30 (29 + 1 regression covering 13 spellings + 3 controls).
+`cargo fmt --check`, targeted all-targets Clippy (-D deprecated/result_large_err/type_complexity), `git diff --check` clean.

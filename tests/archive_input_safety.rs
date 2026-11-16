@@ -137,6 +137,43 @@ fn rejects_userinfo_including_host_in_userinfo() {
 }
 
 #[test]
+fn rejects_noncanonical_authority_introducers_with_empty_userinfo() {
+    let tail = format!("cdn.discordapp.com/attachments/{CH}/{ID}/a.bin");
+    for prefix in [
+        "https:////:@",
+        "https:////@",
+        "https:///:@",
+        "https:///@",
+        "https:/:@",
+        "https:/@",
+        "https:@",
+        "https::@",
+        "HTTPS:////@",
+        "https:////",
+        "https:///",
+        "https:/",
+        "https:",
+    ] {
+        let raw = format!("{prefix}{tail}");
+        let k = url_err(&raw);
+        assert!(
+            matches!(k, K::UserInfoNotAllowed | K::InvalidUrl),
+            "{raw:?} -> {k:?}"
+        );
+    }
+    // Controls: canonical forms still accepted, scheme/host case-insensitive, explicit :443.
+    assert!(validate_attachment_url(&format!("https://{tail}?ex=1&is=2&hm=abc")).is_ok());
+    assert!(validate_attachment_url(&format!(
+        "HTTPS://CDN.DiscordApp.com/attachments/{CH}/{ID}/a.bin"
+    ))
+    .is_ok());
+    assert!(validate_attachment_url(&format!(
+        "https://cdn.discordapp.com:443/attachments/{CH}/{ID}/a.bin"
+    ))
+    .is_ok());
+}
+
+#[test]
 fn rejects_ip_literals_in_every_encoding() {
     for host in [
         "127.0.0.1",

@@ -137,9 +137,17 @@ pub fn validate_attachment_url(raw: &str) -> Result<Url, ArchiveInputError> {
     }
     // `https://:@host/` parses to an empty username and no password, so also inspect the raw
     // authority text (everything between "://" and the first '/', '?' or '#') for '@'.
-    let raw_authority = raw.split_once("://").map_or("", |(_, rest)| {
-        rest.split(['/', '?', '#']).next().unwrap_or("")
-    });
+    // The url crate also tolerates extra/missing slashes after "https:" (e.g. `https:////@host`)
+    // and normalises them away, so only the canonical `https://<nonempty authority>` form is
+    // accepted; otherwise the raw authority text could be misread as empty.
+    let rest = match raw.get(..8) {
+        Some(p) if p.eq_ignore_ascii_case("https://") => &raw[8..],
+        _ => return fail(K::InvalidUrl),
+    };
+    if rest.starts_with('/') {
+        return fail(K::InvalidUrl);
+    }
+    let raw_authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if !url.username().is_empty() || url.password().is_some() || raw_authority.contains('@') {
         return fail(K::UserInfoNotAllowed);
     }
