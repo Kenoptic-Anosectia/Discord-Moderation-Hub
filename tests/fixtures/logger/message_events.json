@@ -1,0 +1,47 @@
+{
+  "provenance": "SYNTHETIC: invented locally; tiny IDs are test sentinels, never Discord inputs",
+  "cases": [
+    {
+      "name": "partial_content_absent",
+      "kind": "update",
+      "content_shape": "absent",
+      "prior_cache": [{"id": "101", "content": "SYNTHETIC prior text", "embeds": []}],
+      "event": {"id": "101", "channel_id": "201", "guild_id": "301", "pinned": true}
+    },
+    {
+      "name": "explicit_empty_content",
+      "kind": "update",
+      "content_shape": "empty",
+      "prior_cache": [{"id": "101", "content": "SYNTHETIC prior text", "embeds": []}],
+      "event": {"id": "101", "channel_id": "201", "guild_id": "301", "content": ""}
+    },
+    {
+      "name": "embed_only_update",
+      "kind": "update",
+      "content_shape": "absent",
+      "prior_cache": [{"id": "101", "content": "SYNTHETIC prior text", "embeds": []}],
+      "event": {"id": "101", "channel_id": "201", "guild_id": "301", "embeds": [{"type": "rich", "description": "SYNTHETIC embed"}]}
+    },
+    {
+      "name": "no_cached_message",
+      "kind": "update",
+      "content_shape": "text",
+      "prior_cache": [],
+      "event": {"id": "102", "channel_id": "201", "guild_id": "301", "content": "SYNTHETIC new text"}
+    },
+    {
+      "name": "single_delete",
+      "kind": "delete",
+      "content_shape": "absent",
+      "prior_cache": [{"id": "101", "content": "SYNTHETIC prior text", "embeds": []}],
+      "event": {"id": "101", "channel_id": "201", "guild_id": "301"}
+    },
+    {
+      "name": "bulk_delete",
+      "kind": "bulk_delete",
+      "content_shape": "absent",
+      "prior_cache": [{"id": "101", "content": "SYNTHETIC prior text", "embeds": []}],
+      "event": {"ids": ["101", "102"], "channel_id": "201", "guild_id": "301"}
+    }
+  ]
+}
