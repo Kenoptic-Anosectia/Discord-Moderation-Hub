@@ -1,15 +1,13 @@
 mod config;
 mod text_helpers;
+mod tickets;
 
 use config::Config;
 use poise::serenity_prelude as serenity;
 use poise::serenity_prelude::Mentionable;
 use rusqlite::params;
-use serenity::all::{
-    ButtonStyle, ChannelId, ComponentInteraction, CreateActionRow, CreateButton, CreateChannel,
-    CreateInteractionResponse, CreateInteractionResponseMessage, PermissionOverwrite,
-    PermissionOverwriteType, Permissions,
-};
+#[cfg(test)]
+use serenity::all::{ChannelId, PermissionOverwrite, PermissionOverwriteType, Permissions};
 use serenity::builder::{
     CreateAttachment, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateMessage,
 };
@@ -31,13 +29,12 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 
 const AUDIT_MATCH_WINDOW_MS: u64 = 8000;
 const CACHE_LIMIT: usize = 10000;
-const TICKET_PANEL_GENERAL_BUTTON: &str = "ticket_open_general";
-const TICKET_PANEL_AGE_BUTTON: &str = "ticket_open_age_verify";
 
 struct Data {
     config: Arc<Config>,
     message_cache: Arc<RwLock<HashMap<serenity::MessageId, CachedMessage>>>,
     rr_db: Arc<Connection>,
+    tickets: Option<tickets::repository::Repository>,
 }
 
 #[derive(Clone)]
@@ -56,7 +53,8 @@ struct AuditActorInfo {
     reason: Option<String>,
 }
 
-// Keep the cache-only calculation testable without adding another inactive ticket function.
+// Retained baseline regression for Serenity's cache permission calculation.
+#[cfg(test)]
 macro_rules! cached_channel_permissions {
     ($cache:expr, $channel:expr, $user_id:expr) => {{
         let cache: &serenity::Cache = $cache;
@@ -72,6 +70,15 @@ macro_rules! cached_channel_permissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ticket_commands_are_registered_only_with_valid_enabled_config() {
+        assert!(!configured_commands(false)
+            .iter()
+            .any(|c| c.name == "ticket-panel-post"));
+        assert!(configured_commands(true)
+            .iter()
+            .any(|c| c.name == "ticket-panel-post"));
+    }
 
     #[test]
     fn ticket_cached_permissions_preserve_visibility_and_cache_miss_policy() {
@@ -1122,7 +1129,24 @@ async fn event_handler(
 ) -> Result<(), Error> {
     let log_channel_id = data.config.log_channel_id;
 
+    if !tickets::allow_general_events(data.config.ticket_privacy_lockdown, event) {
+        return Ok(());
+    }
+
     match event {
+        serenity::FullEvent::InteractionCreate {
+            interaction: serenity::Interaction::Component(component),
+        } => {
+            if let (Some(settings), Some(repo)) = (&data.config.tickets, &data.tickets) {
+                // Do not propagate raw ticket errors into Poise's general error logs.
+                if tickets::runtime::component(ctx, component, settings, repo)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("ticket interaction: private response unavailable");
+                }
+            }
+        }
         serenity::FullEvent::Message { new_message } => {
             if new_message.channel_id.get() == log_channel_id {
                 return Ok(());
@@ -2376,229 +2400,15 @@ async fn ticket_panel_post(
     ctx: Context<'_>,
     #[description = "Channel to post the ticket panel in"] channel: serenity::GuildChannel,
 ) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .ok_or("This command can only be used in a server")?;
-
-    let guild = guild_id
-        .to_partial_guild(&ctx.serenity_context().http)
-        .await?;
-
-    if ctx.author().id != guild.owner_id {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("Only the server owner can use this command.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if channel.kind != ChannelType::Text {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("Please choose a text channel.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let embed = CreateEmbed::new()
-        .title("Open a Ticket")
-        .description(
-            "Use the buttons below to open a private ticket.\n\n\
-             **Contact staff privately** opens a normal support ticket.\n\
-             **Open an age verification ticket** opens a private age verification ticket.",
-        )
-        .color(Colour::from_rgb(88, 101, 242));
-
-    let components = vec![CreateActionRow::Buttons(vec![
-        CreateButton::new(TICKET_PANEL_GENERAL_BUTTON)
-            .label("Contact staff privately")
-            .style(ButtonStyle::Primary),
-        CreateButton::new(TICKET_PANEL_AGE_BUTTON)
-            .label("Open an age verification ticket")
-            .style(ButtonStyle::Success),
-    ])];
-
-    channel
-        .id
-        .send_message(
-            &ctx.serenity_context().http,
-            CreateMessage::new().embed(embed).components(components),
-        )
-        .await?;
-
-    ctx.send(
-        poise::CreateReply::default()
-            .content(format!("Ticket panel posted in {}.", channel.id.mention()))
-            .ephemeral(true),
-    )
-    .await?;
-
-    Ok(())
+    tickets::runtime::publish(ctx, channel).await
 }
 
-async fn handle_ticket_button(
-    ctx: &serenity::Context,
-    interaction: &ComponentInteraction,
-    data: &Data,
-) -> Result<(), Error> {
-    let guild_id = match interaction.guild_id {
-        Some(id) => id,
-        None => return Ok(()),
-    };
-
-    let user_id = interaction.user.id;
-    let is_age_verification = interaction.data.custom_id == TICKET_PANEL_AGE_BUTTON;
-
-    let staff_role_id = match data.config.staff_role_id {
-        Some(id) => id,
-        None => {
-            interaction
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("Ticket system is not configured: STAFF_ROLE_ID is missing.")
-                            .ephemeral(true),
-                    ),
-                )
-                .await?;
-            return Ok(());
-        }
-    };
-
-    let category_id = if is_age_verification {
-        data.config.age_verification_category_id
-    } else {
-        data.config.ticket_category_id
-    };
-
-    let prefix = if is_age_verification {
-        "age-verification-ticket"
-    } else {
-        "ticket"
-    };
-
-    let existing_channels = guild_id.channels(&ctx.http).await?;
-    if existing_channels.values().any(|ch| {
-        ch.kind == ChannelType::Text
-            && ch.name.starts_with(prefix)
-            && cached_channel_permissions!(&ctx.cache, ch, user_id)
-                .map(|p| p.view_channel())
-                .unwrap_or(false)
-    }) {
-        interaction
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("You already have an open ticket of this type.")
-                        .ephemeral(true),
-                ),
-            )
-            .await?;
-        return Ok(());
+fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
+    let mut commands = vec![age_verified(), reactionrole()];
+    if enabled {
+        commands.push(ticket_panel_post());
     }
-
-    let next_number = next_ticket_number(&existing_channels, prefix);
-    let channel_name = format!("{prefix}-{next_number:04}");
-
-    let mut builder = CreateChannel::new(channel_name)
-        .kind(ChannelType::Text)
-        .permissions(vec![
-            PermissionOverwrite {
-                allow: Permissions::VIEW_CHANNEL
-                    | Permissions::SEND_MESSAGES
-                    | Permissions::READ_MESSAGE_HISTORY
-                    | Permissions::ATTACH_FILES
-                    | Permissions::EMBED_LINKS,
-                deny: Permissions::empty(),
-                kind: PermissionOverwriteType::Member(user_id),
-            },
-            PermissionOverwrite {
-                allow: Permissions::VIEW_CHANNEL
-                    | Permissions::SEND_MESSAGES
-                    | Permissions::READ_MESSAGE_HISTORY
-                    | Permissions::ATTACH_FILES
-                    | Permissions::EMBED_LINKS,
-                deny: Permissions::empty(),
-                kind: PermissionOverwriteType::Role(serenity::RoleId::new(staff_role_id)),
-            },
-            PermissionOverwrite {
-                allow: Permissions::empty(),
-                deny: Permissions::VIEW_CHANNEL,
-                kind: PermissionOverwriteType::Role(serenity::RoleId::new(guild_id.get())),
-            },
-        ]);
-
-    if let Some(category_id) = category_id {
-        builder = builder.category(ChannelId::new(category_id));
-    }
-
-    let created_channel = guild_id.create_channel(&ctx.http, builder).await?;
-
-    let open_embed = if is_age_verification {
-        CreateEmbed::new()
-            .title("Age Verification Ticket")
-            .description(format!(
-                "Welcome, {}.\n\nA staff member will assist you shortly. Please have your ID ready. You may cover sensitive information, but staff must still be able to verify your picture and date of birth.",
-                interaction.user.mention()
-            ))
-            .color(Colour::from_rgb(87, 242, 135))
-    } else {
-        CreateEmbed::new()
-            .title("Private Staff Ticket")
-            .description(format!(
-                "Welcome, {}.\n\nPlease explain your issue and a staff member will respond as soon as possible.",
-                interaction.user.mention()
-            ))
-            .color(Colour::from_rgb(88, 101, 242))
-    };
-
-    created_channel
-        .id
-        .send_message(&ctx.http, CreateMessage::new().embed(open_embed))
-        .await?;
-
-    interaction
-        .create_response(
-            &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!(
-                        "Your ticket has been created: {}",
-                        created_channel.id.mention()
-                    ))
-                    .ephemeral(true),
-            ),
-        )
-        .await?;
-
-    Ok(())
-}
-
-fn next_ticket_number(
-    channels: &std::collections::HashMap<serenity::ChannelId, serenity::GuildChannel>,
-    prefix: &str,
-) -> u32 {
-    channels
-        .values()
-        .filter_map(|ch| {
-            if !ch.name.starts_with(prefix) {
-                return None;
-            }
-
-            ch.name
-                .rsplit('-')
-                .next()
-                .and_then(|part| part.parse::<u32>().ok())
-        })
-        .max()
-        .unwrap_or(0)
-        + 1
+    commands
 }
 
 #[tokio::main]
@@ -2622,7 +2432,7 @@ async fn main() -> Result<(), Error> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![age_verified(), reactionrole()],
+            commands: configured_commands(config.tickets.is_some()),
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
@@ -2638,11 +2448,17 @@ async fn main() -> Result<(), Error> {
                     poise::builtins::register_globally(ctx, &framework.options().commands).await?;
 
                     let rr_db = init_reaction_role_db(&config.reaction_role_db_path).await?;
+                    let tickets=match &config.tickets {
+                        Some(settings)=>Some(tickets::repository::Repository::open(&settings.db_path).await?),
+                        None=>None,
+                    };
+                    if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: general event logging paused; ticket opening disabled pending A07."); }
 
                     Ok(Data {
                         config,
                         message_cache: Arc::new(RwLock::new(HashMap::new())),
                         rr_db,
+                        tickets,
                     })
                 })
             }
