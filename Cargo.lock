@@ -1616,6 +1616,7 @@ dependencies = [
  "serenity",
  "tokio",
  "tokio-rusqlite",
+ "url",
 ]
 
 [[package]]
