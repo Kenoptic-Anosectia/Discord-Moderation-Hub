@@ -56,9 +56,109 @@ struct AuditActorInfo {
     reason: Option<String>,
 }
 
+// Keep the cache-only calculation testable without adding another inactive ticket function.
+macro_rules! cached_channel_permissions {
+    ($cache:expr, $channel:expr, $user_id:expr) => {{
+        let cache: &serenity::Cache = $cache;
+        let channel: &serenity::GuildChannel = $channel;
+        let user_id: serenity::UserId = $user_id;
+        cache.guild(channel.guild_id).and_then(|guild| {
+            let member = guild.members.get(&user_id)?;
+            Some(guild.user_permissions_in(channel, member))
+        })
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_cached_permissions_preserve_visibility_and_cache_miss_policy() {
+        let guild_id = serenity::GuildId::new(100);
+        let user_id = serenity::UserId::new(200);
+        // Exercise Serenity's real cache, role calculation, and channel overwrites offline.
+        for case in 0..9 {
+            let cache = serenity::Cache::default();
+            let mut guild = serenity::Guild::default();
+            guild.id = guild_id;
+            guild.owner_id = serenity::UserId::new(if case == 6 { 200 } else { 999 });
+            let mut member = serenity::Member::default();
+            member.guild_id = guild_id;
+            member.user.id = user_id;
+            let mut everyone = serenity::Role::default();
+            everyone.id = serenity::RoleId::new(guild_id.get());
+            everyone.guild_id = guild_id;
+            everyone.permissions = if case == 4 {
+                Permissions::empty()
+            } else {
+                Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES
+            };
+            guild.roles.insert(everyone.id, everyone);
+            let mut channel = serenity::GuildChannel::default();
+            channel.id = ChannelId::new(300);
+            channel.guild_id = guild_id;
+            if matches!(case, 3 | 5 | 6) {
+                channel.permission_overwrites.push(PermissionOverwrite {
+                    allow: Permissions::empty(),
+                    deny: Permissions::VIEW_CHANNEL,
+                    kind: PermissionOverwriteType::Member(user_id),
+                });
+            }
+            if case == 4 {
+                channel.permission_overwrites.push(PermissionOverwrite {
+                    allow: Permissions::VIEW_CHANNEL,
+                    deny: Permissions::empty(),
+                    kind: PermissionOverwriteType::Member(user_id),
+                });
+            }
+            if matches!(case, 5 | 8) {
+                let mut role = serenity::Role::default();
+                role.id = serenity::RoleId::new(400);
+                role.guild_id = guild_id;
+                role.permissions = if case == 5 {
+                    Permissions::ADMINISTRATOR
+                } else {
+                    Permissions::VIEW_CHANNEL
+                };
+                member.roles.push(role.id);
+                guild.roles.insert(role.id, role);
+                if case == 8 {
+                    channel.permission_overwrites.push(PermissionOverwrite {
+                        allow: Permissions::empty(),
+                        deny: Permissions::VIEW_CHANNEL,
+                        kind: PermissionOverwriteType::Role(serenity::RoleId::new(400)),
+                    });
+                }
+            }
+            if case != 1 {
+                guild.members.insert(user_id, member);
+            }
+            if case != 0 {
+                let mut event: serenity::GuildCreateEvent =
+                    serde_json::from_value(serde_json::to_value(&guild).unwrap()).unwrap();
+                cache.update(&mut event);
+            }
+            if case == 7 {
+                // Lookup must use the channel's guild, not an interaction's guild.
+                channel.guild_id = serenity::GuildId::new(101);
+            }
+            let permissions = cached_channel_permissions!(&cache, &channel, user_id);
+            assert_eq!(
+                permissions.is_none(),
+                matches!(case, 0 | 1 | 7),
+                "case {case}"
+            );
+            assert_eq!(
+                permissions.map(|p| p.view_channel()).unwrap_or(false),
+                matches!(case, 2 | 4 | 5 | 6),
+                "case {case}"
+            );
+            if case == 2 {
+                assert!(permissions.unwrap().send_messages());
+            }
+        }
+    }
 
     fn age_member(roles: &[u64], permissions: Permissions) -> serenity::Member {
         let mut member = serenity::Member::default();
@@ -238,7 +338,7 @@ async fn log_to_channel_with_files(
     log_channel_id: u64,
     embed: CreateEmbed,
     files: Vec<CreateAttachment>,
-) -> Result<(), serenity::Error> {
+) -> Result<(), Box<serenity::Error>> {
     let channel_id = serenity::ChannelId::new(log_channel_id);
 
     let mut message = CreateMessage::new().embed(embed);
@@ -486,7 +586,7 @@ async fn log_to_channel(
     ctx: &serenity::Context,
     log_channel_id: u64,
     embed: CreateEmbed,
-) -> Result<(), serenity::Error> {
+) -> Result<(), Box<serenity::Error>> {
     let channel_id = serenity::ChannelId::new(log_channel_id);
 
     channel_id
@@ -501,7 +601,7 @@ async fn find_recent_audit_actor(
     guild_id: serenity::GuildId,
     target_user_id: serenity::UserId,
     action: Action,
-) -> Result<Option<AuditActorInfo>, serenity::Error> {
+) -> Result<Option<AuditActorInfo>, Box<serenity::Error>> {
     let audit_logs = guild_id
         .audit_logs(&ctx.http, Some(action), None, None, Some(10))
         .await?;
@@ -678,13 +778,15 @@ async fn rr_remove_binding(
     Ok(affected)
 }
 
+type ReactionRoleRow = (String, String, String, String, String);
+
 async fn rr_list_bindings(
     db: Arc<Connection>,
     message_id: u64,
-) -> Result<Vec<(String, String, String, String, String)>, Error> {
+) -> Result<Vec<ReactionRoleRow>, Error> {
     let rows = db
         .call(
-            move |conn| -> Result<Vec<(String, String, String, String, String)>, rusqlite::Error> {
+            move |conn| -> Result<Vec<ReactionRoleRow>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT guild_id, channel_id, message_id, emoji_key, role_id
                      FROM reaction_roles
@@ -2384,8 +2486,7 @@ async fn handle_ticket_button(
     if existing_channels.values().any(|ch| {
         ch.kind == ChannelType::Text
             && ch.name.starts_with(prefix)
-            && ch
-                .permissions_for_user(&ctx.cache, user_id)
+            && cached_channel_permissions!(&ctx.cache, ch, user_id)
                 .map(|p| p.view_channel())
                 .unwrap_or(false)
     }) {
