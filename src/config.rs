@@ -31,8 +31,8 @@ impl Config {
 }
 
 fn required_string(key: &str) -> Result<String, Error> {
-    let value = env::var(key)
-        .map_err(|_| format!("Missing required environment variable: {}", key))?;
+    let value =
+        env::var(key).map_err(|_| format!("Missing required environment variable: {}", key))?;
 
     if value.trim().is_empty() {
         return Err(format!("Environment variable {} cannot be empty", key).into());
@@ -53,10 +53,9 @@ fn required_u64(key: &str) -> Result<u64, Error> {
 
 fn optional_u64(key: &str) -> Result<Option<u64>, Error> {
     match optional_string(key) {
-        Some(raw) => Ok(Some(
-            raw.parse::<u64>()
-                .map_err(|_| format!("Environment variable {} must be a valid u64", key))?,
-        )),
+        Some(raw) => Ok(Some(raw.parse::<u64>().map_err(|_| {
+            format!("Environment variable {} must be a valid u64", key)
+        })?)),
         None => Ok(None),
     }
 }

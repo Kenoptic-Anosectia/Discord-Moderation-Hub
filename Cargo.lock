@@ -1605,7 +1605,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "skynet-network-core"
+name = "discord-moderation-hub"
 version = "0.1.0"
 dependencies = [
  "dotenvy",

@@ -4,17 +4,17 @@ use config::Config;
 use poise::serenity_prelude as serenity;
 use poise::serenity_prelude::Mentionable;
 use rusqlite::params;
+use serenity::all::{
+    ButtonStyle, ChannelId, ComponentInteraction, CreateActionRow, CreateButton, CreateChannel,
+    CreateInteractionResponse, CreateInteractionResponseMessage, PermissionOverwrite,
+    PermissionOverwriteType, Permissions,
+};
 use serenity::builder::{
     CreateAttachment, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateMessage,
 };
 use serenity::model::channel::{ChannelType, ReactionType};
 use serenity::model::colour::Colour;
 use serenity::model::guild::audit_log::{Action, MemberAction};
-use serenity::all::{
-    ButtonStyle, ChannelId, ComponentInteraction, CreateActionRow, CreateButton, CreateChannel,
-    CreateInteractionResponse, CreateInteractionResponseMessage, PermissionOverwrite,
-    PermissionOverwriteType, Permissions,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,6 +50,153 @@ struct CachedMessage {
 struct AuditActorInfo {
     moderator: String,
     reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embed_truncation_ascii_boundaries() {
+        for (input, limit, expected) in [
+            ("", 0, ""),
+            ("abc", 3, "abc"),
+            ("abc", 4, "abc"),
+            ("abcd", 3, "..."),
+            ("abcdef", 5, "ab..."),
+            ("abcdef", 6, "abcdef"),
+        ] {
+            assert_eq!(
+                truncate_for_embed(input, limit),
+                expected,
+                "{input:?}, {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_truncation_unicode_scalar_boundaries() {
+        // The existing helper counts Unicode scalar values, not UTF-8 bytes,
+        // UTF-16 code units, or grapheme clusters.
+        for (input, limit, expected) in [
+            ("é界🦀", 3, "é界🦀"),
+            ("é界🦀ab", 4, "é..."),
+            ("🦀界éabc", 5, "🦀界..."),
+            ("e\u{301}界🦀abc", 5, "e\u{301}..."),
+            ("👩\u{200d}💻abc", 5, "👩\u{200d}..."),
+        ] {
+            let result = truncate_for_embed(input, limit);
+            assert_eq!(result, expected, "{input:?}, {limit}");
+            assert!(result.chars().count() <= limit);
+        }
+    }
+
+    #[test]
+    fn embed_truncation_preserves_existing_small_limit_ellipsis() {
+        // Characterize, rather than silently change, the existing behavior:
+        // a truncated result always includes all three dots even below limit 3.
+        for input in ["abcd", "é界🦀a"] {
+            for limit in 0..=3 {
+                assert_eq!(
+                    truncate_for_embed(input, limit),
+                    "...",
+                    "{input:?}, {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emoji_input_normalization_cases() {
+        for (input, expected) in [
+            ("", ""),
+            (" \t\n", ""),
+            (" 🦀 \n", "🦀"),
+            ("\u{2003}👍🏽\u{2003}", "👍🏽"),
+            ("<:wave:123>", "wave:123"),
+            (" <a:dance:456> ", "dance:456"),
+            ("wave:123", "wave:123"),
+            ("<:incomplete>", "<:incomplete>"),
+            ("plain text", "plain text"),
+        ] {
+            assert_eq!(parse_emoji_input(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn reaction_type_normalization_cases() {
+        for (reaction, expected) in [
+            (ReactionType::Unicode("👍🏽".into()), "👍🏽"),
+            (
+                ReactionType::Custom {
+                    animated: false,
+                    id: serenity::EmojiId::new(123),
+                    name: Some("wave".into()),
+                },
+                "wave:123",
+            ),
+            (
+                ReactionType::Custom {
+                    animated: true,
+                    id: serenity::EmojiId::new(456),
+                    name: Some("dance".into()),
+                },
+                "dance:456",
+            ),
+            (
+                ReactionType::Custom {
+                    animated: false,
+                    id: serenity::EmojiId::new(789),
+                    name: None,
+                },
+                "emoji:789",
+            ),
+        ] {
+            assert_eq!(normalize_reaction_type(&reaction), expected, "{reaction:?}");
+        }
+    }
+
+    #[test]
+    fn emoji_input_matches_reaction_lookup_keys() {
+        for (input, reaction) in [
+            (
+                " <:wave:123> ",
+                ReactionType::Custom {
+                    animated: false,
+                    id: serenity::EmojiId::new(123),
+                    name: Some("wave".into()),
+                },
+            ),
+            (
+                "<a:dance:456>",
+                ReactionType::Custom {
+                    animated: true,
+                    id: serenity::EmojiId::new(456),
+                    name: Some("dance".into()),
+                },
+            ),
+            (" 🦀 ", ReactionType::Unicode("🦀".into())),
+        ] {
+            assert_eq!(parse_emoji_input(input), normalize_reaction_type(&reaction));
+        }
+    }
+
+    #[test]
+    fn code_block_placeholder_and_fence_sanitization() {
+        for (input, expected) in [
+            ("", "```*No text content*\n```"),
+            (" \t\n", "```*No text content*\n```"),
+            ("hello 🦀", "```hello 🦀\n```"),
+            ("a```b", "```a'''b\n```"),
+        ] {
+            assert_eq!(code_block_or_placeholder(input), expected, "{input:?}");
+        }
+        let long_unicode = "🦀".repeat(981);
+        assert_eq!(
+            code_block_or_placeholder(&long_unicode),
+            format!("```{}...\n```", "🦀".repeat(977))
+        );
+    }
 }
 
 fn truncate_for_embed(input: &str, max_len: usize) -> String {
@@ -292,9 +439,7 @@ fn format_automod_event_type(
     }
 }
 
-fn format_automod_action_count(
-    actions: &[serenity::model::guild::automod::Action],
-) -> String {
+fn format_automod_action_count(actions: &[serenity::model::guild::automod::Action]) -> String {
     if actions.is_empty() {
         "*None*".to_string()
     } else {
@@ -419,8 +564,7 @@ async fn find_recent_audit_actor_with_retry(
             sleep(Duration::from_millis(delay_ms)).await;
         }
 
-        if let Ok(Some(info)) =
-            find_recent_audit_actor(ctx, guild_id, target_user_id, action).await
+        if let Ok(Some(info)) = find_recent_audit_actor(ctx, guild_id, target_user_id, action).await
         {
             return Some(info);
         }
@@ -676,7 +820,9 @@ async fn reactionrole_add(
     #[description = "Role to assign"] role: serenity::Role,
     #[description = "Channel containing the target message"] channel: serenity::GuildChannel,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().ok_or("This command can only be used in a server")?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or("This command can only be used in a server")?;
     let parsed_message_id = message_id.parse::<u64>()?;
     let emoji_key = parse_emoji_input(&emoji);
 
@@ -705,7 +851,9 @@ async fn reactionrole_add(
         ReactionType::Unicode(emoji.clone())
     };
 
-    let _ = target_message.react(&ctx.serenity_context().http, reaction_type).await;
+    let _ = target_message
+        .react(&ctx.serenity_context().http, reaction_type)
+        .await;
 
     ctx.send(
         poise::CreateReply::default()
@@ -738,7 +886,8 @@ async fn reactionrole_remove(
 ) -> Result<(), Error> {
     let parsed_message_id = message_id.parse::<u64>()?;
 
-    let removed = rr_remove_binding(ctx.data().rr_db.clone(), parsed_message_id, role.id.get()).await?;
+    let removed =
+        rr_remove_binding(ctx.data().rr_db.clone(), parsed_message_id, role.id.get()).await?;
 
     ctx.send(
         poise::CreateReply::default()
@@ -794,12 +943,8 @@ async fn reactionrole_list(
         .description(description)
         .color(Colour::BLUE);
 
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed)
-            .ephemeral(true),
-    )
-    .await?;
+    ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+        .await?;
 
     Ok(())
 }
@@ -850,7 +995,9 @@ async fn event_handler(
 
             let member = guild_id.member(&ctx.http, user_id).await?;
             for role_id in role_ids {
-                let _ = member.add_role(&ctx.http, serenity::RoleId::new(role_id)).await;
+                let _ = member
+                    .add_role(&ctx.http, serenity::RoleId::new(role_id))
+                    .await;
             }
         }
 
@@ -928,7 +1075,11 @@ async fn event_handler(
                         format!("<#{}> (`{}`)", channel_id.get(), channel_id.get()),
                         false,
                     )
-                    .field("Message ID", format!("`{}`", deleted_message_id.get()), false)
+                    .field(
+                        "Message ID",
+                        format!("`{}`", deleted_message_id.get()),
+                        false,
+                    )
                     .description("Original message data was not available in cache.")
                     .footer(build_log_footer())
                     .timestamp(serenity::Timestamp::now());
@@ -1000,14 +1151,22 @@ async fn event_handler(
                 .as_ref()
                 .map(|c| c.author_tag.clone())
                 .or_else(|| new.as_ref().map(|m| format_user_label(&m.author)))
-                .or_else(|| old_if_available.as_ref().map(|m| format_user_label(&m.author)))
+                .or_else(|| {
+                    old_if_available
+                        .as_ref()
+                        .map(|m| format_user_label(&m.author))
+                })
                 .unwrap_or_else(|| "Unknown User".to_string());
 
             let author_avatar = existing_cache
                 .as_ref()
                 .and_then(|c| c.author_avatar_url.clone())
                 .or_else(|| new.as_ref().and_then(|m| m.author.avatar_url()))
-                .or_else(|| old_if_available.as_ref().and_then(|m| m.author.avatar_url()));
+                .or_else(|| {
+                    old_if_available
+                        .as_ref()
+                        .and_then(|m| m.author.avatar_url())
+                });
 
             let author_id = existing_cache
                 .as_ref()
@@ -1075,7 +1234,11 @@ async fn event_handler(
                 .color(Colour::ORANGE)
                 .field(
                     "Channel",
-                    format!("<#{}> (`{}`)", event.channel_id.get(), event.channel_id.get()),
+                    format!(
+                        "<#{}> (`{}`)",
+                        event.channel_id.get(),
+                        event.channel_id.get()
+                    ),
                     false,
                 )
                 .field(
@@ -1088,7 +1251,11 @@ async fn event_handler(
                     false,
                 )
                 .field("Author Type", if is_bot { "Bot" } else { "User" }, true)
-                .field("Text Changed", if text_changed { "Yes" } else { "No" }, true)
+                .field(
+                    "Text Changed",
+                    if text_changed { "Yes" } else { "No" },
+                    true,
+                )
                 .field(
                     "Embeds Changed",
                     if embeds_changed { "Yes" } else { "No" },
@@ -1097,8 +1264,16 @@ async fn event_handler(
 
             if text_changed {
                 embed = embed
-                    .field("Before Text", code_block_or_placeholder(&before_display), false)
-                    .field("After Text", code_block_or_placeholder(&after_display), false);
+                    .field(
+                        "Before Text",
+                        code_block_or_placeholder(&before_display),
+                        false,
+                    )
+                    .field(
+                        "After Text",
+                        code_block_or_placeholder(&after_display),
+                        false,
+                    );
             }
 
             if embeds_changed {
@@ -1231,7 +1406,10 @@ async fn event_handler(
             let _ = log_to_channel(ctx, log_channel_id, embed).await;
         }
 
-        serenity::FullEvent::ChannelDelete { channel, messages: _ } => {
+        serenity::FullEvent::ChannelDelete {
+            channel,
+            messages: _,
+        } => {
             let embed = CreateEmbed::new()
                 .title("Channel Deleted")
                 .color(Colour::DARK_RED)
@@ -1328,7 +1506,11 @@ async fn event_handler(
                     if new.mentionable { "Yes" } else { "No" },
                     true,
                 )
-                .field("Permissions", format!("`{}`", new.permissions.bits()), false)
+                .field(
+                    "Permissions",
+                    format!("`{}`", new.permissions.bits()),
+                    false,
+                )
                 .footer(build_log_footer())
                 .timestamp(serenity::Timestamp::now());
 
@@ -1400,7 +1582,10 @@ async fn event_handler(
                 .map(|r| format!("`#{:06X}`", r.colour.0))
                 .unwrap_or_else(|| "*Unknown*".to_string());
 
-            let old_hoist = old_data_if_available.as_ref().map(|r| r.hoist).unwrap_or(false);
+            let old_hoist = old_data_if_available
+                .as_ref()
+                .map(|r| r.hoist)
+                .unwrap_or(false);
             let old_mentionable = old_data_if_available
                 .as_ref()
                 .map(|r| r.mentionable)
@@ -1433,7 +1618,11 @@ async fn event_handler(
                     true,
                 )
                 .field("Permissions Before", old_permissions, false)
-                .field("Permissions After", format!("`{}`", new.permissions.bits()), false)
+                .field(
+                    "Permissions After",
+                    format!("`{}`", new.permissions.bits()),
+                    false,
+                )
                 .footer(build_log_footer())
                 .timestamp(serenity::Timestamp::now());
 
@@ -1480,7 +1669,10 @@ async fn event_handler(
                 .map(|m| m.roles.clone())
                 .unwrap_or_else(|| event.roles.clone());
 
-            let old_pending = old_if_available.as_ref().map(|m| m.pending).unwrap_or(false);
+            let old_pending = old_if_available
+                .as_ref()
+                .map(|m| m.pending)
+                .unwrap_or(false);
             let new_pending = new.as_ref().map(|m| m.pending).unwrap_or(event.pending);
 
             let old_timeout = old_if_available
@@ -1559,8 +1751,16 @@ async fn event_handler(
             }
 
             embed = embed
-                .field("Pending Before", if old_pending { "Yes" } else { "No" }, true)
-                .field("Pending After", if new_pending { "Yes" } else { "No" }, true)
+                .field(
+                    "Pending Before",
+                    if old_pending { "Yes" } else { "No" },
+                    true,
+                )
+                .field(
+                    "Pending After",
+                    if new_pending { "Yes" } else { "No" },
+                    true,
+                )
                 .field(
                     "Timeout Before",
                     old_timeout
@@ -1613,7 +1813,11 @@ async fn event_handler(
                     .field("Member", format!("<@{}>", user.id.get()), true)
                     .field("User ID", format!("`{}`", user.id.get()), true)
                     .field("Moderator", info.moderator, false)
-                    .field("ID", format_user_id_codeblock(executor_id, user.id.get()), false)
+                    .field(
+                        "ID",
+                        format_user_id_codeblock(executor_id, user.id.get()),
+                        false,
+                    )
                     .field(
                         "Reason",
                         info.reason
@@ -1627,8 +1831,13 @@ async fn event_handler(
                 return Ok(());
             }
 
-            if let Some(info) =
-                find_recent_audit_actor_with_retry(ctx, *guild_id, user.id, Action::Member(MemberAction::Kick)).await
+            if let Some(info) = find_recent_audit_actor_with_retry(
+                ctx,
+                *guild_id,
+                user.id,
+                Action::Member(MemberAction::Kick),
+            )
+            .await
             {
                 let executor_id = info
                     .moderator
@@ -1645,7 +1854,11 @@ async fn event_handler(
                     .field("Member", format!("<@{}>", user.id.get()), true)
                     .field("User ID", format!("`{}`", user.id.get()), true)
                     .field("Moderator", info.moderator, false)
-                    .field("ID", format_user_id_codeblock(executor_id, user.id.get()), false)
+                    .field(
+                        "ID",
+                        format_user_id_codeblock(executor_id, user.id.get()),
+                        false,
+                    )
                     .field(
                         "Reason",
                         info.reason
@@ -1714,7 +1927,10 @@ async fn event_handler(
             let _ = log_to_channel(ctx, log_channel_id, embed).await;
         }
 
-        serenity::FullEvent::GuildBanAddition { guild_id, banned_user } => {
+        serenity::FullEvent::GuildBanAddition {
+            guild_id,
+            banned_user,
+        } => {
             let avatar = banned_user.avatar_url();
 
             let audit = find_recent_audit_actor_with_retry(
@@ -1748,7 +1964,8 @@ async fn event_handler(
                 .field("User ID", format!("`{}`", banned_user.id.get()), true)
                 .field(
                     "Moderator",
-                    audit.as_ref()
+                    audit
+                        .as_ref()
                         .map(|a| a.moderator.clone())
                         .unwrap_or_else(|| "Unknown".to_string()),
                     false,
@@ -1760,7 +1977,8 @@ async fn event_handler(
                 )
                 .field(
                     "Reason",
-                    audit.and_then(|a| a.reason)
+                    audit
+                        .and_then(|a| a.reason)
                         .unwrap_or_else(|| "*No reason provided*".to_string()),
                     false,
                 )
@@ -1807,7 +2025,8 @@ async fn event_handler(
                 .field("User ID", format!("`{}`", unbanned_user.id.get()), true)
                 .field(
                     "Moderator",
-                    audit.as_ref()
+                    audit
+                        .as_ref()
                         .map(|a| a.moderator.clone())
                         .unwrap_or_else(|| "Unknown".to_string()),
                     false,
@@ -1819,7 +2038,8 @@ async fn event_handler(
                 )
                 .field(
                     "Reason",
-                    audit.and_then(|a| a.reason)
+                    audit
+                        .and_then(|a| a.reason)
                         .unwrap_or_else(|| "*No reason provided*".to_string()),
                     false,
                 )
@@ -1874,7 +2094,11 @@ async fn event_handler(
                     format!("<@{}> (`{}`)", rule.creator_id.get(), rule.creator_id.get()),
                     false,
                 )
-                .field("Event Type", format_automod_event_type(rule.event_type), true)
+                .field(
+                    "Event Type",
+                    format_automod_event_type(rule.event_type),
+                    true,
+                )
                 .field(
                     "Trigger",
                     truncate_for_embed(&format_automod_trigger(rule), 1000),
@@ -1914,7 +2138,11 @@ async fn event_handler(
                     format!("<@{}> (`{}`)", rule.creator_id.get(), rule.creator_id.get()),
                     false,
                 )
-                .field("Event Type", format_automod_event_type(rule.event_type), true)
+                .field(
+                    "Event Type",
+                    format_automod_event_type(rule.event_type),
+                    true,
+                )
                 .field(
                     "Trigger",
                     truncate_for_embed(&format_automod_trigger(rule), 1000),
@@ -1954,7 +2182,11 @@ async fn event_handler(
                     format!("<@{}> (`{}`)", rule.creator_id.get(), rule.creator_id.get()),
                     false,
                 )
-                .field("Event Type", format_automod_event_type(rule.event_type), true)
+                .field(
+                    "Event Type",
+                    format_automod_event_type(rule.event_type),
+                    true,
+                )
                 .field(
                     "Trigger",
                     truncate_for_embed(&format_automod_trigger(rule), 1000),
@@ -2089,7 +2321,8 @@ async fn handle_ticket_button(
     if existing_channels.values().any(|ch| {
         ch.kind == ChannelType::Text
             && ch.name.starts_with(prefix)
-            && ch.permissions_for_user(&ctx.cache, user_id)
+            && ch
+                .permissions_for_user(&ctx.cache, user_id)
                 .map(|p| p.view_channel())
                 .unwrap_or(false)
     }) {
