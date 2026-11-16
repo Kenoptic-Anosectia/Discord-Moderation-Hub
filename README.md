@@ -74,6 +74,38 @@ This includes things such as:
 
 If you skip this step, parts of the bot will break, point to the wrong places, or silently fail.
 
+### Staff-authorized age-role command
+
+Configure `STAFF_ROLE_ID`, `AGE_ROLE_1` and `AGE_ROLE_2` in your local `.env`
+(see `.env.example`; the values there are placeholders, not usable configuration).
+`/age-verified user:<member>` requires the caller to hold the configured staff
+role **in the invoking server**. Caller Manage Roles, Administrator or server
+ownership alone does not authorize it; staff members do not need Manage Roles.
+The bot still needs Manage Roles and Discord must permit it to assign the roles.
+
+`STAFF_ROLE_ID` is required for this command, but remains optional for existing
+logger/reaction functionality. Missing, malformed, zero, @everyone or nonexistent
+staff-role configuration disables the command safely. Grant roles must exist in
+the invoking server and cannot be zero, @everyone or the configured staff role.
+No role's semantic meaning needs to be identified or renamed.
+
+Each authorized invocation requests **both** configured roles, `AGE_ROLE_1` then
+`AGE_ROLE_2`, additively. It never replaces unrelated roles. Already-held roles
+and deliberate repeated invocations are supported, including restoring either
+configured role after manual removal. Staff can remove channel access manually
+later; there is no revocation database or separate restore command.
+
+Replies are private and deferred before network work. Grants are two sequential
+Discord requests, **not an atomic transaction**. A first failure stops the pair;
+a second failure reports that the first request succeeded. There is no automatic
+rollback/removal. A failed network response can leave Discord's final state
+uncertain, so inspect the member before retrying. No full success is reported
+unless both requests succeeded. Reply failures propagate a sanitized error.
+
+The generated command no longer has a caller Manage Roles permission/visibility
+gate. Existing Discord registrations or server-level command overrides may need
+an authorized future refresh; this change does not register commands or deploy.
+
 ## Build and run
 
 ```bash

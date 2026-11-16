@@ -56,6 +56,174 @@ struct AuditActorInfo {
 mod tests {
     use super::*;
 
+    fn age_member(roles: &[u64], permissions: Permissions) -> serenity::Member {
+        let mut member = serenity::Member::default();
+        member.guild_id = serenity::GuildId::new(100);
+        member.roles = roles.iter().map(|id| serenity::RoleId::new(*id)).collect();
+        member.permissions = Some(permissions);
+        member
+    }
+
+    fn age_request<'a>(
+        caller: &'a serenity::Member,
+        target: &'a serenity::Member,
+    ) -> AgeRoleRequest<'a> {
+        AgeRoleRequest {
+            guild_id: Some(serenity::GuildId::new(100)),
+            caller: Some(caller),
+            target,
+            staff_role_id: Some(200),
+            grant_roles: [300, 400],
+            guild_roles: {
+                const ROLES: &[serenity::RoleId] = &[
+                    serenity::RoleId::new(200),
+                    serenity::RoleId::new(300),
+                    serenity::RoleId::new(400),
+                ];
+                ROLES
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn age_nonstaff_with_manage_roles_is_denied_before_writes() {
+        for permissions in [
+            Permissions::empty(),
+            Permissions::MANAGE_ROLES,
+            Permissions::ADMINISTRATOR,
+        ] {
+            let caller = age_member(&[999], permissions);
+            let target = age_member(&[777], Permissions::empty());
+            let mut writes = Vec::new();
+            let message = execute_age_roles(age_request(&caller, &target), |role| {
+                writes.push(role);
+                std::future::ready(Ok::<_, ()>(()))
+            })
+            .await;
+            assert_eq!(
+                message,
+                "Only members of the configured staff role can use this command."
+            );
+            assert!(writes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn age_invalid_context_or_configuration_never_writes() {
+        let staff = age_member(&[200, 100, 999], Permissions::empty());
+        let target = age_member(&[777], Permissions::empty());
+        let mut foreign = staff.clone();
+        foreign.guild_id = serenity::GuildId::new(101);
+        for case in 0..13 {
+            let mut request = age_request(&staff, &target);
+            match case {
+                0 => request.guild_id = None,
+                1 => request.caller = None,
+                2 => request.caller = Some(&foreign),
+                3 => request.target = &foreign,
+                4 => request.staff_role_id = None,
+                5 => request.staff_role_id = Some(0),
+                6 => request.staff_role_id = Some(100), // @everyone
+                7 => request.staff_role_id = Some(999), // not a guild role
+                8 => request.grant_roles[0] = 0,
+                9 => request.grant_roles[1] = 0,
+                10 => request.grant_roles[0] = 100,
+                11 => request.grant_roles[1] = 200, // must not grant staff
+                12 => request.grant_roles[1] = 999,
+                _ => unreachable!(),
+            }
+            let mut writes = Vec::new();
+            let message = execute_age_roles(request, |role| {
+                writes.push(role);
+                std::future::ready(Ok::<_, ()>(()))
+            })
+            .await;
+            assert!(writes.is_empty(), "case {case}: {message}");
+            assert!(!message.contains("now granted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn age_staff_grants_are_ordered_additive_and_repeatable() {
+        let staff = age_member(&[200], Permissions::empty());
+        let target = age_member(&[777], Permissions::empty());
+        let mut held = std::collections::HashSet::from([777]);
+        // Existing roles are retained; explicit repeats restore either removed role.
+        for removed in [None, None, Some(300), Some(400)] {
+            if let Some(role) = removed {
+                held.remove(&role);
+            }
+            let mut writes = Vec::new();
+            let message = execute_age_roles(age_request(&staff, &target), |role| {
+                writes.push(role.get());
+                held.insert(role.get());
+                std::future::ready(Ok::<_, ()>(()))
+            })
+            .await;
+            assert_eq!(writes, [300, 400]);
+            assert_eq!(held, std::collections::HashSet::from([777, 300, 400]));
+            assert_eq!(message, "Both configured age roles are now granted.");
+        }
+    }
+
+    #[tokio::test]
+    async fn age_failed_grants_report_progress_and_never_rollback() {
+        let staff = age_member(&[200], Permissions::empty());
+        let target = age_member(&[777], Permissions::empty());
+        for fail_at in [1, 2] {
+            for preexisting in [vec![777], vec![777, 300, 400]] {
+                let mut held: std::collections::HashSet<_> = preexisting.iter().copied().collect();
+                let mut writes = Vec::new();
+                let message = execute_age_roles(age_request(&staff, &target), |role| {
+                    writes.push(role.get());
+                    let result = if writes.len() == fail_at {
+                        Err("synthetic private error")
+                    } else {
+                        held.insert(role.get());
+                        Ok(())
+                    };
+                    std::future::ready(result)
+                })
+                .await;
+                assert_eq!(writes.len(), fail_at);
+                assert!(preexisting.iter().all(|role| held.contains(role)));
+                assert_eq!(
+                    message,
+                    if fail_at == 1 {
+                        "AGE_ROLE_1 request failed; AGE_ROLE_2 was not attempted. Existing roles were not removed. Discord may have applied the failed request; check the member before retrying."
+                    } else {
+                        "AGE_ROLE_1 request succeeded; AGE_ROLE_2 request failed. No roles were removed. Discord may have applied the failed request; check the member before retrying."
+                    }
+                );
+                if fail_at == 2 {
+                    assert!(held.contains(&300));
+                }
+                assert!(!message.contains("Both configured"));
+                assert!(!message.contains("synthetic private error"));
+            }
+        }
+    }
+
+    #[test]
+    fn age_command_metadata_allows_staff_without_manage_roles() {
+        let command = age_verified();
+        assert_eq!(command.name, "age-verified");
+        assert!(command.guild_only);
+        assert!(command.required_permissions.is_empty());
+        assert!(command.default_member_permissions.is_empty());
+        assert_eq!(command.required_bot_permissions, Permissions::MANAGE_ROLES);
+        assert_eq!(command.parameters.len(), 1);
+        assert_eq!(command.parameters[0].name, "user");
+        assert!(command.slash_action.is_some());
+        let registration =
+            serde_json::to_value(command.create_as_slash_command().unwrap()).unwrap();
+        // Discord treats a literal permissions "0" differently from no gate:
+        // require the generated registration to omit/null the caller restriction.
+        assert!(registration["default_member_permissions"].is_null());
+        assert_eq!(registration["options"][0]["required"], true);
+        assert_eq!(registration["options"][0]["type"], 6); // Discord USER option
+    }
+
     #[test]
     fn embed_truncation_ascii_boundaries() {
         for (input, limit, expected) in [
@@ -767,32 +935,116 @@ async fn rr_lookup_roles_for_message_emoji(
     Ok(rows)
 }
 
+// The injected operation is the single-role additive Discord endpoint, never a
+// replacement of the target's complete (potentially stale) role snapshot.
+struct AgeRoleRequest<'a> {
+    guild_id: Option<serenity::GuildId>,
+    caller: Option<&'a serenity::Member>,
+    target: &'a serenity::Member,
+    staff_role_id: Option<u64>,
+    grant_roles: [u64; 2],
+    guild_roles: &'a [serenity::RoleId],
+}
+
+async fn execute_age_roles<F, Fut, E>(request: AgeRoleRequest<'_>, mut grant: F) -> &'static str
+where
+    F: FnMut(serenity::RoleId) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let Some(guild_id) = request.guild_id else {
+        return "This command can only be used in a server.";
+    };
+    if request.target.guild_id != guild_id
+        || !request
+            .caller
+            .is_some_and(|caller| caller.guild_id == guild_id)
+    {
+        return "Could not verify caller and target membership in this server. No roles were requested.";
+    }
+    let valid_role = |id: u64| {
+        id != 0 && id != guild_id.get() && request.guild_roles.iter().any(|role| role.get() == id)
+    };
+    let Some(staff) = request.staff_role_id.filter(|id| valid_role(*id)) else {
+        return "This command is disabled: configure a valid STAFF_ROLE_ID for this server.";
+    };
+    if !request
+        .caller
+        .is_some_and(|caller| caller.roles.iter().any(|role| role.get() == staff))
+    {
+        return "Only members of the configured staff role can use this command.";
+    }
+    if request
+        .grant_roles
+        .iter()
+        .any(|id| !valid_role(*id) || *id == staff)
+    {
+        return "This command is disabled: AGE_ROLE_1 and AGE_ROLE_2 must be valid non-staff roles in this server.";
+    }
+    for (index, role) in request.grant_roles.into_iter().enumerate() {
+        if grant(serenity::RoleId::new(role)).await.is_err() {
+            // A transport failure need not mean Discord did not apply the PUT.
+            return if index == 0 {
+                "AGE_ROLE_1 request failed; AGE_ROLE_2 was not attempted. Existing roles were not removed. Discord may have applied the failed request; check the member before retrying."
+            } else {
+                "AGE_ROLE_1 request succeeded; AGE_ROLE_2 request failed. No roles were removed. Discord may have applied the failed request; check the member before retrying."
+            };
+        }
+    }
+    "Both configured age roles are now granted."
+}
+
 #[poise::command(
     slash_command,
     guild_only,
     rename = "age-verified",
-    required_permissions = "MANAGE_ROLES",
-    default_member_permissions = "MANAGE_ROLES",
     required_bot_permissions = "MANAGE_ROLES"
 )]
 async fn age_verified(
     ctx: Context<'_>,
     #[description = "The user to mark as age verified"] user: serenity::Member,
 ) -> Result<(), Error> {
-    let http = ctx.serenity_context().http.clone();
+    // Defer privately before any network lookup or mutation. If acknowledging
+    // fails, return before touching roles; never silently discard reply errors.
+    ctx.defer_ephemeral()
+        .await
+        .map_err(|_| "age-verified: private acknowledgement failed; no role writes attempted")?;
+    let http = &ctx.serenity_context().http;
+    let caller = ctx.author_member().await;
+    let config = &ctx.data().config;
+    let guild_roles = match ctx.guild_id() {
+        Some(guild) => match guild.roles(http).await {
+            Ok(roles) => roles.into_keys().collect::<Vec<_>>(),
+            Err(_) => {
+                ctx.send(poise::CreateReply::default()
+                    .content("Could not validate this server's roles. No role writes were attempted; try again later.")
+                    .ephemeral(true))
+                    .await
+                    .map_err(|_| "age-verified: private validation-failure reply failed; no role writes attempted")?;
+                return Ok(());
+            }
+        },
+        None => Vec::new(),
+    };
+    let message = execute_age_roles(
+        AgeRoleRequest {
+            guild_id: ctx.guild_id(),
+            caller: caller.as_deref(),
+            target: &user,
+            staff_role_id: config.staff_role_id,
+            grant_roles: [config.age_role_1, config.age_role_2],
+            guild_roles: &guild_roles,
+        },
+        |role| user.add_role(http, role),
+    )
+    .await;
 
-    let role1 = serenity::RoleId::new(ctx.data().config.age_role_1);
-    let role2 = serenity::RoleId::new(ctx.data().config.age_role_2);
-
-    user.add_role(&http, role1).await?;
-    user.add_role(&http, role2).await?;
-
-    ctx.say(format!(
-        "{} has been marked as age verified and given the age verified roles.",
-        user.mention()
-    ))
-    .await?;
-
+    ctx.send(
+        poise::CreateReply::default()
+            .content(message)
+            .ephemeral(true),
+    )
+    .await
+    .map_err(|_| format!("age-verified: private result reply failed; outcome: {message}"))?;
     Ok(())
 }
 
