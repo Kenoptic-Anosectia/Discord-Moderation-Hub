@@ -93,12 +93,24 @@ const LEASE: i64 = 900;
 /// Upper bound on preserved unrecorded orphan directories skipped in one close attempt.
 const MAX_ORPHANS: i64 = 32;
 
-fn verify_recorded(root: &OwnedRoot, ar: &super::repository_close::ArchiveRef) -> bool {
-    recorded_manifest(root, ar).is_some()
+fn verify_recorded(
+    root: &OwnedRoot,
+    ar: &super::repository_close::ArchiveRef,
+    ticket: i64,
+    channel: u64,
+) -> bool {
+    recorded_manifest(root, ar, ticket, channel).is_some()
+}
+/// A manifest may only be trusted for THIS ticket: supported format, same ticket id and same
+/// channel. Anything else (foreign/mismatched/unsupported) is rejected and preserved untouched.
+fn identity_ok(m: &archive::Manifest, ticket: i64, channel: u64) -> bool {
+    m.format == 1 && m.ticket == ticket && m.channel == channel
 }
 fn recorded_manifest(
     root: &OwnedRoot,
     ar: &super::repository_close::ArchiveRef,
+    ticket: i64,
+    channel: u64,
 ) -> Option<archive::Manifest> {
     let dir = root.path().join(&ar.dir_name);
     // dir_name came from our own DB but is re-checked as a plain child component.
@@ -106,7 +118,7 @@ fn recorded_manifest(
         return None;
     }
     match archive::verify(root, &dir, Some(&ar.manifest_sha256), &[]) {
-        Ok(m) if m.message_count == ar.messages => Some(m),
+        Ok(m) if m.message_count == ar.messages && identity_ok(&m, ticket, channel) => Some(m),
         _ => None,
     }
 }
@@ -230,7 +242,10 @@ pub async fn close_ticket<I: CloseIo>(
                         .and_then(
                             |sha| match archive::verify(env.root, &dir, Some(&sha), &ids) {
                                 Ok(m)
-                                    if m.content_sha256 == archive::content_fingerprint(&msgs)
+                                    if identity_ok(&m, ticket_id, channel)
+                                        && m.content_sha256
+                                            == archive::content_fingerprint(&msgs)
+                                        && m.assets.len() == dl.len()
                                         && m.message_count == msgs.len() as u64 =>
                                 {
                                     Some(archive::Published {
@@ -282,15 +297,25 @@ pub async fn close_ticket<I: CloseIo>(
         let Ok(Some(ar)) = env.repo.latest_archive(ticket_id).await else {
             return retain("no archive").await;
         };
-        let Some(manifest) = recorded_manifest(env.root, &ar) else {
+        let Some(manifest) = recorded_manifest(env.root, &ar, ticket_id, channel) else {
             return retain("reverify").await;
         };
         // Immediately before ANY destructive step (also resumed verified/delete states): the
         // live source must still equal the verified archive. Absent-source reconciliation below
         // needs no check (nothing left to delete).
-        if (t.status != "delete_uncertain" || env.io.probe(channel).await == Presence::Present)
-            && !source_unchanged(env, &manifest.content_sha256, manifest.message_count).await
-        {
+        // ONE classified presence outcome for delete_uncertain: Unknown => retain at once,
+        // Absent => reconcile only (nothing left to delete), Present => the mandatory source
+        // stability validation below runs BEFORE any retry/delete.
+        if t.status == "delete_uncertain" {
+            match env.io.probe(channel).await {
+                Presence::Absent => {
+                    return finish(env, &t, token, ticket_id, "absence reconciled").await;
+                }
+                Presence::Unknown => return retain("probe").await,
+                Presence::Present => {}
+            }
+        }
+        if !source_unchanged(env, &manifest.content_sha256, manifest.message_count).await {
             // keep source + slot + the old verified archive; next run publishes a new version
             match t.status.as_str() {
                 "delete_requested" => {
@@ -309,14 +334,7 @@ pub async fn close_ticket<I: CloseIo>(
             return retain("changed").await;
         }
         if t.status == "delete_uncertain" {
-            // never blindly repeat: look first.
-            match env.io.probe(channel).await {
-                Presence::Absent => {
-                    return finish(env, &t, token, ticket_id, "absence reconciled").await;
-                }
-                Presence::Unknown => return retain("probe").await,
-                Presence::Present => {}
-            }
+            // presence was classified Present above and the source re-validated; never blind.
             if !step("delete_uncertain", "delete_requested", "retry after probe").await {
                 return retain("transition").await;
             }
@@ -453,7 +471,7 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
                     continue;
                 }
                 let verified = match env.repo.latest_archive(t.id).await? {
-                    Some(ar) => verify_recorded(env.root, &ar),
+                    Some(ar) => verify_recorded(env.root, &ar, t.id, ch),
                     None => false,
                 };
                 if verified && env.io.probe(ch).await == Presence::Absent {
@@ -590,7 +608,7 @@ pub async fn retrieve<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i64) -
     let Ok(Some(ar)) = env.repo.latest_archive(t.id).await else {
         return "No verified archive is recorded for this ticket.".into();
     };
-    match recorded_manifest(env.root, &ar) {
+    match recorded_manifest(env.root, &ar, t.id, t.channel.unwrap_or(0)) {
         Some(m) => format!(
             "Archive {} (ticket status: {}): {} messages, {} assets, manifest sha256 {}. Integrity re-verified: OK.",
             ar.dir_name, t.status, m.message_count, m.assets.len(), ar.manifest_sha256

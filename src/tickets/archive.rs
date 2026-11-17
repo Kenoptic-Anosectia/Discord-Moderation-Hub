@@ -231,14 +231,24 @@ pub fn content_fingerprint(messages: &[Message]) -> String {
             .map(|e| e.to_string())
             .unwrap_or_default());
         put(&m.timestamp.to_string());
+        put(&m.author.name);
+        put(if m.author.bot { "bot" } else { "user" });
         for a in &m.attachments {
-            put(&format!("a{}:{}:{}", a.id.get(), a.size, a.filename));
+            put(&format!(
+                "a{}:{}:{}:{:?}",
+                a.id.get(),
+                a.size,
+                a.filename,
+                a.content_type
+            ));
         }
         for e in &m.embeds {
             put(&format!(
-                "e{:?}|{:?}|{:?}",
+                "e{:?}|{:?}|{:?}|{:?}|{:?}",
                 e.title,
                 e.description,
+                e.url,
+                e.footer.as_ref().map(|f| &f.text),
                 e.fields
                     .iter()
                     .map(|f| (&f.name, &f.value))

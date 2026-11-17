@@ -30,6 +30,8 @@ struct Fake {
     history_fail: bool,
     delete: Mutex<Vec<DeleteOutcome>>, // queue; last repeats
     probe: Mutex<Presence>,
+    /// scripted probe answers consumed first (then `probe` repeats)
+    probe_seq: Mutex<Vec<Presence>>,
     dm_ok: bool,
     log: Mutex<Vec<String>>,
     root: PathBuf,
@@ -45,6 +47,7 @@ impl Fake {
             history_fail: false,
             delete: Mutex::new(vec![DeleteOutcome::Deleted]),
             probe: Mutex::new(Presence::Present),
+            probe_seq: Mutex::new(vec![]),
             dm_ok: true,
             log: Mutex::new(vec![]),
             root: root.to_path_buf(),
@@ -102,6 +105,12 @@ impl CloseIo for Fake {
     }
     async fn probe(&self, _c: u64) -> Presence {
         self.log.lock().unwrap().push("probe".into());
+        {
+            let mut q = self.probe_seq.lock().unwrap();
+            if !q.is_empty() {
+                return q.remove(0);
+            }
+        }
         *self.probe.lock().unwrap()
     }
     async fn delete(&self, _c: u64) -> DeleteOutcome {
@@ -547,7 +556,7 @@ async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recover
         format!("ticket-{}-3", t.id),
         "fresh seq after orphans"
     );
-    assert!(recorded_manifest(&h.root, &ar).is_some());
+    assert!(recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap()).is_some());
     // both stale orphans preserved byte-for-byte and never recorded
     for (i, b) in before.iter().enumerate() {
         let p = h
@@ -1043,4 +1052,196 @@ async fn retrieval_is_staff_or_owner_only_reverifies_integrity_and_reads_nothing
         .await
         .contains("No verified archive"));
     let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+// ---------------- round-5 regressions (production close controller) ----------------
+async fn to_delete_uncertain(h: &H, io: &Fake, t: &Ticket) {
+    *io.delete.lock().unwrap() = vec![DeleteOutcome::Unknown];
+    assert!(matches!(
+        run(h, io, &actor(t), t.id, "u", &settings()).await,
+        CloseOutcome::Retained(_)
+    ));
+    assert_eq!(status(h, t.id).await, "delete_uncertain");
+    assert_eq!(io.calls("delete"), 1);
+}
+
+#[tokio::test]
+async fn changing_presence_probes_never_delete_a_stale_or_unchecked_source() {
+    // Unknown -> Present with an appended source message: retained at the FIRST (Unknown) probe.
+    let h = harness("probe-uk").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    to_delete_uncertain(&h, &io, &t).await;
+    append_one(&mut io.msgs.lock().unwrap());
+    *io.probe_seq.lock().unwrap() = vec![Presence::Unknown, Presence::Present];
+    assert!(matches!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Retained("probe")
+    ));
+    assert_eq!(io.calls("delete"), 1, "Unknown->Present: zero new deletes");
+    assert_eq!(status(&h, t.id).await, "delete_uncertain");
+    let _ = std::fs::remove_dir_all(&h.dir);
+
+    // Absent -> Present with changed source: Absent is reconcile-only; no retry delete.
+    let h = harness("probe-ab").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    to_delete_uncertain(&h, &io, &t).await;
+    append_one(&mut io.msgs.lock().unwrap());
+    *io.probe_seq.lock().unwrap() = vec![Presence::Absent, Presence::Present];
+    let _ = run(&h, &io, &actor(&t), t.id, "a", &settings()).await;
+    assert_eq!(io.calls("delete"), 1, "Absent->Present: zero new deletes");
+    let _ = std::fs::remove_dir_all(&h.dir);
+
+    // Present with edited / deleted / appended source: validated first, never deleted.
+    for (tag, f) in [
+        ("edit", edit_first as Mutation),
+        ("del", delete_first),
+        ("add", append_one),
+    ] {
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        to_delete_uncertain(&h, &io, &t).await;
+        f(&mut io.msgs.lock().unwrap());
+        *io.probe.lock().unwrap() = Presence::Present;
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+            CloseOutcome::Retained("changed"),
+            "{tag}"
+        );
+        assert_eq!(io.calls("delete"), 1, "{tag}");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+fn orphan_variant(tag: &str, bytes: Vec<u8>) -> Vec<u8> {
+    let s = String::from_utf8(bytes).unwrap();
+    match tag {
+        "ticket" => s.replacen("\"ticket\": ", "\"ticket\": 9", 1),
+        "channel" => s.replacen("\"channel\": ", "\"channel\": 9", 1),
+        _ => s.replacen("\"format\": 1", "\"format\": 2", 1),
+    }
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn foreign_or_unsupported_orphan_is_preserved_never_adopted_and_fresh_archive_is_published() {
+    for tag in ["ticket", "channel", "format"] {
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        let msgs = io.msgs.lock().unwrap().clone();
+        archive::publish(
+            &h.root,
+            &PublishInput {
+                ticket: t.id,
+                channel: t.channel.unwrap(),
+                seq: 1,
+                nonce: 1,
+                messages: &msgs,
+                downloaded: &[],
+            },
+        )
+        .unwrap();
+        let mp = h
+            .root
+            .path()
+            .join(format!("ticket-{}-1", t.id))
+            .join("manifest.json");
+        let forged = orphan_variant(tag, std::fs::read(&mp).unwrap());
+        std::fs::write(&mp, &forged).unwrap();
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+            CloseOutcome::Closed,
+            "{tag}"
+        );
+        let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+        assert_eq!(ar.dir_name, format!("ticket-{}-2", t.id), "{tag}: fresh");
+        assert_eq!(std::fs::read(&mp).unwrap(), forged, "{tag}: preserved");
+        assert!(
+            recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap()).is_some(),
+            "{tag}"
+        );
+        // recorded identity is enforced at every reverify/retrieval boundary
+        assert!(recorded_manifest(&h.root, &ar, t.id + 1, t.channel.unwrap()).is_none());
+        assert!(recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap() + 1).is_none());
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+fn with_embed(m: &mut [Message], url: &str, footer: &str) {
+    m[0].embeds = vec![serde_json::from_value(serde_json::json!({
+        "type": "rich", "title": "t", "description": "d", "url": url,
+        "footer": {"text": footer}, "fields": []
+    }))
+    .unwrap()];
+}
+#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
+fn edit_footer(m: &mut Vec<Message>) {
+    with_embed(m, "https://example.invalid/a", "footer-CHANGED");
+}
+#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
+fn edit_url(m: &mut Vec<Message>) {
+    with_embed(m, "https://example.invalid/CHANGED", "footer");
+}
+
+#[tokio::test]
+async fn footer_only_or_url_only_edit_is_detected_during_download_and_on_retry() {
+    for (tag, f) in [("footer", edit_footer as Mutation), ("url", edit_url)] {
+        // during download
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        with_embed(
+            &mut io.msgs.lock().unwrap(),
+            "https://example.invalid/a",
+            "footer",
+        );
+        *io.mutate.lock().unwrap() = Some((3, f));
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+            CloseOutcome::Retained("changed"),
+            "{tag}"
+        );
+        assert_eq!(io.calls("delete"), 0, "{tag}");
+        assert!(h.repo.latest_archive(t.id).await.unwrap().is_none());
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+            CloseOutcome::Closed,
+            "{tag}"
+        );
+        let _ = std::fs::remove_dir_all(&h.dir);
+
+        // on retry after a rejected delete
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Age).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        with_embed(
+            &mut io.msgs.lock().unwrap(),
+            "https://example.invalid/a",
+            "footer",
+        );
+        *io.delete.lock().unwrap() = vec![DeleteOutcome::Rejected, DeleteOutcome::Deleted];
+        let _ = run(&h, &io, &actor(&t), t.id, "a", &settings()).await;
+        let old = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+        f(&mut io.msgs.lock().unwrap());
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+            CloseOutcome::Retained("changed"),
+            "{tag}"
+        );
+        assert_eq!(io.calls("delete"), 1, "{tag}: no delete vs stale archive");
+        assert!(h.root.path().join(&old.dir_name).is_dir());
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "c", &settings()).await,
+            CloseOutcome::Closed,
+            "{tag}"
+        );
+        assert_eq!(
+            h.repo.latest_archive(t.id).await.unwrap().unwrap().seq,
+            old.seq + 1
+        );
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
 }
