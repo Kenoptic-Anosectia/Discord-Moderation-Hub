@@ -522,6 +522,103 @@ mod tests {
         };
         assert_eq!(d(&repo, &ev, &l).await, Decision::Skip);
     }
+    /// Drives the REAL production seam `guarded` with an injected sink standing in for
+    /// log_event (cache insert + log write): returns (sink writes, outcome).
+    async fn through_guard(
+        enabled: bool,
+        repo: Option<&Repository>,
+        ev: &FullEvent,
+        l: &Fake,
+        c: &Counters,
+    ) -> (usize, Option<()>) {
+        let writes = AtomicUsize::new(0);
+        let s = settings();
+        let out = guarded(enabled, Some(&s), repo, ev, l, c, || async {
+            writes.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        (writes.load(Ordering::SeqCst), out)
+    }
+    #[tokio::test]
+    async fn guarded_seam_performs_zero_sink_writes_for_private_unknown_and_error_cases() {
+        let c = Counters::new();
+        let repo = repo_with_ticket(900).await;
+        let cases: Vec<(FullEvent, Lookup)> = vec![
+            (msg(900, Some(G)), Lookup::Guild { parent: None }), // durable ticket id
+            (delete(900), Lookup::Guild { parent: None }),
+            (msg(777, Some(G)), Lookup::Unknown), // unknown channel
+            (
+                msg(777, Some(G)),
+                Lookup::Guild {
+                    parent: Some(SUPPORT),
+                },
+            ), // private category
+            (msg(777, Some(G)), Lookup::NotGuild), // contradiction
+            (
+                FullEvent::ThreadCreate {
+                    thread: thread(950, 900),
+                },
+                Lookup::Guild { parent: None },
+            ),
+            (
+                FullEvent::ChannelUpdate {
+                    old: None,
+                    new: gchan(902, Some(2)),
+                },
+                Lookup::Unknown,
+            ),
+        ];
+        for (ev, look) in &cases {
+            let l = Fake::new(*look);
+            let (writes, out) = through_guard(true, Some(&repo), ev, &l, &c).await;
+            assert_eq!((writes, out), (0, None));
+        }
+        // DB error and missing repo/config also fail closed
+        let broken = Repository::open(":memory:").await.unwrap();
+        broken.break_for_test().await;
+        let l = Fake::new(Lookup::Guild { parent: None });
+        assert_eq!(
+            through_guard(true, Some(&broken), &msg(5, Some(G)), &l, &c).await,
+            (0, None)
+        );
+        let none = guarded(true, None, None, &msg(5, Some(G)), &l, &c, || async {
+            panic!("sink must not run")
+        })
+        .await;
+        assert!(none.is_none());
+        assert_eq!(c.skipped.load(Ordering::SeqCst), cases.len() as u64 + 2);
+        assert_eq!(c.allowed.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn guarded_seam_runs_sink_exactly_once_for_public_and_disabled() {
+        let c = Counters::new();
+        let repo = Repository::open(":memory:").await.unwrap();
+        let l = Fake::new(Lookup::Guild { parent: Some(42) });
+        assert_eq!(
+            through_guard(true, Some(&repo), &msg(777, Some(G)), &l, &c).await,
+            (1, Some(()))
+        );
+        assert_eq!(
+            through_guard(false, None, &msg(777, Some(G)), &l, &c).await,
+            (1, Some(()))
+        );
+        // other guild + non-channel events pass through without lookups
+        let u = Fake::new(Lookup::Unknown);
+        assert_eq!(
+            through_guard(true, Some(&repo), &msg(5, Some(G + 1)), &u, &c)
+                .await
+                .0,
+            1
+        );
+        let role = FullEvent::GuildRoleCreate {
+            new: Role::default(),
+        };
+        assert_eq!(through_guard(true, Some(&repo), &role, &u, &c).await.0, 1);
+        assert_eq!(u.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(c.allowed.load(Ordering::SeqCst), 4);
+        assert_eq!(c.skipped.load(Ordering::SeqCst), 0);
+    }
+    /// SECONDARY structural check only (not counted as behavioural evidence).
     #[test]
     fn runtime_event_handler_calls_the_guard_before_any_cache_insertion() {
         let main = include_str!("../main.rs");
