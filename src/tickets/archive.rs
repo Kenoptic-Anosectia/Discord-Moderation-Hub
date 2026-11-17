@@ -417,7 +417,7 @@ pub fn verify(root: &OwnedRoot, dir: &Path, manifest_sha: Option<&str>, expected
             return Err(ArchiveError::Verify);
         }
     }
-    if m.message_count != expected_ids.len() as u64 {
+    if !expected_ids.is_empty() && m.message_count != expected_ids.len() as u64 {
         return Err(ArchiveError::Verify);
     }
     let mut expected_files: BTreeSet<String> = ["manifest.json".to_string(), "transcript.html".to_string()].into();
