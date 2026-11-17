@@ -474,7 +474,7 @@ impl Repository {
             .call(move |c| -> rusqlite::Result<bool> {
                 let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let from: Option<String> = tx
-                    .query_row("SELECT status FROM tickets WHERE id=?1 AND status IN ('creating','recovery') AND channel IS NULL", [id], |r| r.get(0))
+                    .query_row("SELECT status FROM tickets WHERE id=?1 AND status IN ('reserved','creating','recovery') AND channel IS NULL", [id], |r| r.get(0))
                     .optional()?;
                 let Some(from) = from else { return Ok(false) };
                 // UNIQUE(channel) rejects a channel already owned by another ticket.
@@ -506,7 +506,7 @@ impl Repository {
             .call(move |c| -> rusqlite::Result<bool> {
                 let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let from: Option<String> = tx
-                    .query_row("SELECT status FROM tickets WHERE id=?1 AND channel IS NULL AND status IN ('creating','recovery')", [id], |r| r.get(0))
+                    .query_row("SELECT status FROM tickets WHERE id=?1 AND channel IS NULL AND status IN ('reserved','creating','recovery')", [id], |r| r.get(0))
                     .optional()?;
                 let Some(from) = from else { return Ok(false) };
                 tx.execute("UPDATE tickets SET status='released',lease_until=0 WHERE id=?1 AND status=?2", params![id, from])?;

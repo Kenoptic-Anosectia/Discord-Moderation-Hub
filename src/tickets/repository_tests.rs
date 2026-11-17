@@ -158,9 +158,18 @@ async fn close_claim_is_compare_and_set_across_independent_connections() {
 async fn recovery_release_and_attach_are_audited_and_only_from_unverified_states() {
     let r = Repository::open(":memory:").await.unwrap();
     let t = r.reserve(1, 100, 5, Kind::Support).await.unwrap();
-    assert!(
-        !r.recovery_release(t.id, 9, "why", 10).await.unwrap(),
-        "reserved is not recoverable"
+    // a reserved row (create never confirmed) is recoverable ONLY through the audited path;
+    // a channel-linked ticket never is.
+    let z = r.reserve(50, 100, 77, Kind::Support).await.unwrap();
+    assert!(r
+        .recovery_release(z.id, 9, "operator confirmed no channel", 9)
+        .await
+        .unwrap());
+    let a = r.audit(z.id).await.unwrap();
+    assert_eq!((a[0].actor, a[0].action.as_str()), (9, "release"));
+    assert_eq!(
+        r.ticket_by_id(z.id).await.unwrap().unwrap().status,
+        "released"
     );
     r.claim(t.id).await.unwrap();
     assert!(r

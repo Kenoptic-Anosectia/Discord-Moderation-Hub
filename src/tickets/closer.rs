@@ -90,6 +90,8 @@ pub struct Env<'a, I: CloseIo> {
     pub now: &'a (dyn Fn() -> i64 + Send + Sync),
 }
 const LEASE: i64 = 900;
+/// Upper bound on preserved unrecorded orphan directories skipped in one close attempt.
+const MAX_ORPHANS: i64 = 32;
 
 fn verify_recorded(root: &OwnedRoot, ar: &super::repository_close::ArchiveRef) -> bool {
     recorded_manifest(root, ar).is_some()
@@ -192,53 +194,66 @@ pub async fn close_ticket<I: CloseIo>(
         if !source_unchanged(env, &archive::content_fingerprint(&msgs), msgs.len() as u64).await {
             return retain("changed").await;
         }
-        let Ok(seq) = env.repo.next_archive_seq(ticket_id).await else {
+        let Ok(base_seq) = env.repo.next_archive_seq(ticket_id).await else {
             return retain("db").await;
         };
         let nonce = (env.now)() as u64;
-        let published = match archive::publish(
-            env.root,
-            &PublishInput {
-                ticket: ticket_id,
-                channel,
-                seq,
-                nonce,
-                messages: &msgs,
-                downloaded: &dl,
-            },
-        ) {
-            Ok(p) => p,
-            // publish-before-record recovery: a previous run published this seq but died before
-            // recording. Adopt it only if it fully re-verifies AND matches the current source.
-            Err(ArchiveError::Exists) => {
-                let name = format!("ticket-{ticket_id}-{seq}");
-                let dir = env.root.path().join(&name);
-                let ids: Vec<u64> = msgs.iter().map(|m| m.id.get()).collect();
-                let adopted = std::fs::read(dir.join("manifest.json"))
-                    .ok()
-                    .map(|b| archive::sha256_hex(&b))
-                    .and_then(
-                        |sha| match archive::verify(env.root, &dir, Some(&sha), &ids) {
-                            Ok(m)
-                                if m.content_sha256 == archive::content_fingerprint(&msgs)
-                                    && m.message_count == msgs.len() as u64 =>
-                            {
-                                Some(archive::Published {
-                                    dir_name: name.clone(),
-                                    manifest_sha256: sha,
-                                    messages: m.message_count,
-                                    assets: m.assets.len() as u64,
-                                })
-                            }
-                            _ => None,
-                        },
-                    );
-                match adopted {
-                    Some(p) => p,
-                    None => return retain("exists").await,
+        // Publish-before-record recovery. A previous run may have published a directory for
+        // this sequence and died before recording it. Per colliding directory: adopt it only
+        // if it fully re-verifies AND matches the current source; otherwise PRESERVE it
+        // (never delete or overwrite) and publish under the next free sequence. Bounded, so a
+        // retry always makes progress instead of colliding on the same name forever.
+        let mut published = None;
+        for seq in base_seq..base_seq + MAX_ORPHANS {
+            match archive::publish(
+                env.root,
+                &PublishInput {
+                    ticket: ticket_id,
+                    channel,
+                    seq,
+                    nonce,
+                    messages: &msgs,
+                    downloaded: &dl,
+                },
+            ) {
+                Ok(p) => {
+                    published = Some(p);
+                    break;
                 }
+                Err(ArchiveError::Exists) => {
+                    let name = format!("ticket-{ticket_id}-{seq}");
+                    let dir = env.root.path().join(&name);
+                    let ids: Vec<u64> = msgs.iter().map(|m| m.id.get()).collect();
+                    let adopted = std::fs::read(dir.join("manifest.json"))
+                        .ok()
+                        .map(|b| archive::sha256_hex(&b))
+                        .and_then(
+                            |sha| match archive::verify(env.root, &dir, Some(&sha), &ids) {
+                                Ok(m)
+                                    if m.content_sha256 == archive::content_fingerprint(&msgs)
+                                        && m.message_count == msgs.len() as u64 =>
+                                {
+                                    Some(archive::Published {
+                                        dir_name: name.clone(),
+                                        manifest_sha256: sha,
+                                        messages: m.message_count,
+                                        assets: m.assets.len() as u64,
+                                    })
+                                }
+                                _ => None,
+                            },
+                        );
+                    if let Some(p) = adopted {
+                        published = Some(p);
+                        break;
+                    }
+                    // stale/corrupt orphan: preserved; try the next sequence
+                }
+                Err(_) => return retain("publish").await,
             }
-            Err(_) => return retain("publish").await,
+        }
+        let Some(published) = published else {
+            return retain("exists").await;
         };
         let rec = env
             .repo
@@ -518,12 +533,12 @@ pub async fn recover<I: CloseIo>(
     let now = (env.now)();
     match action {
         Recovery::Status => match t.status.as_str() {
-            "creating" | "recovery" | "reserved" => "Ticket operation is unresolved; its slot is retained. Use attach/release with confirmation and a reason.",
+            "creating" | "recovery" | "reserved" => "Ticket operation is unresolved; its slot is retained. Use ticket-recover attach or release with confirmation and a reason.",
             "closed" | "failed" | "released" => "Ticket is finished.",
             _ => "Ticket is open or mid-close; no action needed unless a close stays unresolved.",
         },
         Recovery::Attach { channel, confirm, reason } => {
-            if !confirm || reason.trim().is_empty() || t.channel.is_some() || !matches!(t.status.as_str(), "creating" | "recovery") {
+            if !confirm || reason.trim().is_empty() || t.channel.is_some() || !matches!(t.status.as_str(), "reserved" | "creating" | "recovery") {
                 return "Attach needs confirmation, a reason and an unattached unresolved operation.";
             }
             let Ok(c) = env.io.candidates(&t).await else { return "Remote state could not be read; nothing changed." };

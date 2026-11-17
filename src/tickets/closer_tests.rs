@@ -503,8 +503,67 @@ async fn published_but_unrecorded_archive_is_adopted_when_it_verifies() {
 }
 
 #[tokio::test]
-async fn published_but_stale_unrecorded_archive_is_not_adopted() {
+async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recovers() {
     let h = harness("pubstale").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    // TWO stale unrecorded orphans (a crash after publish, source changed, twice).
+    for seq in 1..=2i64 {
+        let mut msgs = io.msgs.lock().unwrap().clone();
+        msgs[0].content.push_str(&format!(" old{seq}"));
+        archive::publish(
+            &h.root,
+            &PublishInput {
+                ticket: t.id,
+                channel: t.channel.unwrap(),
+                seq,
+                nonce: seq as u64,
+                messages: &msgs,
+                downloaded: &[],
+            },
+        )
+        .unwrap();
+    }
+    let before: Vec<_> = (1..=2i64)
+        .map(|s| {
+            std::fs::read(
+                h.root
+                    .path()
+                    .join(format!("ticket-{}-{s}", t.id))
+                    .join("manifest.json"),
+            )
+            .unwrap()
+        })
+        .collect();
+    // eventual fresh verified closure; deletion happens only AFTER the fresh archive verified.
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Closed
+    );
+    assert_eq!(io.calls("delete"), 1);
+    let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+    assert_eq!(
+        ar.dir_name,
+        format!("ticket-{}-3", t.id),
+        "fresh seq after orphans"
+    );
+    assert!(recorded_manifest(&h.root, &ar).is_some());
+    // both stale orphans preserved byte-for-byte and never recorded
+    for (i, b) in before.iter().enumerate() {
+        let p = h
+            .root
+            .path()
+            .join(format!("ticket-{}-{}", t.id, i + 1))
+            .join("manifest.json");
+        assert_eq!(&std::fs::read(p).unwrap(), b);
+    }
+    assert_eq!(ar.seq, 1, "DB sequence counts only recorded archives");
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn stale_orphan_then_failed_delete_retry_never_deletes_against_stale_archive() {
+    let h = harness("pubstale2").await;
     let t = active(&h, 1, Kind::Support).await;
     let io = Fake::new(&h.dir.join("archives"), 3);
     let mut msgs = io.msgs.lock().unwrap().clone();
@@ -521,11 +580,87 @@ async fn published_but_stale_unrecorded_archive_is_not_adopted() {
         },
     )
     .unwrap();
+    *io.delete.lock().unwrap() = vec![DeleteOutcome::Rejected, DeleteOutcome::Deleted];
     assert_eq!(
         run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
-        CloseOutcome::Retained("exists")
+        CloseOutcome::Retained("delete rejected")
     );
-    assert_eq!(io.calls("delete"), 0);
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+        CloseOutcome::Closed
+    );
+    let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+    assert_eq!(ar.dir_name, format!("ticket-{}-2", t.id));
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn reserved_row_is_resolved_only_by_confirmed_audited_operator_action() {
+    let h = harness("reserved").await;
+    let t = h.repo.reserve(1, G, OPENER, Kind::Support).await.unwrap();
+    assert_eq!(t.status, "reserved");
+    let io = Fake::new(&h.dir.join("archives"), 1);
+    let limits = Limits::default();
+    let f = || 5000i64;
+    let env = Env {
+        settings: &settings(),
+        repo: &h.repo,
+        io: &io,
+        root: &h.root,
+        limits: &limits,
+        now: &f,
+    };
+    let a = Actor {
+        user: 7,
+        guild: G,
+        is_guild_owner: false,
+        roles: vec![STAFF],
+        channel: 0,
+    };
+    // startup keeps holding the slot (fail closed)
+    assert_eq!(reconcile(&env).await.unwrap().unresolved, 1);
+    // unconfirmed / reasonless / non-staff: nothing changes
+    let no = Recovery::Release {
+        confirm: false,
+        reason: "x".into(),
+    };
+    assert!(recover(&env, &a, t.id, no).await.contains("confirmation"));
+    let blank = Recovery::Release {
+        confirm: true,
+        reason: " ".into(),
+    };
+    assert!(recover(&env, &a, t.id, blank)
+        .await
+        .contains("confirmation"));
+    let mut stranger = a.clone();
+    stranger.roles = vec![];
+    let go = Recovery::Release {
+        confirm: true,
+        reason: "ok".into(),
+    };
+    assert_eq!(
+        recover(&env, &stranger, t.id, go.clone()).await,
+        "You cannot manage this ticket."
+    );
+    assert_eq!(status(&h, t.id).await, "reserved");
+    assert!(h.repo.audit(t.id).await.unwrap().is_empty());
+    // confirmed + reason + staff: released, audited, slot freed
+    assert_eq!(
+        recover(&env, &a, t.id, go).await,
+        "Slot released by audited operator action."
+    );
+    assert_eq!(status(&h, t.id).await, "released");
+    let au = h.repo.audit(t.id).await.unwrap();
+    assert_eq!(
+        (au[0].actor, au[0].action.as_str(), au[0].reason.as_str()),
+        (7, "release", "ok")
+    );
+    assert!(h.repo.reserve(2, G, OPENER, Kind::Support).await.is_ok());
+    assert_eq!(
+        reconcile(&env).await.unwrap().unresolved,
+        1,
+        "the new reservation is itself unresolved"
+    );
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
