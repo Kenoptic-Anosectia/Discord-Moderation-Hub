@@ -91,10 +91,17 @@ mod tests {
         let on = configured_commands(true);
         let rec = on.iter().find(|c| c.name == "ticket-recover").unwrap();
         let names: Vec<_> = rec.parameters.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["ticket_id", "action", "channel", "confirm", "reason"]);
-        assert!(!tickets::runtime::OPENING_APPROVED, "opening stays gated in this change");
+        assert_eq!(
+            names,
+            ["ticket_id", "action", "channel", "confirm", "reason"]
+        );
+        const {
+            assert!(
+                !tickets::runtime::OPENING_APPROVED,
+                "opening stays gated in this change"
+            )
+        };
     }
-
 
     #[test]
     fn ticket_cached_permissions_preserve_visibility_and_cache_miss_policy() {
@@ -2449,7 +2456,15 @@ async fn ticket_recover(
     #[description = "Explicit confirmation for attach/release"] confirm: Option<bool>,
     #[description = "Audit reason for attach/release"] reason: Option<String>,
 ) -> Result<(), Error> {
-    tickets::runtime_close::recover(ctx, ticket_id, action, channel, confirm.unwrap_or(false), reason).await
+    tickets::runtime_close::recover(
+        ctx,
+        ticket_id,
+        action,
+        channel,
+        confirm.unwrap_or(false),
+        reason,
+    )
+    .await
 }
 
 fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
@@ -2506,7 +2521,7 @@ async fn main() -> Result<(), Error> {
                     if let (Some(settings), Some(repo)) = (&config.tickets, &tickets) {
                         // Reconciliation runs before opening could ever be approved; failure keeps opening gated.
                         match tickets::runtime_close::startup_reconcile(ctx, settings, repo).await {
-                            Ok(r) => println!("Ticket reconciliation: {} to recovery, {} closed by known absence, {} unresolved", r.moved_to_recovery, r.closed_by_known_absence, r.unresolved),
+                            Ok(r) => println!("Ticket reconciliation: {} to recovery, {} closed by known absence, {} unresolved; opening permitted: {}", r.moved_to_recovery, r.closed_by_known_absence, r.unresolved, r.opening_gate(tickets::runtime::OPENING_APPROVED)),
                             Err(_) => println!("Ticket reconciliation failed; opening remains gated."),
                         }
                     }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tickets::repository_close::Step;
 
 pub fn temp_db(tag: &str) -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -34,11 +35,21 @@ async fn v1_database_migrates_preserving_rows_links_sequence_and_slots() {
     assert_eq!(r.schema_version().await.unwrap(), 2);
     let t = r.ticket_by_id(3).await.unwrap().unwrap();
     assert_eq!(
-        (t.operation.as_str(), t.status.as_str(), t.channel, t.greeting.as_str()),
+        (
+            t.operation.as_str(),
+            t.status.as_str(),
+            t.channel,
+            t.greeting.as_str()
+        ),
         ("opa", "active", Some(900), "sent")
     );
     assert!(r
-        .trusted_panel(Panel { guild: 100, channel: 5, message: 6, bot: 7 })
+        .trusted_panel(Panel {
+            guild: 100,
+            channel: 5,
+            message: 6,
+            bot: 7
+        })
         .await
         .unwrap());
     // interaction linkage preserved: replaying interaction 2 returns ticket 9
@@ -50,7 +61,10 @@ async fn v1_database_migrates_preserving_rows_links_sequence_and_slots() {
     drop(r);
     let again = Repository::open(&path).await.unwrap();
     assert_eq!(again.schema_version().await.unwrap(), 2);
-    assert_eq!(again.ticket_by_id(8).await.unwrap().unwrap().status, "failed");
+    assert_eq!(
+        again.ticket_by_id(8).await.unwrap().unwrap().status,
+        "failed"
+    );
 }
 
 #[tokio::test]
@@ -60,7 +74,8 @@ async fn migration_sequence_never_reuses_ids_even_above_surviving_rows() {
         let c = rusqlite::Connection::open(&path).unwrap();
         c.execute_batch(V1).unwrap();
         // a high-water mark above every surviving row (deleted ticket 40 once existed)
-        c.execute("UPDATE sqlite_sequence SET seq=40 WHERE name='tickets'", []).unwrap();
+        c.execute("UPDATE sqlite_sequence SET seq=40 WHERE name='tickets'", [])
+            .unwrap();
     }
     let r = Repository::open(&path).await.unwrap();
     assert!(r.reserve(60, 100, 77, Kind::Age).await.unwrap().id > 40);
@@ -104,36 +119,76 @@ async fn close_claim_is_compare_and_set_across_independent_connections() {
         b.claim_close(t.id, 2, "tok-b", 1000, 2000)
     );
     assert_ne!(x.unwrap(), y.unwrap(), "exactly one worker wins");
-    assert_eq!(a.ticket_by_id(t.id).await.unwrap().unwrap().status, "closing");
-    assert!(!a.advance(t.id, "wrong", "closing", "archiving", 1001, 3000, "x").await.unwrap());
-    assert!(!a.resume_close(t.id, 3, "tok-c", 1500, 3000).await.unwrap(), "live lease blocks resume");
+    assert_eq!(
+        a.ticket_by_id(t.id).await.unwrap().unwrap().status,
+        "closing"
+    );
+    assert!(!a
+        .advance(
+            t.id,
+            "wrong",
+            Step {
+                from: "closing",
+                to: "archiving",
+                note: "x",
+            },
+            1001,
+            3000,
+        )
+        .await
+        .unwrap());
+    assert!(
+        !a.resume_close(t.id, 3, "tok-c", 1500, 3000).await.unwrap(),
+        "live lease blocks resume"
+    );
     let (p, q) = tokio::join!(
         a.resume_close(t.id, 3, "tok-c", 2001, 4000),
         b.resume_close(t.id, 4, "tok-d", 2001, 4000)
     );
     assert_ne!(p.unwrap(), q.unwrap(), "exactly one resumer");
-    assert!(a.history(t.id).await.unwrap().iter().any(|e| e.to == "closing"));
+    assert!(a
+        .history(t.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| e.to == "closing"));
 }
 
 #[tokio::test]
 async fn recovery_release_and_attach_are_audited_and_only_from_unverified_states() {
     let r = Repository::open(":memory:").await.unwrap();
     let t = r.reserve(1, 100, 5, Kind::Support).await.unwrap();
-    assert!(!r.recovery_release(t.id, 9, "why", 10).await.unwrap(), "reserved is not recoverable");
+    assert!(
+        !r.recovery_release(t.id, 9, "why", 10).await.unwrap(),
+        "reserved is not recoverable"
+    );
     r.claim(t.id).await.unwrap();
-    assert!(r.recovery_attach(t.id, 777, 9, "operator verified", 11).await.unwrap());
+    assert!(r
+        .recovery_attach(t.id, 777, 9, "operator verified", 11)
+        .await
+        .unwrap());
     let cur = r.ticket_by_id(t.id).await.unwrap().unwrap();
     assert_eq!((cur.status.as_str(), cur.channel), ("active", Some(777)));
     let audit = r.audit(t.id).await.unwrap();
     assert_eq!(audit.len(), 1);
     assert_eq!(
-        (audit[0].actor, audit[0].action.as_str(), audit[0].reason.as_str()),
+        (
+            audit[0].actor,
+            audit[0].action.as_str(),
+            audit[0].reason.as_str()
+        ),
         (9, "attach", "operator verified")
     );
     let u = r.reserve(2, 100, 6, Kind::Support).await.unwrap();
     r.claim(u.id).await.unwrap();
-    assert!(r.recovery_release(u.id, 9, "confirmed absent", 12).await.unwrap());
-    assert_eq!(r.ticket_by_id(u.id).await.unwrap().unwrap().status, "released");
+    assert!(r
+        .recovery_release(u.id, 9, "confirmed absent", 12)
+        .await
+        .unwrap());
+    assert_eq!(
+        r.ticket_by_id(u.id).await.unwrap().unwrap().status,
+        "released"
+    );
     assert!(r.reserve(3, 100, 6, Kind::Support).await.unwrap().id > u.id);
 }
 
@@ -146,7 +201,10 @@ async fn channel_linkage_lookups_are_private_forever_for_closed_tickets() {
     assert!(r.channel_known(901).await.unwrap());
     assert!(!r.channel_known(902).await.unwrap());
     r.force_status_for_test(t.id, "closed").await.unwrap();
-    assert!(r.channel_known(901).await.unwrap(), "deleted/archived ids stay private");
+    assert!(
+        r.channel_known(901).await.unwrap(),
+        "deleted/archived ids stay private"
+    );
     assert!(r.ticket_by_channel(100, 901).await.unwrap().is_some());
     assert!(r.ticket_by_channel(101, 901).await.unwrap().is_none());
 }

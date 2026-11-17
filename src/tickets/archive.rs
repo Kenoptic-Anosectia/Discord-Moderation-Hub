@@ -2,7 +2,9 @@
 //! attachment download, atomic publication into an owned root, and byte-level re-verification.
 //!
 //! Errors are fixed kinds only; nothing attacker-controlled (URLs, names, bodies) is carried.
-use crate::archive_safety::{generated_asset_name, validate_asset_component, validate_attachment_url};
+use crate::archive_safety::{
+    generated_asset_name, validate_asset_component, validate_attachment_url,
+};
 use serde::{Deserialize, Serialize};
 use serenity::all::Message;
 use std::collections::BTreeSet;
@@ -48,11 +50,17 @@ impl Default for Limits {
 // ---------- history ----------
 pub trait HistorySource: Send + Sync {
     /// Up to 100 messages with id > `after` (any order within the page).
-    fn page_after(&self, after: u64) -> impl std::future::Future<Output = Result<Vec<Message>, ArchiveError>> + Send;
+    fn page_after(
+        &self,
+        after: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>, ArchiveError>> + Send;
 }
 /// Fetch ALL pages to exhaustion in ascending id order. Detects duplicates, regressions and
 /// (after exhaustion) a stability probe: any newer message aborts rather than claiming atomicity.
-pub async fn fetch_all(src: &impl HistorySource, limits: &Limits) -> Result<Vec<Message>, ArchiveError> {
+pub async fn fetch_all(
+    src: &impl HistorySource,
+    limits: &Limits,
+) -> Result<Vec<Message>, ArchiveError> {
     let mut out: Vec<Message> = Vec::new();
     let mut cursor = 0u64;
     loop {
@@ -116,7 +124,10 @@ pub fn render_transcript(ticket: i64, messages: &[Message], assets: &[AssetEntry
     h.push_str("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">");
     h.push_str(&format!("<title>Ticket {ticket} transcript</title>"));
     h.push_str("<style>body{font-family:sans-serif}.m{border-bottom:1px solid #ccc;padding:6px}.meta{color:#555;font-size:small}pre{white-space:pre-wrap}</style></head><body>\n");
-    h.push_str(&format!("<h1>Ticket {ticket}</h1><p>{} messages</p>\n", messages.len()));
+    h.push_str(&format!(
+        "<h1>Ticket {ticket}</h1><p>{} messages</p>\n",
+        messages.len()
+    ));
     for m in messages {
         h.push_str(&format!(
             "<div class=\"m\" data-mid=\"{}\"><div class=\"meta\">{} (id {}{}) at {}",
@@ -133,11 +144,23 @@ pub fn render_transcript(ticket: i64, messages: &[Message], assets: &[AssetEntry
         h.push_str(&format!("<pre>{}</pre>", esc(&m.content)));
         for e in &m.embeds {
             h.push_str("<blockquote>");
-            for part in [e.title.as_deref(), e.description.as_deref(), e.url.as_deref(), e.footer.as_ref().map(|f| f.text.as_str())].into_iter().flatten() {
+            for part in [
+                e.title.as_deref(),
+                e.description.as_deref(),
+                e.url.as_deref(),
+                e.footer.as_ref().map(|f| f.text.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 h.push_str(&format!("<div>{}</div>", esc(part)));
             }
             for f in &e.fields {
-                h.push_str(&format!("<div><b>{}</b>: {}</div>", esc(&f.name), esc(&f.value)));
+                h.push_str(&format!(
+                    "<div><b>{}</b>: {}</div>",
+                    esc(&f.name),
+                    esc(&f.value)
+                ));
             }
             h.push_str("</blockquote>");
         }
@@ -186,7 +209,11 @@ fn ids_hash(messages: &[Message]) -> String {
 // ---------- attachments ----------
 pub trait Downloader: Send + Sync {
     /// Fetch a validated URL with redirects DISABLED; abort once `limit` bytes are exceeded.
-    fn fetch(&self, url: &url::Url, limit: u64) -> impl std::future::Future<Output = Result<Vec<u8>, ArchiveError>> + Send;
+    fn fetch(
+        &self,
+        url: &url::Url,
+        limit: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ArchiveError>> + Send;
 }
 pub struct Downloaded {
     pub entry: AssetEntry,
@@ -194,7 +221,11 @@ pub struct Downloaded {
 }
 /// Download every attachment under count/size/total limits. The initial URL goes through the
 /// A10 validator; the production downloader never follows redirects.
-pub async fn download_all(dl: &impl Downloader, messages: &[Message], limits: &Limits) -> Result<Vec<Downloaded>, ArchiveError> {
+pub async fn download_all(
+    dl: &impl Downloader,
+    messages: &[Message],
+    limits: &Limits,
+) -> Result<Vec<Downloaded>, ArchiveError> {
     let mut out = Vec::new();
     let mut total = 0u64;
     let mut seen = BTreeSet::new();
@@ -209,7 +240,9 @@ pub async fn download_all(dl: &impl Downloader, messages: &[Message], limits: &L
             let url = validate_attachment_url(&a.url).map_err(|_| ArchiveError::UnsafeInput)?;
             let name = generated_asset_name(a.id.get()).map_err(|_| ArchiveError::UnsafeInput)?;
             let declared = u64::from(a.size);
-            if declared > limits.max_asset_bytes || total.saturating_add(declared) > limits.max_total_bytes {
+            if declared > limits.max_asset_bytes
+                || total.saturating_add(declared) > limits.max_total_bytes
+            {
                 return Err(ArchiveError::TooLarge);
             }
             let bytes = dl.fetch(&url, declared.min(limits.max_asset_bytes)).await?;
@@ -254,7 +287,12 @@ impl Downloader for HttpDownloader {
     async fn fetch(&self, url: &url::Url, limit: u64) -> Result<Vec<u8>, ArchiveError> {
         // Re-validate here too: defense in depth for any future caller.
         validate_attachment_url(url.as_str()).map_err(|_| ArchiveError::UnsafeInput)?;
-        let mut resp = self.client.get(url.clone()).send().await.map_err(|_| ArchiveError::Download)?;
+        let mut resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|_| ArchiveError::Download)?;
         if !resp.status().is_success() {
             return Err(ArchiveError::Download); // includes every 3xx: redirects are never followed
         }
@@ -291,7 +329,9 @@ impl OwnedRoot {
         if md.file_type().is_symlink() || !md.is_dir() {
             return Err(ArchiveError::Unsafe);
         }
-        Ok(Self { root: std::fs::canonicalize(path).map_err(|_| ArchiveError::Io)? })
+        Ok(Self {
+            root: std::fs::canonicalize(path).map_err(|_| ArchiveError::Io)?,
+        })
     }
     pub fn path(&self) -> &Path {
         &self.root
@@ -307,7 +347,11 @@ impl OwnedRoot {
     fn write_new(&self, dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ArchiveError> {
         self.contained(dir)?;
         let p = dir.join(name);
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&p).map_err(|_| ArchiveError::Io)?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+            .map_err(|_| ArchiveError::Io)?;
         f.write_all(bytes).map_err(|_| ArchiveError::Io)?;
         f.sync_all().map_err(|_| ArchiveError::Io)?;
         Ok(())
@@ -354,7 +398,9 @@ pub fn publish(root: &OwnedRoot, i: &PublishInput<'_>) -> Result<Published, Arch
     if std::fs::symlink_metadata(&final_dir).is_ok() {
         return Err(ArchiveError::Exists);
     }
-    let staging = root.path().join(format!(".staging-{}-{}-{}", i.ticket, i.seq, i.nonce));
+    let staging = root
+        .path()
+        .join(format!(".staging-{}-{}-{}", i.ticket, i.seq, i.nonce));
     let result = (|| {
         std::fs::create_dir(&staging).map_err(|_| ArchiveError::Io)?;
         root.contained(&staging)?;
@@ -379,12 +425,22 @@ pub fn publish(root: &OwnedRoot, i: &PublishInput<'_>) -> Result<Published, Arch
         let _ = std::fs::remove_dir_all(&staging);
         return result.map(|_| unreachable!());
     }
-    Ok(Published { dir_name: final_name, manifest_sha256: manifest_sha, messages: manifest.message_count, assets: manifest.assets.len() as u64 })
+    Ok(Published {
+        dir_name: final_name,
+        manifest_sha256: manifest_sha,
+        messages: manifest.message_count,
+        assets: manifest.assets.len() as u64,
+    })
 }
 
 /// Reopen the directory and verify the REAL bytes: manifest hash, transcript length/hash, every
 /// asset length/hash, no extra/foreign entries, no symlinks, and every expected message id present.
-pub fn verify(root: &OwnedRoot, dir: &Path, manifest_sha: Option<&str>, expected_ids: &[u64]) -> Result<Manifest, ArchiveError> {
+pub fn verify(
+    root: &OwnedRoot,
+    dir: &Path,
+    manifest_sha: Option<&str>,
+    expected_ids: &[u64],
+) -> Result<Manifest, ArchiveError> {
     root.contained(dir).map_err(|_| ArchiveError::Unsafe)?;
     let regular = |p: &Path| -> Result<(), ArchiveError> {
         let md = std::fs::symlink_metadata(p).map_err(|_| ArchiveError::Verify)?;
@@ -420,7 +476,8 @@ pub fn verify(root: &OwnedRoot, dir: &Path, manifest_sha: Option<&str>, expected
     if !expected_ids.is_empty() && m.message_count != expected_ids.len() as u64 {
         return Err(ArchiveError::Verify);
     }
-    let mut expected_files: BTreeSet<String> = ["manifest.json".to_string(), "transcript.html".to_string()].into();
+    let mut expected_files: BTreeSet<String> =
+        ["manifest.json".to_string(), "transcript.html".to_string()].into();
     if !m.assets.is_empty() {
         expected_files.insert("assets".into());
         let ad = dir.join("assets");
@@ -430,7 +487,12 @@ pub fn verify(root: &OwnedRoot, dir: &Path, manifest_sha: Option<&str>, expected
         }
         let mut names = BTreeSet::new();
         for e in std::fs::read_dir(&ad).map_err(|_| ArchiveError::Verify)? {
-            names.insert(e.map_err(|_| ArchiveError::Verify)?.file_name().to_string_lossy().into_owned());
+            names.insert(
+                e.map_err(|_| ArchiveError::Verify)?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         let want: BTreeSet<String> = m.assets.iter().map(|a| a.file.clone()).collect();
         if names != want || want.len() != m.assets.len() {
@@ -448,7 +510,12 @@ pub fn verify(root: &OwnedRoot, dir: &Path, manifest_sha: Option<&str>, expected
     }
     let mut actual = BTreeSet::new();
     for e in std::fs::read_dir(dir).map_err(|_| ArchiveError::Verify)? {
-        actual.insert(e.map_err(|_| ArchiveError::Verify)?.file_name().to_string_lossy().into_owned());
+        actual.insert(
+            e.map_err(|_| ArchiveError::Verify)?
+                .file_name()
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     if actual != expected_files {
         return Err(ArchiveError::Verify);

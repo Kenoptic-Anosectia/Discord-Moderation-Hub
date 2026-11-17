@@ -11,6 +11,7 @@ use super::{
     controller::RemoteChannel,
     policy::Settings,
     repository::{Repository, Ticket},
+    repository_close::{ArchiveRecord, Step},
 };
 
 /// Who is asking, as established by the trusted interaction (member roles + actual guild
@@ -99,28 +100,52 @@ fn verify_recorded(root: &OwnedRoot, ar: &super::repository_close::ArchiveRef) -
     matches!(archive::verify(root, &dir, Some(&ar.manifest_sha256), &[]), Ok(m) if m.message_count == ar.messages)
 }
 
-pub async fn close_ticket<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i64, token: &str) -> CloseOutcome {
+pub async fn close_ticket<I: CloseIo>(
+    env: &Env<'_, I>,
+    a: &Actor,
+    ticket_id: i64,
+    token: &str,
+) -> CloseOutcome {
     // 1. authorization on guild + durable linkage BEFORE any private read or mutation.
-    let Ok(Some(t)) = env.repo.ticket_by_id(ticket_id).await else { return CloseOutcome::Denied };
+    let Ok(Some(t)) = env.repo.ticket_by_id(ticket_id).await else {
+        return CloseOutcome::Denied;
+    };
     if !authorized(env.settings, a, &t) {
         return CloseOutcome::Denied;
     }
     let now = (env.now)();
     // 2. exactly one worker: CAS claim, or take over only an EXPIRED lease.
-    let claimed = match env.repo.claim_close(t.id, a.user, token, now, now + LEASE).await {
+    let claimed = match env
+        .repo
+        .claim_close(t.id, a.user, token, now, now + LEASE)
+        .await
+    {
         Ok(true) => true,
-        Ok(false) => matches!(env.repo.resume_close(t.id, a.user, token, now, now + LEASE).await, Ok(true)),
+        Ok(false) => matches!(
+            env.repo
+                .resume_close(t.id, a.user, token, now, now + LEASE)
+                .await,
+            Ok(true)
+        ),
         Err(_) => false,
     };
     if !claimed {
         return CloseOutcome::Busy;
     }
-    let Ok(Some(mut t)) = env.repo.ticket_by_id(t.id).await else { return CloseOutcome::Retained("state") };
-    let Some(channel) = t.channel else { return CloseOutcome::Retained("no channel") };
+    let Ok(Some(mut t)) = env.repo.ticket_by_id(t.id).await else {
+        return CloseOutcome::Retained("state");
+    };
+    let Some(channel) = t.channel else {
+        return CloseOutcome::Retained("no channel");
+    };
     let step = |from: &'static str, to: &'static str, note: &'static str| {
         let (repo, id, tok) = (env.repo, ticket_id, token.to_string());
         let now = (env.now)();
-        async move { repo.advance(id, &tok, from, to, now, now + LEASE, note).await.unwrap_or(false) }
+        async move {
+            repo.advance(id, &tok, Step { from, to, note }, now, now + LEASE)
+                .await
+                .unwrap_or(false)
+        }
     };
     let retain = |why: &'static str| async move {
         let _ = env.repo.release_lease(ticket_id, token).await;
@@ -143,22 +168,52 @@ pub async fn close_ticket<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i6
             Ok(d) => d,
             Err(_) => return retain("assets").await,
         };
-        let Ok(seq) = env.repo.next_archive_seq(ticket_id).await else { return retain("db").await };
+        let Ok(seq) = env.repo.next_archive_seq(ticket_id).await else {
+            return retain("db").await;
+        };
         let nonce = (env.now)() as u64;
-        let published = match archive::publish(env.root, &PublishInput { ticket: ticket_id, channel, seq, nonce, messages: &msgs, downloaded: &dl }) {
+        let published = match archive::publish(
+            env.root,
+            &PublishInput {
+                ticket: ticket_id,
+                channel,
+                seq,
+                nonce,
+                messages: &msgs,
+                downloaded: &dl,
+            },
+        ) {
             Ok(p) => p,
             Err(ArchiveError::Exists) => return retain("exists").await,
             Err(_) => return retain("publish").await,
         };
-        let rec = env.repo.record_archive(ticket_id, token, &published.dir_name, &published.manifest_sha256, published.messages, published.assets, (env.now)()).await;
+        let rec = env
+            .repo
+            .record_archive(
+                ticket_id,
+                token,
+                ArchiveRecord {
+                    dir_name: &published.dir_name,
+                    sha: &published.manifest_sha256,
+                    messages: published.messages,
+                    assets: published.assets,
+                },
+                (env.now)(),
+            )
+            .await;
         if !matches!(rec, Ok(Some(_))) || !step("archiving", "verified", "archive verified").await {
             return retain("record").await;
         }
         t.status = "verified".into();
     }
     // 4. independent reopen/reverify of what is on disk, then and only then delete.
-    if matches!(t.status.as_str(), "verified" | "delete_requested" | "delete_uncertain") {
-        let Ok(Some(ar)) = env.repo.latest_archive(ticket_id).await else { return retain("no archive").await };
+    if matches!(
+        t.status.as_str(),
+        "verified" | "delete_requested" | "delete_uncertain"
+    ) {
+        let Ok(Some(ar)) = env.repo.latest_archive(ticket_id).await else {
+            return retain("no archive").await;
+        };
         if !verify_recorded(env.root, &ar) {
             return retain("reverify").await;
         }
@@ -174,17 +229,26 @@ pub async fn close_ticket<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i6
             if !step("delete_uncertain", "delete_requested", "retry after probe").await {
                 return retain("transition").await;
             }
-        } else if t.status == "verified" && !step("verified", "delete_requested", "requesting delete").await {
+        } else if t.status == "verified"
+            && !step("verified", "delete_requested", "requesting delete").await
+        {
             return retain("transition").await;
         }
         match env.io.delete(channel).await {
-            DeleteOutcome::Deleted | DeleteOutcome::NotFound => return finish(env, &t, token, ticket_id, "deleted").await,
+            DeleteOutcome::Deleted | DeleteOutcome::NotFound => {
+                return finish(env, &t, token, ticket_id, "deleted").await
+            }
             DeleteOutcome::Rejected => {
                 let _ = step("delete_requested", "verified", "delete rejected").await;
                 return retain("delete rejected").await;
             }
             DeleteOutcome::Unknown => {
-                let _ = step("delete_requested", "delete_uncertain", "delete outcome unknown").await;
+                let _ = step(
+                    "delete_requested",
+                    "delete_uncertain",
+                    "delete outcome unknown",
+                )
+                .await;
                 return retain("delete unknown").await;
             }
         }
@@ -192,18 +256,42 @@ pub async fn close_ticket<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i6
     retain("state").await
 }
 
-async fn finish<I: CloseIo>(env: &Env<'_, I>, t: &Ticket, token: &str, id: i64, note: &'static str) -> CloseOutcome {
+async fn finish<I: CloseIo>(
+    env: &Env<'_, I>,
+    t: &Ticket,
+    token: &str,
+    id: i64,
+    note: &'static str,
+) -> CloseOutcome {
     let from = match env.repo.ticket_by_id(id).await {
         Ok(Some(x)) => x.status,
         _ => return CloseOutcome::Retained("state"),
     };
     let now = (env.now)();
-    if !env.repo.advance(id, token, &from, "closed", now, 0, note).await.unwrap_or(false) {
+    if !env
+        .repo
+        .advance(
+            id,
+            token,
+            Step {
+                from: &from,
+                to: "closed",
+                note,
+            },
+            now,
+            0,
+        )
+        .await
+        .unwrap_or(false)
+    {
         return CloseOutcome::Retained("transition");
     }
     // DM is best effort and recorded separately; it never carries the archive.
     let ok = env.io.dm_closed(t.opener).await.is_ok();
-    let _ = env.repo.record_dm(id, if ok { "sent" } else { "failed" }, (env.now)()).await;
+    let _ = env
+        .repo
+        .record_dm(id, if ok { "sent" } else { "failed" }, (env.now)())
+        .await;
     CloseOutcome::Closed
 }
 
@@ -229,7 +317,11 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
         match (t.status.as_str(), t.channel) {
             ("creating", None) => {
                 // remote outcome unknown: retain slot, require audited operator recovery
-                if env.repo.mark_recovery(t.id, now, "startup: create outcome unverified").await? {
+                if env
+                    .repo
+                    .mark_recovery(t.id, now, "startup: create outcome unverified")
+                    .await?
+                {
                     r.moved_to_recovery += 1;
                 }
                 r.unresolved += 1;
@@ -238,15 +330,30 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
             ("active", Some(ch)) => {
                 if env.io.probe(ch).await == Presence::Absent {
                     // remote gone without a verified archive: keep slot, operator decides
-                    if env.repo.mark_recovery(t.id, now, "startup: active channel absent, no verified archive").await? {
+                    if env
+                        .repo
+                        .mark_recovery(
+                            t.id,
+                            now,
+                            "startup: active channel absent, no verified archive",
+                        )
+                        .await?
+                    {
                         r.moved_to_recovery += 1;
                     }
                     r.unresolved += 1;
                 }
             }
-            ("closing" | "archiving" | "verified" | "delete_requested" | "delete_uncertain", Some(ch)) => {
+            (
+                "closing" | "archiving" | "verified" | "delete_requested" | "delete_uncertain",
+                Some(ch),
+            ) => {
                 let tok = "reconcile";
-                if !env.repo.resume_close(t.id, 0, tok, now, now + LEASE).await? {
+                if !env
+                    .repo
+                    .resume_close(t.id, 0, tok, now, now + LEASE)
+                    .await?
+                {
                     r.unresolved += 1; // live lease elsewhere or not resumable
                     continue;
                 }
@@ -255,10 +362,30 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
                     None => false,
                 };
                 if verified && env.io.probe(ch).await == Presence::Absent {
-                    let from = env.repo.ticket_by_id(t.id).await?.map(|x| x.status).unwrap_or_default();
+                    let from = env
+                        .repo
+                        .ticket_by_id(t.id)
+                        .await?
+                        .map(|x| x.status)
+                        .unwrap_or_default();
                     // closing/archiving never reach closed directly; only post-verified states do.
-                    if matches!(from.as_str(), "verified" | "delete_requested" | "delete_uncertain")
-                        && env.repo.advance(t.id, tok, &from, "closed", (env.now)(), 0, "startup: absence reconciled after verified archive").await?
+                    if matches!(
+                        from.as_str(),
+                        "verified" | "delete_requested" | "delete_uncertain"
+                    ) && env
+                        .repo
+                        .advance(
+                            t.id,
+                            tok,
+                            Step {
+                                from: &from,
+                                to: "closed",
+                                note: "startup: absence reconciled after verified archive",
+                            },
+                            (env.now)(),
+                            0,
+                        )
+                        .await?
                     {
                         r.closed_by_known_absence += 1;
                         continue;
@@ -277,16 +404,34 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
 #[derive(Clone, Debug)]
 pub enum Recovery {
     Status,
-    Attach { channel: u64, confirm: bool, reason: String },
-    Release { confirm: bool, reason: String },
+    Attach {
+        channel: u64,
+        confirm: bool,
+        reason: String,
+    },
+    Release {
+        confirm: bool,
+        reason: String,
+    },
 }
 fn staff_or_owner(settings: &Settings, a: &Actor, guild: u64) -> bool {
-    settings.valid() && a.guild == settings.guild && guild == settings.guild && a.user != 0 && (a.is_guild_owner || a.roles.contains(&settings.staff))
+    settings.valid()
+        && a.guild == settings.guild
+        && guild == settings.guild
+        && a.user != 0
+        && (a.is_guild_owner || a.roles.contains(&settings.staff))
 }
 /// Returns a fixed, sanitized reply. Status is read-only; mutations need confirm + reason +
 /// verified expectations and are audited with the actor.
-pub async fn recover<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i64, action: Recovery) -> &'static str {
-    let Ok(Some(t)) = env.repo.ticket_by_id(ticket_id).await else { return "Unknown ticket." };
+pub async fn recover<I: CloseIo>(
+    env: &Env<'_, I>,
+    a: &Actor,
+    ticket_id: i64,
+    action: Recovery,
+) -> &'static str {
+    let Ok(Some(t)) = env.repo.ticket_by_id(ticket_id).await else {
+        return "Unknown ticket.";
+    };
     if !staff_or_owner(env.settings, a, t.guild) {
         return "You cannot manage this ticket.";
     }

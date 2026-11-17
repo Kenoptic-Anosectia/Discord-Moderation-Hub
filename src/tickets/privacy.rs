@@ -43,18 +43,35 @@ struct Facts {
     channel_bearing: bool,
 }
 fn facts(event: &FullEvent) -> Facts {
-    let mut f = Facts { guild: None, channels: vec![], parents: vec![], parent_known: false, channel_bearing: true };
+    let mut f = Facts {
+        guild: None,
+        channels: vec![],
+        parents: vec![],
+        parent_known: false,
+        channel_bearing: true,
+    };
     match event {
         FullEvent::Message { new_message } => {
             f.guild = new_message.guild_id.map(|g| g.get());
             f.channels.push(new_message.channel_id);
         }
         FullEvent::MessageUpdate { new, event, .. } => {
-            f.guild = event.guild_id.map(|g| g.get()).or_else(|| new.as_ref().and_then(|m| m.guild_id).map(|g| g.get()));
+            f.guild = event
+                .guild_id
+                .map(|g| g.get())
+                .or_else(|| new.as_ref().and_then(|m| m.guild_id).map(|g| g.get()));
             f.channels.push(event.channel_id);
         }
-        FullEvent::MessageDelete { channel_id, guild_id, .. }
-        | FullEvent::MessageDeleteBulk { channel_id, guild_id, .. } => {
+        FullEvent::MessageDelete {
+            channel_id,
+            guild_id,
+            ..
+        }
+        | FullEvent::MessageDeleteBulk {
+            channel_id,
+            guild_id,
+            ..
+        } => {
             f.guild = guild_id.map(|g| g.get());
             f.channels.push(*channel_id);
         }
@@ -112,7 +129,9 @@ pub async fn decide(
     if !f.channel_bearing {
         return Decision::Allow; // member/server/role/voice/etc. keep normal logging
     }
-    let (Some(settings), Some(repo)) = (settings, repo) else { return Decision::Skip };
+    let (Some(settings), Some(repo)) = (settings, repo) else {
+        return Decision::Skip;
+    };
     if let Some(g) = f.guild {
         if g != settings.guild {
             return Decision::Allow; // other guild: not ticket scope
@@ -127,8 +146,20 @@ pub async fn decide(
         }
     }
     // (b) category membership from the payload (old and new parents).
-    if f.parents.iter().flatten().any(|p| is_category(settings, *p)) {
+    if f.parents
+        .iter()
+        .flatten()
+        .any(|p| is_category(settings, *p))
+    {
         return Decision::Skip;
+    }
+    // A parent that is itself a durable ticket channel (thread under a ticket) is private;
+    // a failed lookup also skips.
+    for p in f.parents.iter().flatten() {
+        match repo.channel_known(*p).await {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return Decision::Skip,
+        }
     }
     if f.parent_known {
         // payload fully describes the channel; ticket-category check above was enough
@@ -167,12 +198,21 @@ impl ChannelLookup for SerenityLookup<'_> {
     async fn lookup(&self, channel: ChannelId) -> Lookup {
         use serenity::all::Channel;
         for g in self.0.cache.guilds() {
-            if let Some(c) = self.0.cache.guild(g).and_then(|g| g.channels.get(&channel).cloned()) {
-                return Lookup::Guild { parent: c.parent_id.map(|p| p.get()) };
+            if let Some(c) = self
+                .0
+                .cache
+                .guild(g)
+                .and_then(|g| g.channels.get(&channel).cloned())
+            {
+                return Lookup::Guild {
+                    parent: c.parent_id.map(|p| p.get()),
+                };
             }
         }
         match channel.to_channel(self.0).await {
-            Ok(Channel::Guild(c)) => Lookup::Guild { parent: c.parent_id.map(|p| p.get()) },
+            Ok(Channel::Guild(c)) => Lookup::Guild {
+                parent: c.parent_id.map(|p| p.get()),
+            },
             Ok(Channel::Private(_)) => Lookup::NotGuild,
             _ => Lookup::Unknown,
         }
@@ -181,8 +221,8 @@ impl ChannelLookup for SerenityLookup<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::policy::{Kind, Settings};
+    use super::*;
     use serenity::all::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -190,7 +230,13 @@ mod tests {
     const SUPPORT: u64 = 500;
     const AGE: u64 = 600;
     fn settings() -> Settings {
-        Settings { guild: G, staff: 7, support_category: SUPPORT, age_category: AGE, db_path: ":memory:".into() }
+        Settings {
+            guild: G,
+            staff: 7,
+            support_category: SUPPORT,
+            age_category: AGE,
+            db_path: ":memory:".into(),
+        }
     }
     struct Fake {
         answer: Lookup,
@@ -198,7 +244,10 @@ mod tests {
     }
     impl Fake {
         fn new(a: Lookup) -> Self {
-            Self { answer: a, calls: AtomicUsize::new(0) }
+            Self {
+                answer: a,
+                calls: AtomicUsize::new(0),
+            }
         }
     }
     impl ChannelLookup for Fake {
@@ -214,16 +263,27 @@ mod tests {
         FullEvent::Message { new_message: m }
     }
     fn delete(ch: u64) -> FullEvent {
-        FullEvent::MessageDelete { channel_id: ChannelId::new(ch), deleted_message_id: MessageId::new(2), guild_id: Some(GuildId::new(G)) }
+        FullEvent::MessageDelete {
+            channel_id: ChannelId::new(ch),
+            deleted_message_id: MessageId::new(2),
+            guild_id: Some(GuildId::new(G)),
+        }
     }
     fn bulk(ch: u64) -> FullEvent {
-        FullEvent::MessageDeleteBulk { channel_id: ChannelId::new(ch), multiple_deleted_messages_ids: vec![MessageId::new(2)], guild_id: Some(GuildId::new(G)) }
+        FullEvent::MessageDeleteBulk {
+            channel_id: ChannelId::new(ch),
+            multiple_deleted_messages_ids: vec![MessageId::new(2)],
+            guild_id: Some(GuildId::new(G)),
+        }
     }
     fn update(ch: u64) -> FullEvent {
         FullEvent::MessageUpdate {
             old_if_available: None,
             new: None,
-            event: serde_json::from_value(serde_json::json!({"id":"2","channel_id":ch.to_string(),"guild_id":G.to_string()})).unwrap(),
+            event: serde_json::from_value(
+                serde_json::json!({"id":"2","channel_id":ch.to_string(),"guild_id":G.to_string()}),
+            )
+            .unwrap(),
         }
     }
     fn gchan(id: u64, parent: Option<u64>) -> GuildChannel {
@@ -250,7 +310,10 @@ mod tests {
         let l = Fake::new(Lookup::Unknown);
         for ev in [msg(900, Some(G)), delete(900), bulk(900), update(900)] {
             assert_eq!(decide(false, None, None, &ev, &l).await, Decision::Allow);
-            assert_eq!(decide(false, Some(&settings()), Some(&repo), &ev, &l).await, Decision::Allow);
+            assert_eq!(
+                decide(false, Some(&settings()), Some(&repo), &ev, &l).await,
+                Decision::Allow
+            );
         }
         assert_eq!(l.calls.load(Ordering::SeqCst), 0);
     }
@@ -273,9 +336,14 @@ mod tests {
             for ev in [msg(901, Some(G)), delete(901), bulk(901), update(901)] {
                 assert_eq!(d(&repo, &ev, &l).await, Decision::Skip);
             }
-            let c = FullEvent::ChannelCreate { channel: gchan(901, Some(cat)) };
+            let c = FullEvent::ChannelCreate {
+                channel: gchan(901, Some(cat)),
+            };
             assert_eq!(d(&repo, &c, &l).await, Decision::Skip);
-            let del = FullEvent::ChannelDelete { channel: gchan(901, Some(cat)), messages: None };
+            let del = FullEvent::ChannelDelete {
+                channel: gchan(901, Some(cat)),
+                messages: None,
+            };
             assert_eq!(d(&repo, &del, &l).await, Decision::Skip);
         }
     }
@@ -283,9 +351,18 @@ mod tests {
     async fn channel_moves_check_old_and_new_category() {
         let repo = Repository::open(":memory:").await.unwrap();
         let l = Fake::new(Lookup::Unknown);
-        let into = FullEvent::ChannelUpdate { old: Some(gchan(902, Some(1))), new: gchan(902, Some(SUPPORT)) };
-        let out = FullEvent::ChannelUpdate { old: Some(gchan(902, Some(AGE))), new: gchan(902, Some(1)) };
-        let pub_ = FullEvent::ChannelUpdate { old: Some(gchan(902, Some(1))), new: gchan(902, Some(2)) };
+        let into = FullEvent::ChannelUpdate {
+            old: Some(gchan(902, Some(1))),
+            new: gchan(902, Some(SUPPORT)),
+        };
+        let out = FullEvent::ChannelUpdate {
+            old: Some(gchan(902, Some(AGE))),
+            new: gchan(902, Some(1)),
+        };
+        let pub_ = FullEvent::ChannelUpdate {
+            old: Some(gchan(902, Some(1))),
+            new: gchan(902, Some(2)),
+        };
         assert_eq!(d(&repo, &into, &l).await, Decision::Skip);
         assert_eq!(d(&repo, &out, &l).await, Decision::Skip);
         assert_eq!(d(&repo, &pub_, &l).await, Decision::Allow);
@@ -302,9 +379,14 @@ mod tests {
             assert_eq!(d(&repo, &ev, &public).await, Decision::Allow);
         }
         // other guild: out of ticket scope
-        assert_eq!(d(&repo, &msg(777, Some(G + 1)), &unknown).await, Decision::Allow);
+        assert_eq!(
+            d(&repo, &msg(777, Some(G + 1)), &unknown).await,
+            Decision::Allow
+        );
         // non-channel events (members/roles/voice/invites) are never blocked, no lookup
-        let ev = FullEvent::GuildRoleCreate { new: Role::default() };
+        let ev = FullEvent::GuildRoleCreate {
+            new: Role::default(),
+        };
         let before = unknown.calls.load(Ordering::SeqCst);
         assert_eq!(d(&repo, &ev, &unknown).await, Decision::Allow);
         assert_eq!(unknown.calls.load(Ordering::SeqCst), before);
@@ -312,8 +394,13 @@ mod tests {
     #[tokio::test]
     async fn invalid_config_or_missing_repo_fails_closed_for_channel_events_only() {
         let l = Fake::new(Lookup::Guild { parent: None });
-        assert_eq!(decide(true, None, None, &msg(1, Some(G)), &l).await, Decision::Skip);
-        let ev = FullEvent::GuildRoleCreate { new: Role::default() };
+        assert_eq!(
+            decide(true, None, None, &msg(1, Some(G)), &l).await,
+            Decision::Skip
+        );
+        let ev = FullEvent::GuildRoleCreate {
+            new: Role::default(),
+        };
         assert_eq!(decide(true, None, None, &ev, &l).await, Decision::Allow);
     }
     #[tokio::test]
@@ -323,14 +410,63 @@ mod tests {
         let l = Fake::new(Lookup::Guild { parent: None });
         assert_eq!(d(&repo, &msg(5, Some(G)), &l).await, Decision::Skip);
     }
+    fn thread(id: u64, parent: u64) -> GuildChannel {
+        let mut c = gchan(id, Some(parent));
+        c.kind = ChannelType::PublicThread;
+        c
+    }
+    #[tokio::test]
+    async fn thread_events_under_a_durable_ticket_channel_are_private() {
+        let repo = repo_with_ticket(900).await;
+        let l = Fake::new(Lookup::Guild { parent: None });
+        let evs = [
+            FullEvent::ThreadCreate {
+                thread: thread(950, 900),
+            },
+            FullEvent::ThreadUpdate {
+                old: None,
+                new: thread(950, 900),
+            },
+            FullEvent::ThreadDelete {
+                thread: serde_json::from_value(serde_json::json!({
+                    "id": "950", "guild_id": G.to_string(), "parent_id": "900", "type": 11
+                }))
+                .unwrap(),
+                full_thread_data: None,
+            },
+        ];
+        for ev in &evs {
+            assert_eq!(d(&repo, ev, &l).await, Decision::Skip);
+        }
+        // a thread under an unrelated channel keeps normal logging
+        let ok = FullEvent::ThreadCreate {
+            thread: thread(951, 12),
+        };
+        assert_eq!(d(&repo, &ok, &l).await, Decision::Allow);
+    }
+    #[tokio::test]
+    async fn thread_events_skip_on_db_error() {
+        let repo = Repository::open(":memory:").await.unwrap();
+        repo.break_for_test().await;
+        let l = Fake::new(Lookup::Guild { parent: None });
+        let ev = FullEvent::ThreadCreate {
+            thread: thread(950, 12),
+        };
+        assert_eq!(d(&repo, &ev, &l).await, Decision::Skip);
+    }
     #[test]
     fn runtime_event_handler_calls_the_guard_before_any_cache_insertion() {
         let main = include_str!("../main.rs");
         let h = main.find("async fn event_handler").unwrap();
         let body = &main[h..];
-        let guard = body.find("tickets::privacy::decide").expect("handler must call the guard");
+        let guard = body
+            .find("tickets::privacy::decide")
+            .expect("handler must call the guard");
         let first_cache = body.find("insert_cache").unwrap();
         assert!(guard < first_cache);
-        assert!(!main.contains("allow_general_events"), "global pause must be gone");
+        assert!(
+            !main.contains("allow_general_events"),
+            "global pause must be gone"
+        );
     }
 }

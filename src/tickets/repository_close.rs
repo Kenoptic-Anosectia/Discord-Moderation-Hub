@@ -14,6 +14,22 @@ pub const NONTERMINAL: &str =
 pub const IN_CLOSE: &str = "'closing','archiving','verified','delete_requested','delete_uncertain'";
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// One validated state transition request.
+#[derive(Clone, Copy)]
+pub struct Step<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub note: &'a str,
+}
+/// Facts recorded for a verified archive.
+#[derive(Clone, Copy)]
+pub struct ArchiveRecord<'a> {
+    pub dir_name: &'a str,
+    pub sha: &'a str,
+    pub messages: u64,
+    pub assets: u64,
+}
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub from: String,
@@ -23,6 +39,7 @@ pub struct HistoryEntry {
     pub at: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct AuditEntry {
     pub actor: u64,
     pub action: String,
@@ -93,18 +110,26 @@ pub(super) fn migrate(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
                 tx.execute_batch(&V2_TICKETS.replace("{name}", "tickets_v2"))?;
                 tx.execute_batch("INSERT INTO tickets_v2(id,operation,guild,opener,kind,status,channel,greeting) SELECT id,operation,guild,opener,kind,status,channel,greeting FROM tickets;")?;
                 let old_seq: i64 = tx
-                    .query_row("SELECT seq FROM sqlite_sequence WHERE name='tickets'", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name='tickets'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .optional()?
                     .unwrap_or(0);
                 tx.execute_batch("DROP INDEX IF EXISTS ticket_active_slot; DROP TABLE tickets; ALTER TABLE tickets_v2 RENAME TO tickets;")?;
-                let max_id: i64 = tx.query_row("SELECT COALESCE(MAX(id),0) FROM tickets", [], |r| r.get(0))?;
+                let max_id: i64 =
+                    tx.query_row("SELECT COALESCE(MAX(id),0) FROM tickets", [], |r| r.get(0))?;
                 tx.execute("DELETE FROM sqlite_sequence WHERE name='tickets'", [])?;
                 tx.execute(
                     "INSERT INTO sqlite_sequence(name,seq) VALUES('tickets',?1)",
                     [old_seq.max(max_id)],
                 )?;
                 create_aux(&tx)?;
-                let bad: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+                let bad: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
                 if bad != 0 {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
@@ -137,22 +162,34 @@ fn hist(
 const COLS: &str = "id,guild,opener,kind,status,channel,greeting,operation";
 
 impl Repository {
+    #[cfg(test)]
     pub async fn schema_version(&self) -> Result<i64, Error> {
         Ok(self
             .db
-            .call(|c| -> rusqlite::Result<i64> { c.query_row("SELECT version FROM ticket_schema", [], |r| r.get(0)) })
+            .call(|c| -> rusqlite::Result<i64> {
+                c.query_row("SELECT version FROM ticket_schema", [], |r| r.get(0))
+            })
             .await?)
     }
     pub async fn ticket_by_id(&self, id: i64) -> Result<Option<Ticket>, Error> {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<Option<Ticket>> {
-                c.query_row(&format!("SELECT {COLS} FROM tickets WHERE id=?1"), [id], read_ticket).optional()
+                c.query_row(
+                    &format!("SELECT {COLS} FROM tickets WHERE id=?1"),
+                    [id],
+                    read_ticket,
+                )
+                .optional()
             })
             .await?)
     }
     /// Durable linkage: guild AND channel must both match a stored ticket.
-    pub async fn ticket_by_channel(&self, guild: u64, channel: u64) -> Result<Option<Ticket>, Error> {
+    pub async fn ticket_by_channel(
+        &self,
+        guild: u64,
+        channel: u64,
+    ) -> Result<Option<Ticket>, Error> {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<Option<Ticket>> {
@@ -170,7 +207,11 @@ impl Repository {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<bool> {
-                c.query_row("SELECT EXISTS(SELECT 1 FROM tickets WHERE channel=?1)", [channel.to_string()], |r| r.get(0))
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tickets WHERE channel=?1)",
+                    [channel.to_string()],
+                    |r| r.get(0),
+                )
             })
             .await?)
     }
@@ -178,14 +219,25 @@ impl Repository {
         Ok(self
             .db
             .call(|c| -> rusqlite::Result<Vec<Ticket>> {
-                let mut s = c.prepare(&format!("SELECT {COLS} FROM tickets WHERE status IN ({NONTERMINAL}) ORDER BY id"))?;
-                let rows = s.query_map([], read_ticket)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut s = c.prepare(&format!(
+                    "SELECT {COLS} FROM tickets WHERE status IN ({NONTERMINAL}) ORDER BY id"
+                ))?;
+                let rows = s
+                    .query_map([], read_ticket)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
             .await?)
     }
     /// Compare-and-set: only an `active` ticket with a stored channel can be claimed.
-    pub async fn claim_close(&self, id: i64, actor: u64, token: &str, now: i64, lease_until: i64) -> Result<bool, Error> {
+    pub async fn claim_close(
+        &self,
+        id: i64,
+        actor: u64,
+        token: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<bool, Error> {
         let token = token.to_string();
         Ok(self
             .db
@@ -204,7 +256,14 @@ impl Repository {
             .await?)
     }
     /// Take over an in-progress close whose lease expired (restart or crashed worker).
-    pub async fn resume_close(&self, id: i64, actor: u64, token: &str, now: i64, lease_until: i64) -> Result<bool, Error> {
+    pub async fn resume_close(
+        &self,
+        id: i64,
+        actor: u64,
+        token: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<bool, Error> {
         let token = token.to_string();
         Ok(self
             .db
@@ -231,11 +290,24 @@ impl Repository {
             .await?)
     }
     /// Token-checked state transition validated against the allowed-transition table.
-    pub async fn advance(&self, id: i64, token: &str, from: &str, to: &str, now: i64, lease_until: i64, note: &str) -> Result<bool, Error> {
+    pub async fn advance(
+        &self,
+        id: i64,
+        token: &str,
+        step: Step<'_>,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<bool, Error> {
+        let Step { from, to, note } = step;
         if !allowed(from, to) {
             return Ok(false);
         }
-        let (token, from, to, note) = (token.to_string(), from.to_string(), to.to_string(), note.to_string());
+        let (token, from, to, note) = (
+            token.to_string(),
+            from.to_string(),
+            to.to_string(),
+            note.to_string(),
+        );
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<bool> {
@@ -262,10 +334,14 @@ impl Repository {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<bool> {
-                Ok(c.execute("UPDATE tickets SET lease_until=0 WHERE id=?1 AND close_token=?2", params![id, token])? == 1)
+                Ok(c.execute(
+                    "UPDATE tickets SET lease_until=0 WHERE id=?1 AND close_token=?2",
+                    params![id, token],
+                )? == 1)
             })
             .await?)
     }
+    #[cfg(test)]
     pub async fn history(&self, id: i64) -> Result<Vec<HistoryEntry>, Error> {
         Ok(self
             .db
@@ -281,7 +357,19 @@ impl Repository {
             .await?)
     }
     /// Record a verified archive for the lease holder; returns the new sequence number.
-    pub async fn record_archive(&self, id: i64, token: &str, dir_name: &str, sha: &str, messages: u64, assets: u64, now: i64) -> Result<Option<i64>, Error> {
+    pub async fn record_archive(
+        &self,
+        id: i64,
+        token: &str,
+        rec: ArchiveRecord<'_>,
+        now: i64,
+    ) -> Result<Option<i64>, Error> {
+        let ArchiveRecord {
+            dir_name,
+            sha,
+            messages,
+            assets,
+        } = rec;
         let (token, dir_name, sha) = (token.to_string(), dir_name.to_string(), sha.to_string());
         Ok(self
             .db
@@ -305,7 +393,11 @@ impl Repository {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<i64> {
-                c.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ticket_archives WHERE ticket=?1", [id], |r| r.get(0))
+                c.query_row(
+                    "SELECT COALESCE(MAX(seq),0)+1 FROM ticket_archives WHERE ticket=?1",
+                    [id],
+                    |r| r.get(0),
+                )
             })
             .await?)
     }
@@ -326,17 +418,24 @@ impl Repository {
         let status = status.to_string();
         self.db
             .call(move |c| -> rusqlite::Result<()> {
-                c.execute("INSERT OR REPLACE INTO ticket_dm(ticket,status,at) VALUES(?1,?2,?3)", params![id, status, now])?;
+                c.execute(
+                    "INSERT OR REPLACE INTO ticket_dm(ticket,status,at) VALUES(?1,?2,?3)",
+                    params![id, status, now],
+                )?;
                 Ok(())
             })
             .await?;
         Ok(())
     }
+    #[cfg(test)]
     pub async fn dm_status(&self, id: i64) -> Result<Option<String>, Error> {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<Option<String>> {
-                c.query_row("SELECT status FROM ticket_dm WHERE ticket=?1", [id], |r| r.get(0)).optional()
+                c.query_row("SELECT status FROM ticket_dm WHERE ticket=?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()
             })
             .await?)
     }
@@ -359,7 +458,14 @@ impl Repository {
             .await?)
     }
     /// Audited operator action: attach a verified remote channel to an unattached operation.
-    pub async fn recovery_attach(&self, id: i64, channel: u64, actor: u64, reason: &str, now: i64) -> Result<bool, Error> {
+    pub async fn recovery_attach(
+        &self,
+        id: i64,
+        channel: u64,
+        actor: u64,
+        reason: &str,
+        now: i64,
+    ) -> Result<bool, Error> {
         let reason = reason.to_string();
         Ok(self
             .db
@@ -385,7 +491,13 @@ impl Repository {
     }
     /// Audited operator action: free the slot of an operation proven (by the caller) not
     /// to own a remote channel. Only from unverified create states or `recovery`.
-    pub async fn recovery_release(&self, id: i64, actor: u64, reason: &str, now: i64) -> Result<bool, Error> {
+    pub async fn recovery_release(
+        &self,
+        id: i64,
+        actor: u64,
+        reason: &str,
+        now: i64,
+    ) -> Result<bool, Error> {
         let reason = reason.to_string();
         Ok(self
             .db
@@ -403,13 +515,23 @@ impl Repository {
             })
             .await?)
     }
+    #[cfg(test)]
     pub async fn audit(&self, id: i64) -> Result<Vec<AuditEntry>, Error> {
         Ok(self
             .db
             .call(move |c| -> rusqlite::Result<Vec<AuditEntry>> {
-                let mut s = c.prepare("SELECT actor,action,reason,at FROM ticket_audit WHERE ticket=?1 ORDER BY id")?;
+                let mut s = c.prepare(
+                    "SELECT actor,action,reason,at FROM ticket_audit WHERE ticket=?1 ORDER BY id",
+                )?;
                 let rows = s
-                    .query_map([id], |r| Ok(AuditEntry { actor: r.get::<_, String>(0)?.parse().unwrap_or(0), action: r.get(1)?, reason: r.get(2)?, at: r.get(3)? }))?
+                    .query_map([id], |r| {
+                        Ok(AuditEntry {
+                            actor: r.get::<_, String>(0)?.parse().unwrap_or(0),
+                            action: r.get(1)?,
+                            reason: r.get(2)?,
+                            at: r.get(3)?,
+                        })
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
@@ -420,7 +542,10 @@ impl Repository {
         let status = status.to_string();
         self.db
             .call(move |c| -> rusqlite::Result<()> {
-                c.execute("UPDATE tickets SET status=?2 WHERE id=?1", params![id, status])?;
+                c.execute(
+                    "UPDATE tickets SET status=?2 WHERE id=?1",
+                    params![id, status],
+                )?;
                 Ok(())
             })
             .await?;
@@ -431,6 +556,11 @@ impl Repository {
 impl Repository {
     /// Simulate a failed metadata lookup by renaming the tickets table away.
     pub async fn break_for_test(&self) {
-        let _ = self.db.call(|c| -> rusqlite::Result<()> { c.execute_batch("ALTER TABLE tickets RENAME TO tickets_broken;") }).await;
+        let _ = self
+            .db
+            .call(|c| -> rusqlite::Result<()> {
+                c.execute_batch("ALTER TABLE tickets RENAME TO tickets_broken;")
+            })
+            .await;
     }
 }
