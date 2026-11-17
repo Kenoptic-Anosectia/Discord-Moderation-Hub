@@ -1129,7 +1129,23 @@ async fn event_handler(
 ) -> Result<(), Error> {
     let log_channel_id = data.config.log_channel_id;
 
-    if !tickets::allow_general_events(data.config.ticket_privacy_lockdown, event) {
+    // Fail-closed private-scope guard: runs before any cache insertion or log construction.
+    if tickets::privacy::decide(
+        data.config.ticket_privacy_lockdown,
+        data.config.tickets.as_ref(),
+        data.tickets.as_ref(),
+        event,
+        &tickets::privacy::SerenityLookup(ctx),
+    )
+    .await
+        == tickets::privacy::Decision::Skip
+        && !matches!(
+            event,
+            serenity::FullEvent::InteractionCreate { .. }
+                | serenity::FullEvent::ReactionAdd { .. }
+                | serenity::FullEvent::ReactionRemove { .. }
+        )
+    {
         return Ok(());
     }
 
@@ -2452,7 +2468,7 @@ async fn main() -> Result<(), Error> {
                         Some(settings)=>Some(tickets::repository::Repository::open(&settings.db_path).await?),
                         None=>None,
                     };
-                    if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: general event logging paused; ticket opening disabled pending A07."); }
+                    if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: channel events in private ticket scope are skipped fail-closed; ticket opening remains gated."); }
 
                     Ok(Data {
                         config,

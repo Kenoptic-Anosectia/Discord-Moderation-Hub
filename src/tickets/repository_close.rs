@@ -427,3 +427,10 @@ impl Repository {
         Ok(())
     }
 }
+#[cfg(test)]
+impl Repository {
+    /// Simulate a failed metadata lookup by renaming the tickets table away.
+    pub async fn break_for_test(&self) {
+        let _ = self.db.call(|c| -> rusqlite::Result<()> { c.execute_batch("ALTER TABLE tickets RENAME TO tickets_broken;") }).await;
+    }
+}
