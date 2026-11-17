@@ -151,3 +151,47 @@ The A09 fixture factory is reused via one `#[cfg(test)]` module (`tickets::fixtu
 * Not covered: live Discord, real network, the serenity `log_event` body, the runtime slash
   command handlers themselves (logic is tested at `closer::*`; command metadata is checked in
   `main.rs`). Orphan skipping is bounded (32); beyond that the close is retained, not forced.
+
+## Round 5 (same card; fixes for the round-4 BLOCK)
+
+Executed with `CARGO_BUILD_JOBS=2 ... --locked --offline`. Final run: `cargo fmt --all -- --check`
+exit 0; `cargo check` exit 0; `cargo build` exit 0; `cargo test` exit 0 with **91 bin + 30 safety
++ 7 logger + 5 factory** tests passing; all-targets Clippy with
+`-D warnings -D deprecated -D clippy::result_large_err -D clippy::type_complexity` exit 0.
+The round-4 "Gate status" claim above still holds: the Serenity adapter is NOT exercised live;
+the real `HttpDownloader` policy is now also exercised *through the close controller*, but only
+over a fake transport (no network).
+
+| # | Defect | Fix (production code) | Regression (production controller) |
+|---|---|---|---|
+| 1 | Two independent `delete_uncertain` presence probes; Unknown/Absent skipped source validation | ONE classified probe: Unknown -> retain at once, Absent -> reconcile only, Present -> mandatory `source_unchanged` before any retry/delete (`closer.rs`) | `changing_presence_probes_never_delete_a_stale_or_unchecked_source` (Unknown->Present, Absent->Present, Present+edit/delete/append) |
+| 2 | Foreign/unsupported-format orphan adopted | `identity_ok` (format==1, ticket, channel) enforced at orphan adoption, `verify_recorded`, `recorded_manifest` (reverify, reconcile, retrieval) + asset-count check at adoption | `foreign_or_unsupported_orphan_is_preserved_never_adopted_and_fresh_archive_is_published` (wrong ticket, wrong channel, format 2; orphan bytes preserved, fresh seq 2 published, identity mismatch rejected on reverify) |
+| 3 | Fingerprint omitted embed URL/footer, author, attachment type | `content_fingerprint` now covers author name/bot flag, attachment content_type, embed url + footer | `footer_only_or_url_only_edit_is_detected_during_download_and_on_retry` (stale archive preserved, no delete until a fresh matching one is published) |
+
+RED (new tests against the round-4 production code, i.e. fixes reverted, only the signature shim
+kept so tests compile): `3 failed; 20 passed` — `foreign_or_unsupported_orphan_...`,
+`footer_only_or_url_only_...`, `changing_presence_probes_...` all FAILED. GREEN: same tests pass
+with the fixes (full suite counts above).
+
+Coverage added (these passed on first run; they add evidence for behaviour that was already
+correct, they are not RED/GREEN fixes):
+* `privacy::tests::guarded_sink_for_invite_voice_reaction_events_private_unknown_error_public_member`:
+  production `guarded` seam with an injected sink counter — InviteCreate/Delete, VoiceStateUpdate
+  (old-only, new-only and both endpoints), ReactionAdd/Remove: private, unknown and DB-error
+  cases give zero sink writes; public gives exactly one; a member event gives one and no lookup.
+* `closer::tests::real_downloader::*`: a real `CloseIo` test adapter whose `Downloader` is the
+  actual `HttpDownloader` over `fake_transport`, with real SQLite and files and a fake Discord:
+  3xx, 404, 500, timeout, transport failure, oversize and short body each give
+  `Retained`, zero source deletes, status `archiving`, held slot, no archive recorded; a 200
+  control closes with exactly one delete.
+* `restart_after_record_but_before_verified_...`: crash window between `record_archive` and the
+  `verified` transition. Accurate claim: the recorded-but-unverified archive is preserved
+  untouched, a fresh independently verified archive (seq 2) is published and only then is the
+  source deleted once. The controller does NOT adopt the earlier recorded archive in that state.
+* Retrieval denial: the existing test uses a tamper oracle (denied callers see only the denial
+  text, whereas an authorized caller sees the integrity failure on the same corrupted archive).
+  This is an inference of zero reads, NOT a read-counter or fault-boundary proof; no such counter
+  exists. Do not cite it as a counted zero-read proof.
+
+Still not covered / limits: no live Discord or network; the member-event control only covers
+`GuildMemberRemoval`; the `Hang` timeout case relies on a 200 ms test deadline.
