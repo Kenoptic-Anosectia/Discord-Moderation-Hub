@@ -1,3 +1,4 @@
+mod archive_safety;
 mod config;
 mod text_helpers;
 mod tickets;

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod controller;
 pub mod policy;
 pub mod privacy;

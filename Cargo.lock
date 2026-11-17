@@ -334,6 +334,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "discord-moderation-hub"
+version = "0.1.0"
+dependencies = [
+ "dotenvy",
+ "poise",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serenity",
+ "tokio",
+ "tokio-rusqlite",
+ "url",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1602,21 +1619,6 @@ dependencies = [
  "pulldown-cmark",
  "tempfile",
  "walkdir",
-]
-
-[[package]]
-name = "discord-moderation-hub"
-version = "0.1.0"
-dependencies = [
- "dotenvy",
- "poise",
- "rusqlite",
- "serde",
- "serde_json",
- "serenity",
- "tokio",
- "tokio-rusqlite",
- "url",
 ]
 
 [[package]]
