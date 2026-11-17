@@ -6,7 +6,7 @@ use tokio_rusqlite::Connection;
 
 #[derive(Clone)]
 pub struct Repository {
-    db: Arc<Connection>,
+    pub(super) db: Arc<Connection>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
@@ -93,19 +93,8 @@ impl Repository {
         } else {
             Connection::open(path).await?
         };
-        db.call(|c| -> rusqlite::Result<()> {
-   c.busy_timeout(std::time::Duration::from_secs(5))?;
-   let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-   tx.execute_batch("CREATE TABLE IF NOT EXISTS ticket_schema(version INTEGER NOT NULL);
-    INSERT INTO ticket_schema SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM ticket_schema);")?;
-   let version:i64=tx.query_row("SELECT version FROM ticket_schema",[],|r| r.get(0))?;
-   if version!=1 { return Err(rusqlite::Error::InvalidQuery); }
-   tx.execute_batch("CREATE TABLE IF NOT EXISTS ticket_panels(guild TEXT NOT NULL, channel TEXT NOT NULL, message TEXT PRIMARY KEY, bot TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16)))), guild TEXT NOT NULL, opener TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('support','age')), status TEXT NOT NULL CHECK(status IN ('reserved','creating','active','failed','closed')), channel TEXT UNIQUE, greeting TEXT NOT NULL DEFAULT 'pending');
-    CREATE UNIQUE INDEX IF NOT EXISTS ticket_active_slot ON tickets(guild,opener,kind) WHERE status IN ('reserved','creating','active');
-    CREATE TABLE IF NOT EXISTS ticket_interactions(interaction TEXT PRIMARY KEY, ticket INTEGER NOT NULL REFERENCES tickets(id));")?;
-   tx.commit()?; Ok(())
-  }).await?;
+        db.call(|c| -> rusqlite::Result<()> { super::repository_close::migrate(c) })
+            .await?;
         Ok(Self { db: Arc::new(db) })
     }
     pub async fn reserve(
@@ -119,7 +108,7 @@ impl Repository {
    let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
    let previous:Option<i64>=tx.query_row("SELECT ticket FROM ticket_interactions WHERE interaction=?1",[interaction.to_string()],|r|r.get(0)).optional()?;
    let id=if let Some(id)=previous { id } else {
-    let slot:Option<i64>=tx.query_row("SELECT id FROM tickets WHERE guild=?1 AND opener=?2 AND kind=?3 AND status IN ('reserved','creating','active')",params![guild.to_string(),opener.to_string(),kind.key()],|r|r.get(0)).optional()?;
+    let slot:Option<i64>=tx.query_row("SELECT id FROM tickets WHERE guild=?1 AND opener=?2 AND kind=?3 AND status IN ('reserved','creating','active','closing','archiving','verified','delete_requested','delete_uncertain','recovery')",params![guild.to_string(),opener.to_string(),kind.key()],|r|r.get(0)).optional()?;
     let id=if let Some(id)=slot { id } else {
      tx.execute("INSERT INTO tickets(guild,opener,kind,status) VALUES(?1,?2,?3,'reserved')",params![guild.to_string(),opener.to_string(),kind.key()])?;
      tx.last_insert_rowid()
@@ -131,7 +120,7 @@ impl Repository {
   }).await?)
     }
 }
-fn read_ticket(r: &rusqlite::Row<'_>) -> rusqlite::Result<Ticket> {
+pub(super) fn read_ticket(r: &rusqlite::Row<'_>) -> rusqlite::Result<Ticket> {
     fn snowflake(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<u64> {
         let s: String = r.get(i)?;
         s.parse().map_err(|e| {
@@ -157,6 +146,9 @@ fn read_ticket(r: &rusqlite::Row<'_>) -> rusqlite::Result<Ticket> {
         greeting: r.get(6)?,
     })
 }
+#[cfg(test)]
+#[path = "repository_tests.rs"]
+pub(crate) mod a07_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

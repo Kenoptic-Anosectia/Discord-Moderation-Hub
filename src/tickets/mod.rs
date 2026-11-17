@@ -1,6 +1,7 @@
 pub mod controller;
 pub mod policy;
 pub mod repository;
+pub mod repository_close;
 pub mod runtime;
 
 // Conservative A06 fallback. No cache lookup, channel fetch, topic construction,
