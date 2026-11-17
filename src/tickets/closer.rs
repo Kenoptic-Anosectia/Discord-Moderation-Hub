@@ -575,6 +575,30 @@ pub async fn recover<I: CloseIo>(
     }
 }
 
+/// Minimal read-only retrieval (full browse/restore is A08): for configured staff or the
+/// actual guild owner ONLY, in the configured guild, for a ticket of this guild. Authorization
+/// happens BEFORE any archive-reference or file read (zero reads on denial). The recorded
+/// archive is re-verified byte-for-byte (manifest hash, transcript, assets) and the reply
+/// carries only the reference and integrity result, never message content or file paths.
+pub async fn retrieve<I: CloseIo>(env: &Env<'_, I>, a: &Actor, ticket_id: i64) -> String {
+    let Ok(Some(t)) = env.repo.ticket_by_id(ticket_id).await else {
+        return "Unknown ticket.".into();
+    };
+    if !staff_or_owner(env.settings, a, t.guild) {
+        return "You cannot manage this ticket.".into();
+    }
+    let Ok(Some(ar)) = env.repo.latest_archive(t.id).await else {
+        return "No verified archive is recorded for this ticket.".into();
+    };
+    match recorded_manifest(env.root, &ar) {
+        Some(m) => format!(
+            "Archive {} (ticket status: {}): {} messages, {} assets, manifest sha256 {}. Integrity re-verified: OK.",
+            ar.dir_name, t.status, m.message_count, m.assets.len(), ar.manifest_sha256
+        ),
+        None => "Archive integrity check FAILED (missing or modified). Nothing was changed or exported; keep the ticket record and escalate to the operator.".into(),
+    }
+}
+
 #[cfg(test)]
 #[path = "closer_tests.rs"]
 mod tests;

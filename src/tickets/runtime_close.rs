@@ -261,6 +261,9 @@ pub async fn recover(
         now: clock,
     };
     let reason = reason.unwrap_or_default();
+    if action == "retrieve" {
+        return reply(ctx, &closer::retrieve(&env, &a, ticket_id).await).await;
+    }
     let act = match (action.as_str(), channel) {
         ("status", _) => Recovery::Status,
         ("attach", Some(channel)) => Recovery::Attach {
@@ -269,7 +272,13 @@ pub async fn recover(
             reason,
         },
         ("release", _) => Recovery::Release { confirm, reason },
-        _ => return reply(ctx, "Unknown action. Use status, attach or release.").await,
+        _ => {
+            return reply(
+                ctx,
+                "Unknown action. Use status, retrieve, attach or release.",
+            )
+            .await
+        }
     };
     reply(ctx, closer::recover(&env, &a, ticket_id, act).await).await
 }

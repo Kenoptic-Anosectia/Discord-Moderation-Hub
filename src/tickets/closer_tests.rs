@@ -975,3 +975,72 @@ async fn operator_recovery_needs_confirmation_reason_checks_and_is_audited() {
     assert_eq!(h.repo.audit(t2.id).await.unwrap()[0].action, "attach");
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+
+#[tokio::test]
+async fn retrieval_is_staff_or_owner_only_reverifies_integrity_and_reads_nothing_on_denial() {
+    let h = harness("retrieve").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Closed
+    );
+    let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+    let limits = Limits::default();
+    let f = || 9000i64;
+    let s = settings();
+    let env = Env {
+        settings: &s,
+        repo: &h.repo,
+        io: &io,
+        root: &h.root,
+        limits: &limits,
+        now: &f,
+    };
+    // the channel is already deleted: retrieval works from a different channel
+    let mut staff = actor(&t);
+    staff.channel = 1;
+    let ok = retrieve(&env, &staff, t.id).await;
+    assert!(
+        ok.contains(&ar.dir_name) && ok.contains("3 messages") && ok.contains("re-verified: OK")
+    );
+    assert!(
+        !ok.contains(h.root.path().to_str().unwrap()),
+        "no filesystem paths leaked"
+    );
+    let mut owner = staff.clone();
+    owner.roles = vec![];
+    owner.is_guild_owner = true;
+    assert!(retrieve(&env, &owner, t.id)
+        .await
+        .contains("re-verified: OK"));
+
+    // Corrupt the recorded archive. Denied callers must get ONLY the denial text (the archive
+    // was never opened: an integrity failure message would prove a read happened).
+    let manifest = h.root.path().join(&ar.dir_name).join("manifest.json");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&manifest, bytes).unwrap();
+    let denied = "You cannot manage this ticket.";
+    let mut requester = staff.clone();
+    requester.user = OPENER;
+    requester.roles = vec![];
+    assert_eq!(retrieve(&env, &requester, t.id).await, denied);
+    let mut admin = staff.clone(); // generic admin: not staff role, not guild owner
+    admin.roles = vec![999];
+    assert_eq!(retrieve(&env, &admin, t.id).await, denied);
+    let mut foreign = staff.clone();
+    foreign.guild = G + 1;
+    assert_eq!(retrieve(&env, &foreign, t.id).await, denied);
+    assert_eq!(retrieve(&env, &staff, 424242).await, "Unknown ticket.");
+    // authorized caller now sees the tamper detected, with no export
+    assert!(retrieve(&env, &staff, t.id)
+        .await
+        .contains("integrity check FAILED"));
+    // a ticket with no recorded archive
+    let u = active(&h, 2, Kind::Support).await;
+    assert!(retrieve(&env, &staff, u.id)
+        .await
+        .contains("No verified archive"));
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
