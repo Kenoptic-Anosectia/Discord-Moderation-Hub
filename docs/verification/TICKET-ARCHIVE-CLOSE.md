@@ -46,16 +46,65 @@ ticket categories (current and old/new on moves), unknown potentially-private ta
 channels, creation-before-attach, and any failed DB/metadata lookup (fail closed).
 Round-1 review fix: ThreadCreate/Update/Delete now call `repo.channel_known` on every payload
 parent, so a thread under a durable ticket channel is Skipped (lookup error also Skips).
-Test: `thread_events_under_a_durable_ticket_channel_are_private`. Runtime wiring is proven by the
-`runtime_event_handler_calls` test.
+Test: `thread_events_under_a_durable_ticket_channel_are_private`.
 
-## Recovery instructions (operator)
+Runtime wiring evidence (executed, not structural): `main.rs::event_handler` routes every event
+through `privacy::guarded(.., &COUNTERS, || log_event(..))`; all cache insertion/log output lives
+inside that sink. Tests `guarded_seam_performs_zero_sink_writes_for_private_unknown_and_error_cases`
+and `guarded_seam_runs_sink_exactly_once_for_public_and_disabled` call the real `guarded` with an
+injected sink and assert 0 sink executions + `skipped` counter for durable ticket ids, private
+category, thread-under-ticket, unknown/contradictory lookups, unprovable moves, DB error and
+missing config, and exactly one execution + `allowed` counter for public/disabled/other-guild/
+non-channel events. The source-order test `runtime_event_handler_calls_the_guard_before_any_cache_insertion`
+is a SECONDARY structural check only and is not counted as behavioural evidence. Limit: the
+actual serenity `log_event` body is not run (needs a live Context); the seam guarantees it is not
+reached.
 
-`/ticket-status`-style output is non-destructive. `/ticket-recover` attach/release requires
-confirmation, a reason, an audited actor and expected guild/category/type/private-overwrite and
-ownership checks; names/topics/nonces are corroboration only and a single candidate is never
-auto-adopted. Manual DB editing is not part of the recovery path. Archives are kept; automatic
-deletion is OFF.
+## Commands, setup and recovery (operator)
+
+* Archive root: `ticket-archives/` next to the configured ticket DB file (`db_path` parent),
+  created if absent; each archive is `ticket-<id>-<seq>/` with `manifest.json`, transcript and
+  assets. Defaults: 200,000 messages, 500 assets, 25 MiB/asset, 512 MiB total, 60 s download
+  timeout. Retention/purge is OFF (A08).
+* `/ticket-close` — run INSIDE the ticket channel by configured staff or the actual guild owner.
+* `/ticket-recover ticket_id action [channel] [confirm] [reason]`, same authorization, ephemeral:
+  * `status` — read-only state hint.
+  * `retrieve` — read-only: re-verifies the recorded archive (manifest hash, transcript, assets,
+    IDs) and replies with archive name, counts and manifest sha256 only (no content/paths/export).
+    Works after channel deletion. Authorization is checked before any archive read; requesters,
+    admins without the staff role, and foreign-guild callers get a fixed denial and zero reads
+    (test `retrieval_is_staff_or_owner_only_...`: archive tampered, denied callers still see only
+    the denial text). Full browse/restore is A08.
+  * `attach` (needs `confirm=true`, `reason`) — link a candidate channel to a reserved/creating/
+    recovery ticket only if guild, category, type and private overwrite match.
+  * `release` (needs `confirm=true`, `reason`) — frees the slot of a reserved/creating/recovery
+    ticket that has NO linked channel and no matching remote candidate; audited with actor and
+    reason. Refused for any channel-linked ticket.
+* Startup reconcile reports and holds slots: active tickets with an Unknown probe and any
+  reserved/creating/recovery row count as unresolved; opening requires `OPENING_APPROVED`
+  (false) AND a clean report (`runtime::permitted(approved)`, tested for approval true/false with
+  clean and Unknown-probe reports).
+* Stale publish-before-record orphans: if a previous attempt published `ticket-<id>-<seq>` and
+  died before recording, the retry adopts it only if it fully re-verifies AND matches the current
+  source fingerprint; otherwise it is PRESERVED untouched and the close publishes under the next
+  free sequence (bounded to 32 orphans, then retained with the slot held). Deletion only follows
+  a freshly verified, recorded archive plus the pre-delete stability check. Tests:
+  `published_but_stale_unrecorded_archives_are_preserved_and_close_recovers` (two orphans),
+  `stale_orphan_then_failed_delete_retry_never_deletes_against_stale_archive`.
+* Reserved-row recovery: `reserved` rows are unresolved at startup and resolvable ONLY by the
+  confirmed, reasoned, staff/owner, audited `release`/`attach` above. Tests:
+  `reserved_row_is_resolved_only_by_confirmed_audited_operator_action` and the repository test
+  covering `recovery_release` of a reserved row.
+* Manual DB editing is not part of any recovery path. Archives are kept; automatic deletion is OFF.
+
+## Downloader failure-path evidence
+
+`HttpDownloader<T: Transport>` keeps the production policy (https-only, no redirects, status,
+declared/streamed size caps, short body, overall deadline) in `fetch`; `ReqwestTransport` is the
+only network piece. Tests in `archive_tests::http_policy` run the real `HttpDownloader::fetch`
+over a scripted in-process transport (no network): success, non-2xx, redirect (not followed),
+timeout/hang, oversize declared and streamed. The older string-contains builder test is secondary.
+The real `ReqwestTransport` and Serenity adapter are still not exercised against a live server.
 
 ## Dependencies added (exact edges)
 
@@ -74,8 +123,15 @@ succeed against the committed lock.
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --locked --offline --all-targets -- -D warnings -D deprecated -D clippy::result_large_err -D clippy::type_complexity` | exit 0, zero warnings |
-| `cargo test --locked --offline` | 65 bin + 30 `archive_input_safety` + 7 `logger_fixture_shapes` + 5 `ticket_archive_fixture_factory`, all pass |
-| `cargo build --locked --offline` | ok |
+| `cargo test --locked --offline` | 84 bin + 30 `archive_input_safety` + 7 `logger_fixture_shapes` + 5 `ticket_archive_fixture_factory`, all pass |
+| `cargo build --locked --offline`, `cargo check --locked --offline` | exit 0 |
+| `git diff --check` | clean |
+
+(Final run at the head commit named in the review request; earlier rounds: 65, 71, 72 bin tests.)
+RED attribution: the thread-privacy RED was executed. For the round-4 items, new tests were
+written alongside/after the code in the same slice; the stale-orphan test replaces the previous
+assertion that such an orphan yields `Retained("exists")` (behaviour intentionally changed to
+recovery). RED runs were not separately captured for them and are not claimed.
 
 RED/GREEN attribution: the thread-privacy test was written first against `decide()` that checked only
 configured categories and would have returned Allow (RED); after the `channel_known` parent loop it
@@ -90,4 +146,8 @@ The A09 fixture factory is reused via one `#[cfg(test)]` module (`tickets::fixtu
 * Filesystem safety = owned archive root, create-new files, generated ID-only names, staging dir +
   atomic rename, byte reverify. Concurrent same-account tampering inside the owned root is NOT
   defended against; this is not claimed to be race-proof.
-* Retrieval is the recorded archive reference plus reverify; browse/restore/retention is A08.
+* Retrieval is the recorded archive reference plus reverify (`/ticket-recover retrieve`);
+  no content export, browse, restore or retention (A08).
+* Not covered: live Discord, real network, the serenity `log_event` body, the runtime slash
+  command handlers themselves (logic is tested at `closer::*`; command metadata is checked in
+  `main.rs`). Orphan skipping is bounded (32); beyond that the close is retained, not forced.
