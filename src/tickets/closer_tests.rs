@@ -21,8 +21,12 @@ fn settings() -> Settings {
         db_path: "owned-test.sqlite".into(),
     }
 }
+type Mutation = fn(&mut Vec<Message>);
 struct Fake {
-    msgs: Vec<Message>,
+    msgs: Mutex<Vec<Message>>,
+    reads: Mutex<usize>,
+    /// (after N history page reads, mutation applied once to the remote channel)
+    mutate: Mutex<Option<(usize, Mutation)>>,
     history_fail: bool,
     delete: Mutex<Vec<DeleteOutcome>>, // queue; last repeats
     probe: Mutex<Presence>,
@@ -35,7 +39,9 @@ struct Fake {
 impl Fake {
     fn new(root: &std::path::Path, n: usize) -> Self {
         Self {
-            msgs: fixtures::message_pages(n).into_iter().flatten().collect(),
+            msgs: Mutex::new(fixtures::message_pages(n).into_iter().flatten().collect()),
+            reads: Mutex::new(0),
+            mutate: Mutex::new(None),
             history_fail: false,
             delete: Mutex::new(vec![DeleteOutcome::Deleted]),
             probe: Mutex::new(Presence::Present),
@@ -61,8 +67,22 @@ impl HistorySource for Fake {
         if self.history_fail {
             return Err(ArchiveError::Source);
         }
+        let n = {
+            let mut r = self.reads.lock().unwrap();
+            *r += 1;
+            *r
+        };
+        {
+            let mut mm = self.mutate.lock().unwrap();
+            if matches!(&*mm, Some((at, _)) if n > *at) {
+                let (_, f) = mm.take().unwrap();
+                f(&mut self.msgs.lock().unwrap());
+            }
+        }
         Ok(self
             .msgs
+            .lock()
+            .unwrap()
             .iter()
             .filter(|m| m.id.get() > after)
             .take(100)
@@ -352,6 +372,182 @@ async fn rejected_delete_returns_to_verified_and_retry_deletes_again() {
     assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+fn edit_first(m: &mut Vec<Message>) {
+    m[0].content.push_str(" (edited after archive)");
+    m[0].edited_timestamp = Some(serenity::all::Timestamp::now());
+}
+fn delete_first(m: &mut Vec<Message>) {
+    m.remove(0);
+}
+fn append_one(m: &mut Vec<Message>) {
+    let mut n = m.last().unwrap().clone();
+    n.id = serenity::all::MessageId::new(n.id.get() + 1);
+    m.push(n);
+}
+
+#[tokio::test]
+async fn edit_or_delete_or_append_during_download_never_deletes_source() {
+    for (tag, f) in [
+        ("edit", edit_first as Mutation),
+        ("del", delete_first),
+        ("add", append_one),
+    ] {
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        *io.mutate.lock().unwrap() = Some((3, f)); // after the archive's own exhaustion pass
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+            CloseOutcome::Retained("changed"),
+            "{tag}"
+        );
+        assert_eq!(io.calls("delete"), 0, "{tag}");
+        assert_eq!(status(&h, t.id).await, "archiving", "{tag}");
+        assert!(h.repo.latest_archive(t.id).await.unwrap().is_none(), "{tag}");
+        // slot stays held
+        if let Ok(other) = h.repo.reserve(50, G, OPENER, Kind::Support).await {
+            assert_eq!(other.id, t.id, "{tag}: slot must still belong to the old ticket");
+        }
+        // retry archives the new state as seq 1 and then closes
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+            CloseOutcome::Closed,
+            "{tag}"
+        );
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+#[tokio::test]
+async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
+    for (tag, f) in [
+        ("edit", edit_first as Mutation),
+        ("del", delete_first),
+        ("add", append_one),
+    ] {
+        let h = harness(tag).await;
+        let t = active(&h, 1, Kind::Age).await;
+        let io = Fake::new(&h.dir.join("archives"), 3);
+        *io.delete.lock().unwrap() = vec![DeleteOutcome::Rejected, DeleteOutcome::Deleted];
+        assert!(matches!(
+            run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+            CloseOutcome::Retained(_)
+        ));
+        assert_eq!(status(&h, t.id).await, "verified");
+        let old = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+        // channel changes while the delete is pending, then the retry runs
+        f(&mut io.msgs.lock().unwrap());
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+            CloseOutcome::Retained("changed"),
+            "{tag}"
+        );
+        assert_eq!(io.calls("delete"), 1, "{tag}: only the first (rejected) delete");
+        assert_eq!(status(&h, t.id).await, "archiving");
+        // the known-good archive is preserved
+        assert!(h.root.path().join(&old.dir_name).is_dir());
+        assert_eq!(
+            run(&h, &io, &actor(&t), t.id, "c", &settings()).await,
+            CloseOutcome::Closed,
+            "{tag}"
+        );
+        assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, old.seq + 1);
+        assert!(h.root.path().join(&old.dir_name).is_dir(), "old version kept");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+#[tokio::test]
+async fn published_but_unrecorded_archive_is_adopted_when_it_verifies() {
+    let h = harness("pubrec").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    // a previous run published seq 1 then died before recording it
+    let msgs = io.msgs.lock().unwrap().clone();
+    archive::publish(
+        &h.root,
+        &PublishInput {
+            ticket: t.id,
+            channel: t.channel.unwrap(),
+            seq: 1,
+            nonce: 1,
+            messages: &msgs,
+            downloaded: &[],
+        },
+    )
+    .unwrap();
+    assert!(h.repo.latest_archive(t.id).await.unwrap().is_none());
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Closed
+    );
+    assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, 1);
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn published_but_stale_unrecorded_archive_is_not_adopted() {
+    let h = harness("pubstale").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 3);
+    let mut msgs = io.msgs.lock().unwrap().clone();
+    msgs[0].content.push_str(" old");
+    archive::publish(
+        &h.root,
+        &PublishInput {
+            ticket: t.id,
+            channel: t.channel.unwrap(),
+            seq: 1,
+            nonce: 1,
+            messages: &msgs,
+            downloaded: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Retained("exists")
+    );
+    assert_eq!(io.calls("delete"), 0);
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn release_of_channel_linked_ticket_is_refused() {
+    let h = harness("linkrel").await;
+    let t = active(&h, 1, Kind::Support).await;
+    // force a nonterminal recovery state while the channel link is retained
+    assert!(h.repo.mark_recovery(t.id, 5, "probe").await.unwrap());
+    let io = Fake::new(&h.dir.join("archives"), 1);
+    let s = settings();
+    let staff = actor(&t);
+    let clock = &h.clock;
+    let f = move || clock.fetch_add(1, Ordering::SeqCst);
+    let limits = Limits::default();
+    let env = Env {
+        settings: &s,
+        repo: &h.repo,
+        io: &io,
+        root: &h.root,
+        limits: &limits,
+        now: &f,
+    };
+    let r = recover(
+        &env,
+        &staff,
+        t.id,
+        Recovery::Release {
+            confirm: true,
+            reason: "r".into(),
+        },
+    )
+    .await;
+    assert!(r.contains("linked"), "{r}");
+    assert_eq!(status(&h, t.id).await, "recovery");
+    assert!(h.repo.recovery_release(t.id, 7, "r", 9).await.unwrap() == false);
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
 #[tokio::test]
 async fn parallel_close_workers_are_prevented() {
     let h = harness("parallel").await;

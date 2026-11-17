@@ -193,6 +193,10 @@ pub struct Manifest {
     pub first_message: u64,
     pub last_message: u64,
     pub message_ids_sha256: String,
+    /// Digest of ids + content + edit stamps + attachment/embed identity at archive time; the
+    /// pre-delete stability check compares the live channel against this.
+    #[serde(default)]
+    pub content_sha256: String,
     pub transcript_len: u64,
     pub transcript_sha256: String,
     pub assets: Vec<AssetEntry>,
@@ -202,6 +206,39 @@ fn ids_hash(messages: &[Message]) -> String {
     for m in messages {
         s.push_str(&m.id.get().to_string());
         s.push('\n');
+    }
+    sha256_hex(s.as_bytes())
+}
+
+/// Canonical digest of everything the archive records about the source: edits, deletions,
+/// additions and attachment changes all alter it. Length-prefixed fields avoid ambiguity.
+pub fn content_fingerprint(messages: &[Message]) -> String {
+    let mut ms: Vec<&Message> = messages.iter().collect();
+    ms.sort_by_key(|m| m.id.get());
+    let mut s = String::new();
+    let mut put = |x: &str| {
+        s.push_str(&x.len().to_string());
+        s.push(':');
+        s.push_str(x);
+        s.push('\n');
+    };
+    for m in ms {
+        put(&m.id.get().to_string());
+        put(&m.author.id.get().to_string());
+        put(&m.content);
+        put(&m.edited_timestamp.map(|e| e.to_string()).unwrap_or_default());
+        put(&m.timestamp.to_string());
+        for a in &m.attachments {
+            put(&format!("a{}:{}:{}", a.id.get(), a.size, a.filename));
+        }
+        for e in &m.embeds {
+            put(&format!(
+                "e{:?}|{:?}|{:?}",
+                e.title,
+                e.description,
+                e.fields.iter().map(|f| (&f.name, &f.value)).collect::<Vec<_>>()
+            ));
+        }
     }
     sha256_hex(s.as_bytes())
 }
@@ -387,6 +424,7 @@ pub fn publish(root: &OwnedRoot, i: &PublishInput<'_>) -> Result<Published, Arch
         first_message: i.messages.first().map(|m| m.id.get()).unwrap_or(0),
         last_message: i.messages.last().map(|m| m.id.get()).unwrap_or(0),
         message_ids_sha256: ids_hash(i.messages),
+        content_sha256: content_fingerprint(i.messages),
         transcript_len: transcript.len() as u64,
         transcript_sha256: sha256_hex(transcript.as_bytes()),
         assets: entries,

@@ -64,10 +64,12 @@ fn allowed(from: &str, to: &str) -> bool {
             | ("archiving", "verified")
             | ("archiving", "closing")
             | ("verified", "delete_requested")
+            | ("verified", "archiving")
             | ("delete_requested", "closed")
             | ("delete_requested", "delete_uncertain")
             | ("delete_requested", "verified")
             | ("delete_uncertain", "closed")
+            | ("delete_uncertain", "verified")
             | ("delete_uncertain", "delete_requested")
             | ("delete_uncertain", "recovery")
             | ("verified", "closed")
@@ -504,7 +506,7 @@ impl Repository {
             .call(move |c| -> rusqlite::Result<bool> {
                 let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let from: Option<String> = tx
-                    .query_row("SELECT status FROM tickets WHERE id=?1 AND ((status='creating' AND channel IS NULL) OR status='recovery')", [id], |r| r.get(0))
+                    .query_row("SELECT status FROM tickets WHERE id=?1 AND channel IS NULL AND status IN ('creating','recovery')", [id], |r| r.get(0))
                     .optional()?;
                 let Some(from) = from else { return Ok(false) };
                 tx.execute("UPDATE tickets SET status='released',lease_until=0 WHERE id=?1 AND status=?2", params![id, from])?;

@@ -15,6 +15,33 @@ use s::all::{
 // classification, and add audited recovery/startup reconciliation before release.
 pub const OPENING_APPROVED: bool = false;
 
+/// Set only by a startup reconciliation that finished with nothing unresolved. Starts false, so
+/// a failed or skipped reconcile keeps opening gated regardless of approval.
+static RECONCILED_CLEAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn record_reconcile(report: Option<&super::closer::Report>) {
+    let clean = report.is_some_and(|r| r.opening_gate(true));
+    RECONCILED_CLEAN.store(clean, std::sync::atomic::Ordering::SeqCst);
+}
+/// The single value every opening path consults (hard gate AND clean reconcile).
+pub fn opening_permitted() -> bool {
+    OPENING_APPROVED && RECONCILED_CLEAN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    #[test]
+    fn opening_stays_closed_without_approval_or_clean_reconcile() {
+        record_reconcile(None);
+        assert!(!opening_permitted());
+        record_reconcile(Some(&super::super::closer::Report::default()));
+        // clean reconcile alone never opens while the hard gate is false
+        assert!(!opening_permitted());
+        record_reconcile(Some(&super::super::closer::Report { unresolved: 1, ..Default::default() }));
+        assert!(!opening_permitted());
+    }
+}
+
 pub struct Adapter<'a> {
     pub ctx: &'a s::Context,
     pub interaction: &'a s::ComponentInteraction,
@@ -187,7 +214,7 @@ pub async fn component(
             interaction,
             settings,
         },
-        OPENING_APPROVED,
+        opening_permitted(),
     )
     .await
 }

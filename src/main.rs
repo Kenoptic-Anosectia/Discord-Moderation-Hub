@@ -1150,27 +1150,27 @@ async fn event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<(), Error> {
-    let log_channel_id = data.config.log_channel_id;
-
-    // Fail-closed private-scope guard: runs before any cache insertion or log construction.
-    if tickets::privacy::decide(
+    // Fail-closed private-scope guard: ALL cache insertion / log construction runs inside the
+    // sink, which is only invoked when the guard allows the event.
+    tickets::privacy::guarded(
         data.config.ticket_privacy_lockdown,
         data.config.tickets.as_ref(),
         data.tickets.as_ref(),
         event,
         &tickets::privacy::SerenityLookup(ctx),
+        &tickets::privacy::COUNTERS,
+        || log_event(ctx, event, data),
     )
     .await
-        == tickets::privacy::Decision::Skip
-        && !matches!(
-            event,
-            serenity::FullEvent::InteractionCreate { .. }
-                | serenity::FullEvent::ReactionAdd { .. }
-                | serenity::FullEvent::ReactionRemove { .. }
-        )
-    {
-        return Ok(());
-    }
+    .unwrap_or(Ok(()))
+}
+
+async fn log_event(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    data: &Data,
+) -> Result<(), Error> {
+    let log_channel_id = data.config.log_channel_id;
 
     match event {
         serenity::FullEvent::InteractionCreate {
@@ -2521,8 +2521,8 @@ async fn main() -> Result<(), Error> {
                     if let (Some(settings), Some(repo)) = (&config.tickets, &tickets) {
                         // Reconciliation runs before opening could ever be approved; failure keeps opening gated.
                         match tickets::runtime_close::startup_reconcile(ctx, settings, repo).await {
-                            Ok(r) => println!("Ticket reconciliation: {} to recovery, {} closed by known absence, {} unresolved; opening permitted: {}", r.moved_to_recovery, r.closed_by_known_absence, r.unresolved, r.opening_gate(tickets::runtime::OPENING_APPROVED)),
-                            Err(_) => println!("Ticket reconciliation failed; opening remains gated."),
+                            Ok(r) => { tickets::runtime::record_reconcile(Some(&r)); println!("Ticket reconciliation: {} to recovery, {} closed by known absence, {} unresolved; opening permitted: {}", r.moved_to_recovery, r.closed_by_known_absence, r.unresolved, tickets::runtime::opening_permitted()) }
+                            Err(_) => { tickets::runtime::record_reconcile(None); println!("Ticket reconciliation failed; opening remains gated.") }
                         }
                     }
                     if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: channel events in private ticket scope are skipped fail-closed; ticket opening remains gated."); }

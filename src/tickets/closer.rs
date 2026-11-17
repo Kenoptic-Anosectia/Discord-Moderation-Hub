@@ -92,12 +92,32 @@ pub struct Env<'a, I: CloseIo> {
 const LEASE: i64 = 900;
 
 fn verify_recorded(root: &OwnedRoot, ar: &super::repository_close::ArchiveRef) -> bool {
+    recorded_manifest(root, ar).is_some()
+}
+fn recorded_manifest(
+    root: &OwnedRoot,
+    ar: &super::repository_close::ArchiveRef,
+) -> Option<archive::Manifest> {
     let dir = root.path().join(&ar.dir_name);
     // dir_name came from our own DB but is re-checked as a plain child component.
     if ar.dir_name.contains(['/', '\\', ':']) || ar.dir_name.starts_with('.') {
+        return None;
+    }
+    match archive::verify(root, &dir, Some(&ar.manifest_sha256), &[]) {
+        Ok(m) if m.message_count == ar.messages => Some(m),
+        _ => None,
+    }
+}
+/// Fresh full read of the source channel compared (content, edits, deletions, additions)
+/// against what an archive recorded. Any failure to read is "unknown" and is NOT stable.
+async fn source_unchanged<I: CloseIo>(env: &Env<'_, I>, want_sha: &str, want_count: u64) -> bool {
+    if want_sha.is_empty() {
         return false;
     }
-    matches!(archive::verify(root, &dir, Some(&ar.manifest_sha256), &[]), Ok(m) if m.message_count == ar.messages)
+    match archive::fetch_all(env.io, env.limits).await {
+        Ok(m) => m.len() as u64 == want_count && archive::content_fingerprint(&m) == want_sha,
+        Err(_) => false,
+    }
 }
 
 pub async fn close_ticket<I: CloseIo>(
@@ -168,6 +188,10 @@ pub async fn close_ticket<I: CloseIo>(
             Ok(d) => d,
             Err(_) => return retain("assets").await,
         };
+        // content stability: nothing added, edited or deleted while assets were downloading.
+        if !source_unchanged(env, &archive::content_fingerprint(&msgs), msgs.len() as u64).await {
+            return retain("changed").await;
+        }
         let Ok(seq) = env.repo.next_archive_seq(ticket_id).await else {
             return retain("db").await;
         };
@@ -184,7 +208,36 @@ pub async fn close_ticket<I: CloseIo>(
             },
         ) {
             Ok(p) => p,
-            Err(ArchiveError::Exists) => return retain("exists").await,
+            // publish-before-record recovery: a previous run published this seq but died before
+            // recording. Adopt it only if it fully re-verifies AND matches the current source.
+            Err(ArchiveError::Exists) => {
+                let name = format!("ticket-{ticket_id}-{seq}");
+                let dir = env.root.path().join(&name);
+                let ids: Vec<u64> = msgs.iter().map(|m| m.id.get()).collect();
+                let adopted = std::fs::read(dir.join("manifest.json"))
+                    .ok()
+                    .map(|b| archive::sha256_hex(&b))
+                    .and_then(|sha| {
+                        match archive::verify(env.root, &dir, Some(&sha), &ids) {
+                            Ok(m)
+                                if m.content_sha256 == archive::content_fingerprint(&msgs)
+                                    && m.message_count == msgs.len() as u64 =>
+                            {
+                                Some(archive::Published {
+                                    dir_name: name.clone(),
+                                    manifest_sha256: sha,
+                                    messages: m.message_count,
+                                    assets: m.assets.len() as u64,
+                                })
+                            }
+                            _ => None,
+                        }
+                    });
+                match adopted {
+                    Some(p) => p,
+                    None => return retain("exists").await,
+                }
+            }
             Err(_) => return retain("publish").await,
         };
         let rec = env
@@ -214,8 +267,31 @@ pub async fn close_ticket<I: CloseIo>(
         let Ok(Some(ar)) = env.repo.latest_archive(ticket_id).await else {
             return retain("no archive").await;
         };
-        if !verify_recorded(env.root, &ar) {
+        let Some(manifest) = recorded_manifest(env.root, &ar) else {
             return retain("reverify").await;
+        };
+        // Immediately before ANY destructive step (also resumed verified/delete states): the
+        // live source must still equal the verified archive. Absent-source reconciliation below
+        // needs no check (nothing left to delete).
+        if t.status != "delete_uncertain" || env.io.probe(channel).await == Presence::Present {
+            if !source_unchanged(env, &manifest.content_sha256, manifest.message_count).await {
+                // keep source + slot + the old verified archive; next run publishes a new version
+                match t.status.as_str() {
+                    "delete_requested" => {
+                        let _ = step("delete_requested", "verified", "source changed").await;
+                        let _ = step("verified", "archiving", "source changed; re-archive").await;
+                    }
+                    "verified" => {
+                        let _ = step("verified", "archiving", "source changed; re-archive").await;
+                    }
+                    "delete_uncertain" => {
+                        let _ = step("delete_uncertain", "verified", "source changed").await;
+                        let _ = step("verified", "archiving", "source changed; re-archive").await;
+                    }
+                    _ => {}
+                }
+                return retain("changed").await;
+            }
         }
         if t.status == "delete_uncertain" {
             // never blindly repeat: look first.
@@ -461,6 +537,10 @@ pub async fn recover<I: CloseIo>(
         Recovery::Release { confirm, reason } => {
             if !confirm || reason.trim().is_empty() {
                 return "Release needs confirmation and a reason.";
+            }
+            // A ticket linked to a channel is never releasable: the channel (and its data) exist.
+            if t.channel.is_some() {
+                return "Ticket is linked to a channel; release refused and the slot is retained. Nothing changed.";
             }
             let Ok(c) = env.io.candidates(&t).await else { return "Remote state could not be read; nothing changed." };
             let marker = super::policy::marker(&t.operation);

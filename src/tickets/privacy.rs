@@ -41,6 +41,8 @@ struct Facts {
     /// The event payload already proves what the channel's parent is (create/update).
     parent_known: bool,
     channel_bearing: bool,
+    /// A move whose previous parent cannot be proven (cache miss): fail closed.
+    uncertain_old: bool,
 }
 fn facts(event: &FullEvent) -> Facts {
     let mut f = Facts {
@@ -49,6 +51,7 @@ fn facts(event: &FullEvent) -> Facts {
         parents: vec![],
         parent_known: false,
         channel_bearing: true,
+        uncertain_old: false,
     };
     match event {
         FullEvent::Message { new_message } => {
@@ -85,8 +88,9 @@ fn facts(event: &FullEvent) -> Facts {
             f.guild = Some(new.guild_id.get());
             f.channels.push(new.id);
             f.parents.push(new.parent_id.map(|p| p.get()));
-            if let Some(o) = old {
-                f.parents.push(o.parent_id.map(|p| p.get()));
+            match old {
+                Some(o) => f.parents.push(o.parent_id.map(|p| p.get())),
+                None => f.uncertain_old = true,
             }
             f.parent_known = true;
         }
@@ -107,6 +111,26 @@ fn facts(event: &FullEvent) -> Facts {
             f.channels.push(thread.id);
             f.parents.push(Some(thread.parent_id.get()));
             f.parent_known = true;
+        }
+        FullEvent::InviteCreate { data } => {
+            f.guild = data.guild_id.map(|g| g.get());
+            f.channels.push(data.channel_id);
+        }
+        FullEvent::InviteDelete { data } => {
+            f.guild = data.guild_id.map(|g| g.get());
+            f.channels.push(data.channel_id);
+        }
+        FullEvent::VoiceStateUpdate { old, new } => {
+            f.guild = new.guild_id.map(|g| g.get());
+            f.channels.extend(new.channel_id);
+            f.channels.extend(old.as_ref().and_then(|o| o.channel_id));
+        }
+        FullEvent::ReactionAdd { add_reaction: r }
+        | FullEvent::ReactionRemove {
+            removed_reaction: r,
+        } => {
+            f.guild = r.guild_id.map(|g| g.get());
+            f.channels.push(r.channel_id);
         }
         _ => f.channel_bearing = false,
     }
@@ -161,6 +185,9 @@ pub async fn decide(
             Ok(true) | Err(_) => return Decision::Skip,
         }
     }
+    if f.uncertain_old {
+        return Decision::Skip;
+    }
     if f.parent_known {
         // payload fully describes the channel; ticket-category check above was enough
         // for events whose parent(s) are carried. Unknown old parent on a move is covered
@@ -190,6 +217,47 @@ pub async fn decide(
         }
     }
     Decision::Allow
+}
+
+/// Observable production counters for the guard (skipped vs. let through).
+pub struct Counters {
+    pub skipped: std::sync::atomic::AtomicU64,
+    pub allowed: std::sync::atomic::AtomicU64,
+}
+impl Counters {
+    pub const fn new() -> Self {
+        Self {
+            skipped: std::sync::atomic::AtomicU64::new(0),
+            allowed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+pub static COUNTERS: Counters = Counters::new();
+/// Production routing seam: `event_handler` runs ALL cache insertion / body / embed / topic /
+/// asset construction and log output inside `sink`, which executes only on `Allow`.
+/// Interactions are never channel-logging paths and always pass through.
+pub async fn guarded<F, Fut, T>(
+    enabled: bool,
+    settings: Option<&Settings>,
+    repo: Option<&Repository>,
+    event: &FullEvent,
+    lookup: &impl ChannelLookup,
+    counters: &Counters,
+    sink: F,
+) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    use std::sync::atomic::Ordering::SeqCst;
+    if decide(enabled, settings, repo, event, lookup).await == Decision::Skip
+        && !matches!(event, FullEvent::InteractionCreate { .. })
+    {
+        counters.skipped.fetch_add(1, SeqCst);
+        return None;
+    }
+    counters.allowed.fetch_add(1, SeqCst);
+    Some(sink().await)
 }
 
 /// Real adapter: cache first, then one HTTP fetch. Never logs the error body.
@@ -460,10 +528,13 @@ mod tests {
         let h = main.find("async fn event_handler").unwrap();
         let body = &main[h..];
         let guard = body
-            .find("tickets::privacy::decide")
+            .find("tickets::privacy::guarded")
             .expect("handler must call the guard");
         let first_cache = body.find("insert_cache").unwrap();
+        // every cache insertion lives in log_event, which is only reachable as the guard's sink
         assert!(guard < first_cache);
+        assert!(body.contains("|| log_event(ctx, event, data)"));
+        assert_eq!(main.matches("log_event(ctx, event, data)").count(), 1);
         assert!(
             !main.contains("allow_general_events"),
             "global pause must be gone"
