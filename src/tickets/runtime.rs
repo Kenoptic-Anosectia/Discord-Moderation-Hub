@@ -24,20 +24,33 @@ pub fn record_reconcile(report: Option<&super::closer::Report>) {
 }
 /// The single value every opening path consults (hard gate AND clean reconcile).
 pub fn opening_permitted() -> bool {
-    OPENING_APPROVED && RECONCILED_CLEAN.load(std::sync::atomic::Ordering::SeqCst)
+    permitted(OPENING_APPROVED)
+}
+/// Same decision with the approval value injected, so tests can exercise both settings.
+pub fn permitted(approved: bool) -> bool {
+    approved && RECONCILED_CLEAN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Serialises tests that touch the process-wide readiness flag.
 #[cfg(test)]
+pub static READINESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod readiness_tests {
     use super::*;
     #[test]
     fn opening_stays_closed_without_approval_or_clean_reconcile() {
+        let _g = READINESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         record_reconcile(None);
         assert!(!opening_permitted());
         record_reconcile(Some(&super::super::closer::Report::default()));
         // clean reconcile alone never opens while the hard gate is false
         assert!(!opening_permitted());
-        record_reconcile(Some(&super::super::closer::Report { unresolved: 1, ..Default::default() }));
+        record_reconcile(Some(&super::super::closer::Report {
+            unresolved: 1,
+            ..Default::default()
+        }));
         assert!(!opening_permitted());
     }
 }

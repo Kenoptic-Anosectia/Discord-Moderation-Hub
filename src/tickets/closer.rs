@@ -217,8 +217,8 @@ pub async fn close_ticket<I: CloseIo>(
                 let adopted = std::fs::read(dir.join("manifest.json"))
                     .ok()
                     .map(|b| archive::sha256_hex(&b))
-                    .and_then(|sha| {
-                        match archive::verify(env.root, &dir, Some(&sha), &ids) {
+                    .and_then(
+                        |sha| match archive::verify(env.root, &dir, Some(&sha), &ids) {
                             Ok(m)
                                 if m.content_sha256 == archive::content_fingerprint(&msgs)
                                     && m.message_count == msgs.len() as u64 =>
@@ -231,8 +231,8 @@ pub async fn close_ticket<I: CloseIo>(
                                 })
                             }
                             _ => None,
-                        }
-                    });
+                        },
+                    );
                 match adopted {
                     Some(p) => p,
                     None => return retain("exists").await,
@@ -273,25 +273,25 @@ pub async fn close_ticket<I: CloseIo>(
         // Immediately before ANY destructive step (also resumed verified/delete states): the
         // live source must still equal the verified archive. Absent-source reconciliation below
         // needs no check (nothing left to delete).
-        if t.status != "delete_uncertain" || env.io.probe(channel).await == Presence::Present {
-            if !source_unchanged(env, &manifest.content_sha256, manifest.message_count).await {
-                // keep source + slot + the old verified archive; next run publishes a new version
-                match t.status.as_str() {
-                    "delete_requested" => {
-                        let _ = step("delete_requested", "verified", "source changed").await;
-                        let _ = step("verified", "archiving", "source changed; re-archive").await;
-                    }
-                    "verified" => {
-                        let _ = step("verified", "archiving", "source changed; re-archive").await;
-                    }
-                    "delete_uncertain" => {
-                        let _ = step("delete_uncertain", "verified", "source changed").await;
-                        let _ = step("verified", "archiving", "source changed; re-archive").await;
-                    }
-                    _ => {}
+        if (t.status != "delete_uncertain" || env.io.probe(channel).await == Presence::Present)
+            && !source_unchanged(env, &manifest.content_sha256, manifest.message_count).await
+        {
+            // keep source + slot + the old verified archive; next run publishes a new version
+            match t.status.as_str() {
+                "delete_requested" => {
+                    let _ = step("delete_requested", "verified", "source changed").await;
+                    let _ = step("verified", "archiving", "source changed; re-archive").await;
                 }
-                return retain("changed").await;
+                "verified" => {
+                    let _ = step("verified", "archiving", "source changed; re-archive").await;
+                }
+                "delete_uncertain" => {
+                    let _ = step("delete_uncertain", "verified", "source changed").await;
+                    let _ = step("verified", "archiving", "source changed; re-archive").await;
+                }
+                _ => {}
             }
+            return retain("changed").await;
         }
         if t.status == "delete_uncertain" {
             // never blindly repeat: look first.
@@ -404,7 +404,11 @@ pub async fn reconcile<I: CloseIo>(env: &Env<'_, I>) -> Result<Report, crate::Er
             }
             ("reserved", _) | ("recovery", _) => r.unresolved += 1,
             ("active", Some(ch)) => {
-                if env.io.probe(ch).await == Presence::Absent {
+                let presence = env.io.probe(ch).await;
+                if presence == Presence::Unknown {
+                    // cannot prove the source channel state: fail closed
+                    r.unresolved += 1;
+                } else if presence == Presence::Absent {
                     // remote gone without a verified archive: keep slot, operator decides
                     if env
                         .repo

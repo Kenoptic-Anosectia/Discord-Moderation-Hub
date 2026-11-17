@@ -226,7 +226,10 @@ pub fn content_fingerprint(messages: &[Message]) -> String {
         put(&m.id.get().to_string());
         put(&m.author.id.get().to_string());
         put(&m.content);
-        put(&m.edited_timestamp.map(|e| e.to_string()).unwrap_or_default());
+        put(&m
+            .edited_timestamp
+            .map(|e| e.to_string())
+            .unwrap_or_default());
         put(&m.timestamp.to_string());
         for a in &m.attachments {
             put(&format!("a{}:{}:{}", a.id.get(), a.size, a.filename));
@@ -236,7 +239,10 @@ pub fn content_fingerprint(messages: &[Message]) -> String {
                 "e{:?}|{:?}|{:?}",
                 e.title,
                 e.description,
-                e.fields.iter().map(|f| (&f.name, &f.value)).collect::<Vec<_>>()
+                e.fields
+                    .iter()
+                    .map(|f| (&f.name, &f.value))
+                    .collect::<Vec<_>>()
             ));
         }
     }

@@ -372,6 +372,7 @@ async fn rejected_delete_returns_to_verified_and_retry_deletes_again() {
     assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
 fn edit_first(m: &mut Vec<Message>) {
     m[0].content.push_str(" (edited after archive)");
     m[0].edited_timestamp = Some(serenity::all::Timestamp::now());
@@ -403,10 +404,16 @@ async fn edit_or_delete_or_append_during_download_never_deletes_source() {
         );
         assert_eq!(io.calls("delete"), 0, "{tag}");
         assert_eq!(status(&h, t.id).await, "archiving", "{tag}");
-        assert!(h.repo.latest_archive(t.id).await.unwrap().is_none(), "{tag}");
+        assert!(
+            h.repo.latest_archive(t.id).await.unwrap().is_none(),
+            "{tag}"
+        );
         // slot stays held
         if let Ok(other) = h.repo.reserve(50, G, OPENER, Kind::Support).await {
-            assert_eq!(other.id, t.id, "{tag}: slot must still belong to the old ticket");
+            assert_eq!(
+                other.id, t.id,
+                "{tag}: slot must still belong to the old ticket"
+            );
         }
         // retry archives the new state as seq 1 and then closes
         assert_eq!(
@@ -442,7 +449,11 @@ async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
             CloseOutcome::Retained("changed"),
             "{tag}"
         );
-        assert_eq!(io.calls("delete"), 1, "{tag}: only the first (rejected) delete");
+        assert_eq!(
+            io.calls("delete"),
+            1,
+            "{tag}: only the first (rejected) delete"
+        );
         assert_eq!(status(&h, t.id).await, "archiving");
         // the known-good archive is preserved
         assert!(h.root.path().join(&old.dir_name).is_dir());
@@ -451,8 +462,14 @@ async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
             CloseOutcome::Closed,
             "{tag}"
         );
-        assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, old.seq + 1);
-        assert!(h.root.path().join(&old.dir_name).is_dir(), "old version kept");
+        assert_eq!(
+            h.repo.latest_archive(t.id).await.unwrap().unwrap().seq,
+            old.seq + 1
+        );
+        assert!(
+            h.root.path().join(&old.dir_name).is_dir(),
+            "old version kept"
+        );
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 }
@@ -544,7 +561,7 @@ async fn release_of_channel_linked_ticket_is_refused() {
     .await;
     assert!(r.contains("linked"), "{r}");
     assert_eq!(status(&h, t.id).await, "recovery");
-    assert!(h.repo.recovery_release(t.id, 7, "r", 9).await.unwrap() == false);
+    assert!(!h.repo.recovery_release(t.id, 7, "r", 9).await.unwrap());
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
@@ -666,6 +683,33 @@ async fn reconcile_closes_only_known_absence_after_verified_archive() {
     assert_eq!((r.closed_by_known_absence, r.unresolved), (1, 0));
     assert_eq!(status(&h, t.id).await, "closed");
     assert_eq!(io.calls("delete"), 1);
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed() {
+    let _g = super::super::runtime::READINESS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let h = harness("recon-unknown").await;
+    let _t = active(&h, 1, Kind::Support).await;
+    let io = Fake::new(&h.dir.join("archives"), 1);
+    let s = settings();
+    *io.probe.lock().unwrap() = Presence::Unknown;
+    let r = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
+    assert_eq!(r.unresolved, 1);
+    // production readiness path, with synthetic approval both ways
+    super::super::runtime::record_reconcile(Some(&r));
+    assert!(!super::super::runtime::permitted(true));
+    assert!(!super::super::runtime::permitted(false));
+    // a Present probe yields a clean report: only then does synthetic approval permit
+    *io.probe.lock().unwrap() = Presence::Present;
+    let r = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
+    assert_eq!(r.unresolved, 0);
+    super::super::runtime::record_reconcile(Some(&r));
+    assert!(super::super::runtime::permitted(true));
+    assert!(!super::super::runtime::permitted(false));
+    super::super::runtime::record_reconcile(None);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 #[tokio::test]
