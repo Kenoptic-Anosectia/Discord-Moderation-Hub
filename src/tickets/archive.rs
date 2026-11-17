@@ -310,12 +310,27 @@ pub async fn download_all(
     Ok(out)
 }
 
-/// Production downloader: reqwest, rustls, redirects disabled, per-request timeout, streamed
-/// with a hard byte cap (no unbounded allocation), HTTPS CDN allow-list already enforced by caller.
-pub struct HttpDownloader {
+/// Transport seam under the production downloader. The decision/streaming policy (status,
+/// redirects, size caps, short bodies, deadline) lives in [`HttpDownloader::fetch`] and runs
+/// identically over the real reqwest transport and a controlled no-network test transport.
+pub trait Transport: Send + Sync {
+    type Resp: TransportResp;
+    fn get(
+        &self,
+        url: &url::Url,
+    ) -> impl std::future::Future<Output = Result<Self::Resp, ArchiveError>> + Send;
+}
+pub trait TransportResp: Send {
+    fn status(&self) -> u16;
+    fn content_length(&self) -> Option<u64>;
+    fn chunk(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, ArchiveError>> + Send;
+}
+pub struct ReqwestTransport {
     client: reqwest::Client,
 }
-impl HttpDownloader {
+impl ReqwestTransport {
     pub fn new(timeout: std::time::Duration) -> Result<Self, ArchiveError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -326,30 +341,83 @@ impl HttpDownloader {
         Ok(Self { client })
     }
 }
-impl Downloader for HttpDownloader {
-    async fn fetch(&self, url: &url::Url, limit: u64) -> Result<Vec<u8>, ArchiveError> {
-        // Re-validate here too: defense in depth for any future caller.
-        validate_attachment_url(url.as_str()).map_err(|_| ArchiveError::UnsafeInput)?;
-        let mut resp = self
-            .client
+impl TransportResp for reqwest::Response {
+    fn status(&self) -> u16 {
+        reqwest::Response::status(self).as_u16()
+    }
+    fn content_length(&self) -> Option<u64> {
+        reqwest::Response::content_length(self)
+    }
+    async fn chunk(&mut self) -> Result<Option<Vec<u8>>, ArchiveError> {
+        reqwest::Response::chunk(self)
+            .await
+            .map(|c| c.map(|b| b.to_vec()))
+            .map_err(|_| ArchiveError::Download)
+    }
+}
+impl Transport for ReqwestTransport {
+    type Resp = reqwest::Response;
+    async fn get(&self, url: &url::Url) -> Result<reqwest::Response, ArchiveError> {
+        self.client
             .get(url.clone())
             .send()
             .await
-            .map_err(|_| ArchiveError::Download)?;
-        if !resp.status().is_success() {
+            .map_err(|_| ArchiveError::Download)
+    }
+}
+
+/// Production downloader: redirects are never followed (every non-2xx, including 3xx, fails
+/// without a second request), a hard overall deadline, streamed with a hard byte cap (no
+/// unbounded allocation) and a declared-length check. HTTPS CDN allow-list is re-validated.
+pub struct HttpDownloader<T: Transport = ReqwestTransport> {
+    transport: T,
+    deadline: std::time::Duration,
+}
+impl HttpDownloader<ReqwestTransport> {
+    pub fn new(timeout: std::time::Duration) -> Result<Self, ArchiveError> {
+        Ok(Self::with_transport(
+            ReqwestTransport::new(timeout)?,
+            timeout,
+        ))
+    }
+}
+impl<T: Transport> HttpDownloader<T> {
+    pub fn with_transport(transport: T, deadline: std::time::Duration) -> Self {
+        Self {
+            transport,
+            deadline,
+        }
+    }
+    async fn fetch_inner(&self, url: &url::Url, limit: u64) -> Result<Vec<u8>, ArchiveError> {
+        let mut resp = self.transport.get(url).await?;
+        if !(200..300).contains(&resp.status()) {
             return Err(ArchiveError::Download); // includes every 3xx: redirects are never followed
         }
-        if resp.content_length().is_some_and(|l| l > limit) {
+        let declared = resp.content_length();
+        if declared.is_some_and(|l| l > limit) {
             return Err(ArchiveError::TooLarge);
         }
         let mut buf = Vec::with_capacity(limit.min(1 << 20) as usize);
-        while let Some(chunk) = resp.chunk().await.map_err(|_| ArchiveError::Download)? {
+        while let Some(chunk) = resp.chunk().await? {
             if (buf.len() + chunk.len()) as u64 > limit {
                 return Err(ArchiveError::TooLarge);
             }
             buf.extend_from_slice(&chunk);
         }
+        if declared.is_some_and(|l| l != buf.len() as u64) {
+            return Err(ArchiveError::Download); // short (or long) body vs declared length
+        }
         Ok(buf)
+    }
+}
+impl<T: Transport> Downloader for HttpDownloader<T> {
+    async fn fetch(&self, url: &url::Url, limit: u64) -> Result<Vec<u8>, ArchiveError> {
+        // Re-validate here too: defense in depth for any future caller.
+        validate_attachment_url(url.as_str()).map_err(|_| ArchiveError::UnsafeInput)?;
+        match tokio::time::timeout(self.deadline, self.fetch_inner(url, limit)).await {
+            Ok(r) => r,
+            Err(_) => Err(ArchiveError::Download),
+        }
     }
 }
 
@@ -565,6 +633,85 @@ pub fn verify(
         return Err(ArchiveError::Verify);
     }
     Ok(m)
+}
+
+/// Controlled, no-network transport for exercising the production downloader policy.
+#[cfg(test)]
+pub mod fake_transport {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    #[derive(Clone)]
+    pub enum Script {
+        Resp {
+            status: u16,
+            declared: Option<u64>,
+            chunks: Vec<Vec<u8>>,
+        },
+        Fail,
+        Hang,
+    }
+    pub struct FakeTransport {
+        script: Mutex<VecDeque<Script>>,
+        fallback: Script,
+        pub gets: Mutex<Vec<String>>,
+    }
+    impl FakeTransport {
+        pub fn new(script: Vec<Script>, fallback: Script) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                fallback,
+                gets: Mutex::new(vec![]),
+            }
+        }
+        pub fn get_count(&self) -> usize {
+            self.gets.lock().unwrap().len()
+        }
+    }
+    pub struct FakeResp {
+        status: u16,
+        declared: Option<u64>,
+        chunks: VecDeque<Vec<u8>>,
+    }
+    impl TransportResp for FakeResp {
+        fn status(&self) -> u16 {
+            self.status
+        }
+        fn content_length(&self) -> Option<u64> {
+            self.declared
+        }
+        async fn chunk(&mut self) -> Result<Option<Vec<u8>>, ArchiveError> {
+            Ok(self.chunks.pop_front())
+        }
+    }
+    impl Transport for FakeTransport {
+        type Resp = FakeResp;
+        async fn get(&self, url: &url::Url) -> Result<FakeResp, ArchiveError> {
+            self.gets.lock().unwrap().push(url.to_string());
+            let s = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.fallback.clone());
+            match s {
+                Script::Resp {
+                    status,
+                    declared,
+                    chunks,
+                } => Ok(FakeResp {
+                    status,
+                    declared,
+                    chunks: chunks.into(),
+                }),
+                Script::Fail => Err(ArchiveError::Download),
+                Script::Hang => {
+                    std::future::pending::<()>().await;
+                    Err(ArchiveError::Download)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

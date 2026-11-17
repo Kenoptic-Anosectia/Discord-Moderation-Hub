@@ -381,3 +381,133 @@ fn root_rejects_file_and_symlink_roots() {
     }
     let _ = std::fs::remove_dir_all(p);
 }
+
+// ---------- production HttpDownloader policy over a controlled no-network transport ----------
+mod http_policy {
+    use super::super::fake_transport::{FakeTransport, Script};
+    use super::*;
+    use std::time::Duration;
+
+    fn dl(script: Vec<Script>, fallback: Script) -> HttpDownloader<FakeTransport> {
+        HttpDownloader::with_transport(
+            FakeTransport::new(script, fallback),
+            Duration::from_millis(200),
+        )
+    }
+    fn url() -> url::Url {
+        validate_attachment_url(CDN).unwrap()
+    }
+    fn resp(status: u16, declared: Option<u64>, chunks: &[&[u8]]) -> Script {
+        Script::Resp {
+            status,
+            declared,
+            chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+        }
+    }
+    #[tokio::test]
+    async fn success_streams_and_returns_exact_bytes() {
+        let d = dl(vec![resp(200, Some(6), &[b"abc", b"def"])], Script::Fail);
+        assert_eq!(d.fetch(&url(), 100).await.unwrap(), b"abcdef");
+        assert_eq!(d.transport.get_count(), 1);
+    }
+    #[tokio::test]
+    async fn redirects_fail_and_the_target_is_never_fetched() {
+        for code in [301u16, 302, 303, 307, 308] {
+            let d = dl(
+                vec![resp(code, None, &[b"Location: https://evil.example/x"])],
+                resp(200, Some(2), &[b"ok"]),
+            );
+            assert_eq!(
+                d.fetch(&url(), 100).await.unwrap_err(),
+                ArchiveError::Download,
+                "{code}"
+            );
+            assert_eq!(
+                d.transport.get_count(),
+                1,
+                "redirect target must not be requested"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn non_2xx_statuses_fail_without_reading_the_body() {
+        for code in [100u16, 400, 401, 403, 404, 429, 500, 503] {
+            let d = dl(vec![resp(code, Some(2), &[b"no"])], Script::Fail);
+            assert_eq!(
+                d.fetch(&url(), 100).await.unwrap_err(),
+                ArchiveError::Download,
+                "{code}"
+            );
+            assert_eq!(d.transport.get_count(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn transport_error_and_timeout_map_to_download_failure() {
+        let d = dl(vec![Script::Fail], Script::Fail);
+        assert_eq!(
+            d.fetch(&url(), 100).await.unwrap_err(),
+            ArchiveError::Download
+        );
+        let d = dl(vec![Script::Hang], Script::Fail);
+        let t = std::time::Instant::now();
+        assert_eq!(
+            d.fetch(&url(), 100).await.unwrap_err(),
+            ArchiveError::Download
+        );
+        assert!(t.elapsed() < Duration::from_secs(5), "deadline enforced");
+    }
+    #[tokio::test]
+    async fn oversize_declared_or_streamed_is_rejected_and_short_body_fails() {
+        let d = dl(vec![resp(200, Some(101), &[b"x"])], Script::Fail);
+        assert_eq!(
+            d.fetch(&url(), 100).await.unwrap_err(),
+            ArchiveError::TooLarge
+        );
+        let big = vec![7u8; 60];
+        let d = dl(vec![resp(200, None, &[&big, &big])], Script::Fail);
+        assert_eq!(
+            d.fetch(&url(), 100).await.unwrap_err(),
+            ArchiveError::TooLarge
+        );
+        let d = dl(vec![resp(200, Some(5), &[&big])], Script::Fail);
+        assert!(d.fetch(&url(), 100).await.is_err());
+        let d = dl(vec![resp(200, Some(10), &[b"short"])], Script::Fail);
+        assert_eq!(
+            d.fetch(&url(), 100).await.unwrap_err(),
+            ArchiveError::Download
+        );
+    }
+    #[tokio::test]
+    async fn non_allowlisted_or_non_https_urls_never_reach_the_transport() {
+        let d = dl(vec![], resp(200, Some(2), &[b"ok"]));
+        for bad in [
+            "http://cdn.discordapp.com/attachments/1/100/a.txt",
+            "https://evil.example/attachments/1/100/a.txt",
+            "https://127.0.0.1/a.txt",
+        ] {
+            let u = url::Url::parse(bad).unwrap();
+            assert_eq!(
+                d.fetch(&u, 100).await.unwrap_err(),
+                ArchiveError::UnsafeInput,
+                "{bad}"
+            );
+        }
+        assert_eq!(d.transport.get_count(), 0);
+    }
+    #[tokio::test]
+    async fn download_all_through_the_production_downloader_fails_closed() {
+        let fx = fixtures::asset_fixtures();
+        let mut m = Pages::new(1).msgs;
+        m[0] = with_asset(m[0].clone(), &fx[0], CDN, Some(5));
+        let d = dl(vec![resp(302, None, &[])], Script::Fail);
+        assert_eq!(
+            download_all(&d, &m, &Limits::default())
+                .await
+                .err()
+                .unwrap(),
+            ArchiveError::Download
+        );
+        let d = dl(vec![resp(200, Some(5), &[b"12345"])], Script::Fail);
+        assert!(download_all(&d, &m, &Limits::default()).await.is_ok());
+    }
+}
