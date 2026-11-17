@@ -1245,3 +1245,201 @@ async fn footer_only_or_url_only_edit_is_detected_during_download_and_on_retry()
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 }
+
+// ------- real CloseIo adapter composing the production HttpDownloader over a fake transport -------
+mod real_downloader {
+    use super::*;
+    use crate::tickets::archive::fake_transport::{FakeTransport, Script};
+    use crate::tickets::archive::HttpDownloader;
+    use std::time::Duration;
+
+    const URL: &str = "https://cdn.discordapp.com/attachments/1/100/a.txt?ex=1&is=2&hm=3";
+    struct RealDlIo {
+        inner: Fake,
+        dl: HttpDownloader<FakeTransport>,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+    impl HistorySource for RealDlIo {
+        async fn page_after(&self, after: u64) -> Result<Vec<Message>, ArchiveError> {
+            self.inner.page_after(after).await
+        }
+    }
+    impl Downloader for RealDlIo {
+        async fn fetch(&self, u: &url::Url, l: u64) -> Result<Vec<u8>, ArchiveError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.dl.fetch(u, l).await // the ACTUAL production downloader policy
+        }
+    }
+    impl CloseIo for RealDlIo {
+        async fn freeze(&self, c: u64, r: u64) -> Result<(), ()> {
+            self.inner.freeze(c, r).await
+        }
+        async fn probe(&self, c: u64) -> Presence {
+            self.inner.probe(c).await
+        }
+        async fn delete(&self, c: u64) -> DeleteOutcome {
+            self.inner.delete(c).await
+        }
+        async fn dm_closed(&self, r: u64) -> Result<(), ()> {
+            self.inner.dm_closed(r).await
+        }
+        async fn candidates(&self, t: &Ticket) -> Result<Vec<RemoteChannel>, ()> {
+            self.inner.candidates(t).await
+        }
+    }
+    async fn go(h: &H, io: &RealDlIo, t: &Ticket) -> CloseOutcome {
+        let clock = &h.clock;
+        let f = move || clock.fetch_add(1, Ordering::SeqCst);
+        let limits = Limits::default();
+        let s = settings();
+        let env = Env {
+            settings: &s,
+            repo: &h.repo,
+            io,
+            root: &h.root,
+            limits: &limits,
+            now: &f,
+        };
+        close_ticket(&env, &actor(t), t.id, "tok").await
+    }
+    fn io_with(h: &H, script: Script) -> RealDlIo {
+        let inner = Fake::new(&h.dir.join("archives"), 3);
+        inner.msgs.lock().unwrap()[0].attachments =
+            vec![serde_json::from_value(serde_json::json!({
+                "id": "5000", "filename": "a.txt", "size": 10, "url": URL, "proxy_url": URL
+            }))
+            .unwrap()];
+        RealDlIo {
+            inner,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+            dl: HttpDownloader::with_transport(
+                FakeTransport::new(vec![], script),
+                Duration::from_millis(200),
+            ),
+        }
+    }
+    fn resp(status: u16, declared: Option<u64>, body: &[u8]) -> Script {
+        Script::Resp {
+            status,
+            declared,
+            chunks: vec![body.to_vec()],
+        }
+    }
+
+    #[tokio::test]
+    async fn download_failures_through_the_real_downloader_delete_nothing_and_hold_the_slot() {
+        let cases = [
+            ("3xx", resp(302, None, b"")),
+            ("404", resp(404, None, b"nope")),
+            ("500", resp(500, None, b"x")),
+            ("timeout", Script::Hang),
+            ("transport", Script::Fail),
+            ("oversize", resp(200, Some(30 * 1024 * 1024), b"")),
+            ("short", resp(200, Some(10), b"12345")),
+        ];
+        for (tag, sc) in cases {
+            let h = harness(tag).await;
+            let t = active(&h, 1, Kind::Support).await;
+            let io = io_with(&h, sc);
+            assert!(
+                matches!(go(&h, &io, &t).await, CloseOutcome::Retained(_)),
+                "{tag}"
+            );
+            assert_eq!(io.inner.calls("delete"), 0, "{tag}: zero source deletes");
+            assert_eq!(
+                io.fetches.load(Ordering::SeqCst),
+                1,
+                "{tag}: production downloader was exercised"
+            );
+            assert_eq!(status(&h, t.id).await, "archiving", "{tag}");
+            assert!(
+                h.repo.latest_archive(t.id).await.unwrap().is_none(),
+                "{tag}"
+            );
+            let again = h.repo.reserve(77, G, OPENER, Kind::Support).await;
+            assert!(
+                again.map(|x| x.id == t.id).unwrap_or(true),
+                "{tag}: slot held"
+            );
+            let _ = std::fs::remove_dir_all(&h.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_download_through_the_real_downloader_closes_with_one_delete() {
+        let h = harness("dl-ok").await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = io_with(&h, resp(200, Some(10), b"0123456789"));
+        assert_eq!(go(&h, &io, &t).await, CloseOutcome::Closed);
+        assert_eq!(io.inner.calls("delete"), 1);
+        assert_eq!(status(&h, t.id).await, "closed");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+#[tokio::test]
+async fn restart_after_record_but_before_verified_preserves_the_recorded_archive_publishes_verified_one_and_deletes_once(
+) {
+    let h = harness("rec-before-ver").await;
+    let t = active(&h, 1, Kind::Support).await;
+    let mut io = Fake::new(&h.dir.join("archives"), 3);
+    io.history_fail = true; // first run stops in `archiving` holding the lease token "a"
+    assert!(matches!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Retained(_)
+    ));
+    assert_eq!(status(&h, t.id).await, "archiving");
+    // Simulated crash window: the archive is published and RECORDED, the state is not yet
+    // advanced to `verified`.
+    let msgs = io.msgs.lock().unwrap().clone();
+    let p = archive::publish(
+        &h.root,
+        &PublishInput {
+            ticket: t.id,
+            channel: t.channel.unwrap(),
+            seq: 1,
+            nonce: 1,
+            messages: &msgs,
+            downloaded: &[],
+        },
+    )
+    .unwrap();
+    let seq = h
+        .repo
+        .record_archive(
+            t.id,
+            "a",
+            ArchiveRecord {
+                dir_name: &p.dir_name,
+                sha: &p.manifest_sha256,
+                messages: p.messages,
+                assets: p.assets,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq, Some(1));
+    assert_eq!(status(&h, t.id).await, "archiving");
+    // restart: history is no longer needed to adopt/verify the recorded archive
+    io.history_fail = false;
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+        CloseOutcome::Closed
+    );
+    assert_eq!(io.calls("delete"), 1);
+    let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+    // Documented behaviour: an unverified-but-recorded archive is PRESERVED (never overwritten)
+    // and a fresh, independently verified one (seq 2) is what authorizes the delete.
+    assert_eq!(ar.seq, 2);
+    assert_ne!(ar.dir_name, p.dir_name);
+    assert!(h
+        .root
+        .path()
+        .join(&p.dir_name)
+        .join("manifest.json")
+        .is_file());
+    assert!(recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap()).is_some());
+    assert_eq!(*io.archive_existed_at_delete.lock().unwrap(), vec![true]);
+    let _ = std::fs::remove_dir_all(&h.dir);
+}

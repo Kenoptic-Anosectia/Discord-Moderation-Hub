@@ -618,6 +618,127 @@ mod tests {
         assert_eq!(c.allowed.load(Ordering::SeqCst), 4);
         assert_eq!(c.skipped.load(Ordering::SeqCst), 0);
     }
+    fn invite_create(ch: u64) -> FullEvent {
+        FullEvent::InviteCreate {
+            data: serde_json::from_value(serde_json::json!({
+                "channel_id": ch.to_string(), "guild_id": G.to_string(), "code": "abc",
+                "created_at": "2026-01-01T00:00:00Z", "max_age": 0, "max_uses": 0,
+                "temporary": false, "uses": 0
+            }))
+            .unwrap(),
+        }
+    }
+    fn invite_delete(ch: u64) -> FullEvent {
+        FullEvent::InviteDelete {
+            data: serde_json::from_value(serde_json::json!({
+                "channel_id": ch.to_string(), "guild_id": G.to_string(), "code": "abc"
+            }))
+            .unwrap(),
+        }
+    }
+    fn voice(old: Option<u64>, new: Option<u64>) -> FullEvent {
+        let vs = |c: Option<u64>| -> VoiceState {
+            serde_json::from_value(serde_json::json!({
+                "guild_id": G.to_string(), "channel_id": c.map(|c| c.to_string()),
+                "user_id": "5", "session_id": "s", "deaf": false, "mute": false,
+                "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false
+            }))
+            .unwrap()
+        };
+        FullEvent::VoiceStateUpdate {
+            old: old.map(|c| vs(Some(c))),
+            new: vs(new),
+        }
+    }
+    fn reaction(ch: u64, add: bool) -> FullEvent {
+        let r: Reaction = serde_json::from_value(serde_json::json!({
+            "channel_id": ch.to_string(), "message_id": "3", "guild_id": G.to_string(),
+            "user_id": "5", "emoji": {"name": "x"}, "burst": false, "burst_colours": [],
+            "type": 0
+        }))
+        .unwrap();
+        if add {
+            FullEvent::ReactionAdd { add_reaction: r }
+        } else {
+            FullEvent::ReactionRemove {
+                removed_reaction: r,
+            }
+        }
+    }
+    #[tokio::test]
+    async fn guarded_sink_for_invite_voice_reaction_events_private_unknown_error_public_member() {
+        let c = Counters::new();
+        let repo = repo_with_ticket(900).await;
+        let private = Fake::new(Lookup::Guild { parent: None });
+        let unknown = Fake::new(Lookup::Unknown);
+        let public = Fake::new(Lookup::Guild { parent: Some(42) });
+        let private_events = [
+            invite_create(900),
+            invite_delete(900),
+            voice(None, Some(900)),
+            voice(Some(900), None),
+            voice(Some(900), Some(777)),
+            voice(Some(777), Some(900)),
+            reaction(900, true),
+            reaction(900, false),
+        ];
+        for ev in &private_events {
+            assert_eq!(
+                through_guard(true, Some(&repo), ev, &private, &c).await,
+                (0, None)
+            );
+        }
+        let unknown_events = [
+            invite_create(777),
+            invite_delete(777),
+            voice(None, Some(777)),
+            voice(Some(777), None),
+            reaction(777, true),
+            reaction(777, false),
+        ];
+        for ev in &unknown_events {
+            assert_eq!(
+                through_guard(true, Some(&repo), ev, &unknown, &c).await,
+                (0, None)
+            );
+        }
+        let broken = Repository::open(":memory:").await.unwrap();
+        broken.break_for_test().await;
+        for ev in [
+            invite_create(777),
+            voice(Some(1), Some(777)),
+            reaction(777, true),
+        ] {
+            assert_eq!(
+                through_guard(true, Some(&broken), &ev, &private, &c).await,
+                (0, None)
+            );
+        }
+        for ev in [
+            invite_create(777),
+            invite_delete(777),
+            voice(Some(777), Some(778)),
+            reaction(777, true),
+            reaction(777, false),
+        ] {
+            assert_eq!(
+                through_guard(true, Some(&repo), &ev, &public, &c).await,
+                (1, Some(())),
+            );
+        }
+        // member control (no channel): never blocked, no lookup at all
+        let member = FullEvent::GuildMemberRemoval {
+            guild_id: GuildId::new(G),
+            user: User::default(),
+            member_data_if_available: None,
+        };
+        let before = unknown.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            through_guard(true, Some(&repo), &member, &unknown, &c).await,
+            (1, Some(()))
+        );
+        assert_eq!(unknown.calls.load(Ordering::SeqCst), before);
+    }
     /// SECONDARY structural check only (not counted as behavioural evidence).
     #[test]
     fn runtime_event_handler_calls_the_guard_before_any_cache_insertion() {
