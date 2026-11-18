@@ -119,6 +119,8 @@ pub struct Snapshot {
     pub dm_sent: bool,
     /// True if `ReactionRemoved` arrived while still `Activating`.
     pub pending_release: bool,
+    /// True if `ReactionAdded` arrived while still `Releasing` (cleared by a later `ReactionRemoved`).
+    pub pending_reactivate: bool,
     /// Release step acknowledgements.
     pub safeword_removed: bool,
     pub roles_restored: bool,
@@ -212,6 +214,7 @@ impl Snapshot {
             snapshot_saved: false,
             dm_sent: false,
             pending_release: false,
+            pending_reactivate: false,
             safeword_removed: false,
             roles_restored: true,
             snapshot_cleared: false,
@@ -1158,5 +1161,229 @@ mod tests {
             .filter(|a| matches!(a, Action::AddSafewordRole))
             .count();
         assert_eq!(total_adds, 1);
+    }
+
+    #[test]
+    fn reaction_added_during_releasing_reactivates_on_completion_and_respects_last_event_wins() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_MEMBER]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+
+        // 1. remove -> add -> complete -> Activating/Active again with the safeword role re-added
+        let (releasing, rel_actions) = step(&active, Event::ReactionRemoved, &ctx);
+        let (releasing_flagged, add_actions) = step(&releasing, Event::ReactionAdded, &ctx);
+        assert!(add_actions.is_empty());
+        assert!(releasing_flagged.snapshot().unwrap().pending_reactivate);
+
+        // Acknowledge all release steps except the last, then acknowledge the last with fresh ctx.held_roles
+        let (releasing_mid, mid_actions) = acknowledge_all(
+            releasing_flagged,
+            &rel_actions[..rel_actions.len() - 1],
+            &ctx,
+        );
+        assert!(mid_actions.is_empty());
+        let reactivate_ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_FEMDOM]);
+        let (reactivating, react_actions) = step(
+            &releasing_mid,
+            Event::ActionDone(rel_actions.last().unwrap().id()),
+            &reactivate_ctx,
+        );
+        assert!(matches!(reactivating, State::Activating(_)));
+        assert_eq!(
+            reactivating.snapshot().unwrap().saved_roles,
+            vec![ROLE_VERIFIED, ROLE_FEMDOM]
+        );
+        assert!(!reactivating.snapshot().unwrap().pending_reactivate);
+        assert!(react_actions.contains(&Action::AddSafewordRole));
+        let (re_active, _) = acknowledge_all(reactivating, &react_actions, &reactivate_ctx);
+        assert!(matches!(re_active, State::Active(_)));
+
+        // 2. remove -> add -> remove -> complete -> stays released (last event wins)
+        let (rel2, rel2_actions) = step(&re_active, Event::ReactionRemoved, &reactivate_ctx);
+        let (rel2_added, _) = step(&rel2, Event::ReactionAdded, &reactivate_ctx);
+        assert!(rel2_added.snapshot().unwrap().pending_reactivate);
+        let (rel2_removed, _) = step(&rel2_added, Event::ReactionRemoved, &reactivate_ctx);
+        assert!(!rel2_removed.snapshot().unwrap().pending_reactivate);
+        let (final_inactive, trailing) =
+            acknowledge_all(rel2_removed, &rel2_actions, &reactivate_ctx);
+        assert_eq!(final_inactive, State::Inactive);
+        assert!(trailing.is_empty());
+
+        // 3. pending_reactivate survives an action failure and retry
+        let (rel3, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (rel3, _) = step(&rel3, Event::ReactionAdded, &ctx);
+        assert!(rel3.snapshot().unwrap().pending_reactivate);
+        let (rel3, _) = step(&rel3, Event::ActionDone(ActionId::RemoveSafewordRole), &ctx);
+        let (rel3_failed, _) = step(
+            &rel3,
+            Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp),
+            &ctx,
+        );
+        assert!(rel3_failed.snapshot().unwrap().pending_reactivate);
+        let (rel3_retried, retry_actions) = step(&rel3_failed, Event::ReactionAdded, &ctx);
+        assert!(rel3_retried.snapshot().unwrap().pending_reactivate);
+        assert_eq!(
+            retry_actions,
+            vec![
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ]
+        );
+        let (reactivated_after_retry, react_after_retry_actions) =
+            acknowledge_all(rel3_retried, &retry_actions, &ctx);
+        assert!(matches!(reactivated_after_retry, State::Activating(_)));
+        assert!(react_after_retry_actions.contains(&Action::AddSafewordRole));
+    }
+
+    #[test]
+    fn remove_then_readd_during_activating_cancels_pending_release_and_ends_active() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_MEMBER]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (activating, _) = step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
+
+        // ReactionRemoved sets pending_release = true.
+        let (activating_removed, _) = step(&activating, Event::ReactionRemoved, &ctx);
+        assert!(activating_removed.snapshot().unwrap().pending_release);
+
+        // Re-adding the reaction clears pending_release (last reaction event wins).
+        let (activating_readded, readd_actions) =
+            step(&activating_removed, Event::ReactionAdded, &ctx);
+        assert!(readd_actions.is_empty());
+        assert!(!activating_readded.snapshot().unwrap().pending_release);
+
+        // Completing activation transitions to Active with no release actions.
+        let (final_state, follow_up) = acknowledge_all(activating_readded, &act_actions[1..], &ctx);
+        assert!(matches!(final_state, State::Active(_)));
+        assert!(follow_up.is_empty());
+    }
+
+    #[test]
+    fn grant_during_releasing_defers_before_restore_ack_and_ignores_after_or_when_disabled() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
+
+        // 1. Before RestoreRoles is acknowledged: restricted grant is recorded and added to restore_plan.
+        let (rel_before, actions_before) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert!(actions_before.is_empty());
+        let snap_before = rel_before.snapshot().unwrap();
+        assert_eq!(snap_before.deferred_roles, vec![ROLE_MEMBER]);
+        assert_eq!(snap_before.restore_plan, vec![ROLE_VERIFIED, ROLE_MEMBER]);
+        assert!(!snap_before.roles_restored);
+
+        // Subject to struck/deleted/protected filters and restricted_roles check:
+        let mut protected_ctx = ctx.clone();
+        protected_ctx.protected_roles = vec![ROLE_FEMDOM];
+        let (rel_prot, _) = step(
+            &rel_before,
+            Event::GrantDuringActive(ROLE_FEMDOM),
+            &protected_ctx,
+        );
+        assert_eq!(
+            rel_prot.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED, ROLE_MEMBER]
+        );
+        let (rel_unrestricted, _) = step(
+            &rel_before,
+            Event::GrantDuringActive(ROLE_UNRESTRICTED),
+            &ctx,
+        );
+        assert_eq!(
+            rel_unrestricted.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED, ROLE_MEMBER]
+        );
+
+        // Also if initial restore_plan was empty (roles_restored == true initially), a deferred grant
+        // while RemoveSafewordRole is still pending sets roles_restored = false and populates restore_plan.
+        let empty_ctx = sample_ctx(vec![]);
+        let (act_empty, act_empty_actions) =
+            step(&State::Inactive, Event::ReactionAdded, &empty_ctx);
+        let (active_empty, _) = acknowledge_all(act_empty, &act_empty_actions, &empty_ctx);
+        let (rel_empty, _) = step(&active_empty, Event::ReactionRemoved, &empty_ctx);
+        assert!(rel_empty.snapshot().unwrap().roles_restored);
+        let (rel_empty_granted, _) = step(
+            &rel_empty,
+            Event::GrantDuringActive(ROLE_VERIFIED),
+            &empty_ctx,
+        );
+        assert!(!rel_empty_granted.snapshot().unwrap().roles_restored);
+        assert_eq!(
+            rel_empty_granted.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED]
+        );
+
+        // 2. Once RestoreRoles is acknowledged: later GrantDuringActive is ignored.
+        let (rel_after_restore, _) =
+            step(&rel_before, Event::ActionDone(ActionId::RestoreRoles), &ctx);
+        let (rel_after_grant, _) = step(
+            &rel_after_restore,
+            Event::GrantDuringActive(ROLE_MEDIA),
+            &ctx,
+        );
+        assert_eq!(
+            rel_after_grant.snapshot().unwrap().deferred_roles,
+            vec![ROLE_MEMBER]
+        );
+        assert_eq!(
+            rel_after_grant.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED, ROLE_MEMBER]
+        );
+
+        // 3. When defer_grants = false: GrantDuringActive during Releasing is ignored.
+        let mut no_defer_ctx = ctx.clone();
+        no_defer_ctx.defer_grants = false;
+        let (rel_no_defer, _) = step(
+            &releasing,
+            Event::GrantDuringActive(ROLE_MEMBER),
+            &no_defer_ctx,
+        );
+        assert!(rel_no_defer.snapshot().unwrap().deferred_roles.is_empty());
+        assert_eq!(
+            rel_no_defer.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED]
+        );
+    }
+
+    #[test]
+    fn action_failed_in_active_records_last_failure_for_any_unacknowledged_step() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+
+        // SaveSnapshot can fail while Active (e.g. after Strike/GrantDuringActive).
+        let (active_save_failed, _) = step(
+            &active,
+            Event::ActionFailed(ActionId::SaveSnapshot, FailureCode::StorageError),
+            &ctx,
+        );
+        assert_eq!(
+            active_save_failed.snapshot().unwrap().last_failure,
+            Some((ActionId::SaveSnapshot, FailureCode::StorageError))
+        );
+
+        // Any not-yet-done step on an Active snapshot also records last_failure (matching step_activating).
+        let mut partial_snap = active.snapshot().unwrap().clone();
+        partial_snap.roles_removed = false;
+        let partial_active = State::Active(partial_snap);
+        let (failed_partial, _) = step(
+            &partial_active,
+            Event::ActionFailed(ActionId::RemoveRoles, FailureCode::MissingPermissions),
+            &ctx,
+        );
+        assert_eq!(
+            failed_partial.snapshot().unwrap().last_failure,
+            Some((ActionId::RemoveRoles, FailureCode::MissingPermissions))
+        );
+
+        // Already-completed activation steps other than SaveSnapshot do not record a bogus failure.
+        let (still_active, _) = step(
+            &active,
+            Event::ActionFailed(ActionId::AddSafewordRole, FailureCode::TransientHttp),
+            &ctx,
+        );
+        assert_eq!(still_active.snapshot().unwrap().last_failure, None);
     }
 }
