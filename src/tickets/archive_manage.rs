@@ -14,8 +14,11 @@ use super::{
 use rusqlite::{params, OptionalExtension, Row};
 use std::{
     collections::BTreeMap,
+    fs,
+    io::ErrorKind,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -114,8 +117,16 @@ pub async fn show(m: &Manage<'_>, a: &Actor, id: &str) -> Result<ArchiveSummary,
     Ok(archive_index::find_archive(m.repo, m.settings, a, id).await?)
 }
 
-fn scan_entry(row: &Row<'_>) -> rusqlite::Result<ScanEntry> {
-    let channel: String = row.get(6)?;
+fn recorded_channel(row: &Row<'_>) -> rusqlite::Result<Option<u64>> {
+    Ok(row
+        .get_ref(6)?
+        .as_str()
+        .ok()
+        .and_then(|channel| channel.parse().ok())
+        .filter(|&channel| channel != 0))
+}
+
+fn scan_entry(row: &Row<'_>, channel: u64) -> rusqlite::Result<ScanEntry> {
     Ok(ScanEntry {
         ticket: row.get(0)?,
         seq: row.get(1)?,
@@ -123,7 +134,7 @@ fn scan_entry(row: &Row<'_>) -> rusqlite::Result<ScanEntry> {
         manifest_sha256: row.get(3)?,
         messages: row.get(4)?,
         assets: row.get(5)?,
-        channel: channel.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+        channel,
     })
 }
 
@@ -155,7 +166,12 @@ pub async fn health(m: &Manage<'_>, a: &Actor, offset: usize) -> Result<HealthRe
             let mut entries = Vec::new();
             while entries.len() < HEALTH_PAGE {
                 let Some(row) = rows.next()? else { break };
-                entries.push(scan_entry(row)?);
+                let sha: String = row.get(3)?;
+                let id = archive_id(guild, row.get(0)?, row.get(1)?, &sha);
+                let entry = recorded_channel(row)?
+                    .map(|channel| scan_entry(row, channel))
+                    .transpose()?;
+                entries.push((id, entry));
             }
             let has_more = entries.len() == HEALTH_PAGE && rows.next()?.is_some();
             Ok((entries, has_more))
@@ -172,11 +188,13 @@ pub async fn health(m: &Manage<'_>, a: &Actor, offset: usize) -> Result<HealthRe
             has_more,
             ..HealthReport::default()
         };
-        for (entry, result) in entries
-            .iter()
-            .zip(archive_scan::scan_recorded(&root, &entries))
-        {
-            match result.health {
+        for (id, entry) in entries {
+            // An unusable expected channel cannot establish identity, even if
+            // the files are intact. Do not scan that row with an invented ID.
+            let status = entry.as_ref().map_or(Health::IdentityMismatch, |entry| {
+                archive_scan::scan_recorded(&root, std::slice::from_ref(entry))[0].health
+            });
+            match status {
                 Health::Verified => {
                     report.verified += 1;
                     continue;
@@ -186,12 +204,7 @@ pub async fn health(m: &Manage<'_>, a: &Actor, offset: usize) -> Result<HealthRe
                 Health::IdentityMismatch => report.identity_mismatch += 1,
                 Health::BadName => report.bad_name += 1,
             }
-            report.non_verified.push(archive_id(
-                guild,
-                entry.ticket,
-                entry.seq,
-                &entry.manifest_sha256,
-            ));
+            report.non_verified.push(id);
         }
         Ok(report)
     })
@@ -291,7 +304,10 @@ async fn restore_record(m: &Manage<'_>, a: &Actor, id: &str) -> Result<ScanEntry
             "SELECT a.ticket,a.seq,a.dir_name,a.manifest_sha256,a.messages,a.assets,t.channel \
              FROM ticket_archives a JOIN tickets t ON t.id=a.ticket \
              WHERE t.guild=?1 AND a.ticket=?2 AND a.seq=?3",
-            params![guild.to_string(), selected.ticket, selected.seq], scan_entry,
+            params![guild.to_string(), selected.ticket, selected.seq], |row| {
+                let channel = recorded_channel(row)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                scan_entry(row, channel)
+            },
         ).optional()
             })
             .await
@@ -354,18 +370,37 @@ fn restore_copy(
     stage: &Path,
     recorded: &ScanEntry,
 ) -> Result<restore_io::Restored, RestoreError> {
-    static NONCE: AtomicU64 = AtomicU64::new(0);
+    static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
     let source = reopen(source)?;
     let stage = reopen(stage)?;
+    let suffix = recorded
+        .dir_name
+        .strip_prefix("ticket-")
+        .filter(|_| archive_scan::is_archive_dir_name(&recorded.dir_name))
+        .ok_or(RestoreError::BadName)?;
+    let epoch_floor = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+        .ok_or(RestoreError::Io)?;
     loop {
-        // Checked monotonic counter never repeats in this process. A surviving
-        // destination from a previous process is skipped by atomic creation.
-        // Read and increment are serialized by RESTORE_GATE.
-        let nonce = NONCE.load(Ordering::Relaxed);
-        NONCE.store(
-            nonce.checked_add(1).ok_or(RestoreError::Exists)?,
-            Ordering::Relaxed,
-        );
+        // Wall-clock seeding avoids the low legacy numbers after a restart;
+        // monotonic allocation handles same-tick calls and clock rollback.
+        // RESTORE_GATE serializes the load and store.
+        let nonce = LAST_NONCE
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or(RestoreError::Exists)?
+            .max(epoch_floor);
+        LAST_NONCE.store(nonce, Ordering::Relaxed);
+        // A restart with a repeated clock value can still meet a survivor.
+        // Skip it before any expensive source verification, without following
+        // links. A16's exclusive create is still the final authority.
+        match fs::symlink_metadata(stage.path().join(format!("restore-{suffix}-{nonce}"))) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(RestoreError::Io),
+        }
         let req = RestoreRequest {
             dir_name: &recorded.dir_name,
             expected_manifest_sha: &recorded.manifest_sha256,
@@ -855,6 +890,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_invalid_channels_without_losing_the_page() {
+        let f = Fixture::new().await;
+        let null = f.publish(GUILD, 4, "closed", None).await;
+        let malformed = f.publish(GUILD, 3, "closed", None).await;
+        let zero = f.publish(GUILD, 2, "closed", None).await;
+        f.publish(GUILD, 1, "closed", None).await;
+        f.repo
+            .db
+            .call(|c| -> rusqlite::Result<()> {
+                c.execute("UPDATE tickets SET channel=NULL WHERE id=4", [])?;
+                c.execute("UPDATE tickets SET channel='not a channel' WHERE id=3", [])?;
+                c.execute("UPDATE tickets SET channel='0' WHERE id=2", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            health(&f.manage(), &staff(), 0).await,
+            Ok(HealthReport {
+                verified: 1,
+                identity_mismatch: 3,
+                non_verified: vec![null, malformed, zero],
+                ..HealthReport::default()
+            }),
+            "bad recorded channels must not poison the health page"
+        );
+    }
+
+    #[tokio::test]
     async fn orphans_use_all_records_and_cap_each_class() {
         let f = Fixture::new().await;
         f.publish(GUILD, 1, "closed", None).await;
@@ -1000,6 +1064,48 @@ mod tests {
             RestoreOutcome::Failed("identity")
         );
         assert_eq!(snapshot(f.staging.path()), staging);
+    }
+
+    #[tokio::test]
+    async fn restore_uses_fresh_nonces_beyond_surviving_legacy_directories() {
+        let _test_gate = RESTORE_TESTS.lock().await;
+        let f = Fixture::new().await;
+        let id = f.publish(GUILD, 1, "closed", None).await;
+        for nonce in 0..32 {
+            fs::create_dir(f.staging.path().join(format!("restore-1-1-{nonce}"))).unwrap();
+        }
+        let epoch_floor = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let m = f.manage();
+        let a = staff();
+        let mut previous = None;
+        for _ in 0..2 {
+            let outcome = restore(&m, &a, id.as_str()).await;
+            let RestoreOutcome::Restored { dest_name, .. } = outcome else {
+                panic!("restore with surviving destinations must succeed: {outcome:?}");
+            };
+            let nonce: u64 = dest_name
+                .strip_prefix("restore-1-1-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                nonce >= epoch_floor,
+                "first restore nonce must start at the epoch-time floor, not the legacy counter: {nonce}"
+            );
+            if let Some(previous) = previous {
+                assert!(nonce > previous);
+            }
+            previous = Some(nonce);
+        }
+        for nonce in 0..32 {
+            assert!(snapshot(&f.staging.path().join(format!("restore-1-1-{nonce}"))).is_empty());
+        }
     }
 
     #[tokio::test]
