@@ -30,7 +30,7 @@ pub struct ScanResult {
     pub health: Health,
 }
 
-fn is_archive_dir_name(name: &str) -> bool {
+pub(super) fn is_archive_dir_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("ticket-") else {
         return false;
     };
