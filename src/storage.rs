@@ -161,6 +161,9 @@ pub fn open(path: &str, reserved: &[PathBuf]) -> Result<Connection, StorageError
     {
         return Err(StorageError::InvalidPath);
     }
+    if cfg!(windows) && windows_path_is_aliasing_form(Path::new(path)) {
+        return Err(StorageError::InvalidPath);
+    }
     let wanted = normalize(Path::new(path))?;
     for r in reserved {
         if normalize(r)? == wanted {
@@ -174,6 +177,17 @@ pub fn open(path: &str, reserved: &[PathBuf]) -> Result<Connection, StorageError
     let conn = Connection::open_with_flags(path, flags)?;
     apply_pragmas(&conn, true)?;
     Ok(conn)
+}
+
+/// Windows-only: true for any path prefix other than a plain drive (UNC in any
+/// separator mix, verbatim, device) and for NTFS alternate-data-stream spellings
+/// (a `:` inside a normal component). Checked on components, not on strings.
+fn windows_path_is_aliasing_form(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        Component::Prefix(p) => !matches!(p.kind(), std::path::Prefix::Disk(_)),
+        Component::Normal(n) => n.to_string_lossy().contains(':'),
+        _ => false,
+    })
 }
 
 fn apply_pragmas(conn: &Connection, wal: bool) -> Result<(), StorageError> {
