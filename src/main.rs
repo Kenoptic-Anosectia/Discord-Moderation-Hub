@@ -1,3 +1,4 @@
+mod archive_safety;
 mod config;
 mod text_helpers;
 mod tickets;
@@ -78,6 +79,28 @@ mod tests {
         assert!(configured_commands(true)
             .iter()
             .any(|c| c.name == "ticket-panel-post"));
+    }
+    #[test]
+    fn close_and_recovery_commands_have_real_metadata_and_are_gated() {
+        for name in ["ticket-close", "ticket-recover"] {
+            assert!(!configured_commands(false).iter().any(|c| c.name == name));
+            let on = configured_commands(true);
+            let c = on.iter().find(|c| c.name == name).expect("registered");
+            assert!(c.guild_only && c.slash_action.is_some());
+        }
+        let on = configured_commands(true);
+        let rec = on.iter().find(|c| c.name == "ticket-recover").unwrap();
+        let names: Vec<_> = rec.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["ticket_id", "action", "channel", "confirm", "reason"]
+        );
+        const {
+            assert!(
+                !tickets::runtime::OPENING_APPROVED,
+                "opening stays gated in this change"
+            )
+        };
     }
 
     #[test]
@@ -1127,11 +1150,27 @@ async fn event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<(), Error> {
-    let log_channel_id = data.config.log_channel_id;
+    // Fail-closed private-scope guard: ALL cache insertion / log construction runs inside the
+    // sink, which is only invoked when the guard allows the event.
+    tickets::privacy::guarded(
+        data.config.ticket_privacy_lockdown,
+        data.config.tickets.as_ref(),
+        data.tickets.as_ref(),
+        event,
+        &tickets::privacy::SerenityLookup(ctx),
+        &tickets::privacy::COUNTERS,
+        || log_event(ctx, event, data),
+    )
+    .await
+    .unwrap_or(Ok(()))
+}
 
-    if !tickets::allow_general_events(data.config.ticket_privacy_lockdown, event) {
-        return Ok(());
-    }
+async fn log_event(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    data: &Data,
+) -> Result<(), Error> {
+    let log_channel_id = data.config.log_channel_id;
 
     match event {
         serenity::FullEvent::InteractionCreate {
@@ -2403,10 +2442,37 @@ async fn ticket_panel_post(
     tickets::runtime::publish(ctx, channel).await
 }
 
+#[poise::command(slash_command, guild_only, rename = "ticket-close")]
+async fn ticket_close(ctx: Context<'_>) -> Result<(), Error> {
+    tickets::runtime_close::close(ctx).await
+}
+
+#[poise::command(slash_command, guild_only, rename = "ticket-recover")]
+async fn ticket_recover(
+    ctx: Context<'_>,
+    #[description = "Ticket id"] ticket_id: i64,
+    #[description = "status, attach or release"] action: String,
+    #[description = "Channel id (attach only)"] channel: Option<u64>,
+    #[description = "Explicit confirmation for attach/release"] confirm: Option<bool>,
+    #[description = "Audit reason for attach/release"] reason: Option<String>,
+) -> Result<(), Error> {
+    tickets::runtime_close::recover(
+        ctx,
+        ticket_id,
+        action,
+        channel,
+        confirm.unwrap_or(false),
+        reason,
+    )
+    .await
+}
+
 fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
     let mut commands = vec![age_verified(), reactionrole()];
     if enabled {
         commands.push(ticket_panel_post());
+        commands.push(ticket_close());
+        commands.push(ticket_recover());
     }
     commands
 }
@@ -2452,7 +2518,14 @@ async fn main() -> Result<(), Error> {
                         Some(settings)=>Some(tickets::repository::Repository::open(&settings.db_path).await?),
                         None=>None,
                     };
-                    if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: general event logging paused; ticket opening disabled pending A07."); }
+                    if let (Some(settings), Some(repo)) = (&config.tickets, &tickets) {
+                        // Reconciliation runs before opening could ever be approved; failure keeps opening gated.
+                        match tickets::runtime_close::startup_reconcile(ctx, settings, repo).await {
+                            Ok(r) => { tickets::runtime::record_reconcile(Some(&r)); println!("Ticket reconciliation: {} to recovery, {} closed by known absence, {} unresolved; opening permitted: {}", r.moved_to_recovery, r.closed_by_known_absence, r.unresolved, tickets::runtime::opening_permitted()) }
+                            Err(_) => { tickets::runtime::record_reconcile(None); println!("Ticket reconciliation failed; opening remains gated.") }
+                        }
+                    }
+                    if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: channel events in private ticket scope are skipped fail-closed; ticket opening remains gated."); }
 
                     Ok(Data {
                         config,

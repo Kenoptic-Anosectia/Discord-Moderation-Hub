@@ -91,6 +91,7 @@ impl ArchiveInputError {
         Self { kind }
     }
 
+    #[allow(dead_code)] // A10 public surface; used by the integration suite
     pub fn kind(&self) -> ArchiveInputErrorKind {
         self.kind
     }
