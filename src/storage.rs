@@ -10,7 +10,7 @@
 // Temporary: wiring card W1 removes this once a production caller exists.
 #![allow(dead_code)]
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::path::{Component, Path, PathBuf};
 
 /// Busy timeout applied to every connection, in milliseconds.
@@ -89,6 +89,15 @@ fn normalize(path: &Path) -> Result<String, StorageError> {
             Component::ParentDir => {
                 out.pop();
             }
+            Component::Normal(name) if cfg!(windows) => {
+                // Win32 silently drops trailing dots/spaces from a component.
+                let text = name.to_string_lossy();
+                let trimmed = text.trim_end_matches(['.', ' ']);
+                if trimmed.is_empty() {
+                    return Err(StorageError::InvalidPath);
+                }
+                out.push(trimmed);
+            }
             other => out.push(other.as_os_str()),
         }
     }
@@ -144,13 +153,25 @@ pub fn open(path: &str, reserved: &[PathBuf]) -> Result<Connection, StorageError
         apply_pragmas(&conn, false)?;
         return Ok(conn);
     }
+    // `file:` URIs and UNC/admin-share spellings can alias a reserved file.
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with("file:")
+        || path.starts_with("\\\\")
+        || (cfg!(windows) && path.starts_with("//"))
+    {
+        return Err(StorageError::InvalidPath);
+    }
     let wanted = normalize(Path::new(path))?;
     for r in reserved {
         if normalize(r)? == wanted {
             return Err(StorageError::ReservedPath);
         }
     }
-    let conn = Connection::open(path)?;
+    // Explicit flags: no SQLITE_OPEN_URI, so the path is never parsed as a URI.
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
     apply_pragmas(&conn, true)?;
     Ok(conn)
 }
@@ -205,7 +226,7 @@ pub fn migrate(
         "CREATE TABLE IF NOT EXISTS schema_versions \
          (feature TEXT PRIMARY KEY, version INTEGER NOT NULL)",
     )?;
-    let stored: Option<i64> = match tx.query_row(
+    let stored: Option<rusqlite::types::Value> = match tx.query_row(
         "SELECT version FROM schema_versions WHERE feature = ?1",
         [feature],
         |r| r.get(0),
@@ -216,7 +237,10 @@ pub fn migrate(
     };
     let current = match stored {
         None => 0u32,
-        Some(v) => u32::try_from(v).map_err(|_| StorageError::CorruptStoredVersion)?,
+        Some(rusqlite::types::Value::Integer(v)) => {
+            u32::try_from(v).map_err(|_| StorageError::CorruptStoredVersion)?
+        }
+        Some(_) => return Err(StorageError::CorruptStoredVersion),
     };
     if current > latest {
         return Err(StorageError::StoredVersionNewer); // tx dropped => rollback
@@ -226,6 +250,11 @@ pub fn migrate(
     }
     for m in migrations.iter().filter(|m| m.version > current) {
         tx.execute_batch(m.sql)?;
+        if tx.is_autocommit() {
+            // The step ran COMMIT/ROLLBACK/END itself: stop before any later
+            // step or the version bump. Already-committed work cannot be undone.
+            return Err(StorageError::StepEndedTransaction);
+        }
     }
     tx.execute(
         "INSERT INTO schema_versions (feature, version) VALUES (?1, ?2) \

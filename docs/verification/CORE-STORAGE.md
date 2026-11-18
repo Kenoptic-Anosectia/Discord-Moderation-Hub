@@ -3,18 +3,19 @@
 `src/storage.rs`: synchronous, Discord-free SQLite opener and per-feature migration runner for the shared `core.sqlite`.
 
 ## Rules enforced
-- `open(path, reserved)` sets `busy_timeout=5000ms`, WAL (file DBs), `foreign_keys=ON`, `synchronous=NORMAL`, and verifies them. `:memory:` is supported.
-- Refuses any path equal to a `reserved` path after normalization (relative/absolute, `.`/`..`, trailing separators, symlink/short-name resolution of existing ancestors, case-insensitive on Windows). Refusal happens before the file is touched.
-- `migrate(conn, feature, &[Migration])`: steps must be versions 1..n in order (duplicates / gaps / zero rejected before any write). All pending steps plus the `schema_versions` bump run in ONE `BEGIN IMMEDIATE` transaction; any failure rolls back the whole call. Rerun is a no-op. Stored version newer than the code is refused with no data writes. Features are independent.
-- `StorageError` is a plain `Copy` enum of stable codes; SQLite errors collapse to `Sqlite` with no message, SQL or path.
+- `open(path, reserved)` sets `busy_timeout=5000ms`, WAL (file DBs), `foreign_keys=ON`, `synchronous=NORMAL`, and verifies them. `:memory:` is supported. Opens with explicit flags (no URI mode).
+- Refuses a path equal to a `reserved` path after normalization (relative/absolute, `.`/`..`, trailing separators, symlink/junction/short-name resolution of the deepest existing ancestor, case-insensitive and trailing-dot/space-stripped on Windows). Refuses `file:` URIs and UNC paths (leading two backslashes, or two slashes on Windows) with `InvalidPath`. Refusal happens before the file is opened.
+- `migrate(conn, feature, &[Migration])`: versions 1..n in order (duplicates/gaps/zero rejected before any write). Pending steps plus the `schema_versions` bump run in ONE `BEGIN IMMEDIATE` transaction; any failure rolls back the whole call. Rerun is a no-op. Stored version newer than the code is refused with no data writes; a non-integer or negative stored version is `CorruptStoredVersion`. Features are independent. An empty list on a fresh DB leaves no table.
+- After each step `migrate` checks the transaction is still open; a step that ran COMMIT/ROLLBACK/END returns `StepEndedTransaction` before any later step or the version bump. Triggers (`BEGIN..END`) are fine.
+- `StorageError` is a plain `Copy` enum of stable codes; no SQL, path or message text.
 
-## Tests (21, in `src/storage.rs`)
-Fresh/rerun/incremental, newer-version refusal (file bytes + row dump identical), failing middle step rollback, feature independence, pragma read-back, FK enforcement, `:memory:`, reserved-path spellings (real files in `target/k01-tests/`), concurrent migrate from two connections (applied exactly once, integrity_check ok), invalid step lists, error text leak check.
-RED evidence: commit `3ed6d83` (stubs `unimplemented!`): 20 failed, 1 passed (`error_codes_are_distinct_and_stable`).
+## Tests (29, in `src/storage.rs`)
+Fresh/rerun/incremental, newer-version refusal (bytes + rows), middle-step rollback, feature independence, pragma read-back, FK, `:memory:`, reserved spellings (real files in `target/k01-tests/`), `file:` URI refusal with reserved bytes unchanged, UNC refusal, trailing dot/space on a not-yet-existing reserved file (Windows only), COMMIT/ROLLBACK/END steps, trigger step, corrupt version, concurrent two-connection migrate, invalid lists, error-text leaks.
+RED: `3ed6d83` (stubs): 20 failed, 1 passed. Review round 2 RED `fe2fa97`: 7 new tests failed (URI, UNC, trailing dot/space, 3 step-ended-tx, non-integer version); the trigger test passed as expected.
 
 ## Config keys (read by the wiring card, not here)
-- `CORE_DB_PATH`: default `core.sqlite` under the data dir (wiring card decides); unset/empty or a reserved path => feature layer stays OFF, bot logs a code, no file is created.
-- Existing `TICKET_DB_PATH`, `REACTION_ROLE_DB_PATH` are passed as `reserved`; never opened here.
+- `CORE_DB_PATH`: default `core.sqlite` under the data dir (wiring card decides); unset/empty or reserved => feature layer stays OFF, bot logs a code, no file created.
+- `TICKET_DB_PATH`, `REACTION_ROLE_DB_PATH` are passed as `reserved`; never opened here.
 
-## NOT done
-No runtime wiring, no commands, no config parsing, no feature tables, no backup tooling. `#![allow(dead_code)]` in `storage.rs` is temporary; wiring card W1 removes it. Step SQL must not contain its own BEGIN/COMMIT. No downgrade path: rollback = restore a backup.
+## NOT done / limits
+No runtime wiring, commands, config parsing, feature tables or backup tooling. `#![allow(dead_code)]` is temporary; wiring card W1 removes it. No downgrade path: rollback = restore a backup. Work a misbehaving step already committed cannot be undone, and statements after a COMMIT inside one multi-statement step still run outside the transaction. Not detected: hardlinks to a reserved file, UNC/admin-share aliases (refused by prefix only), aliasing via other mounts. Case-insensitivity tests run only on Windows.
