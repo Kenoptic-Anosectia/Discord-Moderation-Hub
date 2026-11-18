@@ -114,7 +114,8 @@ pub fn attribute_deletion(
         }
         let increase = previous.map_or(0, |p| e.count.saturating_sub(p));
         let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
-        if !(fresh || increase > 0) {
+        let already_seen_unchanged = previous.is_some() && increase == 0;
+        if !((fresh && !already_seen_unchanged) || increase > 0) {
             continue;
         }
         let key = (increase, e.id, e.executor_id);
@@ -170,6 +171,16 @@ mod tests {
         assert_eq!(run(true, &[], &mut seen), DeletedBy::BotAuthor);
         assert_eq!(DeletedBy::User.field_text(), "User");
         assert_eq!(DeletedBy::BotAuthor.field_text(), "Bot (author)");
+    }
+
+    #[test]
+    fn quick_self_delete_after_moderator_delete_is_not_credited_to_moderator() {
+        let mut seen = LastSeenCounts::new();
+        let first = [entry(1, MOD_A, 1, 1000)];
+        assert_eq!(run(false, &first, &mut seen), DeletedBy::Executor(MOD_A));
+        // author self-deletes 3s later: same entry, count unchanged, still inside the 8s window
+        let later = [entry(1, MOD_A, 1, 4000)];
+        assert_eq!(run(false, &later, &mut seen), DeletedBy::User);
     }
 
     #[test]
