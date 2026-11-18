@@ -68,18 +68,169 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub fn open(path: &str, reserved: &[PathBuf]) -> Result<Connection, StorageError> {
-    let _ = (path, reserved);
-    unimplemented!("K01 RED stub")
+/// Lexically normalise a path: absolute, no `.`/`..`, no trailing separator,
+/// symlinks/8.3 names resolved for the longest existing ancestor, and
+/// lower-cased on Windows. Used only for comparison, never for opening.
+fn normalize(path: &Path) -> Result<String, StorageError> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| StorageError::InvalidPath)?
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    // Resolve the deepest existing ancestor (symlinks, short names).
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut base = out.clone();
+    let resolved = loop {
+        if let Ok(c) = base.canonicalize() {
+            break c;
+        }
+        match (base.file_name().map(|n| n.to_os_string()), base.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                base = parent.to_path_buf();
+            }
+            _ => break out.clone(),
+        }
+    };
+    let mut full = resolved;
+    for part in tail.iter().rev() {
+        full.push(part);
+    }
+    let mut s = full.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    if cfg!(windows) {
+        s = s.to_lowercase();
+    }
+    Ok(s)
 }
 
+fn pragma_text(conn: &Connection, sql: &str) -> Result<String, StorageError> {
+    let v: rusqlite::types::Value = conn.query_row(sql, [], |r| r.get(0))?;
+    Ok(match v {
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Text(t) => t.to_lowercase(),
+        _ => String::new(),
+    })
+}
+
+/// Open (creating if needed) the core database at `path`, refusing any path
+/// that normalises to one of `reserved`. `":memory:"` opens an in-memory DB.
+pub fn open(path: &str, reserved: &[PathBuf]) -> Result<Connection, StorageError> {
+    if path.is_empty() {
+        return Err(StorageError::InvalidPath);
+    }
+    if path == ":memory:" {
+        let conn = Connection::open_in_memory()?;
+        apply_pragmas(&conn, false)?;
+        return Ok(conn);
+    }
+    let wanted = normalize(Path::new(path))?;
+    for r in reserved {
+        if normalize(r)? == wanted {
+            return Err(StorageError::ReservedPath);
+        }
+    }
+    let conn = Connection::open(path)?;
+    apply_pragmas(&conn, true)?;
+    Ok(conn)
+}
+
+fn apply_pragmas(conn: &Connection, wal: bool) -> Result<(), StorageError> {
+    conn.busy_timeout(std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS)))?;
+    if wal && pragma_text(conn, "PRAGMA journal_mode = WAL")? != "wal" {
+        return Err(StorageError::PragmaNotApplied);
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+    if pragma_text(conn, "PRAGMA foreign_keys")? != "1"
+        || pragma_text(conn, "PRAGMA synchronous")? != "1"
+    {
+        return Err(StorageError::PragmaNotApplied);
+    }
+    Ok(())
+}
+
+fn validate(feature: &str, migrations: &[Migration]) -> Result<(), StorageError> {
+    if feature.is_empty() {
+        return Err(StorageError::InvalidFeature);
+    }
+    let mut prev = 0u32;
+    for m in migrations {
+        if m.version == prev && prev != 0 {
+            return Err(StorageError::DuplicateVersion);
+        }
+        if migrations.iter().filter(|o| o.version == m.version).count() > 1 {
+            return Err(StorageError::DuplicateVersion);
+        }
+        if m.version != prev + 1 {
+            return Err(StorageError::NonContiguousVersions);
+        }
+        prev = m.version;
+    }
+    Ok(())
+}
+
+/// Apply every pending step for `feature` in ONE `BEGIN IMMEDIATE`
+/// transaction together with the version bump. Returns the resulting version.
+/// A stored version newer than the code knows is refused with no writes.
+/// Step SQL must not contain its own transaction control (BEGIN/COMMIT).
 pub fn migrate(
     conn: &mut Connection,
     feature: &str,
     migrations: &[Migration],
 ) -> Result<u32, StorageError> {
-    let _ = (conn, feature, migrations);
-    unimplemented!("K01 RED stub")
+    validate(feature, migrations)?;
+    let latest = migrations.last().map_or(0, |m| m.version);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_versions \
+         (feature TEXT PRIMARY KEY, version INTEGER NOT NULL)",
+    )?;
+    let stored: Option<i64> = match tx.query_row(
+        "SELECT version FROM schema_versions WHERE feature = ?1",
+        [feature],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(_) => return Err(StorageError::Sqlite),
+    };
+    let current = match stored {
+        None => 0u32,
+        Some(v) => u32::try_from(v).map_err(|_| StorageError::CorruptStoredVersion)?,
+    };
+    if current > latest {
+        return Err(StorageError::StoredVersionNewer); // tx dropped => rollback
+    }
+    if current == latest {
+        return Ok(current);
+    }
+    for m in migrations.iter().filter(|m| m.version > current) {
+        tx.execute_batch(m.sql)?;
+    }
+    tx.execute(
+        "INSERT INTO schema_versions (feature, version) VALUES (?1, ?2) \
+         ON CONFLICT(feature) DO UPDATE SET version = excluded.version",
+        rusqlite::params![feature, i64::from(latest)],
+    )?;
+    tx.commit()?;
+    Ok(latest)
 }
 
 #[cfg(test)]
@@ -470,7 +621,7 @@ mod tests {
         let e = migrate(&mut c, "feat_marker_zz", &[bad]).unwrap_err();
         let dir = scratch("leak");
         let reserved = dir.join("leak_marker_zz.sqlite");
-        let e2 = open(reserved.to_str().unwrap(), &[reserved.clone()]).unwrap_err();
+        let e2 = open(reserved.to_str().unwrap(), std::slice::from_ref(&reserved)).unwrap_err();
         let bad_open = open(dir.to_str().unwrap(), &[]).unwrap_err(); // a directory
         for err in [e, e2, bad_open] {
             let text = format!("{err:?} | {err}");
