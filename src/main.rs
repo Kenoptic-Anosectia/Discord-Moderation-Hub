@@ -1,9 +1,14 @@
 mod archive_safety;
 mod config;
+mod deletion_attribution;
 mod text_helpers;
 mod tickets;
 
 use config::Config;
+use deletion_attribution::{
+    attribute_deletion, AuditEntryLite, AuditLookupFailed, DeletedBy, LastSeenCounts,
+    LOOKUP_DELAYS_MS,
+};
 use poise::serenity_prelude as serenity;
 use poise::serenity_prelude::Mentionable;
 use rusqlite::params;
@@ -14,7 +19,7 @@ use serenity::builder::{
 };
 use serenity::model::channel::{ChannelType, ReactionType};
 use serenity::model::colour::Colour;
-use serenity::model::guild::audit_log::{Action, MemberAction};
+use serenity::model::guild::audit_log::{Action, MemberAction, MessageAction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -697,6 +702,78 @@ async fn find_recent_audit_actor_with_retry(
     None
 }
 
+static DELETE_AUDIT_SEEN: std::sync::OnceLock<std::sync::Mutex<LastSeenCounts>> =
+    std::sync::OnceLock::new();
+
+/// Thin Serenity shell around `deletion_attribution::attribute_deletion`.
+async fn lookup_deleted_by(
+    ctx: &serenity::Context,
+    guild_id: Option<serenity::GuildId>,
+    author_id: u64,
+    author_is_bot: bool,
+    channel_id: u64,
+) -> DeletedBy {
+    let Some(guild_id) = guild_id else {
+        return DeletedBy::AuditUnavailable;
+    };
+
+    let mut result = DeletedBy::AuditUnavailable;
+    for delay_ms in LOOKUP_DELAYS_MS {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let fetched = guild_id
+            .audit_logs(
+                &ctx.http,
+                Some(Action::Message(MessageAction::Delete)),
+                None,
+                None,
+                Some(50),
+            )
+            .await
+            .map(|logs| {
+                logs.entries
+                    .iter()
+                    .map(|entry| AuditEntryLite {
+                        id: entry.id.get(),
+                        executor_id: entry.user_id.get(),
+                        target_id: entry.target_id.map(|id| id.get()),
+                        channel_id: entry
+                            .options
+                            .as_ref()
+                            .and_then(|o| o.channel_id)
+                            .map(|id| id.get()),
+                        count: entry.options.as_ref().and_then(|o| o.count).unwrap_or(1),
+                        created_ms: entry.id.created_at().unix_timestamp() as u64 * 1000,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|_| AuditLookupFailed);
+
+        result = {
+            let mut seen = DELETE_AUDIT_SEEN
+                .get_or_init(|| std::sync::Mutex::new(LastSeenCounts::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attribute_deletion(
+                author_id,
+                author_is_bot,
+                channel_id,
+                unix_now_ms(),
+                fetched.as_deref().map_err(|e| *e),
+                &mut seen,
+            )
+        };
+
+        if matches!(result, DeletedBy::Executor(_)) {
+            break;
+        }
+    }
+
+    result
+}
+
 async fn find_recent_member_role_update_actor(
     ctx: &serenity::Context,
     guild_id: serenity::GuildId,
@@ -1281,34 +1358,52 @@ async fn log_event(
         serenity::FullEvent::MessageDelete {
             channel_id,
             deleted_message_id,
-            guild_id: _,
+            guild_id,
         } => {
             let cached = data.message_cache.write().await.remove(deleted_message_id);
 
             if let Some(cached) = cached {
-                let embed = CreateEmbed::new()
-                    .author(build_author(
-                        &cached.author_tag,
-                        cached.author_avatar_url.as_deref(),
-                    ))
-                    .title("Message Deleted")
-                    .color(Colour::DARK_RED)
-                    .field(
-                        "Channel",
-                        format!("<#{}> (`{}`)", channel_id.get(), channel_id.get()),
-                        false,
+                // Timestamp is taken at the delete event, not after the audit lookup.
+                let event_time = serenity::Timestamp::now();
+                let ctx = ctx.clone();
+                let channel_id = *channel_id;
+                let guild_id = *guild_id;
+                // The audit lookup retries briefly, so it runs off the event handler.
+                // This code is only reached through log_event, i.e. after the privacy guard.
+                tokio::spawn(async move {
+                    let deleted_by = lookup_deleted_by(
+                        &ctx,
+                        guild_id,
+                        cached.author_id,
+                        cached.is_bot,
+                        channel_id.get(),
                     )
-                    .field("Author ID", format!("`{}`", cached.author_id), true)
-                    .field(
-                        "Author Type",
-                        if cached.is_bot { "Bot" } else { "User" },
-                        true,
-                    )
-                    .field("Content", code_block_or_placeholder(&cached.content), false)
-                    .footer(build_log_footer())
-                    .timestamp(serenity::Timestamp::now());
+                    .await;
+                    let embed = CreateEmbed::new()
+                        .author(build_author(
+                            &cached.author_tag,
+                            cached.author_avatar_url.as_deref(),
+                        ))
+                        .title("Message Deleted")
+                        .color(Colour::DARK_RED)
+                        .field(
+                            "Channel",
+                            format!("<#{}> (`{}`)", channel_id.get(), channel_id.get()),
+                            false,
+                        )
+                        .field("Author ID", format!("`{}`", cached.author_id), true)
+                        .field(
+                            "Author Type",
+                            if cached.is_bot { "Bot" } else { "User" },
+                            true,
+                        )
+                        .field("Deleted By", deleted_by.field_text(), true)
+                        .field("Content", code_block_or_placeholder(&cached.content), false)
+                        .footer(build_log_footer())
+                        .timestamp(event_time);
 
-                let _ = log_to_channel(ctx, log_channel_id, embed).await;
+                    let _ = log_to_channel(&ctx, log_channel_id, embed).await;
+                });
             } else {
                 let embed = CreateEmbed::new()
                     .title("Message Deleted")
@@ -1323,6 +1418,7 @@ async fn log_event(
                         format!("`{}`", deleted_message_id.get()),
                         false,
                     )
+                    .field("Deleted By", DeletedBy::NotCached.field_text(), false)
                     .description("Original message data was not available in cache.")
                     .footer(build_log_footer())
                     .timestamp(serenity::Timestamp::now());
