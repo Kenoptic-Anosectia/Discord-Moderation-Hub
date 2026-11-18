@@ -152,13 +152,13 @@ pub fn archive_root(settings: &Settings) -> Result<OwnedRoot, ArchiveError> {
         .unwrap_or_default();
     OwnedRoot::open(&base.join("ticket-archives"))
 }
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
-async fn actor(ctx: Context<'_>) -> Option<Actor> {
+pub(super) async fn actor(ctx: Context<'_>) -> Option<Actor> {
     let guild = ctx.guild_id()?;
     let owner = guild
         .to_partial_guild(&ctx.serenity_context().http)
@@ -174,7 +174,7 @@ async fn actor(ctx: Context<'_>) -> Option<Actor> {
         channel: ctx.channel_id().get(),
     })
 }
-async fn reply(ctx: Context<'_>, text: &str) -> Result<(), Error> {
+pub(super) async fn reply(ctx: Context<'_>, text: &str) -> Result<(), Error> {
     ctx.send(
         poise::CreateReply::default()
             .content(text)

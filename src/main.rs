@@ -81,6 +81,21 @@ mod tests {
             .any(|c| c.name == "ticket-panel-post"));
     }
     #[test]
+    fn archive_command_is_gated_and_has_slash_metadata() {
+        const NAME: &str = "ticket-archives";
+        assert!(!configured_commands(false).iter().any(|c| c.name == NAME));
+        let enabled = configured_commands(true);
+        let command = enabled.iter().find(|c| c.name == NAME).expect("registered");
+        assert!(command.guild_only && command.slash_action.is_some());
+        let params: Vec<_> = command
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.required))
+            .collect();
+        assert_eq!(params, [("action", true), ("id", false), ("offset", false)]);
+    }
+
+    #[test]
     fn close_and_recovery_commands_have_real_metadata_and_are_gated() {
         for name in ["ticket-close", "ticket-recover"] {
             assert!(!configured_commands(false).iter().any(|c| c.name == name));
@@ -2467,12 +2482,24 @@ async fn ticket_recover(
     .await
 }
 
+#[poise::command(slash_command, guild_only, rename = "ticket-archives")]
+async fn ticket_archives(
+    ctx: Context<'_>,
+    #[description = "list, show, health, orphans, retention or restore"] action: String,
+    #[description = "Opaque archive ID (show or restore)"] id: Option<String>,
+    #[description = "Number of rows to skip (list or health)"] offset: Option<u32>,
+) -> Result<(), Error> {
+    tickets::runtime_archives::command(ctx, &action, id.as_deref(), offset.unwrap_or(0) as usize)
+        .await
+}
+
 fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
     let mut commands = vec![age_verified(), reactionrole()];
     if enabled {
         commands.push(ticket_panel_post());
         commands.push(ticket_close());
         commands.push(ticket_recover());
+        commands.push(ticket_archives());
     }
     commands
 }
