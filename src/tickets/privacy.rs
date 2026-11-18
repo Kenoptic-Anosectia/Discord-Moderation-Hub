@@ -284,12 +284,14 @@ impl Counters {
 /// Process-wide counter pair used by the production event handler.
 pub static COUNTERS: Counters = Counters::new();
 /// Production routing seam: `event_handler` runs ALL cache insertion / body / embed / topic /
-/// asset construction and log output inside `sink`, which executes only on `Allow`.
-/// Interactions are never channel-logging paths and always pass through.
+/// asset construction and log output inside `sink`, which runs on `Allow` and also on a `Skip`
+/// for an interaction event. Interactions are never channel-logging paths and always pass
+/// through.
 ///
-/// Returns `None` without running the sink when the event is private, unknown or unsafe.
-/// The sink is called at most once. The skip is bypassed for interaction events, which are
-/// not channel-logging paths, so their sink still runs.
+/// Returns `None` without running the sink only when the decision is `Skip` and the event is
+/// not an interaction; the sink is then not called at all. The sink is called at most once.
+/// For an interaction event a `Skip` does not suppress the sink, because interactions are
+/// not channel-logging paths.
 pub async fn guarded<F, Fut, T>(
     enabled: bool,
     settings: Option<&Settings>,
