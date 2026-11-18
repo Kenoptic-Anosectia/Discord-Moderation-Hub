@@ -1,6 +1,7 @@
 mod archive_safety;
 mod config;
 mod deletion_attribution;
+mod storage;
 mod text_helpers;
 mod tickets;
 
