@@ -13,7 +13,8 @@ Message not in cache (author unknown): `Unknown (message not cached)`; no channe
 - Never-seen entry: all `count` credits pending if fresh (<= 8 s by id), else baselined as already given (a later count rise is detected). Only matching entries are written to the map.
 - Two matching entries: most pending credits, then freshest; only that entry is credited.
 - Lookup is up to 3 tries (0, 0.5, 1.5 s), in a spawned task; a failed or credit-less try consumes nothing.
-- Limits: a genuine self-delete at the SAME moments as a moderator burst on the same author/channel looks like a pending credit; the map is NOT seeded at startup (restart forgets history: a moderator's deletion of an already-stale merged entry right after restart is missed once, shows `User`); `MessageDeleteBulk` not covered.
+- Expiry: the map also stores the last observed count. A pending credit is spendable only if the entry is fresh by id, its count rose since last observed, or the entry saw activity (a credit or a rise) within 30 s. A stale surplus is never credited.
+- Limits: a genuine self-delete while a burst is still being consumed (within 30 s of the last credit) looks like a pending credit; a moderator deletion after a long quiet gap on an already-stale merged entry falls back to `User`; the map is NOT seeded at startup (restart forgets history: a moderator's deletion of an already-stale merged entry right after restart is missed once, shows `User`); `MessageDeleteBulk` not covered.
 
 ## Privacy
 The audit call lives in the `MessageDelete` arm of `log_event`, which only runs after the

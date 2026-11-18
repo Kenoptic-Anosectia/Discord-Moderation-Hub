@@ -40,8 +40,20 @@ impl DeletedBy {
     }
 }
 
+/// How long surplus credits of an entry stay spendable after the bot last saw activity on it
+/// (a credit consumed or a count rise). Keeps a burst alive while it is being consumed but lets
+/// a stale surplus expire.
+pub const CREDIT_TTL_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Copy)]
+struct EntryState {
+    given: u64,
+    observed: u64,
+    active_ms: u64,
+}
+
 pub struct LastSeenCounts {
-    map: HashMap<u64, u64>,
+    map: HashMap<u64, EntryState>,
     order: VecDeque<u64>,
     cap: usize,
 }
@@ -57,13 +69,32 @@ impl LastSeenCounts {
             cap,
         }
     }
+    /// Credits already given for an entry id.
+    #[cfg(test)]
     pub fn get(&self, id: u64) -> Option<u64> {
+        self.map.get(&id).map(|s| s.given)
+    }
+
+    /// Remember an entry as fully given and observed (no recent activity); evicts the
+    /// oldest-inserted id past the cap.
+    #[cfg(test)]
+    pub fn record(&mut self, id: u64, count: u64) {
+        self.set(
+            id,
+            EntryState {
+                given: count,
+                observed: count,
+                active_ms: 0,
+            },
+        );
+    }
+
+    fn state(&self, id: u64) -> Option<EntryState> {
         self.map.get(&id).copied()
     }
 
-    /// Remember the latest count for an entry id; evicts the oldest-inserted id past the cap.
-    pub fn record(&mut self, id: u64, count: u64) {
-        if self.map.insert(id, count).is_none() {
+    fn set(&mut self, id: u64, state: EntryState) {
+        if self.map.insert(id, state).is_none() {
             self.order.push_back(id);
             while self.map.len() > self.cap {
                 match self.order.pop_front() {
@@ -88,7 +119,9 @@ impl LastSeenCounts {
 /// `count` credits; the map records credits already given per entry id. A matching entry (author
 /// and channel; action filtered by the caller) with `count` > given has a pending credit, and a
 /// returned `Executor` consumes exactly one. A never-seen entry has all credits pending if fresh,
-/// else it is baselined as fully given. Failed lookups consume nothing and are never `User`.
+/// else it is baselined as fully given. The map also tracks the last observed count; pending
+/// credits are spendable only while the entry is fresh, its count rose, or it was active within
+/// `CREDIT_TTL_MS`. Failed lookups consume nothing and are never `User`.
 pub fn attribute_deletion(
     author_id: u64,
     author_is_bot: bool,
@@ -102,8 +135,8 @@ pub fn attribute_deletion(
         Err(AuditLookupFailed) => return DeletedBy::AuditUnavailable,
     };
 
-    // best = (pending credits, entry id, executor, credits given so far)
-    let mut best: Option<(u64, u64, u64, u64)> = None;
+    // best = (pending credits, entry id, executor)
+    let mut best: Option<(u64, u64, u64)> = None;
     for e in entries {
         let matches = e.target_id == Some(author_id) && e.channel_id == Some(channel_id);
         if !matches {
@@ -111,29 +144,52 @@ pub fn attribute_deletion(
         }
         // Only entries for this author and channel are written to the map, so an unrelated
         // deletion's lookup cannot pre-record someone else's entry.
-        let given = match seen.get(e.id) {
-            Some(given) => given,
-            None => {
-                let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
-                // Fresh: all `count` credits are pending. Stale: baseline, nothing pending.
-                let baseline = if fresh { 0 } else { e.count };
-                seen.record(e.id, baseline);
-                baseline
-            }
+        let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
+        let mut st = match seen.state(e.id) {
+            Some(st) => st,
+            // Fresh: nothing seen yet, all `count` credits pending. Stale: baseline, none pending.
+            None if fresh => EntryState {
+                given: 0,
+                observed: 0,
+                active_ms: now_ms,
+            },
+            None => EntryState {
+                given: e.count,
+                observed: e.count,
+                active_ms: 0,
+            },
         };
-        let pending = e.count.saturating_sub(given);
+        let rose = e.count > st.observed;
+        if rose {
+            st.active_ms = now_ms;
+        }
+        // A pending credit is spendable only if the entry is fresh by id-age, its count really
+        // rose since last observed, or the entry was active within CREDIT_TTL_MS. A stale
+        // surplus therefore expires and is never credited.
+        let live = fresh || rose || now_ms.saturating_sub(st.active_ms) <= CREDIT_TTL_MS;
+        st.observed = st.observed.max(e.count);
+        let pending = if live {
+            e.count.saturating_sub(st.given)
+        } else {
+            0
+        };
+        seen.set(e.id, st);
         if pending == 0 {
             continue;
         }
         if best.is_none_or(|b| (pending, e.id) > (b.0, b.1)) {
-            best = Some((pending, e.id, e.executor_id, given));
+            best = Some((pending, e.id, e.executor_id));
         }
     }
 
     match best {
-        Some((_, id, executor, given)) => {
+        Some((_, id, executor)) => {
             // Consume exactly one credit from the chosen entry only.
-            seen.record(id, given + 1);
+            if let Some(mut st) = seen.state(id) {
+                st.given += 1;
+                st.active_ms = now_ms;
+                seen.set(id, st);
+            }
             DeletedBy::Executor(executor)
         }
         None if author_is_bot => DeletedBy::BotAuthor,
@@ -477,7 +533,10 @@ mod tests {
         let rose = [entry(1, MOD_A, 4, FOUR_HOURS + 1000)];
         assert_eq!(run_at(later, &rose, &mut seen), DeletedBy::Executor(MOD_A));
         // surplus is only spendable inside the short TTL; hours later it is gone
-        assert_eq!(run_at(later + FOUR_HOURS, &rose, &mut seen), DeletedBy::User);
+        assert_eq!(
+            run_at(later + FOUR_HOURS, &rose, &mut seen),
+            DeletedBy::User
+        );
     }
 
     #[test]
