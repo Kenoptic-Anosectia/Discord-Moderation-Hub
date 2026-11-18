@@ -186,23 +186,480 @@ pub enum RestartAction {
     Execute(Action),
 }
 
+impl Snapshot {
+    fn new_from_context(ctx: &Context) -> Self {
+        let mut saved: Vec<RoleId> = ctx
+            .held_roles
+            .iter()
+            .copied()
+            .filter(|r| *r != 0 && *r != ctx.safeword_role && ctx.restricted_roles.contains(r))
+            .collect();
+        saved.sort_unstable();
+        saved.dedup();
+
+        let already_holds_safeword =
+            ctx.safeword_role != 0 && ctx.held_roles.contains(&ctx.safeword_role);
+
+        Self {
+            original_roles: saved.clone(),
+            roles_removed: saved.is_empty(),
+            safeword_added: already_holds_safeword,
+            saved_roles: saved,
+            struck_roles: Vec::new(),
+            deleted_roles: Vec::new(),
+            deferred_roles: Vec::new(),
+            restore_plan: Vec::new(),
+            snapshot_saved: false,
+            dm_sent: false,
+            pending_release: false,
+            safeword_removed: false,
+            roles_restored: true,
+            snapshot_cleared: false,
+            release_dm_sent: false,
+            last_failure: None,
+        }
+    }
+
+    fn activation_complete(&self) -> bool {
+        self.snapshot_saved && self.roles_removed && self.safeword_added && self.dm_sent
+    }
+
+    fn release_complete(&self) -> bool {
+        self.safeword_removed
+            && self.roles_restored
+            && self.snapshot_cleared
+            && self.release_dm_sent
+    }
+
+    fn pending_activation_actions(&self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if !self.snapshot_saved {
+            actions.push(Action::SaveSnapshot);
+        }
+        if !self.roles_removed && !self.saved_roles.is_empty() {
+            actions.push(Action::RemoveRoles(self.saved_roles.clone()));
+        }
+        if !self.safeword_added {
+            actions.push(Action::AddSafewordRole);
+        }
+        if !self.dm_sent {
+            actions.push(Action::SendDm(DmKind::Activated));
+        }
+        actions
+    }
+
+    fn pending_release_actions(&self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if !self.safeword_removed {
+            actions.push(Action::RemoveSafewordRole);
+        }
+        if !self.roles_restored && !self.restore_plan.is_empty() {
+            actions.push(Action::RestoreRoles(self.restore_plan.clone()));
+        }
+        if !self.snapshot_cleared {
+            actions.push(Action::ClearSnapshot);
+        }
+        if !self.release_dm_sent {
+            actions.push(Action::SendDm(DmKind::Released));
+        }
+        actions
+    }
+
+    fn compute_restore_roles(&self, ctx: &Context) -> Vec<RoleId> {
+        if !ctx.filter_restore {
+            return self.original_roles.clone();
+        }
+        self.saved_roles
+            .iter()
+            .copied()
+            .filter(|r| {
+                !self.struck_roles.contains(r)
+                    && !self.deleted_roles.contains(r)
+                    && !ctx.protected_roles.contains(r)
+            })
+            .collect()
+    }
+
+    fn enter_releasing(mut self, ctx: &Context) -> (State, Vec<Action>) {
+        let restore_plan = self.compute_restore_roles(ctx);
+        self.pending_release = false;
+        self.last_failure = None;
+        self.safeword_removed = false;
+        self.roles_restored = restore_plan.is_empty();
+        self.snapshot_cleared = false;
+        self.release_dm_sent = false;
+        self.restore_plan = restore_plan;
+        let actions = self.pending_release_actions();
+        (State::Releasing(self), actions)
+    }
+
+    fn apply_strike(&mut self, role: RoleId) -> bool {
+        if role == 0 {
+            return false;
+        }
+        let mut changed = false;
+        if !self.struck_roles.contains(&role) {
+            self.struck_roles.push(role);
+            self.struck_roles.sort_unstable();
+            changed = true;
+        }
+        let before_saved = self.saved_roles.len();
+        self.saved_roles.retain(|&r| r != role);
+        if self.saved_roles.len() != before_saved {
+            changed = true;
+        }
+        self.deferred_roles.retain(|&r| r != role);
+        if self.saved_roles.is_empty() {
+            self.roles_removed = true;
+        }
+        changed
+    }
+
+    fn apply_role_deleted(&mut self, role: RoleId) -> bool {
+        if role == 0 {
+            return false;
+        }
+        let mut changed = false;
+        if !self.deleted_roles.contains(&role) {
+            self.deleted_roles.push(role);
+            self.deleted_roles.sort_unstable();
+            changed = true;
+        }
+        let before_saved = self.saved_roles.len();
+        self.saved_roles.retain(|&r| r != role);
+        if self.saved_roles.len() != before_saved {
+            changed = true;
+        }
+        self.deferred_roles.retain(|&r| r != role);
+        if self.saved_roles.is_empty() {
+            self.roles_removed = true;
+        }
+        changed
+    }
+
+    fn apply_deferred_grant(&mut self, role: RoleId, ctx: &Context) -> bool {
+        if !ctx.defer_grants || role == 0 || role == ctx.safeword_role {
+            return false;
+        }
+        let mut changed = false;
+        if !self.saved_roles.contains(&role) {
+            self.saved_roles.push(role);
+            self.saved_roles.sort_unstable();
+            changed = true;
+            if !self.deferred_roles.contains(&role) {
+                self.deferred_roles.push(role);
+                self.deferred_roles.sort_unstable();
+            }
+        }
+        if !self.original_roles.contains(&role) {
+            self.original_roles.push(role);
+            self.original_roles.sort_unstable();
+            changed = true;
+        }
+        let before_struck = self.struck_roles.len();
+        self.struck_roles.retain(|&r| r != role);
+        if self.struck_roles.len() != before_struck {
+            changed = true;
+        }
+        changed
+    }
+
+    fn is_activation_step_done(&self, id: ActionId) -> Option<bool> {
+        match id {
+            ActionId::SaveSnapshot => Some(self.snapshot_saved),
+            ActionId::RemoveRoles => Some(self.roles_removed),
+            ActionId::AddSafewordRole => Some(self.safeword_added),
+            ActionId::SendActivatedDm => Some(self.dm_sent),
+            _ => None,
+        }
+    }
+
+    fn mark_activation_step_done(&mut self, id: ActionId) -> bool {
+        match id {
+            ActionId::SaveSnapshot => self.snapshot_saved = true,
+            ActionId::RemoveRoles => self.roles_removed = true,
+            ActionId::AddSafewordRole => self.safeword_added = true,
+            ActionId::SendActivatedDm => self.dm_sent = true,
+            _ => return false,
+        }
+        if self.last_failure.map(|(f, _)| f) == Some(id) {
+            self.last_failure = None;
+        }
+        true
+    }
+
+    fn is_release_step_done(&self, id: ActionId) -> Option<bool> {
+        match id {
+            ActionId::RemoveSafewordRole => Some(self.safeword_removed),
+            ActionId::RestoreRoles => Some(self.roles_restored),
+            ActionId::ClearSnapshot => Some(self.snapshot_cleared),
+            ActionId::SendReleasedDm => Some(self.release_dm_sent),
+            _ => None,
+        }
+    }
+
+    fn mark_release_step_done(&mut self, id: ActionId) -> bool {
+        match id {
+            ActionId::RemoveSafewordRole => self.safeword_removed = true,
+            ActionId::RestoreRoles => self.roles_restored = true,
+            ActionId::ClearSnapshot => self.snapshot_cleared = true,
+            ActionId::SendReleasedDm => self.release_dm_sent = true,
+            _ => return false,
+        }
+        if self.last_failure.map(|(f, _)| f) == Some(id) {
+            self.last_failure = None;
+        }
+        true
+    }
+}
+
 /// True only when a reaction event came from a non-bot user on the configured message and emoji.
 pub const fn is_actionable(
-    _author_is_bot: bool,
-    _message_id_matches: bool,
-    _emoji_matches: bool,
+    author_is_bot: bool,
+    message_id_matches: bool,
+    emoji_matches: bool,
 ) -> bool {
-    false
+    !author_is_bot && message_id_matches && emoji_matches
 }
 
 /// Advances the pure safeword state machine by one event.
-pub fn step(state: &State, _event: Event, _ctx: &Context) -> (State, Vec<Action>) {
-    (state.clone(), Vec::new())
+pub fn step(state: &State, event: Event, ctx: &Context) -> (State, Vec<Action>) {
+    match state {
+        State::Inactive => step_inactive(event, ctx),
+        State::Activating(snapshot) => step_activating(snapshot.clone(), event, ctx),
+        State::Active(snapshot) => step_active(snapshot.clone(), event, ctx),
+        State::Releasing(snapshot) => step_releasing(snapshot.clone(), event, ctx),
+    }
+}
+
+fn step_inactive(event: Event, ctx: &Context) -> (State, Vec<Action>) {
+    match event {
+        Event::ReactionAdded => {
+            let snapshot = Snapshot::new_from_context(ctx);
+            let actions = snapshot.pending_activation_actions();
+            (State::Activating(snapshot), actions)
+        }
+        Event::ReactionRemoved
+        | Event::Strike(_)
+        | Event::RoleDeleted(_)
+        | Event::GrantDuringActive(_)
+        | Event::ActionDone(_)
+        | Event::ActionFailed(_, _) => (State::Inactive, Vec::new()),
+    }
+}
+
+fn step_activating(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, Vec<Action>) {
+    match event {
+        Event::ReactionAdded => {
+            // Replayed add never overwrites the snapshot.
+            // If a prior action failed, retry only unacknowledged actions.
+            if snapshot.last_failure.is_some() {
+                snapshot.last_failure = None;
+                let actions = snapshot.pending_activation_actions();
+                (State::Activating(snapshot), actions)
+            } else {
+                snapshot.pending_release = false;
+                (State::Activating(snapshot), Vec::new())
+            }
+        }
+        Event::ReactionRemoved => {
+            snapshot.pending_release = true;
+            if snapshot.activation_complete() {
+                snapshot.enter_releasing(ctx)
+            } else if snapshot.last_failure.is_some() {
+                snapshot.last_failure = None;
+                let actions = snapshot.pending_activation_actions();
+                (State::Activating(snapshot), actions)
+            } else {
+                (State::Activating(snapshot), Vec::new())
+            }
+        }
+        Event::Strike(role) => {
+            snapshot.apply_strike(role);
+            (State::Activating(snapshot), Vec::new())
+        }
+        Event::RoleDeleted(role) => {
+            snapshot.apply_role_deleted(role);
+            (State::Activating(snapshot), Vec::new())
+        }
+        Event::GrantDuringActive(role) => {
+            snapshot.apply_deferred_grant(role, ctx);
+            (State::Activating(snapshot), Vec::new())
+        }
+        Event::ActionDone(id) => {
+            if snapshot.mark_activation_step_done(id) && snapshot.activation_complete() {
+                if snapshot.pending_release {
+                    snapshot.enter_releasing(ctx)
+                } else {
+                    (State::Active(snapshot), Vec::new())
+                }
+            } else {
+                (State::Activating(snapshot), Vec::new())
+            }
+        }
+        Event::ActionFailed(id, code) => {
+            if snapshot.is_activation_step_done(id) == Some(false) {
+                snapshot.last_failure = Some((id, code));
+            }
+            (State::Activating(snapshot), Vec::new())
+        }
+    }
+}
+
+fn step_active(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, Vec<Action>) {
+    match event {
+        Event::ReactionAdded => {
+            // Replayed add while Active never overwrites the snapshot.
+            if snapshot.last_failure.map(|(id, _)| id) == Some(ActionId::SaveSnapshot) {
+                snapshot.last_failure = None;
+                (State::Active(snapshot), vec![Action::SaveSnapshot])
+            } else {
+                (State::Active(snapshot), Vec::new())
+            }
+        }
+        Event::ReactionRemoved => snapshot.enter_releasing(ctx),
+        Event::Strike(role) => {
+            let changed = snapshot.apply_strike(role);
+            let actions = if changed {
+                vec![Action::SaveSnapshot]
+            } else {
+                Vec::new()
+            };
+            (State::Active(snapshot), actions)
+        }
+        Event::RoleDeleted(role) => {
+            let changed = snapshot.apply_role_deleted(role);
+            let actions = if changed {
+                vec![Action::SaveSnapshot]
+            } else {
+                Vec::new()
+            };
+            (State::Active(snapshot), actions)
+        }
+        Event::GrantDuringActive(role) => {
+            let changed = snapshot.apply_deferred_grant(role, ctx);
+            let actions = if changed {
+                vec![Action::SaveSnapshot]
+            } else {
+                Vec::new()
+            };
+            (State::Active(snapshot), actions)
+        }
+        Event::ActionDone(id) => {
+            if id == ActionId::SaveSnapshot
+                && snapshot.last_failure.map(|(f, _)| f) == Some(ActionId::SaveSnapshot)
+            {
+                snapshot.last_failure = None;
+            }
+            (State::Active(snapshot), Vec::new())
+        }
+        Event::ActionFailed(id, code) => {
+            if id == ActionId::SaveSnapshot {
+                snapshot.last_failure = Some((id, code));
+            }
+            (State::Active(snapshot), Vec::new())
+        }
+    }
+}
+
+fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, Vec<Action>) {
+    match event {
+        Event::ReactionRemoved => {
+            if snapshot.last_failure.is_some() {
+                snapshot.last_failure = None;
+                let actions = snapshot.pending_release_actions();
+                (State::Releasing(snapshot), actions)
+            } else {
+                (State::Releasing(snapshot), Vec::new())
+            }
+        }
+        Event::ReactionAdded => {
+            if snapshot.last_failure.is_some() {
+                snapshot.last_failure = None;
+                let actions = snapshot.pending_release_actions();
+                (State::Releasing(snapshot), actions)
+            } else {
+                (State::Releasing(snapshot), Vec::new())
+            }
+        }
+        Event::Strike(role) => {
+            snapshot.apply_strike(role);
+            if !snapshot.roles_restored && ctx.filter_restore {
+                snapshot.restore_plan.retain(|&r| r != role);
+                if snapshot.restore_plan.is_empty() {
+                    snapshot.roles_restored = true;
+                }
+            }
+            (State::Releasing(snapshot), Vec::new())
+        }
+        Event::RoleDeleted(role) => {
+            snapshot.apply_role_deleted(role);
+            if !snapshot.roles_restored && ctx.filter_restore {
+                snapshot.restore_plan.retain(|&r| r != role);
+                if snapshot.restore_plan.is_empty() {
+                    snapshot.roles_restored = true;
+                }
+            }
+            (State::Releasing(snapshot), Vec::new())
+        }
+        Event::GrantDuringActive(_) => (State::Releasing(snapshot), Vec::new()),
+        Event::ActionDone(id) => {
+            if snapshot.mark_release_step_done(id) && snapshot.release_complete() {
+                (State::Inactive, Vec::new())
+            } else {
+                (State::Releasing(snapshot), Vec::new())
+            }
+        }
+        Event::ActionFailed(id, code) => {
+            if snapshot.is_release_step_done(id) == Some(false) {
+                snapshot.last_failure = Some((id, code));
+            }
+            (State::Releasing(snapshot), Vec::new())
+        }
+    }
 }
 
 /// Computes the single deterministic next action on startup from stored state and live reaction presence.
-pub fn restart_action(_state: &State, _reaction_present_now: bool) -> RestartAction {
-    RestartAction::NoOp
+pub fn restart_action(state: &State, reaction_present_now: bool) -> RestartAction {
+    match state {
+        State::Inactive => {
+            if reaction_present_now {
+                RestartAction::Trigger(Event::ReactionAdded)
+            } else {
+                RestartAction::NoOp
+            }
+        }
+        State::Activating(snapshot) => {
+            if !reaction_present_now && !snapshot.pending_release {
+                return RestartAction::Trigger(Event::ReactionRemoved);
+            }
+            if let Some(next) = snapshot.pending_activation_actions().into_iter().next() {
+                RestartAction::Execute(next)
+            } else if reaction_present_now && !snapshot.pending_release {
+                RestartAction::NoOp
+            } else {
+                RestartAction::Trigger(Event::ReactionRemoved)
+            }
+        }
+        State::Active(snapshot) => {
+            if !reaction_present_now {
+                RestartAction::Trigger(Event::ReactionRemoved)
+            } else if snapshot.last_failure.map(|(id, _)| id) == Some(ActionId::SaveSnapshot) {
+                RestartAction::Execute(Action::SaveSnapshot)
+            } else {
+                RestartAction::NoOp
+            }
+        }
+        State::Releasing(snapshot) => {
+            if let Some(next) = snapshot.pending_release_actions().into_iter().next() {
+                RestartAction::Execute(next)
+            } else if reaction_present_now {
+                RestartAction::Trigger(Event::ReactionAdded)
+            } else {
+                RestartAction::NoOp
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +692,11 @@ mod tests {
         }
     }
 
-    fn acknowledge_all(mut state: State, actions: &[Action], ctx: &Context) -> (State, Vec<Action>) {
+    fn acknowledge_all(
+        mut state: State,
+        actions: &[Action],
+        ctx: &Context,
+    ) -> (State, Vec<Action>) {
         let mut follow_up = Vec::new();
         for action in actions {
             let (next, emitted) = step(&state, Event::ActionDone(action.id()), ctx);
@@ -255,7 +716,9 @@ mod tests {
         ]);
         let (state, actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
 
-        let snap = state.snapshot().expect("must enter Activating with snapshot");
+        let snap = state
+            .snapshot()
+            .expect("must enter Activating with snapshot");
         assert_eq!(snap.saved_roles, vec![ROLE_VERIFIED, ROLE_MALEDOM]);
         assert_eq!(
             actions,
@@ -319,10 +782,8 @@ mod tests {
         assert!(matches!(activating, State::Activating(_)));
 
         // Acknowledge only the first activation step before ReactionRemoved arrives.
-        let (activating, _) =
-            step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
-        let (activating_with_release, immediate) =
-            step(&activating, Event::ReactionRemoved, &ctx);
+        let (activating, _) = step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
+        let (activating_with_release, immediate) = step(&activating, Event::ReactionRemoved, &ctx);
         assert!(matches!(activating_with_release, State::Activating(_)));
         assert!(immediate.is_empty());
 
@@ -358,8 +819,7 @@ mod tests {
         let mut release_ctx = ctx.clone();
         release_ctx.protected_roles = vec![ROLE_MEDIA];
 
-        let (releasing, release_actions) =
-            step(&active, Event::ReactionRemoved, &release_ctx);
+        let (releasing, release_actions) = step(&active, Event::ReactionRemoved, &release_ctx);
         assert!(matches!(releasing, State::Releasing(_)));
         assert_eq!(
             release_actions,
@@ -379,12 +839,7 @@ mod tests {
             blind_actions,
             vec![
                 Action::RemoveSafewordRole,
-                Action::RestoreRoles(vec![
-                    ROLE_VERIFIED,
-                    ROLE_MEMBER,
-                    ROLE_MEDIA,
-                    ROLE_FEMDOM,
-                ]),
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER, ROLE_MEDIA, ROLE_FEMDOM,]),
                 Action::ClearSnapshot,
                 Action::SendDm(DmKind::Released),
             ]
@@ -395,7 +850,10 @@ mod tests {
     fn empty_snapshot_still_toggles_safeword_role_and_sends_both_dms() {
         let ctx = sample_ctx(vec![ROLE_UNRESTRICTED]);
         let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
-        assert_eq!(activating.snapshot().unwrap().saved_roles, Vec::<RoleId>::new());
+        assert_eq!(
+            activating.snapshot().unwrap().saved_roles,
+            Vec::<RoleId>::new()
+        );
         assert_eq!(
             act_actions,
             vec![
@@ -435,17 +893,17 @@ mod tests {
             vec![ROLE_MEMBER, ROLE_DEFERRED]
         );
         let (_, release_actions) = step(&active_deferred, Event::ReactionRemoved, &ctx);
-        assert!(release_actions.contains(&Action::RestoreRoles(vec![
-            ROLE_MEMBER,
-            ROLE_DEFERRED
-        ])));
+        assert!(release_actions.contains(&Action::RestoreRoles(vec![ROLE_MEMBER, ROLE_DEFERRED])));
 
         // Deferral disabled: GrantDuringActive is ignored.
         ctx.defer_grants = false;
         let (active_ignored, ignore_actions) =
             step(&active, Event::GrantDuringActive(ROLE_DEFERRED), &ctx);
         assert!(ignore_actions.is_empty());
-        assert_eq!(active_ignored.snapshot().unwrap().saved_roles, vec![ROLE_MEMBER]);
+        assert_eq!(
+            active_ignored.snapshot().unwrap().saved_roles,
+            vec![ROLE_MEMBER]
+        );
     }
 
     #[test]
@@ -455,6 +913,14 @@ mod tests {
         let (active, _) = acknowledge_all(activating.clone(), &act_actions, &ctx);
         let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
 
+        for state in [&State::Inactive, &activating, &active, &releasing] {
+            for present in [true, false] {
+                let first = restart_action(state, present);
+                let second = restart_action(state, present);
+                assert_eq!(first, second);
+            }
+        }
+
         // Inactive
         assert_eq!(
             restart_action(&State::Inactive, true),
@@ -462,7 +928,7 @@ mod tests {
         );
         assert_eq!(restart_action(&State::Inactive, false), RestartAction::NoOp);
 
-        // Activating
+        // Activating (walks through each unacknowledged step in order)
         assert_eq!(
             restart_action(&activating, true),
             RestartAction::Execute(Action::SaveSnapshot)
@@ -470,6 +936,12 @@ mod tests {
         assert_eq!(
             restart_action(&activating, false),
             RestartAction::Trigger(Event::ReactionRemoved)
+        );
+        let (act_after_save, _) =
+            step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
+        assert_eq!(
+            restart_action(&act_after_save, true),
+            RestartAction::Execute(Action::RemoveRoles(vec![ROLE_VERIFIED]))
         );
 
         // Active
@@ -496,10 +968,8 @@ mod tests {
         let (activating, _) = step(&State::Inactive, Event::ReactionAdded, &ctx);
 
         // Acknowledge SaveSnapshot and RemoveRoles, then fail AddSafewordRole.
-        let (activating, _) =
-            step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
-        let (activating, _) =
-            step(&activating, Event::ActionDone(ActionId::RemoveRoles), &ctx);
+        let (activating, _) = step(&activating, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
+        let (activating, _) = step(&activating, Event::ActionDone(ActionId::RemoveRoles), &ctx);
         let (failed_state, fail_emitted) = step(
             &activating,
             Event::ActionFailed(ActionId::AddSafewordRole, FailureCode::TransientHttp),
@@ -511,9 +981,19 @@ mod tests {
             Some((ActionId::AddSafewordRole, FailureCode::TransientHttp))
         );
 
+        // Stale failure on an already-acknowledged action does not un-acknowledge it.
+        let (failed_state, _) = step(
+            &failed_state,
+            Event::ActionFailed(ActionId::SaveSnapshot, FailureCode::StorageError),
+            &ctx,
+        );
+        assert_eq!(
+            failed_state.snapshot().unwrap().last_failure,
+            Some((ActionId::AddSafewordRole, FailureCode::TransientHttp))
+        );
+
         // Retry via ReactionAdded: only unacknowledged actions are emitted.
-        let (retried_state, retry_actions) =
-            step(&failed_state, Event::ReactionAdded, &ctx);
+        let (retried_state, retry_actions) = step(&failed_state, Event::ReactionAdded, &ctx);
         assert_eq!(
             retry_actions,
             vec![Action::AddSafewordRole, Action::SendDm(DmKind::Activated)]
@@ -522,6 +1002,31 @@ mod tests {
 
         let (active, _) = acknowledge_all(retried_state, &retry_actions, &ctx);
         assert!(matches!(active, State::Active(_)));
+
+        // Also verify failure and retry during Releasing.
+        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (releasing, _) = step(
+            &releasing,
+            Event::ActionDone(ActionId::RemoveSafewordRole),
+            &ctx,
+        );
+        let (releasing_failed, _) = step(
+            &releasing,
+            Event::ActionFailed(ActionId::RestoreRoles, FailureCode::RateLimited),
+            &ctx,
+        );
+        let (releasing_retried, rel_retry_actions) =
+            step(&releasing_failed, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            rel_retry_actions,
+            vec![
+                Action::RestoreRoles(vec![ROLE_VERIFIED]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ]
+        );
+        let (inactive, _) = acknowledge_all(releasing_retried, &rel_retry_actions, &ctx);
+        assert_eq!(inactive, State::Inactive);
     }
 
     #[test]
@@ -543,6 +1048,40 @@ mod tests {
         assert!(!is_actionable(false, false, true));
         assert!(!is_actionable(false, true, false));
         assert!(!is_actionable(true, false, false));
+    }
+
+    #[test]
+    fn boundary_and_adversarial_transitions_preserve_consistency() {
+        // 1. Zero role IDs and safeword role in GrantDuringActive/Strike/RoleDeleted are ignored.
+        let ctx = sample_ctx(vec![0, SAFEWORD_ROLE, ROLE_VERIFIED]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        assert_eq!(
+            activating.snapshot().unwrap().saved_roles,
+            vec![ROLE_VERIFIED]
+        );
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+
+        let (active, no_actions_zero) = step(&active, Event::GrantDuringActive(0), &ctx);
+        assert!(no_actions_zero.is_empty());
+        let (active, no_actions_sw) = step(&active, Event::GrantDuringActive(SAFEWORD_ROLE), &ctx);
+        assert!(no_actions_sw.is_empty());
+        let (active, no_actions_dup) = step(&active, Event::GrantDuringActive(ROLE_VERIFIED), &ctx);
+        assert!(no_actions_dup.is_empty());
+
+        // 2. If all saved roles are struck/deleted/protected, RestoreRoles is omitted and release still completes.
+        let (active_all_struck, strike_actions) = step(&active, Event::Strike(ROLE_VERIFIED), &ctx);
+        assert_eq!(strike_actions, vec![Action::SaveSnapshot]);
+        let (releasing, rel_actions) = step(&active_all_struck, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            rel_actions,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ]
+        );
+        let (inactive, _) = acknowledge_all(releasing, &rel_actions, &ctx);
+        assert_eq!(inactive, State::Inactive);
     }
 
     #[test]
@@ -599,13 +1138,25 @@ mod tests {
         // AddSafewordRole is emitted at most once.
         let mut total_adds = 0usize;
         let (s1, a1) = step(&State::Inactive, Event::ReactionAdded, &ctx);
-        total_adds += a1.iter().filter(|a| matches!(a, Action::AddSafewordRole)).count();
+        total_adds += a1
+            .iter()
+            .filter(|a| matches!(a, Action::AddSafewordRole))
+            .count();
         let (s2, a2) = step(&s1, Event::ReactionAdded, &ctx);
-        total_adds += a2.iter().filter(|a| matches!(a, Action::AddSafewordRole)).count();
+        total_adds += a2
+            .iter()
+            .filter(|a| matches!(a, Action::AddSafewordRole))
+            .count();
         let (s3, a3) = acknowledge_all(s2, &a1, &ctx);
-        total_adds += a3.iter().filter(|a| matches!(a, Action::AddSafewordRole)).count();
+        total_adds += a3
+            .iter()
+            .filter(|a| matches!(a, Action::AddSafewordRole))
+            .count();
         let (_s4, a4) = step(&s3, Event::ReactionAdded, &ctx);
-        total_adds += a4.iter().filter(|a| matches!(a, Action::AddSafewordRole)).count();
+        total_adds += a4
+            .iter()
+            .filter(|a| matches!(a, Action::AddSafewordRole))
+            .count();
         assert_eq!(total_adds, 1);
     }
 }
