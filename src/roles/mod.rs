@@ -1,0 +1,5 @@
+//! Role grant eligibility (pure policy, no Discord types).
+// Wiring card W1 removes this allow once a production caller exists.
+#![allow(dead_code)]
+
+pub mod eligibility;
