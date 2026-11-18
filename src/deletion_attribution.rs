@@ -57,6 +57,13 @@ impl LastSeenCounts {
             cap,
         }
     }
+    /// Baseline: treat every given entry as fully credited already (startup seeding).
+    pub fn seed_baseline(&mut self, entries: &[AuditEntryLite]) {
+        for e in entries {
+            self.record(e.id, e.count);
+        }
+    }
+
     pub fn get(&self, id: u64) -> Option<u64> {
         self.map.get(&id).copied()
     }
@@ -320,5 +327,140 @@ mod tests {
     fn retry_delays_are_short() {
         assert!(LOOKUP_DELAYS_MS.iter().sum::<u64>() <= 3000);
         assert_eq!(LOOKUP_DELAYS_MS[0], 0);
+    }
+
+    #[test]
+    fn burst_of_five_with_count_five_credits_each_then_self_delete_is_user() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 5, 1000)];
+        for _ in 0..5 {
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn count_rising_across_lookups_credits_each_time() {
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 1, 2000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 2, 20_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 40_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 41_000)], &mut seen),
+            DeletedBy::User
+        );
+    }
+
+    #[test]
+    fn repeated_lookup_does_not_double_consume_one_credit() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+        assert_eq!(run(true, &e, &mut seen), DeletedBy::BotAuthor);
+    }
+
+    #[test]
+    fn failed_attempt_and_no_credit_attempts_do_not_consume_credit() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        let r = attribute_deletion(AUTHOR, false, CHAN, NOW, Err(AuditLookupFailed), &mut seen);
+        assert_eq!(r, DeletedBy::AuditUnavailable);
+        // a retry whose lookup shows no matching entry (other channel) consumes nothing
+        let r = attribute_deletion(AUTHOR, false, CHAN + 9, NOW, Ok(&e), &mut seen);
+        assert_eq!(r, DeletedBy::User);
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+    }
+
+    #[test]
+    fn stale_never_seen_entry_is_not_credited_but_later_count_rise_is() {
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 60_000)], &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 61_000)], &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 4, 70_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 4, 71_000)], &mut seen),
+            DeletedBy::User
+        );
+    }
+
+    #[test]
+    fn unrelated_lookup_first_does_not_suppress_burst_credits() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(
+            attribute_deletion(333, false, 444, NOW, Ok(&e), &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            attribute_deletion(AUTHOR, false, 444, NOW, Ok(&e), &mut seen),
+            DeletedBy::User
+        );
+        for _ in 0..3 {
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn two_executors_pick_most_pending_credits_and_credit_only_that_entry() {
+        let mut seen = LastSeenCounts::new();
+        seen.record(1, 1);
+        seen.record(2, 1);
+        // entry 1: 3 pending (older), entry 2: 1 pending (fresher)
+        let e = [entry(2, MOD_B, 2, 500), entry(1, MOD_A, 4, 30_000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(seen.get(1), Some(2));
+        assert_eq!(seen.get(2), Some(1));
+        // pending now 2 vs 1: A again, then tie 1 vs 1: freshest (B), then A's last
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_B));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn credit_map_stays_bounded_and_evicts_oldest_while_crediting() {
+        let mut seen = LastSeenCounts::with_cap(3);
+        for id in 1..=6u64 {
+            let e = [entry(id, MOD_A, 1, 1000)];
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.get(1), None);
+        assert_eq!(seen.get(6), Some(1));
+    }
+
+    #[test]
+    fn seeding_baselines_window_so_old_history_is_not_credited() {
+        let mut seen = LastSeenCounts::new();
+        // entry looks fresh but was already present at startup: nothing pending
+        seen.seed_baseline(&[entry(1, MOD_A, 2, 1000)]);
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 2, 1500)], &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 9000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
     }
 }
