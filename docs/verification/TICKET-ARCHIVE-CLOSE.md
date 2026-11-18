@@ -7,8 +7,10 @@ registration, network, `.env`, production DB or private-ticket export was used.
 ## Gate status (read first)
 
 * `tickets::runtime::OPENING_APPROVED = false` — unchanged. `main.rs` asserts it in a
-  `const { assert!(..) }` block. Startup reconciliation reports and gates only
-  (`Report::opening_gate(OPENING_APPROVED)`); flipping the flag is a separate owner decision.
+  `const { assert!(..) }` block. Startup reconciliation records readiness (`main.rs` ~2524-2525)
+  and the runtime route enforces it through `runtime::opening_permitted()` (reconcile report
+  clean AND `OPENING_APPROVED`); `Report::opening_gate` is only the pure helper beneath it.
+  Flipping the flag is a separate owner decision.
 * `TICKETS_ENABLED` stays default off. With tickets disabled, existing non-ticket behaviour is unchanged.
 * **Not live-ready.** The Serenity adapter (freeze/probe/delete/DM/history) and `HttpDownloader`
   are compiled and wired but exercised only through fakes at the Discord/network boundary.
@@ -72,9 +74,10 @@ reached.
   * `retrieve` — read-only: re-verifies the recorded archive (manifest hash, transcript, assets,
     IDs) and replies with archive name, counts and manifest sha256 only (no content/paths/export).
     Works after channel deletion. Authorization is checked before any archive read; requesters,
-    admins without the staff role, and foreign-guild callers get a fixed denial and zero reads
-    (test `retrieval_is_staff_or_owner_only_...`: archive tampered, denied callers still see only
-    the denial text). Full browse/restore is A08.
+    admins without the staff role, and foreign-guild callers get a fixed denial. Authorization
+    precedes the archive read in code; the test `retrieval_is_staff_or_owner_only_...` tampers the
+    archive and shows denied callers see only the denial text — a tamper-oracle INFERENCE of zero
+    reads, not a counted read proof (see Round 5 limits). Full browse/restore is A08.
   * `attach` (needs `confirm=true`, `reason`) — link a candidate channel to a reserved/creating/
     recovery ticket only if guild, category, type and private overwrite match.
   * `release` (needs `confirm=true`, `reason`) — frees the slot of a reserved/creating/recovery
@@ -123,11 +126,11 @@ succeed against the committed lock.
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --locked --offline --all-targets -- -D warnings -D deprecated -D clippy::result_large_err -D clippy::type_complexity` | exit 0, zero warnings |
-| `cargo test --locked --offline` | 84 bin + 30 `archive_input_safety` + 7 `logger_fixture_shapes` + 5 `ticket_archive_fixture_factory`, all pass |
+| `cargo test --locked --offline` | HISTORICAL (round 4, 84 bin): superseded — see the Round 6 section for the final-at-head counts |
 | `cargo build --locked --offline`, `cargo check --locked --offline` | exit 0 |
 | `git diff --check` | clean |
 
-(Final run at the head commit named in the review request; earlier rounds: 65, 71, 72 bin tests.)
+(Historical table: round 4. Earlier rounds: 65, 71, 72 bin; round 5: 91 bin. Final counts: Round 6 section.)
 RED attribution: the thread-privacy RED was executed. For the round-4 items, new tests were
 written alongside/after the code in the same slice; the stale-orphan test replaces the previous
 assertion that such an orphan yields `Retained("exists")` (behaviour intentionally changed to
@@ -195,3 +198,21 @@ correct, they are not RED/GREEN fixes):
 
 Still not covered / limits: no live Discord or network; the member-event control only covers
 `GuildMemberRemoval`; the `Hang` timeout case relies on a 200 ms test deadline.
+
+## Round 6 (final-at-head counts)
+
+* Orphan adoption now compares the COMPLETE expected asset inventory (`m.assets == expected`:
+  attachment id, message id, generated file, len/declared size, sha256, display name) derived from
+  the current source, not just the count. A same-count orphan with a wrong attachment id, message
+  association, display name or file name is preserved untouched and a fresh seq N+1 archive is
+  published, verified and recorded before the single delete. An exact-inventory orphan is adopted.
+  RED (before fix): `orphan_with_same_asset_count_but_wrong_identity_is_never_adopted` failed
+  (`left: ticket-1-1, right: ticket-1-2`).
+* `recorded_manifest` (shared by close, reconcile and retrieval) now also requires
+  `manifest.assets.len() == recorded assets`. Tests `recorded_asset_count_mismatch_fails_closed_for_{close,reconcile,retrieval}`
+  each failed first (close -> Closed; reconcile closed 1; retrieval "Integrity re-verified: OK"), now
+  pass. Recorded manifests/hashes are never modified.
+* The `#[allow(clippy::ptr_arg)]` suppressions are removed; slice helpers are adapted to the
+  `Mutation` fn pointer with const closures (`EDIT_FIRST`, `EDIT_FOOTER`, `EDIT_URL`).
+* Final: fmt/check/build exit 0; tests 96 bin + 30 + 7 + 5 pass; strict all-target Clippy clean.
+  `OPENING_APPROVED` stays false; `TICKETS_ENABLED` default off.
