@@ -10,6 +10,15 @@ const TRANSCRIPT: &str = "transcript.html";
 const ASSETS: &str = "assets";
 
 #[derive(Clone, Debug)]
+pub struct RestoreRequest<'a> {
+    pub dir_name: &'a str,
+    pub expected_manifest_sha: &'a str,
+    pub expected_ticket: i64,
+    pub expected_channel: u64,
+    pub nonce: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct RestoreLimits {
     pub max_files: usize,
     pub max_total_bytes: u64,
@@ -47,14 +56,17 @@ pub struct Restored {
 /// The returned file and byte counts include the manifest and transcript.
 pub fn restore_to_staging(
     archive_root: &OwnedRoot,
-    dir_name: &str,
-    expected_manifest_sha: &str,
-    expected_ticket: i64,
-    expected_channel: u64,
     staging_root: &OwnedRoot,
-    nonce: u64,
+    req: &RestoreRequest<'_>,
     limits: &RestoreLimits,
 ) -> Result<Restored, RestoreError> {
+    let RestoreRequest {
+        dir_name,
+        expected_manifest_sha,
+        expected_ticket,
+        expected_channel,
+        nonce,
+    } = *req;
     let (ticket, seq) = dir_name
         .strip_prefix("ticket-")
         .and_then(|suffix| suffix.split_once('-'))
@@ -337,27 +349,29 @@ mod tests {
         fn run(&self, sha: &str, ticket: i64, channel: u64) -> Result<Restored, RestoreError> {
             restore_to_staging(
                 &self.archive,
-                &self.published.dir_name,
-                sha,
-                ticket,
-                channel,
                 &self.staging,
-                42,
+                &RestoreRequest {
+                    expected_manifest_sha: sha,
+                    expected_ticket: ticket,
+                    expected_channel: channel,
+                    ..self.request(42)
+                },
                 &RestoreLimits::default(),
             )
         }
 
-        fn restore(&self, nonce: u64, limits: &RestoreLimits) -> Result<Restored, RestoreError> {
-            restore_to_staging(
-                &self.archive,
-                &self.published.dir_name,
-                &self.published.manifest_sha256,
-                5,
-                9,
-                &self.staging,
+        fn request(&self, nonce: u64) -> RestoreRequest<'_> {
+            RestoreRequest {
+                dir_name: &self.published.dir_name,
+                expected_manifest_sha: &self.published.manifest_sha256,
+                expected_ticket: 5,
+                expected_channel: 9,
                 nonce,
-                limits,
-            )
+            }
+        }
+
+        fn restore(&self, nonce: u64, limits: &RestoreLimits) -> Result<Restored, RestoreError> {
+            restore_to_staging(&self.archive, &self.staging, &self.request(nonce), limits)
         }
 
         fn empty_staging(&self) {
@@ -488,12 +502,11 @@ mod tests {
             assert_eq!(
                 restore_to_staging(
                     &f.archive,
-                    name,
-                    &f.published.manifest_sha256,
-                    5,
-                    9,
                     &f.staging,
-                    42,
+                    &RestoreRequest {
+                        dir_name: name,
+                        ..f.request(42)
+                    },
                     &RestoreLimits::default()
                 ),
                 Err(RestoreError::BadName),
@@ -556,12 +569,8 @@ mod tests {
             assert_eq!(
                 restore_to_staging(
                     &f.archive,
-                    &f.published.dir_name,
-                    &f.published.manifest_sha256,
-                    5,
-                    9,
                     staging,
-                    42,
+                    &f.request(42),
                     &RestoreLimits::default()
                 ),
                 Err(RestoreError::Unsafe)
