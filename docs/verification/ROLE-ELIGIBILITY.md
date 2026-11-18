@@ -18,7 +18,7 @@ Per-rule tests, all six permission bits on every path, safeword matrix, removals
 RED evidence (commit 5dfc542, stub `decide` returning Allow): 11 of 14 failed (all behavior tests; only baseline, staff-ignored-on-automated and code-stability passed). Then implemented.
 
 ## Config keys (READ by the wiring card, not here)
-- `PROTECTED_ROLE_IDS`: comma list of role ids, default empty. Unparseable entries should be dropped with a warning (never widen); empty means no extra protection (rules 1-4,6 still apply).
+- `PROTECTED_ROLE_IDS`: comma list of role ids, default empty. Fail closed: a malformed entry makes the key invalid; the wiring card must disable the automated grant paths and alert (never drop entries, that would unprotect a role); empty means no extra protection (rules 1-4,6 still apply).
 No other keys. Safeword state and restricted roles come from the safeword feature at call time.
 
 ## NOT done

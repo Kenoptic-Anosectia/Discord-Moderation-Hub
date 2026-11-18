@@ -317,6 +317,25 @@ mod tests {
     }
 
     #[test]
+    fn privileged_bits_match_discord_wire_values() {
+        for lit in [0x2u64, 0x4, 0x8, 0x20, 0x1000_0000, 0x100_0000_0000] {
+            for p in AUTOMATED {
+                let mut r = base(p);
+                r.role.permissions = lit;
+                assert_eq!(
+                    decide(&r),
+                    Decision::Deny(DenyReason::PrivilegedPermission),
+                    "{p:?} {lit:#x}"
+                );
+            }
+        }
+        assert_eq!(
+            PRIVILEGED_MASK,
+            0x2 | 0x4 | 0x8 | 0x20 | 0x1000_0000 | 0x100_0000_0000
+        );
+    }
+
+    #[test]
     fn protected_set_denies_automated() {
         let prot = [7u64, ROLE];
         for p in AUTOMATED {
