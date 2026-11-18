@@ -5,15 +5,30 @@
 //! (durable id, survives close/delete/archive), or (b) it is, or moved from/to, a configured
 //! ticket category (covers creation-before-attach and cache misses). If the answer cannot be
 //! established for a target-guild channel, the event is skipped (never leaked).
+//!
+//! This module only decides; it does not log, cache, delete or publish anything itself. The
+//! caller keeps all side effects behind the decision (see `guarded`). It deliberately does
+//! NOT decide whether a ticket may be opened — that is `tickets::controller` — and it does
+//! NOT own the ticket database beyond reading the durable channel-id linkage.
+//!
+//! Trust boundary: the event payload comes straight from Discord and is untrusted, as are
+//! the channel ids, parent ids and guild ids in it. A channel lookup may fail or miss the
+//! cache, so the decision is fail-closed: when the privacy of a channel-bearing event
+//! cannot be established, the event is skipped rather than logged.
+
 use super::policy::Settings;
 use super::repository::Repository;
 use serenity::all::{ChannelId, FullEvent};
 
+/// The outcome of the private-scope decision for one event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
+    /// The event may be handled by the general logger.
     Allow,
+    /// The event is private, unknown or otherwise unsafe to log: it must be skipped.
     Skip,
 }
+/// What the channel lookup found for one channel id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lookup {
     /// A guild channel/thread; `parent` is its category (or thread parent), if any.
@@ -25,15 +40,26 @@ pub enum Lookup {
 }
 /// Injected boundary: cache first, then HTTP, in the real adapter.
 pub trait ChannelLookup: Send + Sync {
+    /// Resolves a channel id to its guild/parent information. Implementations may hit the
+    /// network; `Lookup::Unknown` must be returned when the channel cannot be resolved.
     fn lookup(&self, channel: ChannelId) -> impl std::future::Future<Output = Lookup> + Send;
 }
 
+/// True when the id is one of the two configured ticket categories.
+///
+/// The explicit `id != 0` guard keeps Discord's null id (0) from ever matching a
+/// category. A configured category id of 0 is already rejected by `Settings::valid`.
 fn is_category(s: &Settings, id: u64) -> bool {
     id != 0 && (id == s.support_category || id == s.age_category)
 }
 
 /// Channel-bearing parts of an event: (guild if carried, channel ids, parents known from the
 /// event payload itself — old AND new for moves).
+///
+/// `channel_bearing` is false for events that carry no channel at all (members, roles,
+/// guilds, ...); those are always allowed through. `parent_known` records that the payload
+/// already proves the channel's parent, so no lookup is needed. `uncertain_old` marks a move
+/// whose previous parent could not be proven from the payload.
 struct Facts {
     guild: Option<u64>,
     channels: Vec<ChannelId>,
@@ -44,6 +70,13 @@ struct Facts {
     /// A move whose previous parent cannot be proven (cache miss): fail closed.
     uncertain_old: bool,
 }
+/// Extracts the channel-relevant facts from an event.
+///
+/// Only the variants listed below are channel-bearing; everything else sets
+/// `channel_bearing = false` and is allowed through untouched. For channel/thread
+/// create/update/delete the payload carries the parent, so `parent_known` is set and no
+/// lookup is required. For a channel move the *old* parent is recorded as well as the new
+/// one, and `uncertain_old` is set when the old state is missing.
 fn facts(event: &FullEvent) -> Facts {
     let mut f = Facts {
         guild: None,
@@ -139,6 +172,12 @@ fn facts(event: &FullEvent) -> Facts {
 
 /// `enabled` = tickets feature on. `settings` None while enabled means invalid config:
 /// fail closed for every channel-bearing event.
+///
+/// Returns `Decision::Skip` (never an error) when the event may belong to a private scope,
+/// and `Decision::Allow` only when the event is provably outside ticket scope. The decision
+/// is fail-closed: an unknown channel, an unresolvable lookup, a database error or a
+/// missing configuration all lead to `Skip` for channel-bearing events. The caller must run
+/// this before performing any logging or cache work for the event.
 pub async fn decide(
     enabled: bool,
     settings: Option<&Settings>,
@@ -166,6 +205,7 @@ pub async fn decide(
         match repo.channel_known(ch.get()).await {
             Ok(true) => return Decision::Skip,
             Ok(false) => {}
+            // A database error means the linkage cannot be established: fail closed.
             Err(_) => return Decision::Skip,
         }
     }
@@ -203,6 +243,7 @@ pub async fn decide(
                 }
                 // A thread under a ticket channel reports the ticket channel as parent.
                 if let Some(p) = parent {
+                    // `unwrap_or(true)` keeps the fail-closed behaviour on a database error.
                     if repo.channel_known(p).await.unwrap_or(true) {
                         return Decision::Skip;
                     }
@@ -221,10 +262,13 @@ pub async fn decide(
 
 /// Observable production counters for the guard (skipped vs. let through).
 pub struct Counters {
+    /// Number of events the guard refused to let through.
     pub skipped: std::sync::atomic::AtomicU64,
+    /// Number of events the guard let through.
     pub allowed: std::sync::atomic::AtomicU64,
 }
 impl Counters {
+    /// Creates a counter pair with both counters at zero.
     pub const fn new() -> Self {
         Self {
             skipped: std::sync::atomic::AtomicU64::new(0),
@@ -232,10 +276,14 @@ impl Counters {
         }
     }
 }
+/// Process-wide counter pair used by the production event handler.
 pub static COUNTERS: Counters = Counters::new();
 /// Production routing seam: `event_handler` runs ALL cache insertion / body / embed / topic /
 /// asset construction and log output inside `sink`, which executes only on `Allow`.
 /// Interactions are never channel-logging paths and always pass through.
+///
+/// Returns `None` without running the sink when the event is private, unknown or unsafe.
+/// The sink is called at most once, and only when the decision is `Allow`.
 pub async fn guarded<F, Fut, T>(
     enabled: bool,
     settings: Option<&Settings>,
@@ -265,6 +313,7 @@ pub struct SerenityLookup<'a>(pub &'a serenity::all::Context);
 impl ChannelLookup for SerenityLookup<'_> {
     async fn lookup(&self, channel: ChannelId) -> Lookup {
         use serenity::all::Channel;
+        // Cache first: the cache is authoritative for guild membership and avoids a request.
         for g in self.0.cache.guilds() {
             if let Some(c) = self
                 .0
@@ -277,6 +326,7 @@ impl ChannelLookup for SerenityLookup<'_> {
                 };
             }
         }
+        // Cache miss: exactly one HTTP fetch. A failed fetch is `Unknown`, never a guess.
         match channel.to_channel(self.0).await {
             Ok(Channel::Guild(c)) => Lookup::Guild {
                 parent: c.parent_id.map(|p| p.get()),
@@ -372,6 +422,9 @@ mod tests {
         decide(true, Some(&settings()), Some(repo), ev, l).await
     }
 
+    /// Proves that with the tickets feature disabled every channel-bearing event is allowed
+    /// and no channel lookup is performed.
+    /// Fails if the disabled path starts consulting the repository or the lookup.
     #[tokio::test]
     async fn disabled_tickets_change_nothing_and_never_touch_lookup() {
         let repo = repo_with_ticket(900).await;
@@ -385,6 +438,11 @@ mod tests {
         }
         assert_eq!(l.calls.load(Ordering::SeqCst), 0);
     }
+    /// Proves that a channel id that ever belonged to a ticket stays private in every
+    /// message-bearing path, even when the lookup would call it public, and that this holds
+    /// after the ticket was closed.
+    /// Fails if the durable ticket linkage stops being consulted, or if closing a ticket
+    /// makes its channel id loggable again.
     #[tokio::test]
     async fn durable_ticket_ids_are_private_in_every_message_path_even_on_cache_miss() {
         let repo = repo_with_ticket(900).await;
@@ -396,6 +454,9 @@ mod tests {
         repo.force_status_for_test(1, "closed").await.unwrap();
         assert_eq!(d(&repo, &delete(900), &l).await, Decision::Skip);
     }
+    /// Proves that channels inside a configured ticket category are private before any ticket
+    /// row links them, for both the category children and the category itself.
+    /// Fails if the category check stops applying, or if creation-before-attach leaks.
     #[tokio::test]
     async fn configured_category_children_are_private_before_attach() {
         let repo = Repository::open(":memory:").await.unwrap(); // no ticket row yet: creation-before-attach
@@ -415,6 +476,10 @@ mod tests {
             assert_eq!(d(&repo, &del, &l).await, Decision::Skip);
         }
     }
+    /// Proves that a channel move is judged on both the old and the new parent: moving into
+    /// or out of a ticket category is skipped, while moving between unrelated categories is
+    /// allowed.
+    /// Fails if only one side of the move is checked.
     #[tokio::test]
     async fn channel_moves_check_old_and_new_category() {
         let repo = Repository::open(":memory:").await.unwrap();
@@ -435,6 +500,10 @@ mod tests {
         assert_eq!(d(&repo, &out, &l).await, Decision::Skip);
         assert_eq!(d(&repo, &pub_, &l).await, Decision::Allow);
     }
+    /// Proves the fail-closed behaviour of an unresolvable channel, the allow path for a
+    /// channel that resolves to a non-category parent, the out-of-scope path for another
+    /// guild, and that non-channel events are never blocked and never trigger a lookup.
+    /// Fails if an unknown channel is allowed, or if a non-channel event is skipped.
     #[tokio::test]
     async fn unknown_target_guild_channel_fails_closed_and_unrelated_logs_normally() {
         let repo = Repository::open(":memory:").await.unwrap();
@@ -459,6 +528,9 @@ mod tests {
         assert_eq!(d(&repo, &ev, &unknown).await, Decision::Allow);
         assert_eq!(unknown.calls.load(Ordering::SeqCst), before);
     }
+    /// Proves that a missing configuration or repository makes channel-bearing events fail
+    /// closed, while non-channel events are still allowed.
+    /// Fails if an invalid configuration becomes a permissive state.
     #[tokio::test]
     async fn invalid_config_or_missing_repo_fails_closed_for_channel_events_only() {
         let l = Fake::new(Lookup::Guild { parent: None });
@@ -471,6 +543,9 @@ mod tests {
         };
         assert_eq!(decide(true, None, None, &ev, &l).await, Decision::Allow);
     }
+    /// Proves that a database failure while checking the durable linkage makes the event
+    /// fail closed rather than being logged.
+    /// Fails if a database error is treated as "not a ticket channel".
     #[tokio::test]
     async fn db_failure_skips() {
         let repo = Repository::open(":memory:").await.unwrap();
@@ -483,6 +558,9 @@ mod tests {
         c.kind = ChannelType::PublicThread;
         c
     }
+    /// Proves that a thread whose parent is a durable ticket channel is private for all
+    /// thread events, while a thread under an unrelated channel is allowed.
+    /// Fails if the thread parent is not resolved to the durable linkage.
     #[tokio::test]
     async fn thread_events_under_a_durable_ticket_channel_are_private() {
         let repo = repo_with_ticket(900).await;
@@ -512,6 +590,8 @@ mod tests {
         };
         assert_eq!(d(&repo, &ok, &l).await, Decision::Allow);
     }
+    /// Proves that thread events also fail closed when the durable linkage lookup fails.
+    /// Fails if a database error on the thread path is treated as "public".
     #[tokio::test]
     async fn thread_events_skip_on_db_error() {
         let repo = Repository::open(":memory:").await.unwrap();
@@ -539,6 +619,9 @@ mod tests {
         .await;
         (writes.load(Ordering::SeqCst), out)
     }
+    /// Proves that the production seam performs no sink work at all for private, unknown,
+    /// contradictory or failing cases, and that the counters record each skip.
+    /// Fails if any sink work happens before the decision, or if the counters drift.
     #[tokio::test]
     async fn guarded_seam_performs_zero_sink_writes_for_private_unknown_and_error_cases() {
         let c = Counters::new();
@@ -589,6 +672,10 @@ mod tests {
         assert_eq!(c.skipped.load(Ordering::SeqCst), cases.len() as u64 + 2);
         assert_eq!(c.allowed.load(Ordering::SeqCst), 0);
     }
+    /// Proves the sink runs exactly once for a public channel and for the disabled feature,
+    /// that other-guild and non-channel events also pass through without a lookup, and that
+    /// the counters count them as allowed.
+    /// Fails if the sink runs more than once, or if an allowed event is skipped.
     #[tokio::test]
     async fn guarded_seam_runs_sink_exactly_once_for_public_and_disabled() {
         let c = Counters::new();
@@ -665,6 +752,9 @@ mod tests {
             }
         }
     }
+    /// Proves the invite, voice-state and reaction event paths share the same private,
+    /// unknown, error and public outcomes as the message paths.
+    /// Fails if any of these event kinds bypasses the decision.
     #[tokio::test]
     async fn guarded_sink_for_invite_voice_reaction_events_private_unknown_error_public_member() {
         let c = Counters::new();

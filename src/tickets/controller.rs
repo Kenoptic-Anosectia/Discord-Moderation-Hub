@@ -1,42 +1,109 @@
+//! Ticket request routing: the decision flow from a button press to a created ticket channel.
+//!
+//! This module owns the ordering of a ticket request. It validates the request, defers the
+//! interaction privately, checks that the panel is trusted, enforces the opening gate,
+//! reserves a slot, and only then asks the `Discord` boundary to create a channel. It
+//! deliberately does NOT talk to Discord directly (all I/O goes through the `Discord` trait),
+//! does NOT decide the opening gate itself (the caller passes the decision in), and does NOT
+//! classify privacy for general (non-ticket) events (that is `tickets::privacy`).
+//!
+//! Trust boundary: the request fields come from a Discord interaction and are untrusted. The
+//! route fails closed — anything not positively recognised produces no side effect or a
+//! fixed, content-free message. Replies never contain raw remote error details.
+
 use super::{
     policy::{marker, Kind, Settings},
     repository::{Panel, Repository, Ticket},
 };
 use crate::Error;
+/// A button press on the ticket panel, normalised into plain ids.
 #[derive(Clone, Debug)]
 pub struct Request {
+    /// Interaction id; used as the reservation idempotency key.
     pub interaction: u64,
+    /// Guild the interaction came from; `None` for a direct message.
     pub guild: Option<u64>,
+    /// Channel the panel message lives in.
     pub channel: u64,
+    /// Id of the panel message.
     pub message: u64,
+    /// Author of the panel message.
     pub author: u64,
+    /// Whether the panel message author is a bot.
     pub author_is_bot: bool,
+    /// Id of the bot account itself.
     pub bot: u64,
+    /// User who pressed the button.
     pub opener: u64,
+    /// Button custom id, which encodes the requested ticket kind.
     pub custom_id: String,
 }
+/// A Discord channel as seen by the recovery path, reduced to the fields that matter for
+/// matching a ticket operation.
 #[derive(Clone, Debug)]
 pub struct RemoteChannel {
+    /// Channel id.
     pub id: u64,
+    /// Guild the channel belongs to.
     pub guild: u64,
+    /// Parent category id.
     pub category: u64,
+    /// Channel topic, which carries the operation marker.
     pub topic: String,
+    /// Whether the channel's permission overwrites look private.
     pub private: bool,
 }
+/// Why a channel creation did not succeed.
 #[derive(Debug, Clone, Copy)]
 pub enum CreateFailure {
+    /// Discord explicitly rejected the request and no channel was created.
     NotCreated,
+    /// The outcome could not be determined; a channel may or may not exist.
     Unknown,
 }
+/// The only I/O boundary of the ticket flow.
+///
+/// Implementations own every call to Discord: the private defer, the private reply, the
+/// capability validation, the channel creation, the channel listing used for recovery, and
+/// the greeting. Errors returned here must never carry remote response bodies into a
+/// user-facing message.
 #[serenity::async_trait]
 pub trait Discord: Send + Sync {
+    /// Defers the interaction with a private (ephemeral) response.
     async fn defer_private(&self) -> Result<(), Error>;
+    /// Sends the final private follow-up message.
     async fn feedback_private(&self, text: &str) -> Result<(), Error>;
+    /// Checks that the guild, categories, staff role and bot permissions are usable.
     async fn validate(&self, kind: Kind) -> Result<(), Error>;
+    /// Creates the ticket channel and returns its id, or reports why it did not happen.
     async fn create(&self, ticket: &Ticket) -> Result<u64, CreateFailure>;
+    /// Lists the guild's channels, for the operator-recovery report.
     async fn channels(&self, _ticket: &Ticket) -> Result<Vec<RemoteChannel>, Error>;
+    /// Posts the greeting into the created channel.
     async fn greet(&self, channel: u64, kind: Kind) -> Result<(), Error>;
 }
+/// Routes one ticket request.
+///
+/// The order of the steps is the security-relevant part:
+/// 1. Locally plausible requests only: a valid configuration, the configured guild, a
+///    non-zero opener and bot, and a panel message authored by the bot itself. Anything else
+///    returns `Ok(())` without contacting Discord at all.
+/// 2. The custom id must parse into a known kind, otherwise the request is ignored.
+/// 3. The interaction is deferred privately *before* the provenance lookup, so a copied
+///    panel only ever receives a private rejection.
+/// 4. The panel must match an active stored panel exactly.
+/// 5. The opening gate is consulted: when it is closed the user is told that opening is
+///    disabled, and no validation, reservation or creation happens.
+/// 6. Only then: capability validation, slot reservation, binding re-check, and finally
+///    channel creation.
+///
+/// Creation outcomes are distinguished. A definite rejection marks the slot failed and
+/// releases it. An uncertain outcome leaves the slot reserved for operator recovery and
+/// never auto-adopts a channel, because channel metadata can be forged. A greeting failure
+/// leaves the ticket open; it is not a failed channel creation.
+///
+/// Errors are converted into one fixed message that contains no remote detail, and no
+/// automatic cleanup is performed.
 pub async fn route<D: Discord>(
     settings: &Settings,
     repo: &Repository,
@@ -61,14 +128,20 @@ pub async fn route<D: Discord>(
     io.defer_private().await?;
     let result:Result<String,Error>=async {
   let panel=Panel {guild:settings.guild,channel:request.channel,message:request.message,bot:request.bot};
+  // Provenance first: the panel must be the one this bot published and still be active.
   if !repo.trusted_panel(panel).await? { return Ok("This panel is not recognized. Ask the server owner for the current panel.".to_string()); }
+  // The hard gate: when opening is not approved, nothing is validated, reserved or created.
   if !opening_approved { return Ok("Ticket opening is disabled pending privacy and archive rollout review.".to_string()); }
   io.validate(kind).await?;
   let ticket=repo.reserve(request.interaction,settings.guild,request.opener,kind).await?;
+  // The reserved row must match the request it came from; a mismatch means the slot or the
+  // interaction binding was tampered with, so the flow stops here.
   if ticket.guild!=settings.guild || ticket.opener!=request.opener || ticket.kind!=kind { return Err("interaction binding mismatch".into()); }
   if let Some(channel)=ticket.channel {return Ok(format!("Your existing ticket is <#{channel}>. Ownership remains reserved."));}
   if ticket.status=="failed" {return Ok("This operation did not create a channel. Use a new request to try again.".into());}
   if !repo.claim(ticket.id).await? {
+   // The claim lost the race: another worker owns this ticket. Report candidates for
+   // operator recovery instead of creating a second channel.
    let matches:Vec<_>=io.channels(&ticket).await?.into_iter().filter(|c|c.guild==settings.guild && c.category==settings.category(kind) && c.topic==marker(&ticket.operation) && c.private).collect();
    // Metadata can be forged by users with channel management privileges. It is
    // corroboration only; an unknown HTTP outcome is never auto-adopted.
@@ -83,10 +156,15 @@ pub async fn route<D: Discord>(
     repo.greeting_result(ticket.id,greeted).await?;
     Ok(format!("Your ticket is <#{channel}>.{}",if greeted {""} else {" The greeting could not be delivered; the ticket remains open."}))
    },
+   // Discord definitively refused: the slot is released so a new request may try again.
    Err(CreateFailure::NotCreated)=>{repo.failed(ticket.id).await?;Ok("Discord rejected channel creation; no channel was created. Use a new request to retry.".into())},
+   // The outcome is unknown: a channel may exist. The slot stays reserved for operator
+   // recovery; nothing is adopted and nothing is cleaned up automatically.
    Err(CreateFailure::Unknown)=>Ok("Channel creation could not be confirmed. The slot remains reserved for recovery; do not keep opening tickets.".into()),
   }
  }.await;
+    // Any internal error becomes one fixed message: no remote error body, no internal
+    // detail, and no automatic cleanup of a possibly existing ticket.
     let text=match result {Ok(text)=>text,Err(_)=>"The operation could not be confirmed. A ticket or reservation may already exist; staff may need to investigate. No automatic cleanup was performed.".to_string()};
     io.feedback_private(&text).await
 }
@@ -201,6 +279,10 @@ mod tests {
         .unwrap();
         r
     }
+    /// Proves that an uncertain channel-creation outcome never adopts a candidate channel,
+    /// not even a single channel whose guild, category, marker topic and privacy all match,
+    /// and that decoys differing in any of those fields are not counted.
+    /// Fails if the recovery path ever attaches a channel it did not create itself.
     #[tokio::test]
     async fn uncertain_operation_never_adopts_a_single_forgeable_match() {
         for matches in [0, 1, 2] {
@@ -262,6 +344,12 @@ mod tests {
             );
         }
     }
+    /// Proves each failure mode is reported truthfully and that no internal error detail
+    /// reaches the user: an ack or feedback failure propagates as an error, a validation
+    /// failure stops before creation, a definite rejection leaves the ticket `failed`, and a
+    /// greeting failure leaves the ticket `active` with `greeting=failed`.
+    /// Fails if a failure is misreported, if a validation failure still creates a channel, or
+    /// if raw error text is echoed to the user.
     #[tokio::test]
     async fn known_rejection_ack_validation_greeting_and_feedback_failures_are_truthful() {
         for mode in ["ack", "validate", "reject", "greet", "feedback"] {
@@ -300,6 +388,10 @@ mod tests {
             }
         }
     }
+    /// Proves that two concurrent presses on the same slot create only one channel, while a
+    /// different opener or a different ticket kind gets its own independent channel.
+    /// Fails if the one-shot claim stops serialising same-slot requests, or if slots stop
+    /// being per user and per kind.
     #[tokio::test]
     async fn concurrent_same_slot_creates_once_but_other_slots_are_independent() {
         let r = repository().await;
@@ -346,6 +438,11 @@ mod tests {
             3
         );
     }
+    /// Proves the private defer happens before any other work, that a valid request creates
+    /// and greets a channel, and that repeating the same interaction does not create a second
+    /// channel but still reports the existing one.
+    /// Fails if the defer is no longer first, if the retry creates a duplicate channel, or if
+    /// the ticket does not end up active with its channel stored.
     #[tokio::test]
     async fn trusted_route_defers_before_work_and_retries_without_creation() {
         for custom in [super::super::policy::SUPPORT, super::super::policy::AGE] {
@@ -379,6 +476,11 @@ mod tests {
             assert_eq!(t.status, "active");
         }
     }
+    /// Proves that untrusted request shapes, an invalid configuration and a closed opening
+    /// gate all produce no channel creation, and that the closed gate still answers the user
+    /// with a message saying opening is disabled.
+    /// Fails if any of those cases reaches creation or validation, or if the gate stops
+    /// replying to the user.
     #[tokio::test]
     async fn untrusted_components_invalid_config_and_rollout_gate_never_create() {
         let r = repository().await;
