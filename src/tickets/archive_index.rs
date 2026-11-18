@@ -63,17 +63,20 @@ fn authorized(settings: &Settings, actor: &Actor) -> bool {
 /// Raw recorded row: (ticket, seq, kind, status, messages, assets, verified_at, manifest sha).
 type Row = (i64, i64, String, String, i64, i64, i64, String);
 
-fn summarize(guild: u64, r: Row) -> ArchiveSummary {
-    ArchiveSummary {
+fn summarize(guild: u64, r: Row) -> Result<ArchiveSummary, ManageError> {
+    // Counts that cannot be represented are corrupt records: fail rather than invent values.
+    let messages = u64::try_from(r.4).map_err(|_| ManageError::Db)?;
+    let assets = u64::try_from(r.5).map_err(|_| ManageError::Db)?;
+    Ok(ArchiveSummary {
         id: archive_id(guild, r.0, r.1, &r.7),
         ticket: r.0,
         seq: r.1,
         kind: r.2,
         ticket_status: r.3,
-        messages: u64::try_from(r.4).unwrap_or(0),
-        assets: u64::try_from(r.5).unwrap_or(0),
+        messages,
+        assets,
         verified_at: r.6,
-    }
+    })
 }
 
 /// Guild rows ordered ticket DESC, seq DESC. A `limit` of -1 means unbounded (SQLite).
@@ -125,9 +128,9 @@ pub async fn list_archives(
     }
     let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let r = rows(repo, settings.guild, limit as i64, offset).await?;
-    Ok(r.into_iter()
+    r.into_iter()
         .map(|r| summarize(settings.guild, r))
-        .collect())
+        .collect()
 }
 
 /// Authorization first; the id is only ever compared with computed ids, never used as a path or SQL.
@@ -142,10 +145,11 @@ pub async fn find_archive(
     }
     let wanted = ArchiveId::parse(id).ok_or(ManageError::BadId)?;
     let all = rows(repo, settings.guild, -1, 0).await?;
-    let mut hits = all
+    let all = all
         .into_iter()
         .map(|r| summarize(settings.guild, r))
-        .filter(|s| s.id == wanted);
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hits = all.into_iter().filter(|s| s.id == wanted);
     match (hits.next(), hits.next()) {
         (Some(s), None) => Ok(s),
         _ => Err(ManageError::NotFound),
@@ -155,7 +159,19 @@ pub async fn find_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tickets::repository::a07_tests::temp_db;
+
+    fn temp_db(tag: &str) -> String {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/a08-tests")
+            .join(format!(
+                "{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("t.sqlite").to_str().unwrap().to_string()
+    }
 
     const G: u64 = 100;
     const STAFF: u64 = 200;
@@ -331,6 +347,44 @@ mod tests {
             h.to_string(),
         ] {
             assert!(ArchiveId::parse(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn id_fixed_vector() {
+        // sha256 of "skynet-archive-id-v1\0100\07\02\0abc123", computed independently with sha256sum.
+        assert_eq!(
+            archive_id(100, 7, 2, "abc123").as_str(),
+            "arc-f2904db292557ed5ae741f8bf775a5c3"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_counts_are_db_errors_and_nonzero_control_passes() {
+        let r = repo().await;
+        add(&r, G, 1, "support", &[1]).await;
+        let (s, a) = (settings(), staff());
+        let ok = list_archives(&r, &s, &a, 10, 0).await.unwrap();
+        assert_eq!((ok[0].messages, ok[0].assets), (3, 1));
+        let id = archive_id(G, 1, 1, "sha1-1");
+        let found = find_archive(&r, &s, &a, id.as_str()).await.unwrap();
+        assert_eq!(found.messages, 3);
+        for col in ["messages", "assets"] {
+            r.db.call(move |c| -> rusqlite::Result<()> {
+                c.execute_batch(&format!("UPDATE ticket_archives SET {col}=-1;"))
+            })
+            .await
+            .unwrap();
+            assert_eq!(list_archives(&r, &s, &a, 10, 0).await, Err(ManageError::Db));
+            assert_eq!(
+                find_archive(&r, &s, &a, id.as_str()).await,
+                Err(ManageError::Db)
+            );
+            r.db.call(move |c| -> rusqlite::Result<()> {
+                c.execute_batch(&format!("UPDATE ticket_archives SET {col}=3;"))
+            })
+            .await
+            .unwrap();
         }
     }
 
