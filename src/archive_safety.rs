@@ -1,35 +1,13 @@
-//! Pure input-safety primitives for the (future) attachment archiver.
+//! Pure input-safety primitives for ticket attachment archiving (`docs/verification/ARCHIVE-INPUT-SAFETY.md`).
 //!
-//! This module performs no I/O: no DNS, no HTTP, no filesystem access. It is a
-//! reusable building block for the real downloader (A07) and does NOT implement
-//! archive downloading or ticket closure.
-//!
-//! # API
-//! * [`validate_attachment_url`] - parse with the real `url` crate and accept only
-//!   `https://cdn.discordapp.com` / `https://media.discordapp.net` URLs whose path is
-//!   `/attachments/<channel_id>/<attachment_id>/<filename>` or
-//!   `/ephemeral-attachments/<app_id>/<attachment_id>/<filename>` (both ids non-zero u64
-//!   decimal). The `ephemeral-attachments` form is allowed deliberately: Discord serves
-//!   ephemeral interaction attachments from that prefix on the same CDN hosts. The query
-//!   string (signed `ex`/`is`/`hm` parameters) is preserved as parsed.
-//! * [`generated_asset_name`] - the only way to build an on-disk asset name:
-//!   `attachment-<id>.bin`, derived from the numeric attachment id alone. Original
-//!   (untrusted) filenames never reach the filesystem layer; keep them as display
-//!   metadata in a future manifest.
-//! * [`validate_asset_component`] - accepts exactly the grammar produced by
-//!   [`generated_asset_name`] (strict, case-sensitive, ASCII, canonical decimal).
-//!
-//! # Limits of this module
-//! * Validating the *initial* URL does not make redirects safe. The downloader must
-//!   disable redirects or re-run [`validate_attachment_url`] on EVERY redirect target,
-//!   bound the streamed byte count, and enforce filesystem containment.
-//! * [`validate_asset_component`] is a pure string check. It cannot prevent
-//!   symlink/junction/TOCTOU races; those belong to the file-open layer in A07
-//!   (e.g. create-new open inside a verified directory handle).
-//! * The URL check is a syntactic allow-list; it says nothing about the host's DNS
-//!   resolution or TLS identity.
-//! * Errors carry only a fixed [`ArchiveInputErrorKind`]; no attacker-controlled text
-//!   (URL, query, filename) is stored or displayed.
+//! Responsible for validating Discord CDN attachment URLs against a strict HTTPS host and path
+//! allow-list, generating deterministic ID-based on-disk asset filenames (`attachment-<id>.bin`),
+//! and verifying asset filename components before filesystem writes or reads.
+//! Deliberately performs no I/O (no DNS, HTTP, or filesystem access) and does not defend against
+//! HTTP redirects, DNS/TLS spoofing, or symlink/TOCTOU races on disk.
+//! Trust boundary: inputs are untrusted URL strings, attachment IDs, and manifest filenames;
+//! original user filenames never reach disk paths, and errors carry only fixed [`ArchiveInputErrorKind`]
+//! values so untrusted URLs, signed query tokens, or filenames are never echoed or leaked.
 
 use std::fmt;
 use url::{Host, Url};
@@ -39,30 +17,49 @@ pub const MAX_URL_LEN: usize = 2048;
 /// Maximum accepted asset component length in bytes.
 pub const MAX_ASSET_NAME_LEN: usize = 64;
 
+/// Approved Discord CDN hostnames; any other host is rejected before network I/O.
 const ALLOWED_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
+/// Approved first path segments for standard and ephemeral Discord interaction attachments.
 const ALLOWED_PATH_ROOTS: [&str; 2] = ["attachments", "ephemeral-attachments"];
+/// Maximum byte length of the trailing filename segment in an attachment URL path.
 const MAX_FILENAME_SEGMENT_LEN: usize = 255;
+/// Fixed ASCII prefix required on all generated on-disk asset filenames.
 const ASSET_PREFIX: &str = "attachment-";
+/// Fixed ASCII extension required on all generated on-disk asset filenames.
 const ASSET_SUFFIX: &str = ".bin";
 
-/// Category of rejection. Contains no input data.
+/// Fixed rejection category for attachment URL and asset-name validation.
+///
+/// Carries no slice or copy of the rejected input so logging or displaying the error
+/// fails closed without leaking untrusted URLs, query tokens, or filenames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveInputErrorKind {
+    /// Input could not be parsed as a canonical `https://<authority>/...` URL.
     InvalidUrl,
+    /// Parsed URL scheme was not `https`.
     UnsupportedScheme,
+    /// Host was missing, an IP literal, or not in `ALLOWED_HOSTS`.
     HostNotAllowed,
+    /// URL contained a username, password, or `@` in the raw authority.
     UserInfoNotAllowed,
+    /// URL specified an explicit non-default port.
     PortNotAllowed,
+    /// URL contained a `#fragment` component.
     FragmentNotAllowed,
     /// Control character or whitespace anywhere in the raw input.
     ControlCharacter,
+    /// Path contained backslashes, traversal/encoded-separator sequences, or wrong segment shape.
     PathNotAllowed,
+    /// Raw URL or asset name exceeded [`MAX_URL_LEN`] or [`MAX_ASSET_NAME_LEN`].
     TooLong,
+    /// Attachment ID was zero.
     InvalidAttachmentId,
+    /// Asset filename did not match canonical `attachment-<non-zero u64>.bin`.
     InvalidAssetName,
 }
 
 impl ArchiveInputErrorKind {
+    /// Returns a static, input-free description suitable for logs and error displays.
     fn message(self) -> &'static str {
         match self {
             Self::InvalidUrl => "attachment URL could not be parsed",
@@ -80,7 +77,7 @@ impl ArchiveInputErrorKind {
     }
 }
 
-/// Sanitized error: only the kind is retained.
+/// Sanitized validation error retaining only [`ArchiveInputErrorKind`] and never the offending input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveInputError {
     kind: ArchiveInputErrorKind,
@@ -91,6 +88,7 @@ impl ArchiveInputError {
         Self { kind }
     }
 
+    /// Returns the fixed rejection category for this validation failure.
     #[allow(dead_code)] // A10 public surface; used by the integration suite
     pub fn kind(&self) -> ArchiveInputErrorKind {
         self.kind
@@ -109,7 +107,9 @@ fn fail<T>(kind: ArchiveInputErrorKind) -> Result<T, ArchiveInputError> {
     Err(ArchiveInputError::new(kind))
 }
 
-/// Non-zero canonical decimal u64 (no sign, no leading zeros, ASCII digits only).
+/// Parses `s` as a non-zero canonical decimal `u64` (ASCII digits only, no sign, no leading zero).
+///
+/// Rejecting leading zeros prevents distinct string representations from mapping to the same ID.
 fn parse_canonical_id(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || s.starts_with('0') {
         return None;
@@ -117,9 +117,11 @@ fn parse_canonical_id(s: &str) -> Option<u64> {
     s.parse::<u64>().ok().filter(|v| *v != 0)
 }
 
-/// Validate a Discord attachment URL. See the module docs for the exact policy.
+/// Validates that `raw` is a canonical Discord CDN attachment URL safe to pass to an non-redirecting HTTPS client.
 ///
-/// Callers MUST also re-validate every redirect target (or disable redirects).
+/// Caller must disable HTTP redirects (or re-validate every target) and bound response bytes.
+/// Fails closed with [`ArchiveInputError`] if length, character set, scheme, authority, host,
+/// port, fragment, or 4-segment attachment path shape violates policy.
 pub fn validate_attachment_url(raw: &str) -> Result<Url, ArchiveInputError> {
     use ArchiveInputErrorKind as K;
     if raw.len() > MAX_URL_LEN {
@@ -170,6 +172,8 @@ pub fn validate_attachment_url(raw: &str) -> Result<Url, ArchiveInputError> {
     if !raw_no_query.ends_with(url.path()) {
         return fail(K::PathNotAllowed);
     }
+    // Reject percent-encoded dots, slashes, backslashes, and NUL bytes so downstream consumers
+    // that decode path segments cannot be tricked into path traversal or truncation.
     let lower_path = url.path().to_ascii_lowercase();
     if ["%2e", "%2f", "%5c", "%00"]
         .iter()
@@ -181,6 +185,7 @@ pub fn validate_attachment_url(raw: &str) -> Result<Url, ArchiveInputError> {
         Some(s) => s.collect(),
         None => return fail(K::PathNotAllowed),
     };
+    // Require exact 4-segment Discord attachment layout: `<root>/<channel_or_app_id>/<attachment_id>/<filename>`.
     let ok_shape = match segments.as_slice() {
         [root, channel, attachment, filename] => {
             ALLOWED_PATH_ROOTS.contains(root)
@@ -199,10 +204,11 @@ pub fn validate_attachment_url(raw: &str) -> Result<Url, ArchiveInputError> {
     Ok(url)
 }
 
-/// Build the on-disk asset file name for an attachment: `attachment-<id>.bin`.
+/// Builds the canonical on-disk asset filename `attachment-<attachment_id>.bin` from the numeric ID alone.
 ///
-/// Depends only on the numeric id, so distinct ids can never collide and original
-/// filenames can never influence the path. Rejects id 0.
+/// Caller must still write the resulting name inside a verified directory handle with `create_new`.
+/// Fails closed with [`ArchiveInputErrorKind::InvalidAttachmentId`] when `attachment_id == 0`;
+/// untrusted original filenames are ignored so they can never influence filesystem paths.
 pub fn generated_asset_name(attachment_id: u64) -> Result<String, ArchiveInputError> {
     if attachment_id == 0 {
         return fail(ArchiveInputErrorKind::InvalidAttachmentId);
@@ -210,14 +216,17 @@ pub fn generated_asset_name(attachment_id: u64) -> Result<String, ArchiveInputEr
     Ok(format!("{ASSET_PREFIX}{attachment_id}{ASSET_SUFFIX}"))
 }
 
-/// Accept only names exactly equal to some `generated_asset_name(id)` output.
+/// Verifies that `name` is an exact, canonical `attachment-<id>.bin` filename produced by [`generated_asset_name`].
 ///
-/// Pure string check; does not defend against symlink/junction races (see module docs).
+/// Pure string check; caller must still enforce directory containment and non-symlink file checks on disk.
+/// Fails closed with [`ArchiveInputErrorKind::TooLong`] or [`ArchiveInputErrorKind::InvalidAssetName`]
+/// on any path separator, leading zero, non-ASCII digit, or extra characters.
 pub fn validate_asset_component(name: &str) -> Result<(), ArchiveInputError> {
     use ArchiveInputErrorKind as K;
     if name.len() > MAX_ASSET_NAME_LEN {
         return fail(K::TooLong);
     }
+    // Round-trip through canonical ID parsing and `generated_asset_name` so only exact bijective names pass.
     let id = name
         .strip_prefix(ASSET_PREFIX)
         .and_then(|rest| rest.strip_suffix(ASSET_SUFFIX))
