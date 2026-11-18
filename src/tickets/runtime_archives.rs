@@ -1,7 +1,6 @@
 //! Discord adapter for the staff archive command. A20 owns authorization and reply rendering.
 use super::{
     archive::OwnedRoot,
-    archive_index::MAX_PAGE,
     archive_manage::{self as manage, Manage, ManageError},
     closer::Actor,
     policy::Settings,
@@ -68,7 +67,7 @@ pub(super) async fn dispatch(
 ) -> String {
     // Use the service's own authorization before even opening (or creating) owned roots.
     if let Err(error) = manage::authorize(settings, actor) {
-        return manage::render_list(&Err(error));
+        return manage::render_list(&Err(error), 0);
     }
     let action = match Action::parse(action, id) {
         Ok(action) => action,
@@ -87,9 +86,13 @@ pub(super) async fn dispatch(
         now: &now,
     };
     match action {
-        Action::List => manage::render_list(&manage::list(&m, actor, MAX_PAGE, offset).await),
+        // One extra row reveals whether another page exists without a second query.
+        Action::List => manage::render_list(
+            &manage::list(&m, actor, manage::LIST_ROWS + 1, offset).await,
+            offset,
+        ),
         Action::Show(id) => manage::render_show(&manage::show(&m, actor, id).await),
-        Action::Health => manage::render_health(&manage::health(&m, actor, offset).await),
+        Action::Health => manage::render_health(&manage::health(&m, actor, offset).await, offset),
         Action::Orphans => manage::render_orphans(&manage::orphans(&m, actor).await),
         Action::Retention => {
             manage::render_retention(&manage::retention_plan(&m, actor, retention).await)
@@ -110,7 +113,7 @@ pub async fn command(
         return reply(ctx, UNAVAILABLE).await;
     };
     let Some(actor) = actor(ctx).await else {
-        return reply(ctx, &manage::render_list(&Err(ManageError::Denied))).await;
+        return reply(ctx, &manage::render_list(&Err(ManageError::Denied), 0)).await;
     };
     let text = dispatch(
         settings,
