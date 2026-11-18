@@ -216,3 +216,10 @@ Still not covered / limits: no live Discord or network; the member-event control
   `Mutation` fn pointer with const closures (`EDIT_FIRST`, `EDIT_FOOTER`, `EDIT_URL`).
 * Final: fmt/check/build exit 0; tests 96 bin + 30 + 7 + 5 pass; strict all-target Clippy clean.
   `OPENING_APPROVED` stays false; `TICKETS_ENABLED` default off.
+
+## Round 7 — remaining clippy suppressions removed
+
+- `runtime.rs`: `mod readiness_tests` moved to the end of the file; `#[allow(clippy::items_after_test_module)]` removed.
+- `closer_tests.rs`: `active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed` now builds both reconcile reports (Unknown, clean) first and takes the synchronous `READINESS_LOCK` only around the synchronous readiness assertions, never across an `.await`; `#[allow(clippy::await_holding_lock)]` removed. Assertions unchanged (synthetic approval true/false for unknown and clean reports).
+- RED: with the allow removed and the test unchanged, Clippy failed `await_holding_lock` at closer_tests.rs:837. GREEN after restructure.
+- Gates: fmt/check/build exit 0; tests 96 + 30 + 7 + 5 pass; strict all-target Clippy exit 0; `grep allow(clippy src tests)` returns nothing. OPENING_APPROVED stays false.

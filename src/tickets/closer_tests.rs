@@ -833,30 +833,32 @@ async fn reconcile_closes_only_known_absence_after_verified_archive() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed() {
-    let _g = super::super::runtime::READINESS_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let h = harness("recon-unknown").await;
     let _t = active(&h, 1, Kind::Support).await;
     let io = Fake::new(&h.dir.join("archives"), 1);
     let s = settings();
+    // build both reports first; the sync readiness lock is never held across an await
     *io.probe.lock().unwrap() = Presence::Unknown;
-    let r = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
-    assert_eq!(r.unresolved, 1);
-    // production readiness path, with synthetic approval both ways
-    super::super::runtime::record_reconcile(Some(&r));
-    assert!(!super::super::runtime::permitted(true));
-    assert!(!super::super::runtime::permitted(false));
-    // a Present probe yields a clean report: only then does synthetic approval permit
+    let unknown = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
     *io.probe.lock().unwrap() = Presence::Present;
-    let r = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
-    assert_eq!(r.unresolved, 0);
-    super::super::runtime::record_reconcile(Some(&r));
-    assert!(super::super::runtime::permitted(true));
-    assert!(!super::super::runtime::permitted(false));
-    super::super::runtime::record_reconcile(None);
+    let clean = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
+    assert_eq!(unknown.unresolved, 1);
+    assert_eq!(clean.unresolved, 0);
+    {
+        let _g = super::super::runtime::READINESS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // production readiness path, with synthetic approval both ways
+        super::super::runtime::record_reconcile(Some(&unknown));
+        assert!(!super::super::runtime::permitted(true));
+        assert!(!super::super::runtime::permitted(false));
+        // only a clean report lets synthetic approval permit
+        super::super::runtime::record_reconcile(Some(&clean));
+        assert!(super::super::runtime::permitted(true));
+        assert!(!super::super::runtime::permitted(false));
+        super::super::runtime::record_reconcile(None);
+    }
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 #[tokio::test]

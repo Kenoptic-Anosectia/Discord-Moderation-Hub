@@ -35,26 +35,6 @@ pub fn permitted(approved: bool) -> bool {
 #[cfg(test)]
 pub static READINESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod readiness_tests {
-    use super::*;
-    #[test]
-    fn opening_stays_closed_without_approval_or_clean_reconcile() {
-        let _g = READINESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        record_reconcile(None);
-        assert!(!opening_permitted());
-        record_reconcile(Some(&super::super::closer::Report::default()));
-        // clean reconcile alone never opens while the hard gate is false
-        assert!(!opening_permitted());
-        record_reconcile(Some(&super::super::closer::Report {
-            unresolved: 1,
-            ..Default::default()
-        }));
-        assert!(!opening_permitted());
-    }
-}
-
 pub struct Adapter<'a> {
     pub ctx: &'a s::Context,
     pub interaction: &'a s::ComponentInteraction,
@@ -263,4 +243,23 @@ async fn private_reply(ctx: Context<'_>, text: &str) -> Result<(), Error> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    #[test]
+    fn opening_stays_closed_without_approval_or_clean_reconcile() {
+        let _g = READINESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        record_reconcile(None);
+        assert!(!opening_permitted());
+        record_reconcile(Some(&super::super::closer::Report::default()));
+        // clean reconcile alone never opens while the hard gate is false
+        assert!(!opening_permitted());
+        record_reconcile(Some(&super::super::closer::Report {
+            unresolved: 1,
+            ..Default::default()
+        }));
+        assert!(!opening_permitted());
+    }
 }
