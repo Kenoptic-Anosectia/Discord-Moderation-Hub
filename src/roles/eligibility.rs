@@ -106,14 +106,57 @@ pub enum Decision {
 
 /// Decide whether a role may be granted.
 pub fn decide(request: &GrantRequest) -> Decision {
-    let _ = request;
+    use DenyReason::*;
+    let role = &request.role;
+    let staff_path = request.path == GrantPath::StaffCommand;
+    if !role.exists {
+        return Decision::Deny(RoleDeleted);
+    }
+    if role.id == request.guild_id {
+        return Decision::Deny(EveryoneRole);
+    }
+    if role.managed {
+        return Decision::Deny(ManagedRole);
+    }
+    if role.position >= request.bot_top_position {
+        return Decision::Deny(AtOrAboveBot);
+    }
+    if !staff_path {
+        if role.permissions & PRIVILEGED_MASK != 0 {
+            return Decision::Deny(PrivilegedPermission);
+        }
+        if request.protected_role_ids.contains(&role.id) {
+            return Decision::Deny(ProtectedRole);
+        }
+    }
+    if request.safeword == SafewordState::Active
+        && request.path != GrantPath::SafewordRestore
+        && request.safeword_restricted_role_ids.contains(&role.id)
+    {
+        return Decision::Deny(SafewordRestricted);
+    }
+    if staff_path {
+        let Some(staff) = request.staff else {
+            return Decision::Deny(MissingStaffContext);
+        };
+        if staff.actor_top_position <= role.position {
+            return Decision::Deny(ActorNotAboveRole);
+        }
+        if staff.actor_top_position <= staff.target_top_position {
+            return Decision::Deny(ActorNotAboveTarget);
+        }
+    }
     Decision::Allow
 }
 
-/// Decide whether a role may be removed. Safeword never blocks removals.
+/// Decide whether a role may be removed. Safeword never blocks removals;
+/// only the bot's own hierarchy can. A deleted role is allowed (nothing to reach).
 pub fn decide_removal(request: &GrantRequest) -> Decision {
-    let _ = request;
-    Decision::Allow
+    if request.role.position >= request.bot_top_position {
+        Decision::Deny(DenyReason::AtOrAboveBot)
+    } else {
+        Decision::Allow
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +235,9 @@ mod tests {
     fn bot_hierarchy_above_equal_below() {
         for p in ALL {
             let mut r = base(p);
+            if p == GrantPath::StaffCommand {
+                r.staff = staff(12, 3); // actor outranks every tested position
+            }
             r.role.position = 9;
             assert_eq!(decide(&r), Decision::Allow);
             r.role.position = 10;
@@ -239,7 +285,11 @@ mod tests {
         for p in ALL {
             let mut r = base(p);
             r.role.id = GUILD;
-            assert_eq!(decide(&r), Decision::Deny(DenyReason::EveryoneRole), "{p:?}");
+            assert_eq!(
+                decide(&r),
+                Decision::Deny(DenyReason::EveryoneRole),
+                "{p:?}"
+            );
         }
     }
 
@@ -272,11 +322,19 @@ mod tests {
         for p in AUTOMATED {
             let mut r = base(p);
             r.protected_role_ids = &prot;
-            assert_eq!(decide(&r), Decision::Deny(DenyReason::ProtectedRole), "{p:?}");
+            assert_eq!(
+                decide(&r),
+                Decision::Deny(DenyReason::ProtectedRole),
+                "{p:?}"
+            );
         }
         let mut r = base(GrantPath::StaffCommand);
         r.protected_role_ids = &prot;
-        assert_eq!(decide(&r), Decision::Allow, "outranking staff may grant protected");
+        assert_eq!(
+            decide(&r),
+            Decision::Allow,
+            "outranking staff may grant protected"
+        );
         r.staff = staff(5, 1);
         assert_eq!(decide(&r), Decision::Deny(DenyReason::ActorNotAboveRole));
         let mut r = base(GrantPath::Menu);
@@ -339,9 +397,27 @@ mod tests {
             (false, true, true, true, true, true, true, EveryoneRole),
             (false, false, true, true, true, true, true, ManagedRole),
             (false, false, false, true, true, true, true, AtOrAboveBot),
-            (false, false, false, false, true, true, true, PrivilegedPermission),
+            (
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                PrivilegedPermission,
+            ),
             (false, false, false, false, false, true, true, ProtectedRole),
-            (false, false, false, false, false, false, true, SafewordRestricted),
+            (
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                SafewordRestricted,
+            ),
         ];
         for (del, ev, man, above, privd, prot, sw, want) in table {
             let mut r = base(GrantPath::Reaction);
@@ -460,6 +536,9 @@ mod tests {
                 assert_eq!(rm, Decision::Allow);
             }
         }
-        assert!(allows > 100, "sweep must exercise Allow paths, got {allows}");
+        assert!(
+            allows > 100,
+            "sweep must exercise Allow paths, got {allows}"
+        );
     }
 }
