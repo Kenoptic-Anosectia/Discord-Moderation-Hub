@@ -57,13 +57,6 @@ impl LastSeenCounts {
             cap,
         }
     }
-    /// Baseline: treat every given entry as fully credited already (startup seeding).
-    pub fn seed_baseline(&mut self, entries: &[AuditEntryLite]) {
-        for e in entries {
-            self.record(e.id, e.count);
-        }
-    }
-
     pub fn get(&self, id: u64) -> Option<u64> {
         self.map.get(&id).copied()
     }
@@ -91,11 +84,11 @@ impl LastSeenCounts {
 
 /// Decide who deleted a cached message.
 ///
-/// An audit entry (already filtered to the message-delete action by the caller) is THIS deletion
-/// when it targets the author in this channel and is either fresh by id-age or its merged `count`
-/// rose since we last looked. Only matching entries (author and channel) are recorded on a successful lookup so a later
-/// self-delete is not credited to an old moderator entry. A failed lookup is never reported as the
-/// author deleting it.
+/// Discord merges repeated deletions into one audit entry whose `count` rises. Each entry has
+/// `count` credits; the map records credits already given per entry id. A matching entry (author
+/// and channel; action filtered by the caller) with `count` > given has a pending credit, and a
+/// returned `Executor` consumes exactly one. A never-seen entry has all credits pending if fresh,
+/// else it is baselined as fully given. Failed lookups consume nothing and are never `User`.
 pub fn attribute_deletion(
     author_id: u64,
     author_is_bot: bool,
@@ -109,31 +102,40 @@ pub fn attribute_deletion(
         Err(AuditLookupFailed) => return DeletedBy::AuditUnavailable,
     };
 
-    // best = (count increase, entry id, executor)
-    let mut best: Option<(u64, u64, u64)> = None;
+    // best = (pending credits, entry id, executor, credits given so far)
+    let mut best: Option<(u64, u64, u64, u64)> = None;
     for e in entries {
         let matches = e.target_id == Some(author_id) && e.channel_id == Some(channel_id);
         if !matches {
             continue;
         }
-        // Only entries for this author and channel are recorded, so an unrelated deletion's
-        // lookup cannot pre-record someone else's entry and suppress it for its real target.
-        let previous = seen.get(e.id);
-        seen.record(e.id, e.count);
-        let increase = previous.map_or(0, |p| e.count.saturating_sub(p));
-        let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
-        let already_seen_unchanged = previous.is_some() && increase == 0;
-        if !((fresh && !already_seen_unchanged) || increase > 0) {
+        // Only entries for this author and channel are written to the map, so an unrelated
+        // deletion's lookup cannot pre-record someone else's entry.
+        let given = match seen.get(e.id) {
+            Some(given) => given,
+            None => {
+                let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
+                // Fresh: all `count` credits are pending. Stale: baseline, nothing pending.
+                let baseline = if fresh { 0 } else { e.count };
+                seen.record(e.id, baseline);
+                baseline
+            }
+        };
+        let pending = e.count.saturating_sub(given);
+        if pending == 0 {
             continue;
         }
-        let key = (increase, e.id, e.executor_id);
-        if best.is_none_or(|b| (key.0, key.1) > (b.0, b.1)) {
-            best = Some(key);
+        if best.is_none_or(|b| (pending, e.id) > (b.0, b.1)) {
+            best = Some((pending, e.id, e.executor_id, given));
         }
     }
 
     match best {
-        Some((_, _, executor)) => DeletedBy::Executor(executor),
+        Some((_, id, executor, given)) => {
+            // Consume exactly one credit from the chosen entry only.
+            seen.record(id, given + 1);
+            DeletedBy::Executor(executor)
+        }
         None if author_is_bot => DeletedBy::BotAuthor,
         None => DeletedBy::User,
     }
@@ -447,20 +449,5 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert_eq!(seen.get(1), None);
         assert_eq!(seen.get(6), Some(1));
-    }
-
-    #[test]
-    fn seeding_baselines_window_so_old_history_is_not_credited() {
-        let mut seen = LastSeenCounts::new();
-        // entry looks fresh but was already present at startup: nothing pending
-        seen.seed_baseline(&[entry(1, MOD_A, 2, 1000)]);
-        assert_eq!(
-            run(false, &[entry(1, MOD_A, 2, 1500)], &mut seen),
-            DeletedBy::User
-        );
-        assert_eq!(
-            run(false, &[entry(1, MOD_A, 3, 9000)], &mut seen),
-            DeletedBy::Executor(MOD_A)
-        );
     }
 }
