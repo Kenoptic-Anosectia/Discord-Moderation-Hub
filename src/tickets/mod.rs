@@ -1,4 +1,13 @@
 pub mod archive;
+// Unwired A08 building block; the wiring card removes this allow.
+#[allow(dead_code)]
+pub mod archive_index;
+// Unwired A08 building block; the wiring card removes this allow.
+#[allow(dead_code)]
+pub mod archive_remove;
+// Unwired A08 building block; the wiring card removes this allow.
+#[allow(dead_code)]
+pub mod archive_scan;
 pub mod closer;
 pub mod controller;
 /// Shared A09 fixture factory, loaded once for all in-crate tests.
@@ -10,5 +19,11 @@ pub mod policy;
 pub mod privacy;
 pub mod repository;
 pub mod repository_close;
+// Unwired A08 building block; the wiring card removes this allow.
+#[allow(dead_code)]
+pub mod restore;
+// Unwired A08 building block; the wiring card removes this allow.
+#[allow(dead_code)]
+pub mod retention;
 pub mod runtime;
 pub mod runtime_close;
