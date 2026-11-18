@@ -53,7 +53,7 @@ pub enum ManageError {
 
 pub const MAX_PAGE: usize = 25;
 
-fn authorized(settings: &Settings, actor: &Actor) -> bool {
+pub(super) fn authorized(settings: &Settings, actor: &Actor) -> bool {
     settings.valid()
         && actor.guild == settings.guild
         && actor.user != 0

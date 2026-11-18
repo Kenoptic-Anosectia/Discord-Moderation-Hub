@@ -173,7 +173,7 @@ fn checked_dir(path: &Path, read_error: RestoreError) -> Result<(), RestoreError
     Ok(())
 }
 
-fn check_root(root: &Path) -> Result<(), RestoreError> {
+pub(super) fn check_root(root: &Path) -> Result<(), RestoreError> {
     // Check ancestors top down so even metadata on a child cannot traverse a
     // pre-existing link (including an ancestor replaced since OwnedRoot::open).
     let ancestors: Vec<_> = root.ancestors().collect();
@@ -194,7 +194,7 @@ fn file_len(path: &Path) -> Result<u64, RestoreError> {
     Ok(meta.len())
 }
 
-fn check_tree(dir: &Path) -> Result<(), RestoreError> {
+pub(super) fn check_tree(dir: &Path) -> Result<(), RestoreError> {
     checked_dir(dir, RestoreError::Verify)?;
     for entry in fs::read_dir(dir).map_err(|_| RestoreError::Verify)? {
         let entry = entry.map_err(|_| RestoreError::Verify)?;

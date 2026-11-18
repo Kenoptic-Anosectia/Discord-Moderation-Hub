@@ -2,6 +2,9 @@ pub mod archive;
 // Unwired A08 building block; the wiring card removes this allow.
 #[allow(dead_code)]
 pub mod archive_index;
+// Unwired until A21 adds the staff command; A21 removes this allow.
+#[allow(dead_code)]
+pub mod archive_manage;
 // Unwired A08 building block; the wiring card removes this allow.
 #[allow(dead_code)]
 pub mod archive_remove;
