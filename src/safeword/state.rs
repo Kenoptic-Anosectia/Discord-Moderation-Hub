@@ -1288,87 +1288,262 @@ mod tests {
         let ctx = sample_ctx(vec![ROLE_VERIFIED]);
         let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
         let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
-        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
-
-        // 1. Before RestoreRoles is acknowledged: restricted grant is recorded and added to restore_plan.
-        let (rel_before, actions_before) =
-            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
-        assert!(actions_before.is_empty());
-        let snap_before = rel_before.snapshot().unwrap();
-        assert_eq!(snap_before.deferred_roles, vec![ROLE_MEMBER]);
-        assert_eq!(snap_before.restore_plan, vec![ROLE_VERIFIED, ROLE_MEMBER]);
-        assert!(!snap_before.roles_restored);
-
-        // Subject to struck/deleted/protected filters and restricted_roles check:
-        let mut protected_ctx = ctx.clone();
-        protected_ctx.protected_roles = vec![ROLE_FEMDOM];
-        let (rel_prot, _) = step(
-            &rel_before,
-            Event::GrantDuringActive(ROLE_FEMDOM),
-            &protected_ctx,
-        );
+        let (releasing, initial_rel_actions) = step(&active, Event::ReactionRemoved, &ctx);
         assert_eq!(
-            rel_prot.snapshot().unwrap().restore_plan,
-            vec![ROLE_VERIFIED, ROLE_MEMBER]
+            initial_rel_actions,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::RestoreRoles(vec![ROLE_VERIFIED]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ]
         );
-        let (rel_unrestricted, _) = step(
-            &rel_before,
-            Event::GrantDuringActive(ROLE_UNRESTRICTED),
+
+        // (a) Grant while RestoreRoles is in flight -> emits second RestoreRoles with late role,
+        // and release does not complete after only the first RestoreRoles ack.
+        let (rel_in_flight, _) = step(
+            &releasing,
+            Event::ActionDone(ActionId::RemoveSafewordRole),
             &ctx,
         );
+        let (rel_in_flight_granted, in_flight_actions) =
+            step(&rel_in_flight, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
         assert_eq!(
-            rel_unrestricted.snapshot().unwrap().restore_plan,
-            vec![ROLE_VERIFIED, ROLE_MEMBER]
+            in_flight_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
         );
+        let (rel_after_other_acks, _) = acknowledge_all(
+            rel_in_flight_granted,
+            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
+            &ctx,
+        );
+        let (still_releasing_after_first_ack, first_ack_actions) = step(
+            &rel_after_other_acks,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &ctx,
+        );
+        assert!(first_ack_actions.is_empty());
+        assert!(matches!(
+            still_releasing_after_first_ack,
+            State::Releasing(_)
+        ));
+        let (completed_after_second_ack, second_ack_actions) = step(
+            &still_releasing_after_first_ack,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &ctx,
+        );
+        assert!(second_ack_actions.is_empty());
+        assert_eq!(completed_after_second_ack, State::Inactive);
 
-        // Also if initial restore_plan was empty (roles_restored == true initially), a deferred grant
-        // while RemoveSafewordRole is still pending sets roles_restored = false and populates restore_plan.
+        // (b) Grant before any release step is acked -> emitted RestoreRoles contains the late role.
+        let (rel_before, actions_before) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert_eq!(
+            actions_before,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+        // Also when initial restore_plan was empty, the first/only emitted RestoreRoles contains the late role.
         let empty_ctx = sample_ctx(vec![]);
         let (act_empty, act_empty_actions) =
             step(&State::Inactive, Event::ReactionAdded, &empty_ctx);
         let (active_empty, _) = acknowledge_all(act_empty, &act_empty_actions, &empty_ctx);
-        let (rel_empty, _) = step(&active_empty, Event::ReactionRemoved, &empty_ctx);
-        assert!(rel_empty.snapshot().unwrap().roles_restored);
-        let (rel_empty_granted, _) = step(
+        let (rel_empty, rel_empty_actions) =
+            step(&active_empty, Event::ReactionRemoved, &empty_ctx);
+        assert!(!rel_empty_actions
+            .iter()
+            .any(|a| matches!(a, Action::RestoreRoles(_))));
+        let (rel_empty_granted, empty_grant_actions) = step(
             &rel_empty,
             Event::GrantDuringActive(ROLE_VERIFIED),
             &empty_ctx,
         );
-        assert!(!rel_empty_granted.snapshot().unwrap().roles_restored);
         assert_eq!(
-            rel_empty_granted.snapshot().unwrap().restore_plan,
-            vec![ROLE_VERIFIED]
+            empty_grant_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED])]
         );
+        let (rel_empty_mid, _) = acknowledge_all(rel_empty_granted, &rel_empty_actions, &empty_ctx);
+        assert!(matches!(rel_empty_mid, State::Releasing(_)));
+        let (rel_empty_done, _) = step(
+            &rel_empty_mid,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &empty_ctx,
+        );
+        assert_eq!(rel_empty_done, State::Inactive);
 
-        // 2. Once RestoreRoles is acknowledged: later GrantDuringActive is ignored.
-        let (rel_after_restore, _) =
-            step(&rel_before, Event::ActionDone(ActionId::RestoreRoles), &ctx);
-        let (rel_after_grant, _) = step(
-            &rel_after_restore,
+        // Subject to struck/deleted/protected filters and restricted_roles check:
+        let mut protected_ctx = ctx.clone();
+        protected_ctx.protected_roles = vec![ROLE_FEMDOM];
+        let (_rel_prot, prot_actions) = step(
+            &rel_before,
+            Event::GrantDuringActive(ROLE_FEMDOM),
+            &protected_ctx,
+        );
+        assert!(prot_actions.is_empty());
+        let (_rel_unrestricted, unres_actions) = step(
+            &rel_before,
+            Event::GrantDuringActive(ROLE_UNRESTRICTED),
+            &ctx,
+        );
+        assert!(unres_actions.is_empty());
+
+        // (e) Post-ack grant is still ignored after all outstanding RestoreRoles are acknowledged.
+        let (rel_one_ack, _) = step(&rel_before, Event::ActionDone(ActionId::RestoreRoles), &ctx);
+        let (rel_all_restore_acked, _) = step(
+            &rel_one_ack,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &ctx,
+        );
+        let (rel_after_grant, post_ack_actions) = step(
+            &rel_all_restore_acked,
             Event::GrantDuringActive(ROLE_MEDIA),
             &ctx,
         );
-        assert_eq!(
-            rel_after_grant.snapshot().unwrap().deferred_roles,
-            vec![ROLE_MEMBER]
-        );
+        assert!(post_ack_actions.is_empty());
         assert_eq!(
             rel_after_grant.snapshot().unwrap().restore_plan,
             vec![ROLE_VERIFIED, ROLE_MEMBER]
         );
 
-        // 3. When defer_grants = false: GrantDuringActive during Releasing is ignored.
+        // (f) When defer_grants = false: GrantDuringActive during Releasing is unchanged (emits nothing).
         let mut no_defer_ctx = ctx.clone();
         no_defer_ctx.defer_grants = false;
-        let (rel_no_defer, _) = step(
+        let (rel_no_defer, no_defer_actions) = step(
             &releasing,
             Event::GrantDuringActive(ROLE_MEMBER),
             &no_defer_ctx,
         );
-        assert!(rel_no_defer.snapshot().unwrap().deferred_roles.is_empty());
+        assert!(no_defer_actions.is_empty());
+        let (inactive_no_defer, _) =
+            acknowledge_all(rel_no_defer, &initial_rel_actions, &no_defer_ctx);
+        assert_eq!(inactive_no_defer, State::Inactive);
+    }
+
+    #[test]
+    fn grant_during_releasing_two_late_grants_and_failure_retry_uses_grown_plan() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+
+        // (c) Two late grants while RestoreRoles is unacknowledged emit growing role lists
+        // and require all three RestoreRoles emissions to be acknowledged before completion.
+        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (releasing, _) = step(
+            &releasing,
+            Event::ActionDone(ActionId::RemoveSafewordRole),
+            &ctx,
+        );
+        let (releasing, grant1_actions) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
         assert_eq!(
-            rel_no_defer.snapshot().unwrap().restore_plan,
-            vec![ROLE_VERIFIED]
+            grant1_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+        let (releasing, grant2_actions) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEDIA), &ctx);
+        assert_eq!(
+            grant2_actions,
+            vec![Action::RestoreRoles(vec![
+                ROLE_VERIFIED,
+                ROLE_MEMBER,
+                ROLE_MEDIA
+            ])]
+        );
+        let (releasing, _) = acknowledge_all(
+            releasing,
+            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
+            &ctx,
+        );
+        let (releasing, _) = step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
+        assert!(matches!(releasing, State::Releasing(_)));
+        let (releasing, _) = step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
+        assert!(matches!(releasing, State::Releasing(_)));
+        let (done_three_acks, _) =
+            step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
+        assert_eq!(done_three_acks, State::Inactive);
+
+        // (d) Failure of the first RestoreRoles then retry uses the grown plan (never the older list).
+        let (rel_d, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (rel_d, _) = step(
+            &rel_d,
+            Event::ActionDone(ActionId::RemoveSafewordRole),
+            &ctx,
+        );
+        let (rel_d, late_grant_actions) = step(&rel_d, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert_eq!(
+            late_grant_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+        let (rel_d_failed, _) = step(
+            &rel_d,
+            Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp),
+            &ctx,
+        );
+        assert_eq!(
+            restart_action(&rel_d_failed, false),
+            RestartAction::Execute(Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]))
+        );
+        let (rel_d_retried, retry_actions) = step(&rel_d_failed, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            retry_actions,
+            vec![
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ]
+        );
+        let (rel_d_done, _) = acknowledge_all(rel_d_retried, &retry_actions, &ctx);
+        assert_eq!(rel_d_done, State::Inactive);
+    }
+
+    #[test]
+    fn grant_during_releasing_with_pending_reactivate_starts_only_after_all_restore_acks() {
+        // (g) Combined with pending_reactivate: re-activation starts only after all restore acks.
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (releasing, _) = step(&releasing, Event::ReactionAdded, &ctx);
+        let (releasing, late_actions) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert_eq!(
+            late_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+        let (releasing, _) = acknowledge_all(
+            releasing,
+            &[
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ],
+            &ctx,
+        );
+
+        // First RestoreRoles ack must NOT trigger re-activation yet.
+        let reactivate_ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_MEMBER]);
+        let (still_releasing, first_ack_actions) = step(
+            &releasing,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &reactivate_ctx,
+        );
+        assert!(first_ack_actions.is_empty());
+        assert!(matches!(still_releasing, State::Releasing(_)));
+
+        // Second RestoreRoles ack completes the release and starts the fresh activation.
+        let (reactivating, react_actions) = step(
+            &still_releasing,
+            Event::ActionDone(ActionId::RestoreRoles),
+            &reactivate_ctx,
+        );
+        assert!(matches!(reactivating, State::Activating(_)));
+        assert_eq!(
+            react_actions,
+            vec![
+                Action::SaveSnapshot,
+                Action::RemoveRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
+                Action::AddSafewordRole,
+                Action::SendDm(DmKind::Activated),
+            ]
         );
     }
 
@@ -1378,7 +1553,7 @@ mod tests {
         let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
         let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
 
-        // SaveSnapshot can fail while Active (e.g. after Strike/GrantDuringActive).
+        // Only SaveSnapshot can be pending in a reachable Active state (after Strike/RoleDeleted/GrantDuringActive).
         let (active_save_failed, _) = step(
             &active,
             Event::ActionFailed(ActionId::SaveSnapshot, FailureCode::StorageError),
@@ -1388,27 +1563,30 @@ mod tests {
             active_save_failed.snapshot().unwrap().last_failure,
             Some((ActionId::SaveSnapshot, FailureCode::StorageError))
         );
-
-        // Any not-yet-done step on an Active snapshot also records last_failure (matching step_activating).
-        let mut partial_snap = active.snapshot().unwrap().clone();
-        partial_snap.roles_removed = false;
-        let partial_active = State::Active(partial_snap);
-        let (failed_partial, _) = step(
-            &partial_active,
-            Event::ActionFailed(ActionId::RemoveRoles, FailureCode::MissingPermissions),
+        let (active_save_cleared, _) = step(
+            &active_save_failed,
+            Event::ActionDone(ActionId::SaveSnapshot),
             &ctx,
         );
-        assert_eq!(
-            failed_partial.snapshot().unwrap().last_failure,
-            Some((ActionId::RemoveRoles, FailureCode::MissingPermissions))
-        );
+        assert_eq!(active_save_cleared.snapshot().unwrap().last_failure, None);
 
-        // Already-completed activation steps other than SaveSnapshot do not record a bogus failure.
-        let (still_active, _) = step(
-            &active,
-            Event::ActionFailed(ActionId::AddSafewordRole, FailureCode::TransientHttp),
-            &ctx,
-        );
-        assert_eq!(still_active.snapshot().unwrap().last_failure, None);
+        // All initial activation steps are already acknowledged before reaching Active, so failures
+        // for them (or release-only steps) are ignored rather than leaving an unclearable flag.
+        for id in [
+            ActionId::RemoveRoles,
+            ActionId::AddSafewordRole,
+            ActionId::SendActivatedDm,
+            ActionId::RemoveSafewordRole,
+            ActionId::RestoreRoles,
+            ActionId::ClearSnapshot,
+            ActionId::SendReleasedDm,
+        ] {
+            let (still_active, _) = step(
+                &active,
+                Event::ActionFailed(id, FailureCode::TransientHttp),
+                &ctx,
+            );
+            assert_eq!(still_active.snapshot().unwrap().last_failure, None);
+        }
     }
 }
