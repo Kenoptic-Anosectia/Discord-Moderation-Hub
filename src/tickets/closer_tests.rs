@@ -22,6 +22,10 @@ fn settings() -> Settings {
     }
 }
 type Mutation = fn(&mut Vec<Message>);
+// closure adapters: slice-based helpers coerce to the `Mutation` fn pointer (no lint suppression)
+const EDIT_FIRST: Mutation = |m| edit_first(m);
+const EDIT_FOOTER: Mutation = |m| edit_footer(m);
+const EDIT_URL: Mutation = |m| edit_url(m);
 struct Fake {
     msgs: Mutex<Vec<Message>>,
     reads: Mutex<usize>,
@@ -381,8 +385,7 @@ async fn rejected_delete_returns_to_verified_and_retry_deletes_again() {
     assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
-#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
-fn edit_first(m: &mut Vec<Message>) {
+fn edit_first(m: &mut [Message]) {
     m[0].content.push_str(" (edited after archive)");
     m[0].edited_timestamp = Some(serenity::all::Timestamp::now());
 }
@@ -398,7 +401,7 @@ fn append_one(m: &mut Vec<Message>) {
 #[tokio::test]
 async fn edit_or_delete_or_append_during_download_never_deletes_source() {
     for (tag, f) in [
-        ("edit", edit_first as Mutation),
+        ("edit", EDIT_FIRST),
         ("del", delete_first),
         ("add", append_one),
     ] {
@@ -437,7 +440,7 @@ async fn edit_or_delete_or_append_during_download_never_deletes_source() {
 #[tokio::test]
 async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
     for (tag, f) in [
-        ("edit", edit_first as Mutation),
+        ("edit", EDIT_FIRST),
         ("del", delete_first),
         ("add", append_one),
     ] {
@@ -1095,7 +1098,7 @@ async fn changing_presence_probes_never_delete_a_stale_or_unchecked_source() {
 
     // Present with edited / deleted / appended source: validated first, never deleted.
     for (tag, f) in [
-        ("edit", edit_first as Mutation),
+        ("edit", EDIT_FIRST),
         ("del", delete_first),
         ("add", append_one),
     ] {
@@ -1177,18 +1180,16 @@ fn with_embed(m: &mut [Message], url: &str, footer: &str) {
     }))
     .unwrap()];
 }
-#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
-fn edit_footer(m: &mut Vec<Message>) {
+fn edit_footer(m: &mut [Message]) {
     with_embed(m, "https://example.invalid/a", "footer-CHANGED");
 }
-#[allow(clippy::ptr_arg)] // must match the `Mutation` fn-pointer type
-fn edit_url(m: &mut Vec<Message>) {
+fn edit_url(m: &mut [Message]) {
     with_embed(m, "https://example.invalid/CHANGED", "footer");
 }
 
 #[tokio::test]
 async fn footer_only_or_url_only_edit_is_detected_during_download_and_on_retry() {
-    for (tag, f) in [("footer", edit_footer as Mutation), ("url", edit_url)] {
+    for (tag, f) in [("footer", EDIT_FOOTER), ("url", EDIT_URL)] {
         // during download
         let h = harness(tag).await;
         let t = active(&h, 1, Kind::Support).await;
@@ -1375,6 +1376,205 @@ mod real_downloader {
         assert_eq!(status(&h, t.id).await, "closed");
         let _ = std::fs::remove_dir_all(&h.dir);
     }
+
+    /// Round-6: same asset COUNT but wrong asset identity/association/metadata at an orphan.
+    #[tokio::test]
+    async fn orphan_with_same_asset_count_but_wrong_identity_is_never_adopted() {
+        use crate::tickets::archive::{AssetEntry, Downloaded};
+        let body = b"0123456789".to_vec();
+        for tag in ["attachment", "message", "display", "file"] {
+            let h = harness(&format!("orph-{tag}")).await;
+            let t = active(&h, 1, Kind::Support).await;
+            let io = io_with(&h, resp(200, Some(10), &body));
+            let msgs = io.inner.msgs.lock().unwrap().clone();
+            let (mut aid, mut mid) = (5000u64, msgs[0].id.get());
+            let mut display = "a.txt".to_string();
+            match tag {
+                "attachment" => aid = 999_999,
+                "message" => mid = msgs[1].id.get(),
+                "display" => display = "other.txt".into(),
+                _ => {}
+            }
+            let mut file = crate::archive_safety::generated_asset_name(aid).unwrap();
+            if tag == "file" {
+                file = crate::archive_safety::generated_asset_name(5001).unwrap();
+            }
+            let orphan = [Downloaded {
+                entry: AssetEntry {
+                    attachment_id: aid,
+                    message_id: mid,
+                    file,
+                    len: 10,
+                    sha256: archive::sha256_hex(&body),
+                    display_name: display,
+                    declared_size: 10,
+                },
+                bytes: body.clone(),
+            }];
+            archive::publish(
+                &h.root,
+                &PublishInput {
+                    ticket: t.id,
+                    channel: t.channel.unwrap(),
+                    seq: 1,
+                    nonce: 1,
+                    messages: &msgs,
+                    downloaded: &orphan,
+                },
+            )
+            .unwrap();
+            let mp = h
+                .root
+                .path()
+                .join(format!("ticket-{}-1", t.id))
+                .join("manifest.json");
+            let before = std::fs::read(&mp).unwrap();
+            assert_eq!(go(&h, &io, &t).await, CloseOutcome::Closed, "{tag}");
+            let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+            assert_eq!(ar.dir_name, format!("ticket-{}-2", t.id), "{tag}: fresh");
+            assert_eq!(std::fs::read(&mp).unwrap(), before, "{tag}: preserved");
+            let m = recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap()).unwrap();
+            assert_eq!(
+                (m.assets[0].attachment_id, m.assets[0].message_id),
+                (5000, msgs[0].id.get()),
+                "{tag}"
+            );
+            assert_eq!(io.inner.calls("delete"), 1, "{tag}");
+            assert_eq!(
+                *io.inner.archive_existed_at_delete.lock().unwrap(),
+                vec![true],
+                "{tag}"
+            );
+            let _ = std::fs::remove_dir_all(&h.dir);
+        }
+    }
+
+    /// An orphan whose asset inventory is exactly the current one is still adopted.
+    #[tokio::test]
+    async fn orphan_with_exact_asset_inventory_is_adopted() {
+        let h = harness("orph-exact").await;
+        let t = active(&h, 1, Kind::Support).await;
+        let io = io_with(&h, resp(200, Some(10), b"0123456789"));
+        let msgs = io.inner.msgs.lock().unwrap().clone();
+        let body = b"0123456789".to_vec();
+        let dl = [crate::tickets::archive::Downloaded {
+            entry: crate::tickets::archive::AssetEntry {
+                attachment_id: 5000,
+                message_id: msgs[0].id.get(),
+                file: crate::archive_safety::generated_asset_name(5000).unwrap(),
+                len: 10,
+                sha256: archive::sha256_hex(&body),
+                display_name: "a.txt".into(),
+                declared_size: 10,
+            },
+            bytes: body,
+        }];
+        archive::publish(
+            &h.root,
+            &PublishInput {
+                ticket: t.id,
+                channel: t.channel.unwrap(),
+                seq: 1,
+                nonce: 1,
+                messages: &msgs,
+                downloaded: &dl,
+            },
+        )
+        .unwrap();
+        assert_eq!(go(&h, &io, &t).await, CloseOutcome::Closed);
+        let ar = h.repo.latest_archive(t.id).await.unwrap().unwrap();
+        assert_eq!(ar.dir_name, format!("ticket-{}-1", t.id), "adopted");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+}
+
+/// Round-6: a durable record whose asset count disagrees with the (self-consistent) manifest
+/// must fail closed at the shared recorded_manifest boundary: close, reconcile and retrieval.
+async fn mismatched_asset_record(tag: &str) -> (H, Fake, Ticket) {
+    let h = harness(tag).await;
+    let t = active(&h, 1, Kind::Support).await;
+    let mut io = Fake::new(&h.dir.join("archives"), 3);
+    io.history_fail = true;
+    assert!(matches!(
+        run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
+        CloseOutcome::Retained(_)
+    ));
+    let msgs = io.msgs.lock().unwrap().clone();
+    let p = archive::publish(
+        &h.root,
+        &PublishInput {
+            ticket: t.id,
+            channel: t.channel.unwrap(),
+            seq: 1,
+            nonce: 1,
+            messages: &msgs,
+            downloaded: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(p.assets, 0);
+    let rec = ArchiveRecord {
+        dir_name: &p.dir_name,
+        sha: &p.manifest_sha256,
+        messages: p.messages,
+        assets: 99, // does NOT match the 0-asset manifest
+    };
+    assert_eq!(
+        h.repo.record_archive(t.id, "a", rec, 1).await.unwrap(),
+        Some(1)
+    );
+    let step = crate::tickets::repository_close::Step {
+        from: "archiving",
+        to: "verified",
+        note: "test",
+    };
+    assert!(h.repo.advance(t.id, "a", step, 1, 2).await.unwrap());
+    io.history_fail = false;
+    (h, io, t)
+}
+
+#[tokio::test]
+async fn recorded_asset_count_mismatch_fails_closed_for_close() {
+    let (h, io, t) = mismatched_asset_record("rec-assets-close").await;
+    assert_eq!(
+        run(&h, &io, &actor(&t), t.id, "b", &settings()).await,
+        CloseOutcome::Retained("reverify")
+    );
+    assert_eq!(io.calls("delete"), 0);
+    assert_ne!(status(&h, t.id).await, "closed");
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn recorded_asset_count_mismatch_fails_closed_for_reconcile() {
+    let (h, io, t) = mismatched_asset_record("rec-assets-recon").await;
+    *io.probe.lock().unwrap() = Presence::Absent;
+    let s = settings();
+    let r = env_run!(h, &io, &s, |e| reconcile(e)).unwrap();
+    assert_eq!(r.closed_by_known_absence, 0);
+    assert_ne!(status(&h, t.id).await, "closed");
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn recorded_asset_count_mismatch_fails_closed_for_retrieval() {
+    let (h, io, t) = mismatched_asset_record("rec-assets-retr").await;
+    let limits = Limits::default();
+    let f = || 9000i64;
+    let s = settings();
+    let env = Env {
+        settings: &s,
+        repo: &h.repo,
+        io: &io,
+        root: &h.root,
+        limits: &limits,
+        now: &f,
+    };
+    let mut staff = actor(&t);
+    staff.channel = 1;
+    let out = retrieve(&env, &staff, t.id).await;
+    assert!(out.contains("integrity check FAILED"), "{out}");
+    let _ = std::fs::remove_dir_all(&h.dir);
 }
 
 #[tokio::test]

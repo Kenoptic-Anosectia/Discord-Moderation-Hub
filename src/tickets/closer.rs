@@ -118,7 +118,13 @@ fn recorded_manifest(
         return None;
     }
     match archive::verify(root, &dir, Some(&ar.manifest_sha256), &[]) {
-        Ok(m) if m.message_count == ar.messages && identity_ok(&m, ticket, channel) => Some(m),
+        Ok(m)
+            if m.message_count == ar.messages
+                && m.assets.len() as u64 == ar.assets
+                && identity_ok(&m, ticket, channel) =>
+        {
+            Some(m)
+        }
         _ => None,
     }
 }
@@ -215,6 +221,10 @@ pub async fn close_ticket<I: CloseIo>(
         // if it fully re-verifies AND matches the current source; otherwise PRESERVE it
         // (never delete or overwrite) and publish under the next free sequence. Bounded, so a
         // retry always makes progress instead of colliding on the same name forever.
+        // Complete expected inventory (attachment/message ids, generated file, sizes, hashes,
+        // display metadata) derived from the CURRENT source; an orphan must match it exactly.
+        let expected_assets: Vec<archive::AssetEntry> =
+            dl.iter().map(|d| d.entry.clone()).collect();
         let mut published = None;
         for seq in base_seq..base_seq + MAX_ORPHANS {
             match archive::publish(
@@ -245,7 +255,7 @@ pub async fn close_ticket<I: CloseIo>(
                                     if identity_ok(&m, ticket_id, channel)
                                         && m.content_sha256
                                             == archive::content_fingerprint(&msgs)
-                                        && m.assets.len() == dl.len()
+                                        && m.assets == expected_assets
                                         && m.message_count == msgs.len() as u64 =>
                                 {
                                     Some(archive::Published {
