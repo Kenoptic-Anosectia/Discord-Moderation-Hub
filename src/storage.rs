@@ -29,6 +29,8 @@ pub enum StorageError {
     StoredVersionNewer,
     CorruptStoredVersion,
     PragmaNotApplied,
+    /// A step ended the surrounding transaction (COMMIT/ROLLBACK/END).
+    StepEndedTransaction,
 }
 
 impl StorageError {
@@ -43,6 +45,7 @@ impl StorageError {
             StorageError::StoredVersionNewer => "stored_version_newer",
             StorageError::CorruptStoredVersion => "corrupt_stored_version",
             StorageError::PragmaNotApplied => "pragma_not_applied",
+            StorageError::StepEndedTransaction => "step_ended_transaction",
         }
     }
 }
@@ -663,5 +666,168 @@ mod tests {
             StorageError::StoredVersionNewer.code(),
             "stored_version_newer"
         );
+    }
+
+    #[test]
+    fn file_uri_spellings_refused_and_reserved_file_untouched() {
+        let dir = scratch("uri");
+        let reserved = dir.join("tickets.sqlite");
+        {
+            let c = Connection::open(&reserved).unwrap();
+            c.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);")
+                .unwrap();
+        }
+        let before = std::fs::read(&reserved).unwrap();
+        let abs = reserved.to_str().unwrap().replace('\\', "/");
+        let spellings = [
+            format!("file:{abs}"),
+            format!("file:///{abs}"),
+            format!("file:{abs}?cache=shared"),
+            format!("FILE:{abs}"),
+            "file::memory:".to_string(),
+        ];
+        for sp in &spellings {
+            assert!(
+                open(sp, std::slice::from_ref(&reserved)).is_err(),
+                "uri spelling accepted: {sp}"
+            );
+        }
+        assert!(
+            std::fs::read(&reserved).unwrap() == before,
+            "reserved file changed"
+        );
+        assert!(!dir.join("tickets.sqlite-wal").exists());
+    }
+
+    #[test]
+    fn unc_style_paths_are_refused() {
+        assert_eq!(
+            open("\\\\localhost\\C$\\x\\tickets.sqlite", &[]).err(),
+            Some(StorageError::InvalidPath)
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                open("//localhost/C$/x/tickets.sqlite", &[]).err(),
+                Some(StorageError::InvalidPath)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_trailing_dot_and_space_spellings_of_missing_reserved_file_refused() {
+        if !cfg!(windows) {
+            return;
+        }
+        let dir = scratch("trailing");
+        let reserved = dir.join("roles.sqlite");
+        let d = dir.to_str().unwrap();
+        for sp in [
+            format!("{d}/roles.sqlite."),
+            format!("{d}/roles.sqlite "),
+            format!("{d}/roles.sqlite. ."),
+            format!("{d}/roles.sqlite../"),
+        ] {
+            assert_eq!(
+                open(&sp, std::slice::from_ref(&reserved)).err(),
+                Some(StorageError::ReservedPath),
+                "not refused: {sp:?}"
+            );
+            assert!(!reserved.exists(), "reserved file created via {sp:?}");
+        }
+        assert_eq!(
+            open(&format!("{d}/..."), &[]).err(),
+            Some(StorageError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn step_that_commits_is_refused_and_no_later_step_runs() {
+        let mut c = mem();
+        let s1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE t1 (x); COMMIT;",
+        };
+        let s2 = Migration {
+            version: 2,
+            sql: "CREATE TABLE t2 (x);",
+        };
+        assert_eq!(
+            migrate(&mut c, "a", &[s1, s2]),
+            Err(StorageError::StepEndedTransaction)
+        );
+        assert!(!table_exists(&c, "t2"), "later step ran");
+        assert_eq!(version_of(&c, "a"), None, "version bumped");
+    }
+
+    #[test]
+    fn step_that_commits_last_is_not_reported_as_success() {
+        let mut c = mem();
+        let s1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE t1 (x); END;",
+        };
+        assert_eq!(
+            migrate(&mut c, "a", &[s1]),
+            Err(StorageError::StepEndedTransaction)
+        );
+        assert_eq!(version_of(&c, "a"), None);
+    }
+
+    #[test]
+    fn step_that_rolls_back_is_refused_and_no_later_step_runs() {
+        let mut c = mem();
+        let s1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE t1 (x);",
+        };
+        let s2 = Migration {
+            version: 2,
+            sql: "ROLLBACK;",
+        };
+        let s3 = Migration {
+            version: 3,
+            sql: "CREATE TABLE t3 (x);",
+        };
+        assert_eq!(
+            migrate(&mut c, "a", &[s1, s2, s3]),
+            Err(StorageError::StepEndedTransaction)
+        );
+        assert!(!table_exists(&c, "t3"), "later step ran");
+        assert_eq!(version_of(&c, "a"), None);
+        // connection still usable afterwards
+        assert_eq!(migrate(&mut c, "b", &[M1]), Ok(1));
+    }
+
+    #[test]
+    fn trigger_with_begin_end_inside_step_still_works() {
+        let mut c = mem();
+        let s1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE t (x); CREATE TABLE log (y); \
+                  CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.x); END;",
+        };
+        assert_eq!(migrate(&mut c, "a", &[s1]), Ok(1));
+        c.execute("INSERT INTO t VALUES (7)", []).unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn non_integer_stored_version_is_corrupt_not_sqlite() {
+        for bad in ["'abc'", "1.5"] {
+            let mut c = mem();
+            migrate(&mut c, "a", &[M1]).unwrap();
+            c.execute_batch(&format!(
+                "UPDATE schema_versions SET version = {bad} WHERE feature = 'a';"
+            ))
+            .unwrap();
+            assert_eq!(
+                migrate(&mut c, "a", &[M1]),
+                Err(StorageError::CorruptStoredVersion),
+                "{bad}"
+            );
+        }
     }
 }
