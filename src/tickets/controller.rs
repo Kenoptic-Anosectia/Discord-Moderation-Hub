@@ -279,10 +279,8 @@ mod tests {
         .unwrap();
         r
     }
-    /// Proves that an uncertain channel-creation outcome never adopts a candidate channel,
-    /// not even a single channel whose guild, category, marker topic and privacy all match,
-    /// and that decoys differing in any of those fields are not counted.
-    /// Fails if the recovery path ever attaches a channel it did not create itself.
+    /// Proves an uncertain channel-creation outcome never adopts a candidate channel, not
+    /// even one matching guild, category, marker topic and privacy. Fails on adoption.
     #[tokio::test]
     async fn uncertain_operation_never_adopts_a_single_forgeable_match() {
         for matches in [0, 1, 2] {
@@ -344,12 +342,8 @@ mod tests {
             );
         }
     }
-    /// Proves each failure mode is reported truthfully and that no internal error detail
-    /// reaches the user: an ack or feedback failure propagates as an error, a validation
-    /// failure stops before creation, a definite rejection leaves the ticket `failed`, and a
-    /// greeting failure leaves the ticket `active` with `greeting=failed`.
-    /// Fails if a failure is misreported, if a validation failure still creates a channel, or
-    /// if raw error text is echoed to the user.
+    /// Proves each failure mode is reported truthfully and no internal error detail reaches
+    /// the user. Fails if a mode is misreported or raw error text is echoed.
     #[tokio::test]
     async fn known_rejection_ack_validation_greeting_and_feedback_failures_are_truthful() {
         for mode in ["ack", "validate", "reject", "greet", "feedback"] {
@@ -388,10 +382,8 @@ mod tests {
             }
         }
     }
-    /// Proves that two concurrent presses on the same slot create only one channel, while a
-    /// different opener or a different ticket kind gets its own independent channel.
-    /// Fails if the one-shot claim stops serialising same-slot requests, or if slots stop
-    /// being per user and per kind.
+    /// Proves two concurrent presses on the same slot create only one channel, while a
+    /// different opener or kind gets its own channel. Fails if the claim stops serialising.
     #[tokio::test]
     async fn concurrent_same_slot_creates_once_but_other_slots_are_independent() {
         let r = repository().await;
@@ -438,11 +430,8 @@ mod tests {
             3
         );
     }
-    /// Proves the private defer happens before any other work, that a valid request creates
-    /// and greets a channel, and that repeating the same interaction does not create a second
-    /// channel but still reports the existing one.
-    /// Fails if the defer is no longer first, if the retry creates a duplicate channel, or if
-    /// the ticket does not end up active with its channel stored.
+    /// Proves the private defer happens before any other work and that repeating the same
+    /// interaction creates no second channel. Fails if the defer stops being first.
     #[tokio::test]
     async fn trusted_route_defers_before_work_and_retries_without_creation() {
         for custom in [super::super::policy::SUPPORT, super::super::policy::AGE] {
@@ -476,11 +465,8 @@ mod tests {
             assert_eq!(t.status, "active");
         }
     }
-    /// Proves that untrusted request shapes, an invalid configuration and a closed opening
-    /// gate all produce no channel creation, and that the closed gate still answers the user
-    /// with a message saying opening is disabled.
-    /// Fails if any of those cases reaches creation or validation, or if the gate stops
-    /// replying to the user.
+    /// Proves untrusted request shapes, an invalid configuration and a closed opening gate
+    /// all create no channel. Fails if any of those reaches creation.
     #[tokio::test]
     async fn untrusted_components_invalid_config_and_rollout_gate_never_create() {
         let r = repository().await;

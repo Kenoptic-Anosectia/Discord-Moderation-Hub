@@ -193,9 +193,8 @@ mod tests {
             db_path: "owned-test.sqlite".into(),
         }
     }
-    /// Proves the publish check accepts only the guild owner publishing into a text channel of
-    /// the configured guild, and that a staff role equal to the guild id is rejected.
-    /// Fails if any precondition is dropped or if `valid()` stops rejecting staff == guild.
+    /// Proves the publish check accepts only the guild owner publishing into a text channel
+    /// of the configured guild. Fails if a precondition is dropped or staff==guild passes.
     #[test]
     fn owner_only_and_config_validation() {
         let mut s = settings();
@@ -217,9 +216,7 @@ mod tests {
         }
     }
     /// Proves the created channel lands under the right category with the marker topic and
-    /// exactly four overwrites: @everyone denied view, requester/staff/bot allowed.
-    /// Fails if an overwrite is added, removed, widened or reordered, or if the topic or
-    /// parent changes.
+    /// exactly four overwrites with the expected ids and types. Fails if any differs.
     #[test]
     fn private_payload_is_explicit_and_category_bound() {
         let s = settings();

@@ -1,16 +1,15 @@
 //! Durable ticket storage: panel provenance, ticket slots, and the create state machine.
 //!
-//! This module owns the SQLite side of the ticket feature. It stores which panel message may
-//! open tickets, reserves one slot per (guild, opener, kind), and drives the
-//! `reserved -> creating -> active|failed` transitions that surround Discord channel
-//! creation. It deliberately does NOT create Discord channels, does not greet users, and
-//! never auto-adopts a channel it did not attach itself.
+//! This module owns the SQLite side of the ticket feature: it stores which panel message
+//! may open tickets, reserves one slot per (guild, opener, kind), and drives the
+//! `reserved -> creating -> active|failed` transitions around Discord channel creation.
+//! It does NOT create Discord channels, greet users, or auto-adopt a channel it did not
+//! attach itself.
 //!
 //! Trust boundary: every method takes ids and strings that ultimately come from Discord
-//! payloads, so they are untrusted. Ids are stored as TEXT and parsed back on read, and a
+//! payloads, so they are untrusted. Ids are stored as TEXT and parsed back on read; a
 //! parse failure surfaces as an error rather than a silent default. State transitions are
-//! compare-and-set: a caller that lost a race gets `false` or an error and must not assume
-//! the ticket is in the state it asked for.
+//! compare-and-set: a caller that lost a race gets `false` or an error.
 
 use super::policy::Kind;
 use crate::Error;
@@ -121,9 +120,14 @@ impl Repository {
     }
     /// Transition `creating -> active` and stores the created channel id.
     ///
-    /// Fails with an error when the UPDATE did not change exactly one row: the ticket must be
-    /// in `creating` and must not already have a channel. The error is deliberately loud
-    /// because it means the caller lost a race or is out of order.
+    /// The update matches on the ticket id and on `status='creating'` only; it does NOT
+    /// check that the row has no channel yet, so it will overwrite an already-stored
+    /// channel id if one is present. The caller is responsible for calling this exactly
+    /// once, after a successful channel creation, on a ticket it has claimed.
+    ///
+    /// Fails with an error when the update did not change exactly one row, i.e. the ticket
+    /// was not in `creating`. The error is deliberately loud because it means the caller
+    /// lost a race or is out of order.
     pub async fn attach(&self, id: i64, channel: u64) -> Result<(), Error> {
         self.db.call(move |c| -> rusqlite::Result<()> {
    let changed=c.execute("UPDATE tickets SET status='active',channel=?2 WHERE id=?1 AND status='creating'",params![id,channel.to_string()])?;
@@ -246,11 +250,8 @@ pub(crate) mod a07_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Proves the slot and the opaque operation survive separate connections and a restart:
-    /// two concurrent reserves on the same opener/kind share one slot and one operation id,
-    /// only one concurrent claim wins, and reopening the file restores the same slot.
-    /// Fails if slot reuse, the interaction binding, the one-shot claim or the operation
-    /// column stops behaving across connections or restarts.
+    /// Proves the slot and the opaque operation survive separate connections and a restart.
+    /// Fails if slot reuse, the one-shot claim or the operation column stops persisting.
     #[tokio::test]
     async fn separate_connections_and_restart_preserve_slots_and_opaque_operations() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -306,9 +307,7 @@ mod tests {
         );
     }
     /// Proves panel trust is exact on all four fields and that republishing deactivates the
-    /// previous panel.
-    /// Fails if any single field stops being compared, or if the old panel stays trusted
-    /// after a new one is saved.
+    /// previous panel. Fails if a field stops being compared, or the old panel stays trusted.
     #[tokio::test]
     async fn panel_provenance_is_exact() {
         let r = Repository::open(":memory:").await.unwrap();
@@ -336,11 +335,8 @@ mod tests {
         );
         assert!(r.trusted_panel(replacement).await.unwrap());
     }
-    /// Proves the create state machine is a compare-and-set: only one of two concurrent
-    /// claims wins, `failed` is only reachable from `creating` and only while no channel is
-    /// attached, and a failed slot is released so the next request creates a new ticket.
-    /// Fails if the transitions become unconditional, or if a failed slot keeps blocking the
-    /// opener.
+    /// Proves the create state machine is a compare-and-set: one concurrent claim wins and
+    /// a failed slot is released. Fails if a transition becomes unconditional.
     #[tokio::test]
     async fn claim_attach_and_known_failure_are_durable_and_concurrent() {
         let r = Repository::open(":memory:").await.unwrap();
@@ -372,11 +368,8 @@ mod tests {
         );
         assert!(r.reserve(5, 100, 3, Kind::Support).await.unwrap().id > b.id);
     }
-    /// Proves reservation is idempotent per interaction id, that the slot is per
-    /// (opener, kind) so support and age are independent, and that a new ticket id is
-    /// allocated for a different opener.
-    /// Fails if reservation stops being idempotent, if the slot becomes per-user-only (so
-    /// support and age would collide), or if ids stop increasing.
+    /// Proves reservation is idempotent per interaction id and that the slot is per
+    /// (opener, kind). Fails if reservation stops being idempotent or slots collide.
     #[tokio::test]
     async fn reservation_is_idempotent_and_slots_are_per_type_and_user() {
         let r = Repository::open(":memory:").await.unwrap();
