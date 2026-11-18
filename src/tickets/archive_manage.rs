@@ -441,12 +441,55 @@ fn reply(error: ManageError) -> &'static str {
     }
 }
 
-pub fn render_list(result: &Result<Vec<ArchiveSummary>, ManageError>) -> String {
-    match result {
-        Ok(rows) if rows.is_empty() => "No archives on this page.".into(),
-        Ok(rows) => format!("Archives on this page: {}.", rows.len()),
-        Err(e) => reply(*e).into(),
+/// Rows shown per `list` reply. A worst-case row (20-digit numbers, longest kind and
+/// status) is about 165 characters, so ten rows plus header and offset hint stay well
+/// under Discord's 2000-character limit; a unit test asserts the maximum.
+pub const LIST_ROWS: usize = 10;
+/// Opaque ids shown per `health` reply.
+const HEALTH_IDS: usize = 10;
+
+/// Recorded kind/status are constrained by the schema, but a reply must stay safe and
+/// bounded even if a row is not: keep only lowercase ASCII word characters, at most 16.
+fn token(text: &str) -> String {
+    let clean: String = text
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+        .take(16)
+        .collect();
+    if clean.is_empty() {
+        "?".into()
+    } else {
+        clean
     }
+}
+
+pub fn render_list(result: &Result<Vec<ArchiveSummary>, ManageError>, offset: usize) -> String {
+    let rows = match result {
+        Ok(rows) if rows.is_empty() => return "No archives on this page.".into(),
+        Ok(rows) => rows,
+        Err(e) => return reply(*e).into(),
+    };
+    let shown = rows.len().min(LIST_ROWS);
+    let mut text = format!("Archives on this page: {shown}.");
+    for row in &rows[..shown] {
+        text.push_str(&format!(
+            "\n{} ticket {} seq {} {} {} {} msgs {} assets",
+            row.id.as_str(),
+            row.ticket,
+            row.seq,
+            token(&row.kind),
+            token(&row.ticket_status),
+            row.messages,
+            row.assets
+        ));
+    }
+    if rows.len() > LIST_ROWS {
+        text.push_str(&format!(
+            "\nMore archives are available: use offset {}.",
+            offset.saturating_add(LIST_ROWS)
+        ));
+    }
+    text
 }
 
 pub fn render_show(result: &Result<ArchiveSummary, ManageError>) -> String {
@@ -461,13 +504,35 @@ pub fn render_show(result: &Result<ArchiveSummary, ManageError>) -> String {
     }
 }
 
-pub fn render_health(result: &Result<HealthReport, ManageError>) -> String {
-    match result {
-        Ok(r) => format!("Archive health: {} verified, {} missing, {} corrupt, {} identity mismatches, {} invalid names.{}",
-            r.verified, r.missing, r.corrupt, r.identity_mismatch, r.bad_name,
-            if r.has_more { " More archives are available." } else { "" }),
-        Err(e) => reply(*e).into(),
+pub fn render_health(result: &Result<HealthReport, ManageError>, offset: usize) -> String {
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => return reply(*e).into(),
+    };
+    let mut text = format!(
+        "Archive health: {} verified, {} missing, {} corrupt, {} identity mismatches, {} invalid names.",
+        r.verified, r.missing, r.corrupt, r.identity_mismatch, r.bad_name
+    );
+    if !r.non_verified.is_empty() {
+        text.push_str("\nNot verified (pass an ID to show or restore):");
+        for id in r.non_verified.iter().take(HEALTH_IDS) {
+            text.push('\n');
+            text.push_str(id.as_str());
+        }
+        if r.non_verified.len() > HEALTH_IDS {
+            text.push_str(&format!(
+                "\nShowing the first {HEALTH_IDS} of {}.",
+                r.non_verified.len()
+            ));
+        }
     }
+    if r.has_more {
+        text.push_str(&format!(
+            "\nMore archives are available: use offset {}.",
+            offset.saturating_add(HEALTH_PAGE)
+        ));
+    }
+    text
 }
 
 pub fn render_orphans(result: &Result<OrphanSummary, ManageError>) -> String {
@@ -816,7 +881,13 @@ mod tests {
         let actor = staff();
         let run =
             |action, id, offset| dispatch(&f.settings, &f.repo, &actor, policy, action, id, offset);
-        assert_eq!(run("list", None, 0).await, "Archives on this page: 1.");
+        assert_eq!(
+            run("list", None, 0).await,
+            format!(
+                "Archives on this page: 1.\n{} ticket 1 seq 1 age closed 1 msgs 1 assets",
+                id.as_str()
+            )
+        );
         assert_eq!(run("list", None, 1).await, "No archives on this page.");
         assert_eq!(
             run("show", Some(id.as_str()), 0).await,
@@ -853,7 +924,13 @@ mod tests {
         let stage = f.scratch.0.join("ticket-restore-staging");
         assert_eq!(fs::read_dir(stage).unwrap().count(), 1);
         assert_eq!(snapshot(f.root.path()), source);
-        assert_eq!(run("list", None, 0).await, "Archives on this page: 1.");
+        assert_eq!(
+            run("list", None, 0).await,
+            format!(
+                "Archives on this page: 1.\n{} ticket 1 seq 1 age closed 1 msgs 1 assets",
+                id.as_str()
+            )
+        );
     }
 
     #[tokio::test]
@@ -1261,9 +1338,9 @@ mod tests {
         const DENIED: &str = "You cannot manage archives.";
         const RAW: &str = r"<@123> C:\secret\path SQLITE_CORRUPT";
         let denial = [
-            render_list(&Err(ManageError::Denied)),
+            render_list(&Err(ManageError::Denied), 0),
             render_show(&Err(ManageError::Denied)),
-            render_health(&Err(ManageError::Denied)),
+            render_health(&Err(ManageError::Denied), 0),
             render_orphans(&Err(ManageError::Denied)),
             render_retention(&Err(ManageError::Denied)),
             render_restore(&RestoreOutcome::Denied),
@@ -1277,9 +1354,9 @@ mod tests {
         let m = f.manage();
         let a = staff();
         let mut replies = vec![
-            render_list(&list(&m, &a, 5, 0).await),
+            render_list(&list(&m, &a, 5, 0).await, 0),
             render_show(&show(&m, &a, id.as_str()).await),
-            render_health(&health(&m, &a, 0).await),
+            render_health(&health(&m, &a, 0).await, 0),
             render_retention(&retention_plan(&m, &a, RetentionPolicy::Disabled).await),
             render_orphans(&Ok(OrphanSummary {
                 unknown_entries: OrphanClass {
@@ -1313,6 +1390,208 @@ mod tests {
         for text in replies {
             assert!(!text.is_empty());
             for forbidden in ["@", "<", "\\", "C:", "SQLITE_CORRUPT"] {
+                assert!(!text.contains(forbidden), "unsafe reply: {text}");
+            }
+        }
+    }
+
+    fn summary(n: u32, ticket: i64, seq: i64, kind: &str, status: &str) -> ArchiveSummary {
+        ArchiveSummary {
+            id: ArchiveId::parse(&format!("arc-{n:032x}")).unwrap(),
+            ticket,
+            seq,
+            kind: kind.into(),
+            ticket_status: status.into(),
+            messages: 3,
+            assets: 4,
+            verified_at: 0,
+        }
+    }
+
+    fn worst_row(n: u32) -> ArchiveSummary {
+        ArchiveSummary {
+            messages: u64::MAX,
+            assets: u64::MAX,
+            ..summary(n, i64::MIN, i64::MIN, "support", "delete_requested")
+        }
+    }
+
+    fn hex(n: u32) -> String {
+        format!("arc-{n:032x}")
+    }
+
+    #[test]
+    fn list_renders_exact_rows_and_offset_hints() {
+        assert_eq!(render_list(&Ok(vec![]), 0), "No archives on this page.");
+        assert_eq!(
+            render_list(&Ok(vec![summary(1, 14, 2, "age", "closed")]), 0),
+            format!(
+                "Archives on this page: 1.\n{} ticket 14 seq 2 age closed 3 msgs 4 assets",
+                hex(1)
+            )
+        );
+        let rows: Vec<_> = (0..LIST_ROWS as u32)
+            .map(|n| summary(n, 50 - i64::from(n), 1, "support", "active"))
+            .collect();
+        let full = render_list(&Ok(rows.clone()), 0);
+        assert!(full.starts_with(&format!("Archives on this page: {LIST_ROWS}.\n")));
+        assert_eq!(full.lines().count(), LIST_ROWS + 1);
+        assert!(
+            !full.contains("offset"),
+            "exactly a full page has no next page: {full}"
+        );
+        let mut over = rows;
+        over.push(summary(99, 1, 1, "age", "closed"));
+        let more = render_list(&Ok(over), 20);
+        assert!(!more.contains(&hex(99)), "the probe row is not shown");
+        assert_eq!(more.lines().count(), LIST_ROWS + 2);
+        assert_eq!(
+            more.lines().last().unwrap(),
+            format!(
+                "More archives are available: use offset {}.",
+                20 + LIST_ROWS
+            )
+        );
+    }
+
+    #[test]
+    fn list_and_health_replies_fit_discord_in_the_worst_case() {
+        let rows: Vec<_> = (0..LIST_ROWS as u32 + 5).map(worst_row).collect();
+        let text = render_list(&Ok(rows), usize::MAX - 10);
+        assert!(
+            text.chars().count() <= 2000,
+            "list reply is {} chars",
+            text.chars().count()
+        );
+        assert_eq!(text.matches("arc-").count(), LIST_ROWS);
+        let hostile = ArchiveSummary {
+            kind: "<@1> C:\\x".repeat(500),
+            ticket_status: "@everyone".repeat(500),
+            ..worst_row(0)
+        };
+        let text = render_list(&Ok(vec![hostile; LIST_ROWS + 1]), usize::MAX - 10);
+        assert!(text.chars().count() <= 2000);
+        for forbidden in ["@", "<", "\\", "C:"] {
+            assert!(!text.contains(forbidden), "unsafe: {text}");
+        }
+        let report = HealthReport {
+            verified: usize::MAX,
+            missing: usize::MAX,
+            corrupt: usize::MAX,
+            identity_mismatch: usize::MAX,
+            bad_name: usize::MAX,
+            non_verified: (0..HEALTH_PAGE as u32)
+                .map(|n| summary(n, 1, 1, "age", "closed").id)
+                .collect(),
+            has_more: true,
+        };
+        let text = render_health(&Ok(report), usize::MAX - HEALTH_PAGE);
+        assert!(
+            text.chars().count() <= 2000,
+            "health reply is {} chars",
+            text.chars().count()
+        );
+        assert_eq!(text.matches("arc-").count(), HEALTH_IDS);
+    }
+
+    #[test]
+    fn health_renders_ids_of_non_verified_archives_only() {
+        let clean = HealthReport {
+            verified: 2,
+            ..HealthReport::default()
+        };
+        assert_eq!(
+            render_health(&Ok(clean), 0),
+            "Archive health: 2 verified, 0 missing, 0 corrupt, 0 identity mismatches, 0 invalid names."
+        );
+        let some = HealthReport {
+            verified: 1,
+            corrupt: 1,
+            missing: 1,
+            non_verified: vec![
+                summary(1, 1, 1, "age", "closed").id,
+                summary(2, 1, 1, "age", "closed").id,
+            ],
+            ..HealthReport::default()
+        };
+        assert_eq!(
+            render_health(&Ok(some), 0),
+            format!("Archive health: 1 verified, 1 missing, 1 corrupt, 0 identity mismatches, 0 invalid names.\nNot verified (pass an ID to show or restore):\n{}\n{}", hex(1), hex(2))
+        );
+        let many = HealthReport {
+            missing: HEALTH_IDS + 2,
+            non_verified: (0..HEALTH_IDS as u32 + 2)
+                .map(|n| summary(n, 1, 1, "age", "closed").id)
+                .collect(),
+            has_more: true,
+            ..HealthReport::default()
+        };
+        let text = render_health(&Ok(many), 50);
+        assert_eq!(text.matches("arc-").count(), HEALTH_IDS);
+        assert!(text.contains(&format!(
+            "Showing the first {HEALTH_IDS} of {}.",
+            HEALTH_IDS + 2
+        )));
+        assert!(text.ends_with(&format!(
+            "More archives are available: use offset {}.",
+            50 + HEALTH_PAGE
+        )));
+    }
+
+    #[tokio::test]
+    async fn ids_from_list_and_health_drive_show_and_restore() {
+        use super::super::{runtime_archives::dispatch, runtime_close::archive_root};
+        let _restore_lock = RESTORE_TESTS.lock().await;
+        let mut f = Fixture::new().await;
+        f.root = archive_root(&f.settings).unwrap();
+        let good = f.publish(GUILD, 1, "closed", Some(1)).await;
+        let bad = f.publish(GUILD, 2, "active", None).await;
+        fs::remove_file(f.dir(2).join("assets/attachment-100.bin")).unwrap();
+        let actor = staff();
+        let policy = RetentionPolicy::Disabled;
+        let run =
+            |action, id, offset| dispatch(&f.settings, &f.repo, &actor, policy, action, id, offset);
+        let ids = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.split_whitespace().next())
+                .filter(|t| t.starts_with("arc-"))
+                .map(String::from)
+                .collect()
+        };
+        let listed = run("list", None, 0).await;
+        assert_eq!(
+            listed,
+            format!(
+                "Archives on this page: 2.\n{} ticket 2 seq 1 age active 1 msgs 1 assets\n{} ticket 1 seq 1 age closed 1 msgs 1 assets",
+                bad.as_str(),
+                good.as_str()
+            )
+        );
+        assert_eq!(ids(&listed), vec![bad.as_str(), good.as_str()]);
+        let health_text = run("health", None, 0).await;
+        assert_eq!(ids(&health_text), vec![bad.as_str()], "{health_text}");
+        let listed_ids = ids(&listed);
+        let health_ids = ids(&health_text);
+        for id in listed_ids.iter().chain(health_ids.iter()) {
+            let shown = run("show", Some(id), 0).await;
+            assert_eq!(shown, format!("Archive {id}: 1 messages, 1 assets."));
+        }
+        let restored = run("restore", Some(&listed_ids[1]), 0).await;
+        assert!(
+            restored.starts_with("Restored to staging: 3 files,"),
+            "{restored}"
+        );
+        for text in [&listed, &health_text, &restored] {
+            for forbidden in [
+                "@",
+                "<",
+                "\\",
+                "C:",
+                "ticket-1-1",
+                "ticket-2-1",
+                "scratch",
+                "target",
+            ] {
                 assert!(!text.contains(forbidden), "unsafe reply: {text}");
             }
         }
