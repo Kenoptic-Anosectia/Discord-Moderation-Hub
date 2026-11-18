@@ -47,9 +47,9 @@ pub fn parse_retention(raw: Option<&str>) -> Result<RetentionPolicy, RetentionEr
     if !trimmed.chars().all(|c: char| c.is_ascii_digit()) {
         return Err(RetentionError::Invalid);
     }
-    // Reject leading-zero numbers like "007" — the spec says ASCII digits
-    // only and parse to integer; "0" itself is valid digits but out of range.
-    // Use u64 parsing to avoid overflow, then check range.
+    // Parse as u64 to handle large digit strings; range check below rejects
+    // out-of-bounds values (0, >36500, overflow). Leading zeros like "007"
+    // parse fine as 7 and pass the range check.
     let n: u64 = trimmed.parse().map_err(|_| RetentionError::Invalid)?;
     if !(1..=36500).contains(&n) {
         return Err(RetentionError::Invalid);
