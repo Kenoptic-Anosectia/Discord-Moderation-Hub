@@ -86,7 +86,7 @@ impl LastSeenCounts {
 ///
 /// An audit entry (already filtered to the message-delete action by the caller) is THIS deletion
 /// when it targets the author in this channel and is either fresh by id-age or its merged `count`
-/// rose since we last looked. Every entry's count is recorded on every successful lookup so a later
+/// rose since we last looked. Only matching entries (author and channel) are recorded on a successful lookup so a later
 /// self-delete is not credited to an old moderator entry. A failed lookup is never reported as the
 /// author deleting it.
 pub fn attribute_deletion(
@@ -105,13 +105,14 @@ pub fn attribute_deletion(
     // best = (count increase, entry id, executor)
     let mut best: Option<(u64, u64, u64)> = None;
     for e in entries {
-        let previous = seen.get(e.id);
-        seen.record(e.id, e.count);
-
         let matches = e.target_id == Some(author_id) && e.channel_id == Some(channel_id);
         if !matches {
             continue;
         }
+        // Only entries for this author and channel are recorded, so an unrelated deletion's
+        // lookup cannot pre-record someone else's entry and suppress it for its real target.
+        let previous = seen.get(e.id);
+        seen.record(e.id, e.count);
         let increase = previous.map_or(0, |p| e.count.saturating_sub(p));
         let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
         let already_seen_unchanged = previous.is_some() && increase == 0;
@@ -181,6 +182,16 @@ mod tests {
         // author self-deletes 3s later: same entry, count unchanged, still inside the 8s window
         let later = [entry(1, MOD_A, 1, 4000)];
         assert_eq!(run(false, &later, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn unrelated_lookup_does_not_pre_record_target_entry() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        // a different author's deletion in another channel looks first over the same window
+        let other = attribute_deletion(333, false, 444, NOW, Ok(&e), &mut seen);
+        assert_eq!(other, DeletedBy::User);
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
     }
 
     #[test]

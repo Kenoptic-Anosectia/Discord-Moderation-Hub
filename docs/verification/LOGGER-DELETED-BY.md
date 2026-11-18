@@ -12,7 +12,7 @@ Message not in cache (author unknown): `Unknown (message not cached)`; no channe
   (`count` rises, id/timestamp stay at the first). An entry targeting the author in this channel
   counts as this deletion if fresh (<= 8 s by id) OR its count rose since we last looked
   (bounded in-memory map id -> count, 256 entries, oldest evicted, not seeded at startup).
-- Counts are recorded on every lookup; an already-seen entry with an unchanged count never matches, even if under 8 s old, so a later self-delete is not credited to the old entry.
+- Only entries matching the author and channel are recorded (an unrelated lookup cannot pre-record them); an already-seen entry with an unchanged count never matches, even if under 8 s old, so a later self-delete is not credited to the old entry.
 - A restart empties the map: a merged entry whose first deletion is stale is missed once (shows `User`).
 - Two simultaneous deletions by the same author/channel may share one count increase.
 - Lookup is up to 3 tries (0, 0.5, 1.5 s), run in a spawned task; the embed timestamp is the event time.
