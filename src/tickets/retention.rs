@@ -85,7 +85,9 @@ pub fn eligible(policy: RetentionPolicy, closed_at: Option<i64>, now: i64) -> bo
         let seconds: i64 = (days as i64).saturating_mul(86400);
         let threshold = match closed_at.checked_add(seconds) {
             Some(v) => v,
-            None => return true, // overflow → far in the future, always past
+            // Overflow means the threshold is beyond i64::MAX, so no
+            // representable `now` can reach it — not eligible.
+            None => return false,
         };
         return now >= threshold;
     }
@@ -292,6 +294,25 @@ mod tests {
     }
 
     #[test]
+    fn eligible_overflow_threshold_returns_false() {
+        // AfterDays(1), closed_at = i64::MAX - 1, now = i64::MAX
+        // threshold = (i64::MAX - 1) + 86400 → overflows i64
+        // No representable now can reach it → false
+        assert!(!eligible(
+            RetentionPolicy::AfterDays(1),
+            Some(i64::MAX - 1),
+            i64::MAX
+        ));
+    }
+
+    #[test]
+    fn eligible_overflow_boundary_control() {
+        // Verify a representable exact-boundary case still works
+        // AfterDays(1), closed_at = 0, now = 86400 (exactly at boundary)
+        assert!(eligible(RetentionPolicy::AfterDays(1), Some(0), 86400));
+    }
+
+    #[test]
     fn eligible_max_days_no_panic() {
         // 36500 days = ~100 years — saturating_mul should handle it
         let result = eligible(RetentionPolicy::AfterDays(36500), Some(1000), i64::MAX);
@@ -451,5 +472,45 @@ mod tests {
             .collect();
         let result = plan_purge(RetentionPolicy::AfterDays(30), now, &cands);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plan_purge_disabled_large_old_list() {
+        // Large list of old candidates with Disabled policy → zero purge requests
+        let now = 1000000i64;
+        let cands: Vec<Candidate> = (1..=50)
+            .map(|t| Candidate {
+                ticket: t,
+                seq: 1,
+                dir_name: format!("ticket-{}-1", t),
+                closed_at: Some(100), // closed very long ago
+            })
+            .collect();
+        let result = plan_purge(RetentionPolicy::Disabled, now, &cands);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plan_purge_overflow_candidate_not_included() {
+        // Candidate with closed_at = i64::MAX - 1, AfterDays(1) → overflow threshold
+        // should NOT be included in the purge plan
+        let now = i64::MAX;
+        let cands = vec![
+            Candidate {
+                ticket: 1,
+                seq: 1,
+                dir_name: "ticket-1-1".to_string(),
+                closed_at: Some(i64::MAX - 1),
+            },
+            Candidate {
+                ticket: 2,
+                seq: 1,
+                dir_name: "ticket-2-1".to_string(),
+                closed_at: Some(0),
+            },
+        ];
+        let result = plan_purge(RetentionPolicy::AfterDays(1), now, &cands);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ticket, 2);
     }
 }
