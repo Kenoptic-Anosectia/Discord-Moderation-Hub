@@ -286,6 +286,7 @@ impl Snapshot {
     fn enter_releasing(mut self, ctx: &Context) -> (State, Vec<Action>) {
         let restore_plan = self.compute_restore_roles(ctx);
         self.pending_release = false;
+        self.pending_reactivate = false;
         self.last_failure = None;
         self.safeword_removed = false;
         self.roles_restored = restore_plan.is_empty();
@@ -557,7 +558,7 @@ fn step_active(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, V
             (State::Active(snapshot), Vec::new())
         }
         Event::ActionFailed(id, code) => {
-            if id == ActionId::SaveSnapshot {
+            if id == ActionId::SaveSnapshot || snapshot.is_activation_step_done(id) == Some(false) {
                 snapshot.last_failure = Some((id, code));
             }
             (State::Active(snapshot), Vec::new())
@@ -568,6 +569,7 @@ fn step_active(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, V
 fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, Vec<Action>) {
     match event {
         Event::ReactionRemoved => {
+            snapshot.pending_reactivate = false;
             if snapshot.last_failure.is_some() {
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_release_actions();
@@ -577,7 +579,12 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             }
         }
         Event::ReactionAdded => {
-            if snapshot.last_failure.is_some() {
+            snapshot.pending_reactivate = true;
+            if snapshot.release_complete() {
+                let fresh = Snapshot::new_from_context(ctx);
+                let actions = fresh.pending_activation_actions();
+                (State::Activating(fresh), actions)
+            } else if snapshot.last_failure.is_some() {
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_release_actions();
                 (State::Releasing(snapshot), actions)
@@ -605,10 +612,28 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             }
             (State::Releasing(snapshot), Vec::new())
         }
-        Event::GrantDuringActive(_) => (State::Releasing(snapshot), Vec::new()),
+        Event::GrantDuringActive(role) => {
+            if (!snapshot.roles_restored
+                || (!snapshot.safeword_removed && snapshot.restore_plan.is_empty()))
+                && ctx.restricted_roles.contains(&role)
+            {
+                let changed = snapshot.apply_deferred_grant(role, ctx);
+                if changed {
+                    snapshot.restore_plan = snapshot.compute_restore_roles(ctx);
+                    snapshot.roles_restored = snapshot.restore_plan.is_empty();
+                }
+            }
+            (State::Releasing(snapshot), Vec::new())
+        }
         Event::ActionDone(id) => {
             if snapshot.mark_release_step_done(id) && snapshot.release_complete() {
-                (State::Inactive, Vec::new())
+                if snapshot.pending_reactivate {
+                    let fresh = Snapshot::new_from_context(ctx);
+                    let actions = fresh.pending_activation_actions();
+                    (State::Activating(fresh), actions)
+                } else {
+                    (State::Inactive, Vec::new())
+                }
             } else {
                 (State::Releasing(snapshot), Vec::new())
             }
