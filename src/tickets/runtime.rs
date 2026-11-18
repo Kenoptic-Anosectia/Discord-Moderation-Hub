@@ -159,7 +159,8 @@ impl Discord for Adapter<'_> {
     // Lists text channels in the guild and marks each `private` only when the @everyone
     // overwrite denies VIEW_CHANNEL without allowing it (`everyone`) AND every overwrite
     // that allows VIEW_CHANNEL belongs to the staff role, the bot or this ticket's opener
-    // (`narrow`). Any other allowed viewer, or an unknown overwrite kind, makes it not private.
+    // (`narrow`). Any other allowed viewer, or an unknown overwrite kind that allows VIEW_CHANNEL, makes it not
+    // private.
     async fn channels(&self, ticket: &Ticket) -> Result<Vec<RemoteChannel>, Error> {
         let channels = GuildId::new(self.settings.guild)
             .channels(&self.ctx.http)
@@ -302,9 +303,9 @@ async fn private_reply(ctx: Context<'_>, text: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
-    /// Proves the gate stays closed with no reconcile, with a clean reconcile (hard approval
-    /// is false) and with an unresolved one. Fails if `opening_permitted` ignored the constant
-    /// or treated a missing or unresolved reconcile as clean.
+    /// Proves the gate stays closed with no reconcile, a clean reconcile and an unresolved one,
+    /// because the hard approval constant is false. Fails if `opening_permitted` ignored that
+    /// constant. Reconcile-state handling is asserted separately in `closer_tests.rs`.
     #[test]
     fn opening_stays_closed_without_approval_or_clean_reconcile() {
         let _g = READINESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());

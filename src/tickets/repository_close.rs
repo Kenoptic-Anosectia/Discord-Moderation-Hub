@@ -546,8 +546,8 @@ impl Repository {
     /// Audited operator action: attach a verified remote channel to an unattached operation.
     /// Needs status `reserved`, `creating` or `recovery` and no channel yet. The caller must
     /// already have verified that the remote channel belongs to this operation. Writes a history
-    /// row and an audit row in the same transaction. A constraint failure, such as the channel
-    /// already belonging to another ticket, returns `Ok(false)`.
+    /// row and an audit row in the same transaction. A SQLite engine failure on the update
+    /// (for example a UNIQUE(channel) violation) returns `Ok(false)`.
     pub async fn recovery_attach(
         &self,
         id: i64,
@@ -570,8 +570,9 @@ impl Repository {
                 let n = tx.execute("UPDATE tickets SET status='active',channel=?2 WHERE id=?1 AND status=?3 AND channel IS NULL", params![id, channel.to_string(), from]);
                 match n {
                     Ok(1) => {}
-                    // No row changed, or a SQLite constraint failure: refuse; the transaction is dropped
-                    // without commit. Other errors propagate.
+                    // No row changed, or any SQLite engine error (a UNIQUE(channel) violation is one
+                    // example): refuse; the transaction is dropped without commit. Only
+                    // non-engine rusqlite errors propagate.
                     Ok(_) | Err(rusqlite::Error::SqliteFailure(_, _)) => return Ok(false),
                     Err(e) => return Err(e),
                 }

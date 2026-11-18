@@ -9,11 +9,14 @@
 //!
 //! Responsible for: the authorization decision for closing and recovering a ticket, the close
 //! sequence (freeze, archive, re-verify, delete), the startup classification of unfinished
-//! rows, and the read-only archive status reply. Every Discord/file side effect goes through
-//! the `CloseIo` trait and the archive module, so this file holds only the decision logic.
+//! rows, and the read-only archive status reply. Discord side effects go through the `CloseIo`
+//! trait and archive writing through the archive module; this file holds the decision logic
+//! and itself reads the archive `manifest.json`.
 //! Not responsible for: opening tickets, the archive file format, or browsing/restoring files.
 //! Trust boundary: the `Actor` must come from a trusted interaction. Remote error bodies,
-//! message content and file paths are never placed in a reply; replies are fixed strings.
+//! message content and file paths are never placed in a reply; replies are fixed text, plus the
+//! archive reference and integrity facts (directory name, status, counts, manifest sha256)
+//! that `retrieve` formats into its reply.
 //! Recorded archive directory names are re-checked before they touch the filesystem.
 use super::{
     archive::{self, ArchiveError, Downloader, HistorySource, Limits, OwnedRoot, PublishInput},
@@ -49,7 +52,8 @@ pub enum Presence {
     Unknown,
 }
 /// Classified result of a channel deletion request.
-/// Only `Deleted` and `NotFound` allow a ticket to be closed.
+/// Of the delete outcomes, only `Deleted` and `NotFound` allow a ticket to be closed
+/// (a channel found `Absent` by presence checks also closes it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeleteOutcome {
     Deleted,
@@ -94,7 +98,8 @@ pub fn authorized(settings: &Settings, a: &Actor, t: &Ticket) -> bool {
 pub enum CloseOutcome {
     /// Archive verified, deletion confirmed (or channel known absent), ticket marked closed.
     Closed,
-    /// Actor not authorized, or ticket unknown; nothing was read or changed.
+    /// Actor not authorized, or ticket unknown, or the ticket lookup failed. Only the ticket row
+    /// is read before authorization; nothing is changed.
     Denied,
     /// Another worker holds a live lease, or the claim could not be made.
     Busy,
