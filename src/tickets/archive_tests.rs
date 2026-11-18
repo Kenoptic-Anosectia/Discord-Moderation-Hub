@@ -1,9 +1,15 @@
+//! Exercises history collection, attachment downloads, and archive publication and verification.
+//! Synthetic history, URLs, and on-disk mutations stand in for untrusted inputs.
+//! Writes are confined to fixture roots; no real ticket data or live HTTP requests are used.
+
 use super::*;
 use serenity::all::{Attachment, MessageId};
 use std::sync::Mutex;
 
 use crate::tickets::fixtures;
 
+/// Opens a fixture-owned archive root under `target` for a trusted test tag.
+/// Returns the cleanup path and root handle; panics if setup fails.
 fn owned(tag: &str) -> (PathBuf, OwnedRoot) {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/a07-owned-tests")
@@ -20,6 +26,7 @@ fn owned(tag: &str) -> (PathBuf, OwnedRoot) {
     (p, r)
 }
 
+/// Models cursor pages from synthetic history, with optional source faults and late arrival.
 struct Pages {
     msgs: Vec<Message>,
     fail_at: Option<usize>,
@@ -29,6 +36,7 @@ struct Pages {
     empties: Mutex<usize>,
 }
 impl Pages {
+    /// Builds ordered synthetic history with normal paging until a fault is configured.
     fn new(n: usize) -> Self {
         Self {
             msgs: fixtures::message_pages(n).into_iter().flatten().collect(),
@@ -41,6 +49,7 @@ impl Pages {
     }
 }
 impl HistorySource for Pages {
+    /// Serves newest-first cursor pages, with a scripted error or deliberate paging inconsistency.
     async fn page_after(&self, after: u64) -> Result<Vec<Message>, ArchiveError> {
         let n = {
             let mut c = self.calls.lock().unwrap();
@@ -57,6 +66,7 @@ impl HistorySource for Pages {
             .take(100)
             .cloned()
             .collect();
+        // Repeat the cursor item to catch acceptance of an overlapping page.
         if self.dup_boundary && after > 0 && !v.is_empty() {
             v.insert(
                 0,
@@ -67,6 +77,7 @@ impl HistorySource for Pages {
                     .clone(),
             );
         }
+        // Wait until the first empty page so the arrival tests the exhaustion recheck.
         if v.is_empty() && {
             let mut e = self.empties.lock().unwrap();
             *e += 1;
@@ -81,6 +92,8 @@ impl HistorySource for Pages {
     }
 }
 
+/// Fetches exactly the requested number of messages in increasing ID order across page cuts;
+/// catches stopping after one page or returning server order.
 #[tokio::test]
 async fn fetches_all_pages_beyond_100_in_order() {
     for n in [0usize, 1, 99, 100, 101, 250, 1000] {
@@ -89,6 +102,8 @@ async fn fetches_all_pages_beyond_100_in_order() {
         assert!(got.windows(2).all(|w| w[0].id < w[1].id));
     }
 }
+/// Source failure, cursor overlap, late arrival, and message limits return distinct errors;
+/// catches treating incomplete or inconsistent history as a complete snapshot.
 #[tokio::test]
 async fn page_error_duplicate_boundary_and_late_message_abort() {
     let mut p = Pages::new(250);
@@ -121,11 +136,13 @@ async fn page_error_duplicate_boundary_and_late_message_abort() {
     );
 }
 
+/// In-memory downloader that records attempted synthetic URLs and enforces its byte budget.
 struct FakeDl {
     bytes: Vec<u8>,
     seen: Mutex<Vec<String>>,
 }
 impl Downloader for FakeDl {
+    /// Returns fixture bytes or `TooLarge`; records the attempt without making an HTTP request.
     async fn fetch(&self, url: &url::Url, limit: u64) -> Result<Vec<u8>, ArchiveError> {
         self.seen.lock().unwrap().push(url.to_string());
         if self.bytes.len() as u64 > limit {
@@ -134,6 +151,7 @@ impl Downloader for FakeDl {
         Ok(self.bytes.clone())
     }
 }
+/// Adds synthetic attachment metadata with a chosen URL and optional declared-size override.
 fn with_asset(mut m: Message, f: &fixtures::AssetFixture, url: &str, size: Option<u32>) -> Message {
     let mut a: Attachment = f.attachment.clone();
     a.url = url.to_string();
@@ -143,8 +161,11 @@ fn with_asset(mut m: Message, f: &fixtures::AssetFixture, url: &str, size: Optio
     m.attachments.push(a);
     m
 }
+/// Allowlisted attachment URL with synthetic signature fields; never fetched live here.
 const CDN: &str = "https://cdn.discordapp.com/attachments/1/100/same.txt?ex=1&is=2&hm=3";
 
+/// Checks generated file names independently of display names and rejects unsafe URLs before fetch;
+/// catches passing rejected URLs to the downloader or using the original name as the file key.
 #[tokio::test]
 async fn downloads_use_a10_validators_and_generated_names() {
     let fx = fixtures::asset_fixtures();
@@ -195,6 +216,8 @@ async fn downloads_use_a10_validators_and_generated_names() {
         assert!(dl.seen.lock().unwrap().is_empty());
     }
 }
+/// Checks failure on length disagreement, per-asset byte overflow, and attachment-count overflow;
+/// catches accepting a partial response or ignoring the configured limits.
 #[tokio::test]
 async fn size_mismatch_and_limits_fail() {
     let fx = fixtures::asset_fixtures();
@@ -204,7 +227,7 @@ async fn size_mismatch_and_limits_fail() {
         bytes: fx[0].bytes.clone(),
         seen: Mutex::new(vec![]),
     };
-    // declared 5 < actual -> fake enforces limit as TooLarge; declared==limit mismatch path:
+    // An oversized fake response and a short response exercise different checks.
     assert!(download_all(&dl, &m, &Limits::default()).await.is_err());
     let mut m = Pages::new(1).msgs;
     m[0] = with_asset(m[0].clone(), &fx[0], CDN, None);
@@ -235,6 +258,8 @@ async fn size_mismatch_and_limits_fail() {
         ArchiveError::SizeMismatch
     );
 }
+/// Checks the source contains both client policy settings and that client construction succeeds;
+/// catches removing either setting's source marker, not runtime redirect behavior.
 #[test]
 fn production_downloader_disables_redirects_and_non_https() {
     let src = include_str!("archive.rs");
@@ -242,6 +267,8 @@ fn production_downloader_disables_redirects_and_non_https() {
     assert!(HttpDownloader::new(std::time::Duration::from_secs(1)).is_ok());
 }
 
+/// Checks deterministic escaping of sampled message and author markup and absence of sampled tags;
+/// catches interpolating raw fixture HTML into a transcript.
 #[test]
 fn transcript_escapes_and_has_no_active_or_remote_content() {
     let mut msgs = Pages::new(2).msgs;
@@ -254,6 +281,8 @@ fn transcript_escapes_and_has_no_active_or_remote_content() {
     assert_eq!(h, render_transcript(7, &msgs, &[])); // deterministic
 }
 
+/// Builds synthetic history and optionally downloads one fixture attachment in memory.
+/// Pass a nonzero count when requesting an attachment; setup failures panic.
 async fn build(n: usize, with_assets: bool) -> (Vec<Message>, Vec<Downloaded>) {
     let mut msgs = Pages::new(n).msgs;
     let mut dls = vec![];
@@ -268,6 +297,7 @@ async fn build(n: usize, with_assets: bool) -> (Vec<Message>, Vec<Downloaded>) {
     }
     (msgs, dls)
 }
+/// Binds fixture history and downloaded assets to a fixed synthetic identity and chosen sequence.
 fn input<'a>(m: &'a [Message], d: &'a [Downloaded], seq: i64) -> PublishInput<'a> {
     PublishInput {
         ticket: 5,
@@ -279,6 +309,8 @@ fn input<'a>(m: &'a [Message], d: &'a [Downloaded], seq: i64) -> PublishInput<'a
     }
 }
 
+/// A published archive verifies, but changed or missing asset bytes, extra files, and wrong
+/// expectations fail; catches a verifier that trusts incomplete or mismatched archives.
 #[tokio::test]
 async fn publish_and_verify_roundtrip_then_detects_corruption() {
     let (p, root) = owned("rt");
@@ -320,6 +352,8 @@ async fn publish_and_verify_roundtrip_then_detects_corruption() {
     assert!(verify(&root, &dir, None, &ids).is_err());
     let _ = std::fs::remove_dir_all(p);
 }
+/// Reusing a final archive name returns `Exists` and preserves its manifest;
+/// catches overwriting an earlier version rather than publishing under a fresh sequence.
 #[tokio::test]
 async fn existing_final_archive_is_never_overwritten() {
     let (p, root) = owned("nover");
@@ -335,6 +369,8 @@ async fn existing_final_archive_is_never_overwritten() {
     assert!(publish(&root, &input(&m, &d, 2)).is_ok()); // retry uses a new sequence
     let _ = std::fs::remove_dir_all(p);
 }
+/// Unsafe names and digest mismatch leave the root empty; staging collision returns `Io`.
+/// Catches leftover partial archives or accepting an occupied staging path.
 #[tokio::test]
 async fn failed_publication_leaves_no_final_dir_and_cleans_staging() {
     let (p, root) = owned("fault");
@@ -364,6 +400,8 @@ async fn failed_publication_leaves_no_final_dir_and_cleans_staging() {
     );
     let _ = std::fs::remove_dir_all(p);
 }
+/// Rejects a regular file root and, where the fixture link can be created, a symlink root;
+/// catches accepting those paths as owned archive directories.
 #[test]
 fn root_rejects_file_and_symlink_roots() {
     let (p, root) = owned("sym");
@@ -388,6 +426,7 @@ mod http_policy {
     use super::*;
     use std::time::Duration;
 
+    /// Builds the actual downloader policy with scripted responses and a bounded timeout.
     fn dl(script: Vec<Script>, fallback: Script) -> HttpDownloader<FakeTransport> {
         HttpDownloader::with_transport(
             FakeTransport::new(script, fallback),
@@ -397,6 +436,7 @@ mod http_policy {
     fn url() -> url::Url {
         validate_attachment_url(CDN).unwrap()
     }
+    /// Constructs a synthetic HTTP response with optional declared size and separate stream chunks.
     fn resp(status: u16, declared: Option<u64>, chunks: &[&[u8]]) -> Script {
         Script::Resp {
             status,
@@ -404,12 +444,16 @@ mod http_policy {
             chunks: chunks.iter().map(|c| c.to_vec()).collect(),
         }
     }
+    /// Two successful body chunks produce one exact payload from a single request;
+    /// catches dropping a chunk or fetching again.
     #[tokio::test]
     async fn success_streams_and_returns_exact_bytes() {
         let d = dl(vec![resp(200, Some(6), &[b"abc", b"def"])], Script::Fail);
         assert_eq!(d.fetch(&url(), 100).await.unwrap(), b"abcdef");
         assert_eq!(d.transport.get_count(), 1);
     }
+    /// Sampled redirect statuses fail after one request even with a successful fallback;
+    /// catches following a redirect with a second transport call.
     #[tokio::test]
     async fn redirects_fail_and_the_target_is_never_fetched() {
         for code in [301u16, 302, 303, 307, 308] {
@@ -429,6 +473,8 @@ mod http_policy {
             );
         }
     }
+    /// Sampled non-success statuses return `Download` after one request;
+    /// catches accepting an HTTP error response as attachment bytes.
     #[tokio::test]
     async fn non_2xx_statuses_fail_without_reading_the_body() {
         for code in [100u16, 400, 401, 403, 404, 429, 500, 503] {
@@ -441,6 +487,8 @@ mod http_policy {
             assert_eq!(d.transport.get_count(), 1);
         }
     }
+    /// A transport error and a hanging response both return `Download`, with the hang bounded;
+    /// catches waiting indefinitely for the transport.
     #[tokio::test]
     async fn transport_error_and_timeout_map_to_download_failure() {
         let d = dl(vec![Script::Fail], Script::Fail);
@@ -456,6 +504,8 @@ mod http_policy {
         );
         assert!(t.elapsed() < Duration::from_secs(5), "deadline enforced");
     }
+    /// Oversized declarations, oversized streams, and short bodies fail;
+    /// catches enforcing limits on headers alone or accepting incomplete bytes.
     #[tokio::test]
     async fn oversize_declared_or_streamed_is_rejected_and_short_body_fails() {
         let d = dl(vec![resp(200, Some(101), &[b"x"])], Script::Fail);
@@ -477,6 +527,8 @@ mod http_policy {
             ArchiveError::Download
         );
     }
+    /// Parsed disallowed URLs still return `UnsafeInput` before transport;
+    /// catches trusting the URL type alone as proof of validation.
     #[tokio::test]
     async fn non_allowlisted_or_non_https_urls_never_reach_the_transport() {
         let d = dl(vec![], resp(200, Some(2), &[b"ok"]));
@@ -494,6 +546,8 @@ mod http_policy {
         }
         assert_eq!(d.transport.get_count(), 0);
     }
+    /// The attachment batch propagates a downloader redirect error and accepts the valid control;
+    /// catches swallowing transport-policy errors in archive collection.
     #[tokio::test]
     async fn download_all_through_the_production_downloader_fails_closed() {
         let fx = fixtures::asset_fixtures();
