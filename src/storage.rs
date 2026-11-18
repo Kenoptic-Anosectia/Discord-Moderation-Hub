@@ -743,6 +743,76 @@ mod tests {
     }
 
     #[test]
+    fn windows_mixed_separator_unc_spellings_refused_and_reserved_untouched() {
+        if !cfg!(windows) {
+            return;
+        }
+        let dir = scratch("mixedunc");
+        let reserved = dir.join("tickets.sqlite");
+        {
+            let c = Connection::open(&reserved).unwrap();
+            c.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);")
+                .unwrap();
+        }
+        let before = std::fs::read(&reserved).unwrap();
+        let abs = reserved.to_str().unwrap();
+        let share = format!("{}$", &abs[..1]);
+        let rest = abs[2..].trim_start_matches(['\\', '/']);
+        for lead in ["/\\", "\\/", "\\\\", "//"] {
+            let sp = format!("{lead}localhost\\{share}\\{rest}");
+            assert!(
+                open(&sp, std::slice::from_ref(&reserved)).is_err(),
+                "unc spelling accepted: {sp}"
+            );
+        }
+        for sp in [
+            "\\\\?\\UNC\\localhost\\C$\\x",
+            "\\\\.\\C:\\x",
+            "/\\?\\C:\\x",
+        ] {
+            assert!(open(sp, &[]).is_err(), "prefix accepted: {sp}");
+        }
+        assert!(
+            std::fs::read(&reserved).unwrap() == before,
+            "reserved changed"
+        );
+        let missing = dir.join("roles.sqlite");
+        let mrest = missing.to_str().unwrap()[2..].trim_start_matches(['\\', '/']);
+        let sp = format!("/\\localhost\\{share}\\{mrest}");
+        assert!(open(&sp, std::slice::from_ref(&missing)).is_err());
+        assert!(!missing.exists(), "reserved file created via UNC spelling");
+    }
+
+    #[test]
+    fn windows_alternate_data_stream_spellings_refused() {
+        if !cfg!(windows) {
+            return;
+        }
+        let dir = scratch("ads");
+        let d = dir.to_str().unwrap();
+        let missing = dir.join("roles.sqlite");
+        for sp in [
+            format!("{d}/roles.sqlite:stream"),
+            format!("{d}/roles.sqlite::$DATA"),
+            format!("{d}/roles.sqlite:x:$DATA"),
+        ] {
+            assert_eq!(
+                open(&sp, std::slice::from_ref(&missing)).err(),
+                Some(StorageError::InvalidPath),
+                "ads accepted: {sp}"
+            );
+            assert!(!missing.exists(), "reserved file created via {sp}");
+        }
+        let existing = dir.join("tickets.sqlite");
+        std::fs::write(&existing, b"x").unwrap();
+        let sp = format!("{d}/tickets.sqlite:stream");
+        assert!(open(&sp, std::slice::from_ref(&existing)).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"x");
+        // A plain drive colon still works.
+        assert!(open(&format!("{d}/core.sqlite"), &[]).is_ok());
+    }
+
+    #[test]
     fn windows_trailing_dot_and_space_spellings_of_missing_reserved_file_refused() {
         if !cfg!(windows) {
             return;
