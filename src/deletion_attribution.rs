@@ -450,4 +450,49 @@ mod tests {
         assert_eq!(seen.get(1), None);
         assert_eq!(seen.get(6), Some(1));
     }
+
+    fn run_at(now: u64, entries: &[AuditEntryLite], seen: &mut LastSeenCounts) -> DeletedBy {
+        attribute_deletion(AUTHOR, false, CHAN, now, Ok(entries), seen)
+    }
+
+    const FOUR_HOURS: u64 = 4 * 60 * 60 * 1000;
+
+    #[test]
+    fn stale_surplus_credit_is_not_spendable_hours_later() {
+        let mut seen = LastSeenCounts::new();
+        // first observation while fresh with count 3: one credit consumed, two surplus
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        // 4h later the author self-deletes; entry unchanged and stale
+        assert_eq!(run_at(NOW + FOUR_HOURS, &e, &mut seen), DeletedBy::User);
+        assert_eq!(run_at(NOW + FOUR_HOURS + 1, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn count_rise_on_stale_entry_after_long_gap_is_still_credited() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        let later = NOW + FOUR_HOURS;
+        let rose = [entry(1, MOD_A, 4, FOUR_HOURS + 1000)];
+        assert_eq!(run_at(later, &rose, &mut seen), DeletedBy::Executor(MOD_A));
+        // surplus is only spendable inside the short TTL; hours later it is gone
+        assert_eq!(run_at(later + FOUR_HOURS, &rose, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn burst_with_stale_id_keeps_crediting_while_credits_are_recent() {
+        let mut seen = LastSeenCounts::new();
+        // entry id timestamp is 21s old (stale) but the burst is being consumed right now
+        let e = [entry(1, MOD_A, 5, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        let stale = [entry(1, MOD_A, 5, 21_000)];
+        for i in 0..4 {
+            assert_eq!(
+                run_at(NOW + 20_000 + i, &stale, &mut seen),
+                DeletedBy::Executor(MOD_A)
+            );
+        }
+        assert_eq!(run_at(NOW + 20_010, &stale, &mut seen), DeletedBy::User);
+    }
 }
