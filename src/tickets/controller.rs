@@ -342,8 +342,8 @@ mod tests {
             );
         }
     }
-    /// Proves each failure mode is reported truthfully and no internal error detail reaches
-    /// the user. Fails if a mode is misreported or raw error text is echoed.
+    /// Proves each failure mode is reported truthfully: the recorded events never contain the
+    /// synthetic marker `private raw details`. Fails if a mode is misreported or that marker appears.
     #[tokio::test]
     async fn known_rejection_ack_validation_greeting_and_feedback_failures_are_truthful() {
         for mode in ["ack", "validate", "reject", "greet", "feedback"] {

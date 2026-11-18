@@ -165,15 +165,23 @@ fn facts(event: &FullEvent) -> Facts {
     f
 }
 
-/// `enabled` = tickets feature on. `settings` None while enabled means invalid config:
-/// fail closed for every channel-bearing event.
+/// `enabled` = tickets feature on. `settings` None while enabled means invalid config.
 ///
 /// Returns `Decision::Skip` (never an error) when the event may belong to a private scope.
-/// `Decision::Allow` is returned on four paths that do NOT prove the event is outside ticket
-/// scope: the feature is disabled, the event carries no channel at all, the event comes from
-/// another guild, and the channel is provably neither a ticket channel nor under a ticket
-/// category. Every other channel-bearing event is `Skip` and fails closed: an unknown
-/// channel, an unresolvable lookup, a database error, or missing settings or repository.
+/// The checks run in this order and the first one that matches decides:
+/// (1) feature disabled -> `Allow`, before any scope or configuration is inspected;
+/// (2) event carries no channel -> `Allow`;
+/// (3) settings or repository missing -> `Skip` (fail closed on invalid configuration);
+/// (4) event from another guild -> `Allow`;
+/// (5) a channel id is a known durable ticket -> `Skip`; a durable lookup error -> `Skip`;
+/// (6) a carried parent is a ticket category -> `Skip`; a carried parent is a known durable
+/// ticket channel -> `Skip`; a durable lookup error on a parent -> `Skip`;
+/// (7) the payload's old parent is uncertain -> `Skip`;
+/// (8) the payload fully describes the channel -> `Allow`;
+/// (9) resolving a message-style channel finds a ticket category or a durable ticket
+/// parent -> `Skip`; a contradictory or unknown lookup -> `Skip`;
+/// (10) otherwise `Allow`.
+///
 /// The caller must run this before performing any logging or cache work for the event.
 pub async fn decide(
     enabled: bool,
@@ -811,8 +819,8 @@ mod tests {
         );
         assert_eq!(unknown.calls.load(Ordering::SeqCst), before);
     }
-    /// Proves the runtime event handler calls the privacy guard before any cache insertion,
-    /// and that the old global-pause switch is gone. Fails if either stops holding.
+    /// Secondary structural source-text check, not a behavioural proof: asserts `main.rs`
+    /// mentions the guard before the first cache insertion, and no longer mentions the switch.
     #[test]
     fn runtime_event_handler_calls_the_guard_before_any_cache_insertion() {
         let main = include_str!("../main.rs");
