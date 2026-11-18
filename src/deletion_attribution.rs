@@ -40,8 +40,20 @@ impl DeletedBy {
     }
 }
 
+/// How long surplus credits of an entry stay spendable after the bot last saw activity on it
+/// (a credit consumed or a count rise). Keeps a burst alive while it is being consumed but lets
+/// a stale surplus expire.
+pub const CREDIT_TTL_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Copy)]
+struct EntryState {
+    given: u64,
+    observed: u64,
+    active_ms: u64,
+}
+
 pub struct LastSeenCounts {
-    map: HashMap<u64, u64>,
+    map: HashMap<u64, EntryState>,
     order: VecDeque<u64>,
     cap: usize,
 }
@@ -57,13 +69,32 @@ impl LastSeenCounts {
             cap,
         }
     }
+    /// Credits already given for an entry id.
+    #[cfg(test)]
     pub fn get(&self, id: u64) -> Option<u64> {
+        self.map.get(&id).map(|s| s.given)
+    }
+
+    /// Remember an entry as fully given and observed (no recent activity); evicts the
+    /// oldest-inserted id past the cap.
+    #[cfg(test)]
+    pub fn record(&mut self, id: u64, count: u64) {
+        self.set(
+            id,
+            EntryState {
+                given: count,
+                observed: count,
+                active_ms: 0,
+            },
+        );
+    }
+
+    fn state(&self, id: u64) -> Option<EntryState> {
         self.map.get(&id).copied()
     }
 
-    /// Remember the latest count for an entry id; evicts the oldest-inserted id past the cap.
-    pub fn record(&mut self, id: u64, count: u64) {
-        if self.map.insert(id, count).is_none() {
+    fn set(&mut self, id: u64, state: EntryState) {
+        if self.map.insert(id, state).is_none() {
             self.order.push_back(id);
             while self.map.len() > self.cap {
                 match self.order.pop_front() {
@@ -84,11 +115,13 @@ impl LastSeenCounts {
 
 /// Decide who deleted a cached message.
 ///
-/// An audit entry (already filtered to the message-delete action by the caller) is THIS deletion
-/// when it targets the author in this channel and is either fresh by id-age or its merged `count`
-/// rose since we last looked. Only matching entries (author and channel) are recorded on a successful lookup so a later
-/// self-delete is not credited to an old moderator entry. A failed lookup is never reported as the
-/// author deleting it.
+/// Discord merges repeated deletions into one audit entry whose `count` rises. Each entry has
+/// `count` credits; the map records credits already given per entry id. A matching entry (author
+/// and channel; action filtered by the caller) with `count` > given has a pending credit, and a
+/// returned `Executor` consumes exactly one. A never-seen entry has all credits pending if fresh,
+/// else it is baselined as fully given. The map also tracks the last observed count; pending
+/// credits are spendable only while the entry is fresh, its count rose, or it was active within
+/// `CREDIT_TTL_MS`. Failed lookups consume nothing and are never `User`.
 pub fn attribute_deletion(
     author_id: u64,
     author_is_bot: bool,
@@ -102,31 +135,63 @@ pub fn attribute_deletion(
         Err(AuditLookupFailed) => return DeletedBy::AuditUnavailable,
     };
 
-    // best = (count increase, entry id, executor)
+    // best = (pending credits, entry id, executor)
     let mut best: Option<(u64, u64, u64)> = None;
     for e in entries {
         let matches = e.target_id == Some(author_id) && e.channel_id == Some(channel_id);
         if !matches {
             continue;
         }
-        // Only entries for this author and channel are recorded, so an unrelated deletion's
-        // lookup cannot pre-record someone else's entry and suppress it for its real target.
-        let previous = seen.get(e.id);
-        seen.record(e.id, e.count);
-        let increase = previous.map_or(0, |p| e.count.saturating_sub(p));
+        // Only entries for this author and channel are written to the map, so an unrelated
+        // deletion's lookup cannot pre-record someone else's entry.
         let fresh = now_ms.saturating_sub(e.created_ms) <= AUDIT_MATCH_WINDOW_MS;
-        let already_seen_unchanged = previous.is_some() && increase == 0;
-        if !((fresh && !already_seen_unchanged) || increase > 0) {
+        let mut st = match seen.state(e.id) {
+            Some(st) => st,
+            // Fresh: nothing seen yet, all `count` credits pending. Stale: baseline, none pending.
+            None if fresh => EntryState {
+                given: 0,
+                observed: 0,
+                active_ms: now_ms,
+            },
+            None => EntryState {
+                given: e.count,
+                observed: e.count,
+                active_ms: 0,
+            },
+        };
+        let rose = e.count > st.observed;
+        if rose {
+            st.active_ms = now_ms;
+        }
+        // A pending credit is spendable only if the entry is fresh by id-age, its count really
+        // rose since last observed, or the entry was active within CREDIT_TTL_MS. A stale
+        // surplus therefore expires and is never credited.
+        let live = fresh || rose || now_ms.saturating_sub(st.active_ms) <= CREDIT_TTL_MS;
+        st.observed = st.observed.max(e.count);
+        let pending = if live {
+            e.count.saturating_sub(st.given)
+        } else {
+            0
+        };
+        seen.set(e.id, st);
+        if pending == 0 {
             continue;
         }
-        let key = (increase, e.id, e.executor_id);
-        if best.is_none_or(|b| (key.0, key.1) > (b.0, b.1)) {
-            best = Some(key);
+        if best.is_none_or(|b| (pending, e.id) > (b.0, b.1)) {
+            best = Some((pending, e.id, e.executor_id));
         }
     }
 
     match best {
-        Some((_, _, executor)) => DeletedBy::Executor(executor),
+        Some((_, id, executor)) => {
+            // Consume exactly one credit from the chosen entry only.
+            if let Some(mut st) = seen.state(id) {
+                st.given += 1;
+                st.active_ms = now_ms;
+                seen.set(id, st);
+            }
+            DeletedBy::Executor(executor)
+        }
         None if author_is_bot => DeletedBy::BotAuthor,
         None => DeletedBy::User,
     }
@@ -320,5 +385,173 @@ mod tests {
     fn retry_delays_are_short() {
         assert!(LOOKUP_DELAYS_MS.iter().sum::<u64>() <= 3000);
         assert_eq!(LOOKUP_DELAYS_MS[0], 0);
+    }
+
+    #[test]
+    fn burst_of_five_with_count_five_credits_each_then_self_delete_is_user() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 5, 1000)];
+        for _ in 0..5 {
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn count_rising_across_lookups_credits_each_time() {
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 1, 2000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 2, 20_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 40_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 41_000)], &mut seen),
+            DeletedBy::User
+        );
+    }
+
+    #[test]
+    fn repeated_lookup_does_not_double_consume_one_credit() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+        assert_eq!(run(true, &e, &mut seen), DeletedBy::BotAuthor);
+    }
+
+    #[test]
+    fn failed_attempt_and_no_credit_attempts_do_not_consume_credit() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        let r = attribute_deletion(AUTHOR, false, CHAN, NOW, Err(AuditLookupFailed), &mut seen);
+        assert_eq!(r, DeletedBy::AuditUnavailable);
+        // a retry whose lookup shows no matching entry (other channel) consumes nothing
+        let r = attribute_deletion(AUTHOR, false, CHAN + 9, NOW, Ok(&e), &mut seen);
+        assert_eq!(r, DeletedBy::User);
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+    }
+
+    #[test]
+    fn stale_never_seen_entry_is_not_credited_but_later_count_rise_is() {
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 60_000)], &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 3, 61_000)], &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 4, 70_000)], &mut seen),
+            DeletedBy::Executor(MOD_A)
+        );
+        assert_eq!(
+            run(false, &[entry(1, MOD_A, 4, 71_000)], &mut seen),
+            DeletedBy::User
+        );
+    }
+
+    #[test]
+    fn unrelated_lookup_first_does_not_suppress_burst_credits() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(
+            attribute_deletion(333, false, 444, NOW, Ok(&e), &mut seen),
+            DeletedBy::User
+        );
+        assert_eq!(
+            attribute_deletion(AUTHOR, false, 444, NOW, Ok(&e), &mut seen),
+            DeletedBy::User
+        );
+        for _ in 0..3 {
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn two_executors_pick_most_pending_credits_and_credit_only_that_entry() {
+        let mut seen = LastSeenCounts::new();
+        seen.record(1, 1);
+        seen.record(2, 1);
+        // entry 1: 3 pending (older), entry 2: 1 pending (fresher)
+        let e = [entry(2, MOD_B, 2, 500), entry(1, MOD_A, 4, 30_000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(seen.get(1), Some(2));
+        assert_eq!(seen.get(2), Some(1));
+        // pending now 2 vs 1: A again, then tie 1 vs 1: freshest (B), then A's last
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_B));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn credit_map_stays_bounded_and_evicts_oldest_while_crediting() {
+        let mut seen = LastSeenCounts::with_cap(3);
+        for id in 1..=6u64 {
+            let e = [entry(id, MOD_A, 1, 1000)];
+            assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        }
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.get(1), None);
+        assert_eq!(seen.get(6), Some(1));
+    }
+
+    fn run_at(now: u64, entries: &[AuditEntryLite], seen: &mut LastSeenCounts) -> DeletedBy {
+        attribute_deletion(AUTHOR, false, CHAN, now, Ok(entries), seen)
+    }
+
+    const FOUR_HOURS: u64 = 4 * 60 * 60 * 1000;
+
+    #[test]
+    fn stale_surplus_credit_is_not_spendable_hours_later() {
+        let mut seen = LastSeenCounts::new();
+        // first observation while fresh with count 3: one credit consumed, two surplus
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        // 4h later the author self-deletes; entry unchanged and stale
+        assert_eq!(run_at(NOW + FOUR_HOURS, &e, &mut seen), DeletedBy::User);
+        assert_eq!(run_at(NOW + FOUR_HOURS + 1, &e, &mut seen), DeletedBy::User);
+    }
+
+    #[test]
+    fn count_rise_on_stale_entry_after_long_gap_is_still_credited() {
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 3, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        let later = NOW + FOUR_HOURS;
+        let rose = [entry(1, MOD_A, 4, FOUR_HOURS + 1000)];
+        assert_eq!(run_at(later, &rose, &mut seen), DeletedBy::Executor(MOD_A));
+        // surplus is only spendable inside the short TTL; hours later it is gone
+        assert_eq!(
+            run_at(later + FOUR_HOURS, &rose, &mut seen),
+            DeletedBy::User
+        );
+    }
+
+    #[test]
+    fn burst_with_stale_id_keeps_crediting_while_credits_are_recent() {
+        let mut seen = LastSeenCounts::new();
+        // entry id timestamp is 21s old (stale) but the burst is being consumed right now
+        let e = [entry(1, MOD_A, 5, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        let stale = [entry(1, MOD_A, 5, 21_000)];
+        for i in 0..4 {
+            assert_eq!(
+                run_at(NOW + 20_000 + i, &stale, &mut seen),
+                DeletedBy::Executor(MOD_A)
+            );
+        }
+        assert_eq!(run_at(NOW + 20_010, &stale, &mut seen), DeletedBy::User);
     }
 }
