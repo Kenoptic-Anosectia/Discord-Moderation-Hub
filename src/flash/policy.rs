@@ -152,12 +152,24 @@ impl FlashConfig {
         }
         if let Some(role) = ping_role_id {
             if role == 0 {
-                return Err(ConfigError::new(ConfigErrorKind::InvalidRoleId, KEY_PING_ROLE_ID));
+                return Err(ConfigError::new(
+                    ConfigErrorKind::InvalidRoleId,
+                    KEY_PING_ROLE_ID,
+                ));
             }
+        }
+        if !(MIN_DELAY_SECS..=MAX_DELAY_SECS).contains(&delay_secs) {
+            return Err(ConfigError::new(
+                ConfigErrorKind::DelayOutOfRange,
+                KEY_DELAY_SECS,
+            ));
         }
         if let Some(guild) = guild_id {
             if guild == 0 {
-                return Err(ConfigError::new(ConfigErrorKind::InvalidGuildId, "GUILD_ID"));
+                return Err(ConfigError::new(
+                    ConfigErrorKind::InvalidGuildId,
+                    "GUILD_ID",
+                ));
             }
         }
         Ok(Self {
@@ -342,8 +354,16 @@ pub fn is_flash_channel(
     channel_id: u64,
     parent_channel_id: Option<u64>,
 ) -> bool {
-    let _ = (cfg, channel_id, parent_channel_id);
-    false
+    if !cfg.is_enabled() {
+        return false;
+    }
+    if cfg.channel_ids.contains(&channel_id) {
+        return true;
+    }
+    match parent_channel_id {
+        Some(parent) if cfg.include_threads => cfg.channel_ids.contains(&parent),
+        _ => false,
+    }
 }
 
 /// True when this location sits inside the configured flash area.
@@ -352,8 +372,16 @@ pub fn is_flash_channel(
 /// must exclude a thread of a flash channel whether or not the timer acts on it. This
 /// predicate is never weaker than [`is_flash_channel`].
 pub fn is_flash_area(cfg: &FlashConfig, channel_id: u64, parent_channel_id: Option<u64>) -> bool {
-    let _ = (cfg, channel_id, parent_channel_id);
-    false
+    if !cfg.is_enabled() {
+        return false;
+    }
+    if cfg.channel_ids.contains(&channel_id) {
+        return true;
+    }
+    match parent_channel_id {
+        Some(parent) => cfg.channel_ids.contains(&parent),
+        None => false,
+    }
 }
 
 /// Decides whether one message is a flash that must expire.
@@ -361,8 +389,102 @@ pub fn is_flash_area(cfg: &FlashConfig, channel_id: u64, parent_channel_id: Opti
 /// The decision is a pure function of the facts and the configuration. Nothing is read
 /// from the clock and no id is looked up.
 pub fn decide(msg: &MessageFacts, cfg: &FlashConfig) -> Decision {
-    let _ = (msg, cfg);
-    Decision::Ignore(IgnoreReason::FeatureDisabled)
+    if let Some(guild) = cfg.guild_id {
+        if msg.guild_id != guild {
+            return Decision::Ignore(IgnoreReason::GuildMismatch);
+        }
+    }
+    if !cfg.is_enabled() {
+        return Decision::Ignore(IgnoreReason::FeatureDisabled);
+    }
+    if msg.author_is_bot {
+        return Decision::Ignore(IgnoreReason::BotAuthor);
+    }
+    if msg.is_webhook {
+        return Decision::Ignore(IgnoreReason::WebhookAuthor);
+    }
+    if msg.author_id == 0 {
+        return Decision::Ignore(IgnoreReason::InvalidAuthor);
+    }
+    if msg.message_id == 0 {
+        return Decision::Ignore(IgnoreReason::InvalidMessage);
+    }
+    if msg.attachment_count == 0 {
+        return Decision::Ignore(IgnoreReason::NoAttachments);
+    }
+    if !cfg.channel_ids.contains(&msg.channel_id) {
+        // The message is not in a flash channel. It may still be in a thread of one.
+        match msg.parent_channel_id {
+            Some(parent) if cfg.channel_ids.contains(&parent) => {
+                if !cfg.include_threads {
+                    return Decision::Ignore(IgnoreReason::ThreadNotIncluded);
+                }
+            }
+            _ => return Decision::Ignore(IgnoreReason::ChannelNotConfigured),
+        }
+    }
+    let notice = render_notice(msg, cfg);
+    Decision::Expire(ExpirePlan {
+        delay_secs: cfg.delay_secs,
+        notice,
+        original_message_id: msg.message_id,
+        channel_id: msg.channel_id,
+        author_id: msg.author_id,
+    })
+}
+
+/// Renders the notice the bot posts next to a flashed message.
+///
+/// The text is built only from the configured role id, the author id and the channel id.
+/// The content of the flashed message is never an input, so it can never be quoted here
+/// and can never inject a mention.
+fn render_notice(msg: &MessageFacts, cfg: &FlashConfig) -> Notice {
+    let mut text = String::new();
+    if let Some(role) = cfg.ping_role_id {
+        text.push_str("<@&");
+        text.push_str(&role.to_string());
+        text.push_str("> ");
+    }
+    text.push_str("New flash from <@");
+    text.push_str(&msg.author_id.to_string());
+    text.push_str("> in <#");
+    text.push_str(&msg.channel_id.to_string());
+    text.push_str(">. This will be deleted in ");
+    text.push_str(&duration_phrase(cfg.delay_secs));
+    text.push('.');
+
+    let users = vec![msg.author_id];
+    let mut roles = Vec::with_capacity(1);
+    if let Some(role) = cfg.ping_role_id {
+        roles.push(role);
+    }
+    Notice {
+        text,
+        allowed_mentions: AllowedMentions {
+            users,
+            roles,
+            everyone: false,
+        },
+    }
+}
+
+/// Renders the delay of a notice.
+///
+/// A delay that is a whole number of minutes is rendered in minutes, and a single minute
+/// is singular ("1 minute"). Every other delay is rendered in seconds, which also covers
+/// a delay below one minute. The original command printed "1 minutes" and truncated the
+/// text; that grammar flaw is deliberately not copied.
+fn duration_phrase(delay_secs: u64) -> String {
+    if delay_secs >= 60 && delay_secs.is_multiple_of(60) {
+        let minutes = delay_secs / 60;
+        if minutes == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{minutes} minutes")
+        }
+    } else {
+        format!("{delay_secs} seconds")
+    }
 }
 
 #[cfg(test)]
@@ -437,10 +559,7 @@ mod tests {
     fn bot_author_is_ignored() {
         let mut f = facts();
         f.author_is_bot = true;
-        assert_eq!(
-            expect_ignore(&decide(&f, &cfg())),
-            IgnoreReason::BotAuthor
-        );
+        assert_eq!(expect_ignore(&decide(&f, &cfg())), IgnoreReason::BotAuthor);
     }
 
     /// A webhook author is ignored, even with attachments in a flash channel.
@@ -534,14 +653,8 @@ mod tests {
             (180, "3 minutes"),
             (10, "10 seconds"),
         ] {
-            let c = FlashConfig::new(
-                vec![FLASH_CH],
-                Some(ROLE),
-                delay_secs,
-                true,
-                Some(GUILD),
-            )
-            .expect("config is valid");
+            let c = FlashConfig::new(vec![FLASH_CH], Some(ROLE), delay_secs, true, Some(GUILD))
+                .expect("config is valid");
             let plan = expect_expire(&decide(&facts(), &c));
             let tail = format!("This will be deleted in {expected}.");
             assert!(
@@ -555,14 +668,8 @@ mod tests {
     /// Without a configured ping role the notice carries no role mention at all.
     #[test]
     fn missing_ping_role_omits_the_role_mention() {
-        let c = FlashConfig::new(
-            vec![FLASH_CH],
-            None,
-            DEFAULT_DELAY_SECS,
-            true,
-            Some(GUILD),
-        )
-        .expect("config is valid");
+        let c = FlashConfig::new(vec![FLASH_CH], None, DEFAULT_DELAY_SECS, true, Some(GUILD))
+            .expect("config is valid");
         let plan = expect_expire(&decide(&facts(), &c));
         assert_eq!(
             plan.notice.text,
@@ -621,9 +728,18 @@ mod tests {
             assert_eq!(err.key(), KEY_DELAY_SECS);
             let text = err.to_string();
             assert!(text.contains(KEY_DELAY_SECS), "error text: {text}");
-            assert!(!text.contains(&bad.to_string()), "error echoes the value: {text}");
+            // The rejected value must not appear in the message as a standalone number.
+            // The bounds are allowed to be named; the offending value is not.
+            let standalone = format!(" {bad} ");
+            assert!(
+                !text.contains(&standalone) && !text.contains(&format!("{bad}.")),
+                "error echoes the value: {text}"
+            );
             let debug = format!("{err:?}");
-            assert!(!debug.contains(&bad.to_string()), "debug echoes the value: {debug}");
+            assert!(
+                !debug.contains(&standalone) && !debug.contains(&format!("{bad}.")),
+                "debug echoes the value: {debug}"
+            );
         }
     }
 
@@ -711,15 +827,65 @@ mod tests {
                         "is_flash_channel disagrees with decide: channel={channel_id} \
                          parent={parent:?} include_threads={include_threads}"
                     );
-                    // The logger exclusion must never be weaker than the timer.
+                    // The logger exclusion must never be weaker than the timer: whenever
+                    // the timer acts on a location, the logger must exclude it too.
                     assert!(
-                        !is_flash_area(&c, channel_id, parent) || predicted,
+                        !predicted || is_flash_area(&c, channel_id, parent),
                         "the flash area must contain every flash channel: channel={channel_id} \
                          parent={parent:?} include_threads={include_threads}"
                     );
                 }
             }
         }
+    }
+
+    /// A thread of a channel that is not a flash channel is not a flash channel.
+    #[test]
+    fn thread_of_an_ordinary_channel_is_ignored() {
+        let mut f = facts();
+        f.channel_id = THREAD_CH;
+        f.parent_channel_id = Some(OTHER_CH);
+        assert_eq!(
+            expect_ignore(&decide(&f, &cfg())),
+            IgnoreReason::ChannelNotConfigured
+        );
+    }
+
+    /// The zero author id and the zero message id are refused; a mention of them would be
+    /// meaningless and a deletion of message zero would be a wrong request.
+    #[test]
+    fn zero_author_and_message_ids_are_ignored() {
+        let mut f = facts();
+        f.author_id = 0;
+        assert_eq!(
+            expect_ignore(&decide(&f, &cfg())),
+            IgnoreReason::InvalidAuthor
+        );
+        let mut f = facts();
+        f.message_id = 0;
+        assert_eq!(
+            expect_ignore(&decide(&f, &cfg())),
+            IgnoreReason::InvalidMessage
+        );
+    }
+
+    /// The logger exclusion covers a thread of a flash channel even when the timer does
+    /// not act on it, so flash media in that thread still never reaches the log channel.
+    #[test]
+    fn the_logger_exclusion_covers_a_thread_even_when_the_timer_does_not_act() {
+        let c = FlashConfig::new(
+            vec![FLASH_CH],
+            Some(ROLE),
+            DEFAULT_DELAY_SECS,
+            false,
+            Some(GUILD),
+        )
+        .expect("config is valid");
+        assert!(!is_flash_channel(&c, THREAD_CH, Some(FLASH_CH)));
+        assert!(is_flash_area(&c, THREAD_CH, Some(FLASH_CH)));
+        // A thread of an ordinary channel is in neither set.
+        assert!(!is_flash_area(&c, THREAD_CH, Some(OTHER_CH)));
+        assert!(!is_flash_channel(&c, THREAD_CH, Some(OTHER_CH)));
     }
 
     /// The deadline saturates at `u64::MAX` instead of wrapping around.
