@@ -1,4 +1,7 @@
-//! Synthetic fixture/schema checks, NOT executions of the application's logger handlers.
+//! Checks synthetic logger event fixtures against the locked Serenity event models.
+//! Fixture JSON is untrusted input to a test-only validator, not captured messages or cache data.
+//! Does not run logger handlers, read a live cache, or send anything to Discord.
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use serenity::model::{
@@ -10,6 +13,7 @@ use std::collections::HashSet;
 
 const PACK: &str = include_str!("fixtures/logger/message_events.json");
 
+/// Test-only fixture envelope; unknown fields are rejected to catch schema drift.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pack {
@@ -17,6 +21,7 @@ struct Pack {
     cases: Vec<Case>,
 }
 
+/// Pairs one raw event with the expected wire shape and minimal synthetic cache setup.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Case {
@@ -36,6 +41,7 @@ enum Kind {
     BulkDelete,
 }
 
+/// Expected raw content presence; null is not a valid substitute for an absent key here.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ContentShape {
@@ -44,6 +50,7 @@ enum ContentShape {
     Text,
 }
 
+/// Minimal synthetic cache setup, not an event or a full cached message.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prior {
@@ -52,6 +59,8 @@ struct Prior {
     embeds: Vec<Embed>,
 }
 
+/// Parses a complete synthetic pack or rejects malformed or contradictory fixture input.
+/// Error strings are test diagnostics, not suitable for logging arbitrary live payloads.
 fn validate_pack(input: &str) -> Result<Pack, String> {
     let p: Pack = serde_json::from_str(input).map_err(|e| e.to_string())?;
     if !p.provenance.starts_with("SYNTHETIC:") || p.cases.is_empty() {
@@ -62,6 +71,7 @@ fn validate_pack(input: &str) -> Result<Pack, String> {
         if c.name.is_empty() || !names.insert(&c.name) {
             return Err("empty or duplicate scenario name".into());
         }
+        // Validate raw presence first: the typed event can collapse distinct wire forms.
         let content_matches = match c.content_shape {
             ContentShape::Absent => c.event.get("content").is_none(),
             ContentShape::Empty => c.event.get("content").and_then(Value::as_str) == Some(""),
@@ -99,18 +109,23 @@ fn validate_pack(input: &str) -> Result<Pack, String> {
     Ok(p)
 }
 
+/// Loads the checked-in fixture pack; panics on fixture drift rather than skipping scenarios.
 fn pack() -> Pack {
     validate_pack(PACK).expect("final synthetic fixture pack must validate")
 }
 
+/// Looks up a unique named scenario; panics on an invalid pack or missing name.
 fn case(name: &str) -> Case {
     pack().cases.into_iter().find(|c| c.name == name).unwrap()
 }
 
+/// Decodes a fixture known to be an update; panics if the caller passes the wrong shape.
 fn update(c: &Case) -> MessageUpdateEvent {
     serde_json::from_value(c.event.clone()).unwrap()
 }
 
+/// The validated pack contains exactly the expected six named cases;
+/// catches a silently omitted or substituted scenario.
 #[test]
 fn final_pack_has_exact_six_named_scenarios() {
     let p = pack();
@@ -129,6 +144,8 @@ fn final_pack_has_exact_six_named_scenarios() {
     assert_eq!(p.cases.len(), 6);
 }
 
+/// Raw JSON and typed updates distinguish omitted content from an explicit empty string;
+/// catches rewriting a sparse update as a content clear.
 #[test]
 fn update_omission_and_explicit_empty_are_distinct_in_raw_and_serenity() {
     let absent = case("partial_content_absent");
@@ -141,6 +158,8 @@ fn update_omission_and_explicit_empty_are_distinct_in_raw_and_serenity() {
     assert!(update(&empty).embeds.is_none());
 }
 
+/// An embed-only fixture omits content and decodes one expected embed;
+/// catches inventing a content update or dropping the embed payload.
 #[test]
 fn embed_only_preserves_content_omission_and_typed_embed() {
     let c = case("embed_only_update");
@@ -153,6 +172,8 @@ fn embed_only_preserves_content_omission_and_typed_embed() {
     assert!(c.prior_cache[0].embeds.is_empty());
 }
 
+/// The cache-miss fixture has new text but no prior entry or typed author;
+/// catches populating metadata the event does not supply.
 #[test]
 fn cache_miss_has_no_invented_prior_or_event_author() {
     let c = case("no_cached_message");
@@ -162,6 +183,8 @@ fn cache_miss_has_no_invented_prior_or_event_author() {
     assert_eq!(e.content.as_deref(), Some("SYNTHETIC new text"));
 }
 
+/// Single and bulk delete fixtures decode through Serenity with the expected IDs and cache setup;
+/// catches using incompatible wire keys or dropping a bulk ID.
 #[test]
 fn delete_models_use_actual_id_and_ids_wire_fields() {
     let single = case("single_delete");
@@ -178,6 +201,8 @@ fn delete_models_use_actual_id_and_ids_wire_fields() {
     assert_eq!(bulk.prior_cache.len(), 1); // one known, one unknown
 }
 
+/// Typed updates collapse null and omitted content, but distinguish null webhook IDs and empty embeds;
+/// catches a change in Serenity's optional-field decoding.
 #[test]
 fn raw_null_distinction_is_lost_for_content_but_preserved_for_webhook_id() {
     let base = json!({"id": "101", "channel_id": "201"});
@@ -196,6 +221,8 @@ fn raw_null_distinction_is_lost_for_content_but_preserved_for_webhook_id() {
     assert_eq!(empty.embeds, Some(vec![]));
 }
 
+/// The test validator rejects malformed JSON and each sampled schema or shape contradiction;
+/// catches accepting malformed event data or mislabeled fixtures.
 #[test]
 fn validator_rejects_malformed_and_contradictory_inputs() {
     assert!(validate_pack("{broken").is_err());
@@ -208,6 +235,7 @@ fn validator_rejects_malformed_and_contradictory_inputs() {
         ("unknown envelope field", 5),
         ("non synthetic provenance", 6),
     ] {
+        // Start from the same valid pack so rejection cannot come from a previous mutation.
         let mut raw: Value = serde_json::from_str(PACK).unwrap();
         match mutate {
             0 => {

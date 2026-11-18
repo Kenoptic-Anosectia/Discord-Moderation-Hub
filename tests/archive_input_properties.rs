@@ -1,21 +1,7 @@
-//! Property-style sweeps for the archive input-safety primitives.
-//!
-//! These extend `tests/archive_input_safety.rs`, which hand-picks representative
-//! cases. Here we sweep large deterministic ranges instead:
-//!
-//! * `generated_asset_name` injectivity/determinism across `1..=4096` plus
-//!   selected nonoverlapping neighborhoods around `u32::MAX` and `u64::MAX`,
-//!   checking the produced names are ASCII-safe and accepted by the real
-//!   `validate_asset_component`.
-//! * `validate_attachment_url` acceptance of many distinct canonical CDN URLs
-//!   with synthetic signed query values, checking the query is preserved
-//!   exactly (not dropped or rewritten).
-//! * `validate_attachment_url` rejection of generated invalid host/port/path
-//!   variants that carry a synthetic private marker in the query, checking the
-//!   sanitized error never echoes the marker or the whole URL.
-//!
-//! All inputs are synthetic strings; nothing resolves DNS, opens a socket, or
-//! touches the filesystem. The tests call the real production functions.
+//! Deterministic sweeps of archive URL validation and generated asset names.
+//! Tests sampled ID boundaries, signed query preservation, and rejection without diagnostic leaks.
+//! All external-looking URLs and private markers are synthetic and treated as untrusted strings.
+//! Nothing resolves DNS, opens a socket, or touches the filesystem at runtime.
 #![allow(dead_code)] // the module is compiled standalone via #[path]; not every item is used
 #[path = "../src/archive_safety.rs"]
 mod archive_safety;
@@ -25,8 +11,7 @@ use archive_safety::{
 };
 use std::collections::HashSet;
 
-/// Distinct canonical nonzero IDs for the URL sweep. Deliberately nonoverlapping
-/// with the ID sweep in `generated_names_are_injective` and with each other.
+/// Distinct canonical nonzero IDs spanning short numbers and snowflake-sized values.
 const URL_IDS: [&str; 8] = [
     "1",
     "42",
@@ -54,12 +39,10 @@ const SIGNED_QUERIES: [&str; 6] = [
 /// echo attacker-controlled input. Not a real secret.
 const PRIVATE_MARKER: &str = "LEAK-me-9f8e7d";
 
-// --------------------------------------------------------------------------
-// 1. generated_asset_name: injective, deterministic, ASCII-safe, validator-accepted
-// --------------------------------------------------------------------------
+// ---- Generated asset names ----
 
-/// Generated names are injective across distinct IDs: distinct IDs map to
-/// distinct names across `1..=4096` plus selected u32/u64 MAX neighborhoods.
+/// Distinct sampled IDs produce stable, distinct names accepted by the component validator;
+/// catches truncation, unstable generation, or naming/validation drift.
 #[test]
 fn generated_names_are_injective_across_id_sweep() {
     let mut ids: Vec<u64> = (1..=4096u64).collect();
@@ -105,7 +88,8 @@ fn generated_names_are_injective_across_id_sweep() {
     }
 }
 
-/// The sweep range is large enough to be meaningful and covers the boundaries.
+/// Checks uniqueness and exact output around the integer boundaries;
+/// catches truncating a 64-bit ID to 32 bits or formatting a boundary incorrectly.
 #[test]
 fn generated_name_sweep_covers_range_and_boundaries() {
     let ids: Vec<u64> = (1..=4096u64)
@@ -115,7 +99,7 @@ fn generated_name_sweep_covers_range_and_boundaries() {
         .iter()
         .map(|i| generated_asset_name(*i).unwrap())
         .collect();
-    // 4096 + 4 distinct ids -> 4096 distinct names (no collisions).
+    // Include all four boundary IDs in the collision check.
     assert_eq!(names.len(), ids.len());
     // The canonical boundary outputs match the documented grammar.
     assert_eq!(
@@ -134,8 +118,8 @@ fn generated_name_sweep_covers_range_and_boundaries() {
     );
 }
 
-/// Every generated name is ASCII-only and uses only the safe component grammar,
-/// and is accepted by the real component validator.
+/// Sampled generated names fit the ASCII grammar and length cap and pass validation;
+/// catches emitting an unsafe or unrecognized filename component.
 #[test]
 fn generated_names_are_ascii_safe_and_grammar_compliant() {
     let ids: Vec<u64> = (1..=4096u64).chain([u32::MAX as u64, u64::MAX]).collect();
@@ -159,12 +143,10 @@ fn generated_names_are_ascii_safe_and_grammar_compliant() {
     }
 }
 
-// --------------------------------------------------------------------------
-// 2. validate_attachment_url: accepts valid synthetic CDN URLs, query preserved
-// --------------------------------------------------------------------------
+// ---- Accepted attachment URLs ----
 
-/// Many distinct canonical CDN URLs with synthetic signed query values are
-/// accepted, and each query pair is preserved exactly (not dropped or rewritten).
+/// Both allowed CDN hosts accept the signed fixture sweep without changing URL bytes;
+/// catches rewriting opaque query values or rejecting valid attachment hosts.
 #[test]
 fn valid_signed_cdn_urls_are_accepted_with_query_preserved() {
     let mut seen_ids = HashSet::new();
@@ -175,7 +157,7 @@ fn valid_signed_cdn_urls_are_accepted_with_query_preserved() {
 
     for id in URL_IDS {
         for q in SIGNED_QUERIES {
-            // Two allowed host shapes, both attachment roots.
+            // Keep the path form fixed so both hosts face the same opaque query inputs.
             for host in ["cdn.discordapp.com", "media.discordapp.net"] {
                 let raw =
                     format!("https://{host}/attachments/{id}/1000000000000000002/{id}.png?{q}");
@@ -201,7 +183,8 @@ fn valid_signed_cdn_urls_are_accepted_with_query_preserved() {
     }
 }
 
-/// The ephemeral-attachments root is accepted deliberately, with query preserved.
+/// The sampled ephemeral URL is accepted without rewriting its path or query;
+/// catches dropping support for that attachment root.
 #[test]
 fn ephemeral_attachment_url_accepted_with_query_preserved() {
     let id = "1000000000000000003";
@@ -218,13 +201,10 @@ fn ephemeral_attachment_url_accepted_with_query_preserved() {
     assert_eq!(u.as_str(), raw);
 }
 
-// --------------------------------------------------------------------------
-// 3. validate_attachment_url: rejects invalid variants, error never echoes marker
-// --------------------------------------------------------------------------
+// ---- Rejected URLs and sanitized errors ----
 
-/// Generated invalid host/port/path variants carrying a synthetic private marker
-/// in the query are rejected, and the sanitized error never echoes the marker or
-/// the whole URL.
+/// Host, port, and path variants fail without echoing the tested marker or host fragment;
+/// catches reflecting those private input fragments in Display or Debug.
 #[test]
 fn invalid_variants_rejected_and_error_never_echoes_marker() {
     let id = "1000000000000000004";
@@ -279,15 +259,15 @@ fn invalid_variants_rejected_and_error_never_echoes_marker() {
         for text in [e.to_string(), format!("{e:?}")] {
             // The sanitized error must not echo the private marker...
             assert!(!text.contains(PRIVATE_MARKER), "leaked marker: {text:?}");
-            // ...nor attacker-controlled host/path fragments of the whole URL.
+            // Also check the disallowed host fragment independently of the query marker.
             assert!(!text.contains("evil.example"), "leaked host: {text:?}");
             assert!(!text.is_empty());
         }
     }
 }
 
-/// A control/whitespace variant carrying the marker is rejected and the marker
-/// is not echoed, even though the raw input contains both.
+/// A newline-suffixed URL fails without reflecting the marker or host;
+/// catches silently normalizing the control character or leaking input in diagnostics.
 #[test]
 fn control_variant_with_marker_rejected_and_not_echoed() {
     let raw = format!(

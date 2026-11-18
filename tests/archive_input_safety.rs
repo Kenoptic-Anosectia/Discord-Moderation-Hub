@@ -1,5 +1,6 @@
-//! Tests for the archive input-safety primitives. All inputs are synthetic;
-//! nothing here resolves DNS, opens a socket or touches the filesystem.
+//! Tests archive URL validation, generated asset names, and path-component checks.
+//! URL, filename, and private-marker strings are synthetic but model untrusted metadata.
+//! No runtime DNS, sockets, or filesystem I/O; only validation and error formatting are tested.
 #![allow(dead_code)] // the module is compiled standalone via #[path]; not every item is used here
 #[path = "../src/archive_safety.rs"]
 mod archive_safety;
@@ -13,6 +14,7 @@ use std::collections::HashSet;
 const ID: &str = "1100000000000000001";
 const CH: &str = "1000000000000000002";
 
+/// Returns the typed rejection kind for a synthetic URL; panics if it was accepted.
 fn url_err(raw: &str) -> K {
     match validate_attachment_url(raw) {
         Ok(u) => panic!(
@@ -25,6 +27,8 @@ fn url_err(raw: &str) -> K {
 
 // ---------- URL: accepted ----------
 
+/// The signed fixture URL keeps its HTTPS host, path, and exact query bytes;
+/// catches dropping or rewriting opaque signature data.
 #[test]
 fn accepts_signed_cdn_url_and_preserves_query_exactly() {
     let q = "ex=65f0aa00&is=65ee2b00&hm=abcdef0123456789abcdef0123456789&other=a%2Fb%20c&x=";
@@ -37,6 +41,7 @@ fn accepts_signed_cdn_url_and_preserves_query_exactly() {
     assert_eq!(u.as_str(), raw);
 }
 
+/// The media proxy host accepts the unsigned fixture; catches requiring CDN-only hosts or a query.
 #[test]
 fn accepts_media_proxy_host_and_unsigned_url() {
     let raw = format!("https://media.discordapp.net/attachments/{CH}/{ID}/a.txt");
@@ -45,6 +50,7 @@ fn accepts_media_proxy_host_and_unsigned_url() {
     assert_eq!(u.query(), None);
 }
 
+/// The sampled ephemeral path is accepted; catches restricting validation to regular attachments.
 #[test]
 fn accepts_ephemeral_attachments_path_deliberately() {
     let raw =
@@ -52,6 +58,8 @@ fn accepts_ephemeral_attachments_path_deliberately() {
     assert!(validate_attachment_url(&raw).is_ok());
 }
 
+/// Mixed-case host and explicit HTTPS default port normalize to the approved host;
+/// catches rejecting this equivalent host or retaining a separate port.
 #[test]
 fn host_case_and_explicit_default_port_normalise_to_approved_host() {
     let raw = format!("HTTPS://CDN.DiscordApp.COM:443/attachments/{CH}/{ID}/a.bin");
@@ -62,6 +70,7 @@ fn host_case_and_explicit_default_port_normalise_to_approved_host() {
 
 // ---------- URL: rejected ----------
 
+/// The sampled non-HTTPS and relative inputs fail; catches accepting a URL without HTTPS authority.
 #[test]
 fn rejects_non_https_schemes_and_relative_inputs() {
     let tail = format!("cdn.discordapp.com/attachments/{CH}/{ID}/a.bin");
@@ -87,6 +96,7 @@ fn rejects_non_https_schemes_and_relative_inputs() {
     assert_eq!(url_err(&format!("http://{tail}")), K::UnsupportedScheme);
 }
 
+/// Sampled lookalikes and host relatives fail; catches loose substring or suffix host matching.
 #[test]
 fn rejects_lookalike_subdomain_and_parent_hosts() {
     for host in [
@@ -113,6 +123,7 @@ fn rejects_lookalike_subdomain_and_parent_hosts() {
     }
 }
 
+/// Sampled userinfo forms fail; catches accepting credentials or mistaking them for host data.
 #[test]
 fn rejects_userinfo_including_host_in_userinfo() {
     for raw in [
@@ -136,6 +147,8 @@ fn rejects_userinfo_including_host_in_userinfo() {
     );
 }
 
+/// The sampled noncanonical authority forms fail while canonical controls work;
+/// catches relying on parsing that normalizes away the empty userinfo marker.
 #[test]
 fn rejects_noncanonical_authority_introducers_with_empty_userinfo() {
     let tail = format!("cdn.discordapp.com/attachments/{CH}/{ID}/a.bin");
@@ -161,6 +174,7 @@ fn rejects_noncanonical_authority_introducers_with_empty_userinfo() {
             "{raw:?} -> {k:?}"
         );
     }
+    // Keep accepted controls alongside rejects so an overly broad rule also fails.
     // Controls: canonical forms still accepted, scheme/host case-insensitive, explicit :443.
     assert!(validate_attachment_url(&format!("https://{tail}?ex=1&is=2&hm=abc")).is_ok());
     assert!(validate_attachment_url(&format!(
@@ -173,6 +187,7 @@ fn rejects_noncanonical_authority_introducers_with_empty_userinfo() {
     .is_ok());
 }
 
+/// The sampled IP literal spellings fail; catches allowing addresses instead of approved DNS names.
 #[test]
 fn rejects_ip_literals_in_every_encoding() {
     for host in [
@@ -194,6 +209,7 @@ fn rejects_ip_literals_in_every_encoding() {
     }
 }
 
+/// The sampled non-default ports produce `PortNotAllowed`; catches weakening the HTTPS port rule.
 #[test]
 fn rejects_non_default_ports() {
     for port in ["80", "8443", "444", "0", "65535"] {
@@ -202,6 +218,7 @@ fn rejects_non_default_ports() {
     }
 }
 
+/// Empty and nonempty fragments produce `FragmentNotAllowed`; catches ignoring a fragment marker.
 #[test]
 fn rejects_fragments() {
     for suffix in ["#frag", "#", "?ex=1#frag"] {
@@ -210,6 +227,8 @@ fn rejects_fragments() {
     }
 }
 
+/// Sampled whitespace and control characters fail with a typed error;
+/// catches accepting them after parser normalization.
 #[test]
 fn rejects_controls_whitespace_and_newline_variants() {
     let base = format!("https://cdn.discordapp.com/attachments/{CH}/{ID}/a.bin");
@@ -231,6 +250,8 @@ fn rejects_controls_whitespace_and_newline_variants() {
     }
 }
 
+/// Sampled malformed or non-attachment paths produce `PathNotAllowed`;
+/// catches accepting an invalid root or attachment identifier.
 #[test]
 fn rejects_non_attachment_paths() {
     for path in [
@@ -257,6 +278,7 @@ fn rejects_non_attachment_paths() {
     }
 }
 
+/// The sampled traversal and separator variants fail; catches accepting a path changed by decoding.
 #[test]
 fn rejects_dot_segments_encoded_separators_and_backslashes() {
     for path in [
@@ -282,6 +304,8 @@ fn rejects_dot_segments_encoded_separators_and_backslashes() {
     }
 }
 
+/// The exact URL length cap is accepted and one byte beyond yields `TooLong`;
+/// catches an off-by-one or a missing bound.
 #[test]
 fn rejects_overlong_urls_without_parsing_them() {
     let pad = "a".repeat(MAX_URL_LEN);
@@ -299,6 +323,8 @@ fn rejects_overlong_urls_without_parsing_them() {
 
 // ---------- error display is sanitised ----------
 
+/// Sampled rejected URLs omit query, filename, host, and credential markers in diagnostics;
+/// catches reflecting private URL data in Display or Debug.
 #[test]
 fn error_display_and_debug_never_echo_input() {
     let secret = "SIGNEDSECRET123hm";
@@ -328,6 +354,8 @@ fn error_display_and_debug_never_echo_input() {
     assert!(!format!("{e:?}").contains("evil"));
 }
 
+/// Distinct sampled kinds display distinctly and implement the standard error trait;
+/// catches collapsing those diagnostics into one text value.
 #[test]
 fn error_display_is_distinct_per_kind_and_is_std_error() {
     let a = validate_attachment_url("http://x").unwrap_err();
@@ -339,6 +367,8 @@ fn error_display_is_distinct_per_kind_and_is_std_error() {
 
 // ---------- generated names ----------
 
+/// Exact names at the sampled integer boundaries retain the full ID;
+/// catches truncation or a noncanonical decimal representation.
 #[test]
 fn generated_name_known_values_and_u64_boundaries() {
     assert_eq!(generated_asset_name(1).unwrap(), "attachment-1.bin");
@@ -365,6 +395,7 @@ fn generated_name_known_values_and_u64_boundaries() {
     );
 }
 
+/// Zero returns the typed error; catches generating a storage name for an invalid attachment ID.
 #[test]
 fn generated_name_rejects_zero() {
     assert_eq!(
@@ -373,6 +404,7 @@ fn generated_name_rejects_zero() {
     );
 }
 
+/// Repeated generation for sampled IDs is stable; catches nondeterministic storage names.
 #[test]
 fn generated_name_is_deterministic() {
     for id in [1u64, 42, u64::MAX, 1 << 63] {
@@ -383,6 +415,8 @@ fn generated_name_is_deterministic() {
     }
 }
 
+/// Names for the sampled distinct IDs stay distinct after case folding;
+/// catches naming collisions on a case-insensitive filesystem.
 #[test]
 fn distinct_ids_never_collide_even_case_insensitively() {
     let ids: Vec<u64> = (1..=2000u64)
@@ -406,6 +440,8 @@ fn distinct_ids_never_collide_even_case_insensitively() {
     assert_eq!(names.len(), uniq_ids.len());
 }
 
+/// Sampled generated components match the required ASCII shape and pass validation;
+/// catches drift between name generation and component validation.
 #[test]
 fn generated_names_satisfy_the_component_validator_and_ascii_grammar() {
     for id in [1u64, 7, 99, 100, 123456789, i64::MAX as u64, u64::MAX] {
@@ -421,6 +457,8 @@ fn generated_names_satisfy_the_component_validator_and_ascii_grammar() {
     }
 }
 
+/// The ID-only generator returns one fixed safe component for the repeated ID;
+/// catches unstable output, not a filesystem write using an original filename.
 #[test]
 fn generated_name_has_no_input_channel_for_original_filenames() {
     // The signature takes only a u64: hostile original names cannot influence it. Pair each hostile
@@ -446,6 +484,7 @@ fn generated_name_has_no_input_channel_for_original_filenames() {
 
 // ---------- component validator ----------
 
+/// Sampled canonical components pass and alternate spellings fail; catches a widened grammar.
 #[test]
 fn component_accepts_exact_grammar_only() {
     for ok in [
@@ -458,6 +497,7 @@ fn component_accepts_exact_grammar_only() {
     }
 }
 
+/// Overflow, zero, and leading-zero components fail; catches accepting noncanonical numeric IDs.
 #[test]
 fn component_rejects_u64_overflow_leading_zero_and_zero() {
     for bad in [
@@ -474,6 +514,7 @@ fn component_rejects_u64_overflow_leading_zero_and_zero() {
     }
 }
 
+/// Sampled empty, dot, parent, and separator forms fail; catches treating a path as one component.
 #[test]
 fn component_rejects_empty_dot_dotdot_and_separators() {
     for bad in [
@@ -501,6 +542,7 @@ fn component_rejects_empty_dot_dotdot_and_separators() {
     }
 }
 
+/// The sampled Windows path forms fail; catches accepting names with platform-specific semantics.
 #[test]
 fn component_rejects_windows_path_attack_corpus() {
     for bad in [
@@ -570,6 +612,7 @@ fn component_rejects_windows_path_attack_corpus() {
     }
 }
 
+/// Sampled Unicode lookalikes fail; catches accepting non-ASCII spellings as canonical names.
 #[test]
 fn component_rejects_unicode_confusables_and_non_ascii() {
     for bad in [
@@ -598,6 +641,7 @@ fn component_rejects_unicode_confusables_and_non_ascii() {
     }
 }
 
+/// The longest valid ID name fits while over-cap strings fail; catches dropping the length check.
 #[test]
 fn component_length_is_bounded() {
     // The longest legal name is u64::MAX, well under the cap.
@@ -618,6 +662,8 @@ fn component_length_is_bounded() {
     );
 }
 
+/// Sampled invalid components return their expected typed kinds;
+/// catches flattening length, grammar, or ID failures into the wrong kind.
 #[test]
 fn component_rejection_kinds_are_typed() {
     assert_eq!(

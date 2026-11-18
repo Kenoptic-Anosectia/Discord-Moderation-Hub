@@ -1,10 +1,17 @@
+//! Checks the ticket repository's migrations, slot ownership, leases, and recovery audit.
+//! Databases are in-memory or isolated under `target`; all rows and operators are synthetic.
+//! This suite does not call Discord or authorize users and must not use a production database.
+
 use super::*;
 use crate::tickets::repository_close::Step;
 
+/// Allocates a test SQLite path using the process ID and counter without opening the file.
+/// Supply a trusted filename tag; directory creation or path conversion failures panic.
 pub fn temp_db(tag: &str) -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/a07-owned-tests");
     std::fs::create_dir_all(&root).unwrap();
+    // Include the process ID and a per-process counter to separate parallel test paths.
     root.join(format!(
         "{tag}-{}-{}.sqlite",
         std::process::id(),
@@ -15,6 +22,7 @@ pub fn temp_db(tag: &str) -> String {
     .to_string()
 }
 
+/// Version-one schema with synthetic linked, failed, and uncertain tickets for migration tests.
 const V1: &str = "CREATE TABLE ticket_schema(version INTEGER NOT NULL); INSERT INTO ticket_schema VALUES(1);
  CREATE TABLE ticket_panels(guild TEXT NOT NULL, channel TEXT NOT NULL, message TEXT PRIMARY KEY, bot TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
  CREATE TABLE tickets(id INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16)))), guild TEXT NOT NULL, opener TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('support','age')), status TEXT NOT NULL CHECK(status IN ('reserved','creating','active','failed','closed')), channel TEXT UNIQUE, greeting TEXT NOT NULL DEFAULT 'pending');
@@ -24,6 +32,8 @@ const V1: &str = "CREATE TABLE ticket_schema(version INTEGER NOT NULL); INSERT I
  INSERT INTO tickets(id,operation,guild,opener,kind,status,channel,greeting) VALUES(3,'opa','100','11','support','active','900','sent'),(8,'opb','100','12','age','failed',NULL,'pending'),(9,'opc','100','13','support','creating',NULL,'pending');
  INSERT INTO ticket_interactions VALUES('1',3),('2',9);";
 
+/// Migration keeps the sampled rows, panel, interaction replay, slot and sequence on reopen;
+/// catches losing durable identity or freeing an uncertain ticket's slot during schema upgrade.
 #[tokio::test]
 async fn v1_database_migrates_preserving_rows_links_sequence_and_slots() {
     let path = temp_db("v1");
@@ -67,6 +77,8 @@ async fn v1_database_migrates_preserving_rows_links_sequence_and_slots() {
     );
 }
 
+/// Migration keeps a sequence high-water mark above all surviving rows;
+/// catches rebuilding the counter from the largest remaining ticket ID.
 #[tokio::test]
 async fn migration_sequence_never_reuses_ids_even_above_surviving_rows() {
     let path = temp_db("seq");
@@ -81,6 +93,8 @@ async fn migration_sequence_never_reuses_ids_even_above_surviving_rows() {
     assert!(r.reserve(60, 100, 77, Kind::Age).await.unwrap().id > 40);
 }
 
+/// Checks slot reuse for every listed state and isolation between ticket kinds;
+/// catches releasing nonterminal rows or keeping terminal rows in the uniqueness index.
 #[tokio::test]
 async fn slot_index_covers_every_nonterminal_state_and_releases_only_terminal() {
     for (state, held) in [
@@ -97,6 +111,7 @@ async fn slot_index_covers_every_nonterminal_state_and_releases_only_terminal() 
         ("closed", false),
         ("released", false),
     ] {
+        // Start with a fresh database per state so earlier reservations can't mask slot behavior.
         let r = Repository::open(&temp_db("slot")).await.unwrap();
         let t = r.reserve(1, 100, 5, Kind::Support).await.unwrap();
         r.force_status_for_test(t.id, state).await.unwrap();
@@ -106,6 +121,8 @@ async fn slot_index_covers_every_nonterminal_state_and_releases_only_terminal() 
     }
 }
 
+/// Independent connections yield one close claimant and one expired-lease resumer each;
+/// catches concurrent winners, accepting a wrong token, or allowing an early takeover.
 #[tokio::test]
 async fn close_claim_is_compare_and_set_across_independent_connections() {
     let path = temp_db("cas");
@@ -141,6 +158,7 @@ async fn close_claim_is_compare_and_set_across_independent_connections() {
         !a.resume_close(t.id, 3, "tok-c", 1500, 3000).await.unwrap(),
         "live lease blocks resume"
     );
+    // Race again after expiry to test takeover separately from the original claim.
     let (p, q) = tokio::join!(
         a.resume_close(t.id, 3, "tok-c", 2001, 4000),
         b.resume_close(t.id, 4, "tok-d", 2001, 4000)
@@ -154,12 +172,13 @@ async fn close_claim_is_compare_and_set_across_independent_connections() {
         .any(|e| e.to == "closing"));
 }
 
+/// Recovery release changes state and frees the tested creating slot; attach links the
+/// channel and records actor and reason. Catches dropping the audit or state change.
 #[tokio::test]
 async fn recovery_release_and_attach_are_audited_and_only_from_unverified_states() {
     let r = Repository::open(":memory:").await.unwrap();
     let t = r.reserve(1, 100, 5, Kind::Support).await.unwrap();
-    // a reserved row (create never confirmed) is recoverable ONLY through the audited path;
-    // a channel-linked ticket never is.
+    // Exercise the audited release path with a reservation that has no attached channel.
     let z = r.reserve(50, 100, 77, Kind::Support).await.unwrap();
     assert!(r
         .recovery_release(z.id, 9, "operator confirmed no channel", 9)
@@ -201,6 +220,8 @@ async fn recovery_release_and_attach_are_audited_and_only_from_unverified_states
     assert!(r.reserve(3, 100, 6, Kind::Support).await.unwrap().id > u.id);
 }
 
+/// The sampled closed channel remains known, but ticket lookup still requires its guild;
+/// catches dropping the privacy linkage on close or returning it across guilds.
 #[tokio::test]
 async fn channel_linkage_lookups_are_private_forever_for_closed_tickets() {
     let r = Repository::open(":memory:").await.unwrap();

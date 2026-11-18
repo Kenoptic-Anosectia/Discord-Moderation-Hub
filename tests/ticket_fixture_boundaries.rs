@@ -1,8 +1,12 @@
+//! Checks pagination boundaries and stable attachment identities in the fixture factory.
+//! The data is synthetic and may include untrusted-looking names; no name is opened as a path.
+//! This tests fixture generation, not Discord pagination or production archive handling.
+
 #[path = "support/ticket_archive_fixtures.rs"]
 mod fixtures;
 
-/// Test 1: page boundaries at exact multiples of 100 produce full pages with no
-/// empty trailing page.
+/// The 100- and 200-message cases yield full pages only;
+/// catches an empty trailing page at an exact page boundary.
 #[test]
 fn message_pages_at_exact_multiples_of_100() {
     // Exactly 100 => exactly one page of 100, no empty trailing page.
@@ -23,9 +27,8 @@ fn message_pages_at_exact_multiples_of_100() {
     }
 }
 
-/// Test 2: at counts straddling the boundary (99 and 101) the total equals the
-/// requested count, every page is nonempty and at most 100, and numeric message
-/// IDs stay contiguous across the boundary with no duplicate or drop.
+/// The 99- and 101-message cases retain every expected ID in bounded, nonempty pages;
+/// catches dropped or duplicated messages at a page cut.
 #[test]
 fn message_pages_ids_contiguous_across_boundary() {
     for count in [99usize, 101] {
@@ -56,9 +59,8 @@ fn message_pages_ids_contiguous_across_boundary() {
     }
 }
 
-/// Test 3: every asset fixture reports size equal to its actual byte length, all
-/// attachment IDs are unique, repeated calls are identical, and the two same.txt
-/// assets keep distinct IDs and their own bytes.
+/// Assets have unique IDs, accurate lengths, and stable IDs, names, and bytes across calls;
+/// catches collapsing attachments with the same display name into one payload.
 #[test]
 fn asset_fixtures_size_unique_and_deterministic() {
     let assets = fixtures::asset_fixtures();

@@ -1,3 +1,8 @@
+//! Exercises ticket close, reconciliation, operator recovery, and archive retrieval.
+//! SQLite and archive files are disposable; Discord operations and identities are synthetic.
+//! Treat simulated message history, attachments, and remote outcomes as untrusted.
+//! These tests never contact Discord or use real ticket data; they do not exercise ticket opening.
+
 use super::*;
 use crate::tickets::policy::Kind;
 use serenity::all::Message;
@@ -12,6 +17,7 @@ const STAFF: u64 = 200;
 const CH: u64 = 900;
 const OPENER: u64 = 55;
 
+/// Builds synthetic guild, staff, and category settings; the harness supplies its own database.
 fn settings() -> Settings {
     Settings {
         guild: G,
@@ -26,6 +32,8 @@ type Mutation = fn(&mut Vec<Message>);
 const EDIT_FIRST: Mutation = |m| edit_first(m);
 const EDIT_FOOTER: Mutation = |m| edit_footer(m);
 const EDIT_URL: Mutation = |m| edit_url(m);
+/// Scripted Discord boundary with synthetic history and observable remote calls.
+/// Deletion only records an attempt and returns a scripted outcome.
 struct Fake {
     msgs: Mutex<Vec<Message>>,
     reads: Mutex<usize>,
@@ -43,6 +51,7 @@ struct Fake {
     archive_existed_at_delete: Mutex<Vec<bool>>,
 }
 impl Fake {
+    /// Starts with `n` synthetic messages and successful channel operations, but no downloads.
     fn new(root: &std::path::Path, n: usize) -> Self {
         Self {
             msgs: Mutex::new(fixtures::message_pages(n).into_iter().flatten().collect()),
@@ -69,6 +78,7 @@ impl Fake {
     }
 }
 impl HistorySource for Fake {
+    /// Returns one cursor page or the scripted source error; changes are injected between reads.
     async fn page_after(&self, after: u64) -> Result<Vec<Message>, ArchiveError> {
         self.log.lock().unwrap().push("history".into());
         if self.history_fail {
@@ -81,6 +91,7 @@ impl HistorySource for Fake {
         };
         {
             let mut mm = self.mutate.lock().unwrap();
+            // Consume the edit once so a later retry sees a stable replacement history.
             if matches!(&*mm, Some((at, _)) if n > *at) {
                 let (_, f) = mm.take().unwrap();
                 f(&mut self.msgs.lock().unwrap());
@@ -107,6 +118,7 @@ impl CloseIo for Fake {
         self.log.lock().unwrap().push("freeze".into());
         Ok(())
     }
+    /// Consumes staged presence answers before falling back to the default probe result.
     async fn probe(&self, _c: u64) -> Presence {
         self.log.lock().unwrap().push("probe".into());
         {
@@ -117,8 +129,10 @@ impl CloseIo for Fake {
         }
         *self.probe.lock().unwrap()
     }
+    /// Records an attempted delete and its archive-presence observation without touching Discord.
     async fn delete(&self, _c: u64) -> DeleteOutcome {
         self.log.lock().unwrap().push("delete".into());
+        // Ignore staging names: a partial archive must not satisfy the timing assertion.
         let any = std::fs::read_dir(&self.root)
             .map(|d| {
                 d.filter_map(|e| e.ok())
@@ -146,12 +160,14 @@ impl CloseIo for Fake {
     }
 }
 
+/// Keeps each scenario's SQLite state, archive root, and simulated lease clock together.
 struct H {
     repo: Repository,
     root: OwnedRoot,
     dir: PathBuf,
     clock: AtomicI64,
 }
+/// Opens an isolated archive root and database for a trusted test tag; panics on setup failure.
 async fn harness(tag: &str) -> H {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/a07-owned-tests")
@@ -174,12 +190,15 @@ async fn harness(tag: &str) -> H {
         clock: AtomicI64::new(1000),
     }
 }
+/// Seeds a linked ticket via reserve, claim, and attach; panics if setup fails.
+/// Use a fresh slot and interaction unless the prior ticket has released the slot.
 async fn active(h: &H, interaction: u64, kind: Kind) -> Ticket {
     let t = h.repo.reserve(interaction, G, OPENER, kind).await.unwrap();
     assert!(h.repo.claim(t.id).await.unwrap());
     h.repo.attach(t.id, CH + interaction).await.unwrap();
     h.repo.ticket_by_id(t.id).await.unwrap().unwrap()
 }
+/// Builds a staff actor in the ticket's channel; requires an already-linked ticket.
 fn actor(t: &Ticket) -> Actor {
     Actor {
         user: 7,
@@ -189,9 +208,11 @@ fn actor(t: &Ticket) -> Actor {
         channel: t.channel.unwrap(),
     }
 }
+/// Runs the close controller against the fixture repository, archive root, and fake Discord.
 async fn run(h: &H, io: &Fake, a: &Actor, id: i64, tok: &str, s: &Settings) -> CloseOutcome {
     let now = |_: ()| 0;
     let _ = now;
+    // Advance synthetic lease time without sleeping between attempts.
     let clock = &h.clock;
     let f = move || clock.fetch_add(1, Ordering::SeqCst);
     let limits = Limits::default();
@@ -209,6 +230,8 @@ async fn status(h: &H, id: i64) -> String {
     h.repo.ticket_by_id(id).await.unwrap().unwrap().status
 }
 
+/// Checks one delete with a visible archive and ordered close history for both kinds;
+/// catches duplicate deletes or a missing verified transition.
 #[tokio::test]
 async fn happy_path_both_kinds_archives_verifies_then_deletes_once() {
     for (i, kind) in [(1u64, Kind::Support), (2, Kind::Age)] {
@@ -228,6 +251,7 @@ async fn happy_path_both_kinds_archives_verifies_then_deletes_once() {
             h.repo.dm_status(t.id).await.unwrap().as_deref(),
             Some("sent")
         );
+        // Check that the repository accepts a reservation after closure.
         // slot freed only now
         assert!(h.repo.reserve(10 + i, G, OPENER, kind).await.is_ok());
         let hist: Vec<_> = h
@@ -251,6 +275,8 @@ async fn happy_path_both_kinds_archives_verifies_then_deletes_once() {
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 }
+/// Checks denial without logged Discord calls or a status change for disallowed actors;
+/// catches a role or channel check that lets those actors reach the close path.
 #[tokio::test]
 async fn unauthorized_actors_get_denied_with_zero_private_io_or_mutation() {
     let h = harness("authz").await;
@@ -303,6 +329,8 @@ async fn unauthorized_actors_get_denied_with_zero_private_io_or_mutation() {
     );
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// A history error leaves no archive record or delete call; a clean retry closes.
+/// Catches proceeding with incomplete history or allocating a new slot on successful reserve.
 #[tokio::test]
 async fn any_incompleteness_means_zero_deletion_and_slot_retained() {
     let h = harness("incomplete").await;
@@ -327,6 +355,8 @@ async fn any_incompleteness_means_zero_deletion_and_slot_retained() {
     );
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// An uncertain delete closes only after known absence and archive re-verification;
+/// catches a blind repeat delete or closing despite transcript corruption.
 #[tokio::test]
 async fn unknown_delete_keeps_archive_and_reconciles_without_blind_repeat() {
     let h = harness("uncertain").await;
@@ -366,6 +396,8 @@ async fn unknown_delete_keeps_archive_and_reconciles_without_blind_repeat() {
     assert_eq!(io.calls("delete"), 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// A rejected delete leaves the ticket verified and allows closure using archive sequence 1;
+/// catches discarding the reusable archive on rejection.
 #[tokio::test]
 async fn rejected_delete_returns_to_verified_and_retry_deletes_again() {
     let h = harness("rejected").await;
@@ -385,19 +417,24 @@ async fn rejected_delete_returns_to_verified_and_retry_deletes_again() {
     assert_eq!(h.repo.latest_archive(t.id).await.unwrap().unwrap().seq, 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// Edits the first synthetic message without changing its ID; requires nonempty history.
 fn edit_first(m: &mut [Message]) {
     m[0].content.push_str(" (edited after archive)");
     m[0].edited_timestamp = Some(serenity::all::Timestamp::now());
 }
+/// Removes the first synthetic message to simulate a gap; requires nonempty history.
 fn delete_first(m: &mut Vec<Message>) {
     m.remove(0);
 }
+/// Appends a copy with the next ID to simulate arrival after the existing history.
 fn append_one(m: &mut Vec<Message>) {
     let mut n = m.last().unwrap().clone();
     n.id = serenity::all::MessageId::new(n.id.get() + 1);
     m.push(n);
 }
 
+/// Edits, removals, and appends after initial paging prevent deletion and archive recording;
+/// catches a missing source recheck before publication.
 #[tokio::test]
 async fn edit_or_delete_or_append_during_download_never_deletes_source() {
     for (tag, f) in [
@@ -437,6 +474,8 @@ async fn edit_or_delete_or_append_during_download_never_deletes_source() {
     }
 }
 
+/// A source change after a rejected delete blocks the second attempt and preserves the old archive;
+/// catches reusing stale verified data instead of publishing a new sequence.
 #[tokio::test]
 async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
     for (tag, f) in [
@@ -486,6 +525,8 @@ async fn stale_retry_after_rejected_delete_rearchives_instead_of_deleting() {
     }
 }
 
+/// Resumes from an unrecorded archive matching the current history;
+/// catches allocating a new archive sequence instead of recording sequence 1.
 #[tokio::test]
 async fn published_but_unrecorded_archive_is_adopted_when_it_verifies() {
     let h = harness("pubrec").await;
@@ -514,6 +555,8 @@ async fn published_but_unrecorded_archive_is_adopted_when_it_verifies() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Two stale orphans keep their manifest bytes while closure records a fresh directory;
+/// catches adopting stale content or overwriting an occupied archive name.
 #[tokio::test]
 async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recovers() {
     let h = harness("pubstale").await;
@@ -547,7 +590,7 @@ async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recover
             .unwrap()
         })
         .collect();
-    // eventual fresh verified closure; deletion happens only AFTER the fresh archive verified.
+    // Expect a fresh verified record rather than reuse of either older directory.
     assert_eq!(
         run(&h, &io, &actor(&t), t.id, "a", &settings()).await,
         CloseOutcome::Closed
@@ -560,7 +603,7 @@ async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recover
         "fresh seq after orphans"
     );
     assert!(recorded_manifest(&h.root, &ar, t.id, t.channel.unwrap()).is_some());
-    // both stale orphans preserved byte-for-byte and never recorded
+    // Compare the old manifests to detect overwrites of either orphan.
     for (i, b) in before.iter().enumerate() {
         let p = h
             .root
@@ -573,6 +616,8 @@ async fn published_but_stale_unrecorded_archives_are_preserved_and_close_recover
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// After a stale orphan and a rejected delete, retry closes with the fresh archive recorded;
+/// catches selecting the stale directory as the final archive.
 #[tokio::test]
 async fn stale_orphan_then_failed_delete_retry_never_deletes_against_stale_archive() {
     let h = harness("pubstale2").await;
@@ -606,6 +651,8 @@ async fn stale_orphan_then_failed_delete_retry_never_deletes_against_stale_archi
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Reconcile leaves a reservation unresolved; only confirmed staff release with a reason is audited.
+/// Catches releasing the slot through a denied or incomplete operator request.
 #[tokio::test]
 async fn reserved_row_is_resolved_only_by_confirmed_audited_operator_action() {
     let h = harness("reserved").await;
@@ -676,6 +723,8 @@ async fn reserved_row_is_resolved_only_by_confirmed_audited_operator_action() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Recovery release is denied at both controller and repository for a linked ticket;
+/// catches treating a linked recovery row as an unconfirmed reservation.
 #[tokio::test]
 async fn release_of_channel_linked_ticket_is_refused() {
     let h = harness("linkrel").await;
@@ -712,6 +761,8 @@ async fn release_of_channel_linked_ticket_is_refused() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Two concurrent close attempts produce one successful close and one delete call;
+/// catches duplicate deletion when workers contend for the same ticket.
 #[tokio::test]
 async fn parallel_close_workers_are_prevented() {
     let h = harness("parallel").await;
@@ -732,6 +783,8 @@ async fn parallel_close_workers_are_prevented() {
     assert_eq!(io.calls("delete"), 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// A failed notification is recorded without undoing closure;
+/// catches returning a close failure or losing the failed-DM status.
 #[tokio::test]
 async fn dm_failure_is_recorded_and_does_not_undo_closure() {
     let h = harness("dm").await;
@@ -748,6 +801,8 @@ async fn dm_failure_is_recorded_and_does_not_undo_closure() {
     );
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// The sampled close replies omit an internal retention detail;
+/// catches formatting the internal reason into a user-facing reply.
 #[test]
 fn replies_are_fixed_text() {
     for o in [
@@ -760,6 +815,7 @@ fn replies_are_fixed_text() {
     }
 }
 
+/// Runs an async controller call with a fixture root, repository, I/O, and lease clock.
 macro_rules! env_run {
     ($h:expr, $io:expr, $s:expr, |$e:ident| $body:expr) => {{
         let clock = &$h.clock;
@@ -778,6 +834,8 @@ macro_rules! env_run {
     }};
 }
 
+/// A plausible candidate does not resolve an unverified creation; the row keeps its slot.
+/// Catches automatic channel adoption or release based on candidate metadata alone.
 #[tokio::test]
 async fn reconcile_retains_unverified_create_and_never_adopts_or_releases() {
     let h = harness("recon").await;
@@ -813,6 +871,8 @@ async fn reconcile_retains_unverified_create_and_never_adopts_or_releases() {
     let _ = std::fs::remove_dir_all(&h.dir);
     let _ = std::fs::remove_dir_all(&clean.dir);
 }
+/// Reconcile leaves an uncertain delete unresolved until absence is known, then closes without
+/// a new delete call; catches treating an unknown probe as proof of absence.
 #[tokio::test]
 async fn reconcile_closes_only_known_absence_after_verified_archive() {
     let h = harness("recon3").await;
@@ -832,6 +892,8 @@ async fn reconcile_closes_only_known_absence_after_verified_archive() {
     assert_eq!(io.calls("delete"), 1);
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// An unknown probe keeps readiness denied even with synthetic approval;
+/// catches ignoring unresolved tickets in the readiness predicate.
 #[tokio::test]
 async fn active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed() {
     let h = harness("recon-unknown").await;
@@ -849,7 +911,7 @@ async fn active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed
         let _g = super::super::runtime::READINESS_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // production readiness path, with synthetic approval both ways
+        // Exercise the readiness predicate only; this does not enable ticket opening.
         super::super::runtime::record_reconcile(Some(&unknown));
         assert!(!super::super::runtime::permitted(true));
         assert!(!super::super::runtime::permitted(false));
@@ -861,6 +923,8 @@ async fn active_ticket_with_unknown_probe_is_unresolved_and_keeps_opening_closed
     }
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+/// Recovery checks staff access, confirmation, reason, and channel eligibility.
+/// Catches accepting ineligible attach requests or losing the audit for successful recovery.
 #[tokio::test]
 async fn operator_recovery_needs_confirmation_reason_checks_and_is_audited() {
     let h = harness("op").await;
@@ -990,6 +1054,8 @@ async fn operator_recovery_needs_confirmation_reason_checks_and_is_audited() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Checks staff and owner retrieval, tamper detection, and denial replies for other callers;
+/// catches exposing a local root in the tested success reply or integrity status on denial.
 #[tokio::test]
 async fn retrieval_is_staff_or_owner_only_reverifies_integrity_and_reads_nothing_on_denial() {
     let h = harness("retrieve").await;
@@ -1029,8 +1095,8 @@ async fn retrieval_is_staff_or_owner_only_reverifies_integrity_and_reads_nothing
         .await
         .contains("re-verified: OK"));
 
-    // Corrupt the recorded archive. Denied callers must get ONLY the denial text (the archive
-    // was never opened: an integrity failure message would prove a read happened).
+    // Contrast replies on the same corrupt archive: only authorized staff should see
+    // the integrity failure. This does not instrument filesystem reads.
     let manifest = h.root.path().join(&ar.dir_name).join("manifest.json");
     let mut bytes = std::fs::read(&manifest).unwrap();
     bytes.push(b' ');
@@ -1059,7 +1125,8 @@ async fn retrieval_is_staff_or_owner_only_reverifies_integrity_and_reads_nothing
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
-// ---------------- round-5 regressions (production close controller) ----------------
+// ---- Uncertain deletes and archive recovery ----
+/// Drives a linked fixture ticket into `delete_uncertain` with exactly one fake delete attempt.
 async fn to_delete_uncertain(h: &H, io: &Fake, t: &Ticket) {
     *io.delete.lock().unwrap() = vec![DeleteOutcome::Unknown];
     assert!(matches!(
@@ -1070,6 +1137,8 @@ async fn to_delete_uncertain(h: &H, io: &Fake, t: &Ticket) {
     assert_eq!(io.calls("delete"), 1);
 }
 
+/// Uncertain-delete retries do not delete again on the tested changing probes or stale history;
+/// catches using a later presence result to skip the initial safety decision.
 #[tokio::test]
 async fn changing_presence_probes_never_delete_a_stale_or_unchecked_source() {
     // Unknown -> Present with an appended source message: retained at the FIRST (Unknown) probe.
@@ -1120,6 +1189,7 @@ async fn changing_presence_probes_never_delete_a_stale_or_unchecked_source() {
     }
 }
 
+/// Alters one identity or format field in a UTF-8 fixture manifest for the orphan checks.
 fn orphan_variant(tag: &str, bytes: Vec<u8>) -> Vec<u8> {
     let s = String::from_utf8(bytes).unwrap();
     match tag {
@@ -1130,6 +1200,8 @@ fn orphan_variant(tag: &str, bytes: Vec<u8>) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Foreign ticket or channel IDs and unsupported formats keep their original manifest bytes;
+/// catches adopting those orphans instead of verifying a fresh archive for this ticket.
 #[tokio::test]
 async fn foreign_or_unsupported_orphan_is_preserved_never_adopted_and_fresh_archive_is_published() {
     for tag in ["ticket", "channel", "format"] {
@@ -1175,6 +1247,7 @@ async fn foreign_or_unsupported_orphan_is_preserved_never_adopted_and_fresh_arch
     }
 }
 
+/// Installs a typed rich embed on the first synthetic message; requires nonempty history.
 fn with_embed(m: &mut [Message], url: &str, footer: &str) {
     m[0].embeds = vec![serde_json::from_value(serde_json::json!({
         "type": "rich", "title": "t", "description": "d", "url": url,
@@ -1182,13 +1255,17 @@ fn with_embed(m: &mut [Message], url: &str, footer: &str) {
     }))
     .unwrap()];
 }
+/// Changes only the footer relative to the baseline embed used in these tests.
 fn edit_footer(m: &mut [Message]) {
     with_embed(m, "https://example.invalid/a", "footer-CHANGED");
 }
+/// Changes only the URL relative to the baseline embed used in these tests.
 fn edit_url(m: &mut [Message]) {
     with_embed(m, "https://example.invalid/CHANGED", "footer");
 }
 
+/// Footer-only and URL-only edits prevent deletion after the first read and on retry;
+/// catches a snapshot comparison that ignores these embed fields.
 #[tokio::test]
 async fn footer_only_or_url_only_edit_is_detected_during_download_and_on_retry() {
     for (tag, f) in [("footer", EDIT_FOOTER), ("url", EDIT_URL)] {
@@ -1256,7 +1333,9 @@ mod real_downloader {
     use crate::tickets::archive::HttpDownloader;
     use std::time::Duration;
 
+    /// Signed-shaped attachment URL with inert query values; the adapter never sends it over HTTP.
     const URL: &str = "https://cdn.discordapp.com/attachments/1/100/a.txt?ex=1&is=2&hm=3";
+    /// Runs actual downloader policy over a scripted transport, with all other Discord I/O fake.
     struct RealDlIo {
         inner: Fake,
         dl: HttpDownloader<FakeTransport>,
@@ -1290,6 +1369,7 @@ mod real_downloader {
             self.inner.candidates(t).await
         }
     }
+    /// Closes a linked fixture ticket as staff using the scripted HTTP adapter.
     async fn go(h: &H, io: &RealDlIo, t: &Ticket) -> CloseOutcome {
         let clock = &h.clock;
         let f = move || clock.fetch_add(1, Ordering::SeqCst);
@@ -1305,6 +1385,7 @@ mod real_downloader {
         };
         close_ticket(&env, &actor(t), t.id, "tok").await
     }
+    /// Builds three messages with a ten-byte attachment declaration and a scripted HTTP response.
     fn io_with(h: &H, script: Script) -> RealDlIo {
         let inner = Fake::new(&h.dir.join("archives"), 3);
         inner.msgs.lock().unwrap()[0].attachments =
@@ -1321,6 +1402,7 @@ mod real_downloader {
             ),
         }
     }
+    /// Supplies an HTTP status, optional declared length, and one synthetic body chunk.
     fn resp(status: u16, declared: Option<u64>, body: &[u8]) -> Script {
         Script::Resp {
             status,
@@ -1329,6 +1411,8 @@ mod real_downloader {
         }
     }
 
+    /// Scripted downloader failures leave the ticket archiving with no record or delete call;
+    /// catches proceeding without complete attachment bytes.
     #[tokio::test]
     async fn download_failures_through_the_real_downloader_delete_nothing_and_hold_the_slot() {
         let cases = [
@@ -1368,6 +1452,8 @@ mod real_downloader {
         }
     }
 
+    /// A complete ten-byte response allows closure and exactly one delete call;
+    /// catches rejecting the valid download or duplicating the delete.
     #[tokio::test]
     async fn successful_download_through_the_real_downloader_closes_with_one_delete() {
         let h = harness("dl-ok").await;
@@ -1379,7 +1465,8 @@ mod real_downloader {
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 
-    /// Round-6: same asset COUNT but wrong asset identity/association/metadata at an orphan.
+    /// Equal asset counts do not make a mismatched orphan eligible for adoption;
+    /// catches ignoring attachment, message, display-name, or file identity.
     #[tokio::test]
     async fn orphan_with_same_asset_count_but_wrong_identity_is_never_adopted() {
         use crate::tickets::archive::{AssetEntry, Downloaded};
@@ -1391,6 +1478,7 @@ mod real_downloader {
             let msgs = io.inner.msgs.lock().unwrap().clone();
             let (mut aid, mut mid) = (5000u64, msgs[0].id.get());
             let mut display = "a.txt".to_string();
+            // Keep the payload and count fixed to isolate each inventory field.
             match tag {
                 "attachment" => aid = 999_999,
                 "message" => mid = msgs[1].id.get(),
@@ -1451,7 +1539,8 @@ mod real_downloader {
         }
     }
 
-    /// An orphan whose asset inventory is exactly the current one is still adopted.
+    /// An orphan with the matching asset inventory is adopted at its original directory;
+    /// catches discarding a reusable archive during recovery.
     #[tokio::test]
     async fn orphan_with_exact_asset_inventory_is_adopted() {
         let h = harness("orph-exact").await;
@@ -1490,8 +1579,8 @@ mod real_downloader {
     }
 }
 
-/// Round-6: a durable record whose asset count disagrees with the (self-consistent) manifest
-/// must fail closed at the shared recorded_manifest boundary: close, reconcile and retrieval.
+/// Returns a verified-state fixture whose archive bytes are valid but whose SQL asset count
+/// disagrees with the manifest, isolating the cross-check from file corruption.
 async fn mismatched_asset_record(tag: &str) -> (H, Fake, Ticket) {
     let h = harness(tag).await;
     let t = active(&h, 1, Kind::Support).await;
@@ -1525,6 +1614,7 @@ async fn mismatched_asset_record(tag: &str) -> (H, Fake, Ticket) {
         h.repo.record_archive(t.id, "a", rec, 1).await.unwrap(),
         Some(1)
     );
+    // Enter verified without the controller check so each consumer sees the same bad record.
     let step = crate::tickets::repository_close::Step {
         from: "archiving",
         to: "verified",
@@ -1535,6 +1625,8 @@ async fn mismatched_asset_record(tag: &str) -> (H, Fake, Ticket) {
     (h, io, t)
 }
 
+/// Close retains the ticket with no delete when the recorded asset count disagrees;
+/// catches relying on the verified state without checking the manifest against SQL.
 #[tokio::test]
 async fn recorded_asset_count_mismatch_fails_closed_for_close() {
     let (h, io, t) = mismatched_asset_record("rec-assets-close").await;
@@ -1547,6 +1639,8 @@ async fn recorded_asset_count_mismatch_fails_closed_for_close() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Reconcile does not close on known absence when asset counts disagree;
+/// catches using channel absence in place of archive re-verification.
 #[tokio::test]
 async fn recorded_asset_count_mismatch_fails_closed_for_reconcile() {
     let (h, io, t) = mismatched_asset_record("rec-assets-recon").await;
@@ -1558,6 +1652,8 @@ async fn recorded_asset_count_mismatch_fails_closed_for_reconcile() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// Staff retrieval reports integrity failure on a record-to-manifest asset count mismatch;
+/// catches reporting success based only on a valid manifest hash.
 #[tokio::test]
 async fn recorded_asset_count_mismatch_fails_closed_for_retrieval() {
     let (h, io, t) = mismatched_asset_record("rec-assets-retr").await;
@@ -1579,6 +1675,8 @@ async fn recorded_asset_count_mismatch_fails_closed_for_retrieval() {
     let _ = std::fs::remove_dir_all(&h.dir);
 }
 
+/// A retry from the recorded-but-unverified state preserves the old manifest and closes once
+/// with a fresh verified record; catches overwriting or reusing the unverified record.
 #[tokio::test]
 async fn restart_after_record_but_before_verified_preserves_the_recorded_archive_publishes_verified_one_and_deletes_once(
 ) {
@@ -1623,7 +1721,7 @@ async fn restart_after_record_but_before_verified_preserves_the_recorded_archive
         .unwrap();
     assert_eq!(seq, Some(1));
     assert_eq!(status(&h, t.id).await, "archiving");
-    // restart: history is no longer needed to adopt/verify the recorded archive
+    // Restore the history source so the retry can take a fresh snapshot.
     io.history_fail = false;
     assert_eq!(
         run(&h, &io, &actor(&t), t.id, "b", &settings()).await,

@@ -1,6 +1,12 @@
+//! Checks generated ticket history and attachment metadata against Serenity's wire models.
+//! All messages, attachment names, and payloads are synthetic; names are data, not paths.
+//! No archive writes, downloads, or live Discord operations are exercised.
+
 #[path = "support/ticket_archive_fixtures.rs"]
 mod fixtures;
 
+/// A 205-message fixture yields three ordered pages and preserves IDs and content on JSON decode;
+/// catches dropped messages, bad page cuts, or incompatible message fixtures.
 #[test]
 fn generated_history_pages_preserve_every_message_in_numeric_order() {
     let pages = fixtures::message_pages(205);
@@ -20,12 +26,15 @@ fn generated_history_pages_preserve_every_message_in_numeric_order() {
     }
 }
 
+/// Zero messages yield no pages; catches emitting an empty page as a sentinel.
 #[test]
 fn empty_history_generates_no_pages() {
     let pages = fixtures::message_pages(0);
     assert!(pages.is_empty());
 }
 
+/// Same-count generation yields equal message fields and JSON values;
+/// catches timestamps or fields that vary between fixture runs.
 #[test]
 fn repeated_generation_is_deterministic() {
     let first = fixtures::message_pages(50);
@@ -40,6 +49,7 @@ fn repeated_generation_is_deterministic() {
             assert_eq!(m.timestamp, n.timestamp);
         }
     }
+    // Compare full wire values too so changes outside the selected fields are visible.
     let wire_first: Vec<_> = first
         .iter()
         .flatten()
@@ -53,6 +63,8 @@ fn repeated_generation_is_deterministic() {
     assert_eq!(wire_first, wire_second);
 }
 
+/// Checks the four attachment fixtures, their collision and path-shaped cases, and JSON decode;
+/// catches losing a negative case or changing its metadata or sample bytes.
 #[test]
 fn attachment_fixtures_have_expected_assets() {
     let assets = fixtures::asset_fixtures();
@@ -65,7 +77,7 @@ fn attachment_fixtures_have_expected_assets() {
     assert_eq!(same_txt.len(), 2);
     let ids: Vec<_> = same_txt.iter().map(|a| a.attachment.id.get()).collect();
     assert_ne!(ids[0], ids[1]);
-    // ../outside.txt and C:\outside.txt
+    // Keep path-shaped names in metadata so consumers can test treating them as untrusted.
     let outside = assets
         .iter()
         .find(|a| a.attachment.filename == "../outside.txt")
@@ -92,6 +104,8 @@ fn attachment_fixtures_have_expected_assets() {
     }
 }
 
+/// A synthetic message can carry the first attachment through Serenity JSON;
+/// catches a fixture that only round-trips as a standalone attachment.
 #[test]
 fn attachment_can_attach_to_generated_message() {
     let pages = fixtures::message_pages(1);
