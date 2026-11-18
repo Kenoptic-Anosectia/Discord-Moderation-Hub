@@ -85,8 +85,8 @@ pub enum RestoreOutcome {
     Failed(&'static str),
 }
 
-fn authorize(m: &Manage<'_>, a: &Actor) -> Result<(), ManageError> {
-    if archive_index::authorized(m.settings, a) {
+pub(super) fn authorize(settings: &Settings, a: &Actor) -> Result<(), ManageError> {
+    if archive_index::authorized(settings, a) {
         Ok(())
     } else {
         Err(ManageError::Denied)
@@ -150,7 +150,7 @@ fn reopen(path: &Path) -> Result<OwnedRoot, RestoreError> {
 }
 
 pub async fn health(m: &Manage<'_>, a: &Actor, offset: usize) -> Result<HealthReport, ManageError> {
-    authorize(m, a)?;
+    authorize(m.settings, a)?;
     let guild = m.settings.guild;
     let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let (entries, has_more) = m
@@ -213,7 +213,7 @@ pub async fn health(m: &Manage<'_>, a: &Actor, offset: usize) -> Result<HealthRe
 }
 
 pub async fn orphans(m: &Manage<'_>, a: &Actor) -> Result<OrphanSummary, ManageError> {
-    authorize(m, a)?;
+    authorize(m.settings, a)?;
     let guild = m.settings.guild.to_string();
     let mut known: Vec<String> = m.repo.db.call(move |c| -> rusqlite::Result<_> {
         let mut sql = c.prepare(
@@ -255,7 +255,7 @@ pub async fn retention_plan(
     a: &Actor,
     policy: RetentionPolicy,
 ) -> Result<RetentionReport, ManageError> {
-    authorize(m, a)?;
+    authorize(m.settings, a)?;
     if policy == RetentionPolicy::Disabled {
         return Ok(RetentionReport::default());
     }
@@ -334,7 +334,7 @@ fn stale_hash(root: &OwnedRoot, req: &RestoreRequest<'_>) -> bool {
 }
 
 pub async fn restore(m: &Manage<'_>, a: &Actor, id: &str) -> RestoreOutcome {
-    if authorize(m, a).is_err() {
+    if authorize(m.settings, a).is_err() {
         return RestoreOutcome::Denied;
     }
     let Ok(guard) = RESTORE_GATE.try_lock() else {
@@ -802,6 +802,107 @@ mod tests {
         visit(root, root, &mut entries);
         entries.sort_unstable();
         entries
+    }
+
+    #[tokio::test]
+    async fn archive_command_dispatches_each_action_to_its_rendered_operation() {
+        use super::super::{runtime_archives::dispatch, runtime_close::archive_root};
+        let _restore_lock = RESTORE_TESTS.lock().await;
+        let mut f = Fixture::new().await;
+        f.root = archive_root(&f.settings).unwrap();
+        let id = f.publish(GUILD, 1, "closed", Some(1)).await;
+        let source = snapshot(f.root.path());
+        let policy = RetentionPolicy::AfterDays(30);
+        let actor = staff();
+        let run =
+            |action, id, offset| dispatch(&f.settings, &f.repo, &actor, policy, action, id, offset);
+        assert_eq!(run("list", None, 0).await, "Archives on this page: 1.");
+        assert_eq!(run("list", None, 1).await, "No archives on this page.");
+        assert_eq!(
+            run("show", Some(id.as_str()), 0).await,
+            format!("Archive {}: 1 messages, 1 assets.", id.as_str())
+        );
+        assert_eq!(run("health", None, 0).await, "Archive health: 1 verified, 0 missing, 0 corrupt, 0 identity mismatches, 0 invalid names.");
+        assert_eq!(run("health", None, 1).await, "Archive health: 0 verified, 0 missing, 0 corrupt, 0 identity mismatches, 0 invalid names.");
+        assert_eq!(
+            run("orphans", None, 0).await,
+            "Orphan scan: 0 unrecorded archives, 0 staging entries, 0 unknown entries."
+        );
+        assert_eq!(
+            run("retention", None, 0).await,
+            "Retention dry run: 1 eligible. Nothing was deleted."
+        );
+        assert_eq!(
+            run("delete", Some(id.as_str()), 0).await,
+            "Unknown action. Use list, show, health, orphans, retention or restore."
+        );
+        for action in ["show", "restore"] {
+            assert_eq!(
+                run(action, None, 0).await,
+                "Supply an archive ID using the id option."
+            );
+        }
+        let restored_bytes: u64 = source
+            .iter()
+            .filter_map(|(_, file)| file.as_ref().map(|(bytes, _)| bytes))
+            .sum();
+        assert_eq!(
+            run("restore", Some(id.as_str()), 0).await,
+            format!("Restored to staging: 3 files, {restored_bytes} bytes.")
+        );
+        let stage = f.scratch.0.join("ticket-restore-staging");
+        assert_eq!(fs::read_dir(stage).unwrap().count(), 1);
+        assert_eq!(snapshot(f.root.path()), source);
+        assert_eq!(run("list", None, 0).await, "Archives on this page: 1.");
+    }
+
+    #[tokio::test]
+    async fn archive_command_root_failure_precedes_repository_access() {
+        use super::super::runtime_archives::dispatch;
+        for blocked_root in ["ticket-archives", "ticket-restore-staging"] {
+            let f = Fixture::new().await;
+            let blocked = f.scratch.0.join(blocked_root);
+            fs::write(&blocked, b"not a directory").unwrap();
+            assert_eq!(
+                dispatch(
+                    &f.settings,
+                    &f.repo,
+                    &staff(),
+                    RetentionPolicy::Disabled,
+                    "list",
+                    None,
+                    0
+                )
+                .await,
+                "Ticket archives are unavailable (configuration or storage)."
+            );
+            assert_eq!(fs::read(&blocked).unwrap(), b"not a directory");
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_command_denial_precedes_root_creation() {
+        use super::super::runtime_archives::dispatch;
+        let f = Fixture::new().await;
+        let actor = Actor {
+            roles: vec![],
+            ..staff()
+        };
+        assert_eq!(
+            dispatch(
+                &f.settings,
+                &f.repo,
+                &actor,
+                RetentionPolicy::Disabled,
+                "list",
+                None,
+                0
+            )
+            .await,
+            "You cannot manage archives."
+        );
+        assert!(!f.scratch.0.join("ticket-archives").exists());
+        assert!(!f.scratch.0.join("ticket-restore-staging").exists());
     }
 
     #[tokio::test]

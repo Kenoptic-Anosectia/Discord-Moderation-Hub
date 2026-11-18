@@ -1,5 +1,9 @@
-use std::env;
+use std::{env, ffi::OsStr};
 
+use crate::tickets::{
+    policy::Settings,
+    retention::{parse_retention, RetentionPolicy, RETENTION_DAYS_KEY},
+};
 use crate::Error;
 
 #[derive(Clone, Debug)]
@@ -10,12 +14,22 @@ pub struct Config {
     pub age_role_2: u64,
     pub reaction_role_db_path: String,
     pub staff_role_id: Option<u64>,
-    pub tickets: Option<crate::tickets::policy::Settings>,
+    pub tickets: Option<Settings>,
+    pub ticket_archive_retention: RetentionPolicy,
     pub ticket_privacy_lockdown: bool,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, Error> {
+        let (tickets, ticket_archive_retention) =
+            match ticket_configuration(optional_string, env::var_os(RETENTION_DAYS_KEY).as_deref())
+            {
+                Ok(configuration) => configuration,
+                Err(message) => {
+                    eprintln!("{message}");
+                    (None, RetentionPolicy::Disabled)
+                }
+            };
         Ok(Self {
             discord_token: required_string("DISCORD_TOKEN")?,
             log_channel_id: required_u64("LOG_CHANNEL_ID")?,
@@ -25,20 +39,19 @@ impl Config {
                 .unwrap_or_else(|| "reaction_roles.sqlite".to_string()),
             // Invalid staff configuration disables the command, not the logger.
             staff_role_id: parse_staff_role(optional_string("STAFF_ROLE_ID").as_deref()),
-            tickets: ticket_settings(optional_string),
+            tickets,
+            ticket_archive_retention,
             ticket_privacy_lockdown: optional_string("TICKETS_ENABLED").as_deref() == Some("true"),
         })
     }
 }
 
-fn ticket_settings(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Option<crate::tickets::policy::Settings> {
+fn ticket_settings(lookup: impl Fn(&str) -> Option<String>) -> Option<Settings> {
     if lookup("TICKETS_ENABLED").as_deref() != Some("true") {
         return None;
     }
     let id = |key| lookup(key)?.parse::<u64>().ok();
-    let settings = crate::tickets::policy::Settings {
+    let settings = Settings {
         guild: id("TICKET_GUILD_ID")?,
         staff: id("STAFF_ROLE_ID")?,
         support_category: id("TICKET_CATEGORY_ID")?,
@@ -46,6 +59,22 @@ fn ticket_settings(
         db_path: lookup("TICKET_DB_PATH")?,
     };
     settings.valid().then_some(settings)
+}
+
+fn ticket_configuration(
+    lookup: impl Fn(&str) -> Option<String>,
+    raw_retention: Option<&OsStr>,
+) -> Result<(Option<Settings>, RetentionPolicy), String> {
+    if lookup("TICKETS_ENABLED").as_deref() != Some("true") {
+        return Ok((None, RetentionPolicy::Disabled));
+    }
+    let invalid = || format!("Ticket settings unavailable: invalid {RETENTION_DAYS_KEY}.");
+    // A non-Unicode value is invalid, not equivalent to an absent variable.
+    let value = raw_retention
+        .map(|raw| raw.to_str().ok_or_else(invalid))
+        .transpose()?;
+    let retention = parse_retention(value).map_err(|_| invalid())?;
+    Ok((ticket_settings(lookup), retention))
 }
 
 fn required_string(key: &str) -> Result<String, Error> {
@@ -120,6 +149,48 @@ mod tests {
                 lookup(k)
             })
             .is_none());
+        }
+    }
+
+    #[test]
+    fn archive_command_retention_config_validates_and_redacts() {
+        use crate::tickets::retention::{RetentionPolicy::*, RETENTION_DAYS_KEY};
+        use std::ffi::OsStr;
+        let lookup = |key: &str| {
+            Some(
+                match key {
+                    "TICKETS_ENABLED" => "true",
+                    "TICKET_GUILD_ID" => "100",
+                    "STAFF_ROLE_ID" => "200",
+                    "TICKET_CATEGORY_ID" => "300",
+                    "AGE_VERIFICATION_CATEGORY_ID" => "400",
+                    "TICKET_DB_PATH" => "tickets.sqlite",
+                    _ => return None,
+                }
+                .into(),
+            )
+        };
+        for (raw, expected) in [
+            (None, Disabled),
+            (Some(""), Disabled),
+            (Some(" \t"), Disabled),
+            (Some(" 30 "), AfterDays(30)),
+            (Some("36500"), AfterDays(36500)),
+        ] {
+            let (settings, policy) = ticket_configuration(lookup, raw.map(OsStr::new)).unwrap();
+            assert!(settings.is_some());
+            assert_eq!(policy, expected, "{raw:?}");
+        }
+        for invalid in [
+            "0",
+            "-91",
+            "sensitive-invalid",
+            "36501",
+            "18446744073709551616",
+        ] {
+            let message = ticket_configuration(lookup, Some(OsStr::new(invalid))).unwrap_err();
+            assert!(message.contains(RETENTION_DAYS_KEY));
+            assert!(!message.contains(invalid));
         }
     }
 
