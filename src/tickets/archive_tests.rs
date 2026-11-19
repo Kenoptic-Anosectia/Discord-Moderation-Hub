@@ -565,3 +565,191 @@ mod http_policy {
         assert!(download_all(&d, &m, &Limits::default()).await.is_ok());
     }
 }
+
+// ---------- bounds (SF2 archive-bounds) ----------
+
+/// Opens a scratch root under `target/sf2-archive-bounds-tests` for a trusted test tag.
+fn bounds_root(tag: &str) -> (PathBuf, OwnedRoot) {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/sf2-archive-bounds-tests")
+        .join(format!(
+            "b-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let r = OwnedRoot::open(&p).unwrap();
+    (p, r)
+}
+
+/// Writes `transcript` plus a matching manifest (no assets) into a new dir and returns its path.
+fn write_raw_archive(root: &OwnedRoot, name: &str, transcript: &str, ids: &[u64]) -> PathBuf {
+    let dir = root.path().join(name);
+    std::fs::create_dir(&dir).unwrap();
+    let m = Manifest {
+        format: 1,
+        ticket: 7,
+        channel: 9,
+        message_count: ids.len() as u64,
+        first_message: ids.first().copied().unwrap_or(0),
+        last_message: ids.last().copied().unwrap_or(0),
+        message_ids_sha256: String::new(),
+        content_sha256: String::new(),
+        transcript_len: transcript.len() as u64,
+        transcript_sha256: sha256_hex(transcript.as_bytes()),
+        assets: vec![],
+    };
+    std::fs::write(dir.join("transcript.html"), transcript).unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&m).unwrap(),
+    )
+    .unwrap();
+    dir
+}
+
+/// Best-of-three wall time of `verify` for an `n`-message synthetic archive.
+fn verify_time(tag: &str, n: usize) -> std::time::Duration {
+    let (p, root) = bounds_root(tag);
+    let msgs = Pages::new(n).msgs;
+    let ids: Vec<u64> = msgs.iter().map(|m| m.id.get()).collect();
+    let dir = write_raw_archive(&root, "a", &render_transcript(7, &msgs, &[]), &ids);
+    let best = (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            verify(&root, &dir, None, &ids).unwrap();
+            t.elapsed()
+        })
+        .min()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(p);
+    best
+}
+
+/// Finding 1: `verify` must scale linearly with transcript size. Compares 5,000 vs 20,000
+/// messages (4x); a quadratic scan costs ~16x, a single pass ~4x. The bound (<10x) leaves wide
+/// margin for noise and avoids any absolute wall-clock threshold.
+#[test]
+fn verify_scales_linearly_with_message_count() {
+    let small = verify_time("scale-s", 5_000);
+    let large = verify_time("scale-l", 20_000);
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 10.0,
+        "verify looks super-linear: 4x messages took {ratio:.1}x ({small:?} -> {large:?})"
+    );
+}
+
+/// Verify still fails closed for a missing id and for an id that is only a prefix of a real one.
+#[test]
+fn verify_still_rejects_missing_and_partial_ids() {
+    let (p, root) = bounds_root("ids");
+    let msgs = Pages::new(300).msgs;
+    let ids: Vec<u64> = msgs.iter().map(|m| m.id.get()).collect();
+    let dir = write_raw_archive(&root, "a", &render_transcript(7, &msgs, &[]), &ids);
+    assert!(verify(&root, &dir, None, &ids).is_ok());
+    let mut missing = ids.clone();
+    *missing.last_mut().unwrap() = 99_999_999;
+    assert_eq!(
+        verify(&root, &dir, None, &missing).unwrap_err(),
+        ArchiveError::Verify
+    );
+    // 1000 is a prefix of the real id 10000 but never an exact data-mid value.
+    let mut prefix = ids.clone();
+    prefix[0] = 1000;
+    assert_eq!(
+        verify(&root, &dir, None, &prefix).unwrap_err(),
+        ArchiveError::Verify
+    );
+    let _ = std::fs::remove_dir_all(p);
+}
+
+/// Verbatim transcript from the unmodified writer for `Pages::new(2)` (ticket 7), captured
+/// before the bounds change. Pins that existing archives still verify and that short messages
+/// render byte-identically.
+const LEGACY_TRANSCRIPT: &str = "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>Ticket 7 transcript</title><style>body{font-family:sans-serif}.m{border-bottom:1px solid #ccc;padding:6px}.meta{color:#555;font-size:small}pre{white-space:pre-wrap}</style></head><body>\n<h1>Ticket 7</h1><p>2 messages</p>\n<div class=\"m\" data-mid=\"10000\"><div class=\"meta\">user_0 (id 1) at 2026-01-01T00:00:00.000Z</div><pre>synthetic message number 0</pre></div>\n<div class=\"m\" data-mid=\"10001\"><div class=\"meta\">user_1 (id 1) at 2026-01-01T00:00:01.000Z</div><pre>synthetic message number 1</pre></div>\n</body></html>\n";
+
+/// Finding 2 (compat): an archive written by the old writer verifies, and the new renderer
+/// emits the same bytes for short messages.
+#[test]
+fn legacy_archive_still_verifies_and_short_messages_render_identically() {
+    let (p, root) = bounds_root("legacy");
+    let dir = write_raw_archive(&root, "a", LEGACY_TRANSCRIPT, &[10000, 10001]);
+    assert!(verify(&root, &dir, None, &[10000, 10001]).is_ok());
+    assert_eq!(
+        render_transcript(7, &Pages::new(2).msgs, &[]),
+        LEGACY_TRANSCRIPT
+    );
+    let _ = std::fs::remove_dir_all(p);
+}
+
+/// Finding 2: one oversized message is cut to the per-message cap plus the stable marker, and
+/// the published archive still verifies.
+#[tokio::test]
+async fn oversized_message_is_truncated_with_marker_and_archive_verifies() {
+    let (p, root) = bounds_root("big");
+    let (mut m, d) = build(3, false).await;
+    m[1].content = "A".repeat(MAX_MESSAGE_TEXT_BYTES * 10);
+    let out = publish(&root, &input(&m, &d, 1)).unwrap();
+    let dir = root.path().join(&out.dir_name);
+    let html = std::fs::read_to_string(dir.join("transcript.html")).unwrap();
+    assert!(html.contains(&"A".repeat(MAX_MESSAGE_TEXT_BYTES)));
+    assert_eq!(html.matches(TRUNCATION_MARKER).count(), 1);
+    assert!(
+        html.len() < MAX_MESSAGE_TEXT_BYTES * 2,
+        "len {}",
+        html.len()
+    );
+    let ids: Vec<u64> = m.iter().map(|x| x.id.get()).collect();
+    assert!(verify(&root, &dir, Some(&out.manifest_sha256), &ids).is_ok());
+    let _ = std::fs::remove_dir_all(p);
+}
+
+/// Truncation never splits a multi-byte character; output stays bounded and valid UTF-8.
+#[test]
+fn truncation_respects_char_boundaries() {
+    let mut msgs = Pages::new(1).msgs;
+    msgs[0].content = "é".repeat(MAX_MESSAGE_TEXT_BYTES); // 2 bytes per char
+    let h = render_transcript(7, &msgs, &[]);
+    assert!(h.contains(TRUNCATION_MARKER));
+    assert!(h.len() < MAX_MESSAGE_TEXT_BYTES + 4096);
+}
+
+/// Finding 2: many maximal messages are bounded by the total transcript text cap, every message
+/// stays listed (ids still verify), and the cut-off messages carry the marker.
+#[tokio::test]
+async fn total_transcript_text_is_capped_and_all_ids_remain() {
+    let (p, root) = bounds_root("total");
+    let n = MAX_TRANSCRIPT_TEXT_BYTES / MAX_MESSAGE_TEXT_BYTES + 40;
+    let (mut m, d) = build(n, false).await;
+    for x in m.iter_mut() {
+        x.content = "B".repeat(MAX_MESSAGE_TEXT_BYTES);
+    }
+    let out = publish(&root, &input(&m, &d, 1)).unwrap();
+    let dir = root.path().join(&out.dir_name);
+    let html = std::fs::read_to_string(dir.join("transcript.html")).unwrap();
+    assert!(
+        html.len() < MAX_TRANSCRIPT_TEXT_BYTES + n * 1024,
+        "transcript {} bytes not bounded",
+        html.len()
+    );
+    assert!(html.contains(TRUNCATION_MARKER));
+    let ids: Vec<u64> = m.iter().map(|x| x.id.get()).collect();
+    assert_eq!(out.messages as usize, n);
+    assert!(verify(&root, &dir, Some(&out.manifest_sha256), &ids).is_ok());
+    let _ = std::fs::remove_dir_all(p);
+}
+
+/// Truncation is a rendering bound only: the content fingerprint (compared against the live
+/// channel before deletion) still covers the full, untruncated text.
+#[test]
+fn fingerprint_still_covers_untruncated_text() {
+    let mut a = Pages::new(1).msgs;
+    let mut b = a.clone();
+    a[0].content = format!("{}X", "A".repeat(MAX_MESSAGE_TEXT_BYTES * 2));
+    b[0].content = format!("{}Y", "A".repeat(MAX_MESSAGE_TEXT_BYTES * 2));
+    assert_ne!(content_fingerprint(&a), content_fingerprint(&b));
+}

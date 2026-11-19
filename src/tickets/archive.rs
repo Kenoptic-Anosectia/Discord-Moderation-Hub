@@ -74,6 +74,17 @@ impl Default for Limits {
     }
 }
 
+/// Per-message cap (bytes, content plus embed text) rendered into the transcript. Discord limits
+/// content to 4,000 characters and embeds to 6,000, so 64 KiB never cuts a legitimate message but
+/// bounds an abusive one.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 64 * 1024;
+/// Total cap (bytes) of message text rendered into one transcript; later messages stay listed
+/// (id, author, time) but their text is replaced by [`TRUNCATION_MARKER`].
+pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 32 * 1024 * 1024;
+/// Stable plain-ASCII marker appended where text was cut; needs no escaping and can never form
+/// the `data-mid="` attribute that `verify` indexes.
+pub const TRUNCATION_MARKER: &str = "[truncated: archive text limit]";
+
 // ---------- history ----------
 /// Paginated read-only message history provider for a single Discord ticket channel.
 ///
