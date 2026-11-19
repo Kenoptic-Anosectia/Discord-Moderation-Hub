@@ -440,6 +440,79 @@ class HardeningTests(unittest.TestCase):
         self.assertNotIn('private-marker', result.stdout + result.stderr)
         self.assertNotIn('Traceback', result.stderr)
 
+    def plant_overlay(self, wal_header):
+        """Plant a committed WAL beside the backup; main file bytes stay untouched."""
+        self.make_backup()
+        if wal_header:
+            with closing(sqlite3.connect(self.destination)) as db:
+                self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone(), ('wal',))
+            self.rehash()
+            self.assertEqual(self.cli('verify', self.destination).returncode, 0)
+        before = self.destination.read_bytes()
+        self.assertEqual(before[18:20], b'\x02\x02' if wal_header else b'\x01\x01')
+        donor = self.root / 'donor.sqlite'
+        donor.write_bytes(before)
+        with closing(sqlite3.connect(donor)) as writer:
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute("INSERT INTO parent VALUES (3, 'planted')")
+            writer.commit()
+            for suffix in ('-wal', '-shm'):
+                Path(str(self.destination) + suffix).write_bytes(
+                    Path(str(donor) + suffix).read_bytes())
+        self.assertEqual(self.destination.read_bytes(), before)
+
+    def test_planted_wal_overlay_fails_verify_header_2_2(self):
+        self.plant_overlay(True)
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'sidecar_present')
+
+    def test_planted_wal_overlay_fails_verify_header_1_1(self):
+        self.plant_overlay(False)
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'sidecar_present')
+
+    def test_each_sidecar_alone_fails_verify(self):
+        self.make_backup()
+        for suffix in ('-wal', '-shm', '-journal'):
+            with self.subTest(suffix=suffix):
+                side = Path(str(self.destination) + suffix)
+                side.write_bytes(b'')
+                self.assertEqual(self.code(self.cli('verify', self.destination)), 'sidecar_present')
+                side.unlink()
+
+    def assert_restore_refused(self, code):
+        restored = self.root / 'restored.sqlite'
+        result = self.cli('restore', self.destination, restored)
+        self.assertEqual(self.code(result), code)
+        self.assertFalse(restored.exists())
+        self.assertFalse(Path(str(restored) + '.manifest.json').exists())
+        self.assertEqual([p.name for p in self.root.glob('.sqlite-backup-*')], [])
+
+    def test_restore_refuses_tampered_source(self):
+        self.make_backup()
+        self.edit('DELETE FROM child WHERE id=2')
+        self.assert_restore_refused('checksum_mismatch')
+
+    def test_restore_refuses_missing_manifest(self):
+        self.make_backup()
+        self.manifest.unlink()
+        self.assert_restore_refused('manifest_missing')
+
+    def test_restore_refuses_sidecar_present(self):
+        self.plant_overlay(False)
+        self.assert_restore_refused('sidecar_present')
+
+    def test_restore_refuses_foreign_key_violation(self):
+        self.make_backup()
+        self.edit('UPDATE child SET parent_id=99 WHERE id=2')
+        self.rehash()
+        self.assert_restore_refused('foreign_key_violation')
+
+    def test_restore_of_good_backup_still_works_and_is_verifiable(self):
+        self.make_backup()
+        restored = self.root / 'restored.sqlite'
+        self.assertEqual(self.cli('restore', self.destination, restored).returncode, 0)
+        self.assertEqual(self.cli('verify', restored).returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main()
