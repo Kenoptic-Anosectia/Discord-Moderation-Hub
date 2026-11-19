@@ -239,6 +239,62 @@ mod tests {
         assert_eq!(DeletedBy::BotAuthor.field_text(), "Bot (author)");
     }
 
+    /// SF4 / audit CARD-011: a moderator's deletion is credited to the WRONG moderator.
+    ///
+    /// Exact event sequence:
+    /// 1. MOD_A bulk-deletes 5 messages by AUTHOR in CHAN -> audit entry id 10, count 5.
+    /// 2. The bot observes that entry: one credit is consumed, MOD_A is credited, and the
+    ///    entry keeps 4 surplus credits that stay spendable while it is active.
+    /// 3. Nine seconds later MOD_B deletes one more message by AUTHOR in CHAN. Discord
+    ///    creates a SEPARATE audit entry id 11, count 1, executor MOD_B.
+    /// 4. The bot's next lookup sees both entries. Entry 10's count did NOT change (no new
+    ///    deletion by MOD_A), while entry 11's count rose from never-seen to 1 - the direct
+    ///    evidence that MOD_B performed the deletion now being logged.
+    ///
+    /// The tie-break must follow that evidence, otherwise MOD_B's deletion is logged as
+    /// MOD_A's: a wrong accusation against a moderator.
+    #[test]
+    fn deletion_is_credited_to_the_moderator_whose_entry_count_rose() {
+        let mut seen = LastSeenCounts::new();
+
+        // Step 1+2: MOD_A's bulk delete is observed and credited.
+        let a_only = [entry(10, MOD_A, 5, 1000)];
+        assert_eq!(run(false, &a_only, &mut seen), DeletedBy::Executor(MOD_A));
+
+        // Step 3+4: MOD_B deletes another message of the same author in the same channel.
+        // Entry 10 is now stale by id age but still active (a credit was just consumed);
+        // entry 11 is fresh and its count rose from never-seen to 1.
+        let later = NOW + 9_000;
+        let both = [
+            entry(10, MOD_A, 5, 9_000), // no new deletion by MOD_A: count unchanged
+            entry(11, MOD_B, 1, 500),   // MOD_B deleted a message: count rose
+        ];
+        let credited = attribute_deletion(AUTHOR, false, CHAN, later, Ok(&both), &mut seen);
+        assert_eq!(
+            credited,
+            DeletedBy::Executor(MOD_B),
+            "the deletion whose audit entry count rose must be credited to its executor"
+        );
+    }
+
+    /// OWNER RULE (Ava, 2026-11-18): an audit entry found -> its executor; no entry -> the
+    /// field shows `User (assumed)`, because nothing in the audit log points to anyone else.
+    /// The enum variant and the attribution logic stay as they are; only the rendered text
+    /// of the unattributed case changes.
+    #[test]
+    fn unattributed_case_renders_user_assumed_and_attributed_case_renders_the_executor() {
+        // Unattributed: no audit entry at all -> `User (assumed)`.
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(run(false, &[], &mut seen), DeletedBy::User);
+        assert_eq!(DeletedBy::User.field_text(), "User (assumed)");
+
+        // Attributed: a matching audit entry still renders its executor.
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(DeletedBy::Executor(MOD_A).field_text(), "<@901>");
+    }
+
     #[test]
     fn quick_self_delete_after_moderator_delete_is_not_credited_to_moderator() {
         let mut seen = LastSeenCounts::new();
