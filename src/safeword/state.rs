@@ -131,8 +131,11 @@ pub struct Snapshot {
     pub last_emitted_restore_plan: Vec<RoleId>,
     pub snapshot_cleared: bool,
     pub release_dm_sent: bool,
-    /// Most recent unrecovered action failure.
+    /// Most recent action failure: INFORMATIONAL ONLY (runtime/logging), never a retry gate.
     pub last_failure: Option<(ActionId, FailureCode)>,
+    /// Steps reported failed and not yet acknowledged or re-emitted: the retry gate. A set, so a
+    /// later failure can never forget an earlier one (defaults to empty for older snapshots).
+    pub failed_steps: Vec<ActionId>,
 }
 
 /// Safeword lifecycle state for one member.
@@ -227,7 +230,21 @@ impl Snapshot {
             snapshot_cleared: false,
             release_dm_sent: false,
             last_failure: None,
+            failed_steps: Vec::new(),
         }
+    }
+
+    /// Records a failure of a still-unacknowledged step (informational slot plus the retry set).
+    fn note_failure(&mut self, id: ActionId, code: FailureCode) {
+        self.last_failure = Some((id, code));
+        if !self.failed_steps.contains(&id) {
+            self.failed_steps.push(id);
+        }
+    }
+
+    /// True when a retry trigger must re-emit unacknowledged steps.
+    fn retry_due(&self) -> bool {
+        !self.failed_steps.is_empty() || self.restore_emission_due()
     }
 
     fn activation_complete(&self) -> bool {
@@ -282,6 +299,8 @@ impl Snapshot {
 
     /// Pending release actions for a retry, never putting a second `RestoreRoles` in flight.
     fn retry_release_actions(&mut self) -> Vec<Action> {
+        self.failed_steps.clear();
+        self.last_failure = None;
         let mut actions = self.pending_release_actions();
         if self.restore_in_flight {
             actions.retain(|a| !matches!(a, Action::RestoreRoles(_)));
@@ -312,6 +331,7 @@ impl Snapshot {
         self.pending_release = false;
         self.pending_reactivate = false;
         self.last_failure = None;
+        self.failed_steps.clear();
         self.safeword_removed = false;
         self.roles_restored = restore_plan.is_empty();
         self.restore_in_flight = !restore_plan.is_empty();
@@ -412,6 +432,7 @@ impl Snapshot {
             ActionId::SendActivatedDm => self.dm_sent = true,
             _ => return false,
         }
+        self.failed_steps.retain(|f| *f != id);
         if self.last_failure.map(|(f, _)| f) == Some(id) {
             self.last_failure = None;
         }
@@ -436,6 +457,7 @@ impl Snapshot {
             ActionId::SendReleasedDm => self.release_dm_sent = true,
             _ => return false,
         }
+        self.failed_steps.retain(|f| *f != id);
         if self.last_failure.map(|(f, _)| f) == Some(id) {
             self.last_failure = None;
         }
@@ -482,26 +504,29 @@ fn step_activating(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (Stat
     match event {
         Event::ReactionAdded => {
             // Replayed add never overwrites the snapshot.
-            // If a prior action failed, retry only unacknowledged actions.
-            if snapshot.last_failure.is_some() {
+            // The retry gate is the failed-step set (`last_failure` is informational only); a
+            // retry re-emits EVERY unacknowledged activation step.
+            snapshot.pending_release = false;
+            if snapshot.failed_steps.is_empty() {
+                (State::Activating(snapshot), Vec::new())
+            } else {
+                snapshot.failed_steps.clear();
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_activation_actions();
                 (State::Activating(snapshot), actions)
-            } else {
-                snapshot.pending_release = false;
-                (State::Activating(snapshot), Vec::new())
             }
         }
         Event::ReactionRemoved => {
             snapshot.pending_release = true;
             if snapshot.activation_complete() {
                 snapshot.enter_releasing(ctx)
-            } else if snapshot.last_failure.is_some() {
+            } else if snapshot.failed_steps.is_empty() {
+                (State::Activating(snapshot), Vec::new())
+            } else {
+                snapshot.failed_steps.clear();
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_activation_actions();
                 (State::Activating(snapshot), actions)
-            } else {
-                (State::Activating(snapshot), Vec::new())
             }
         }
         Event::Strike(role) => {
@@ -529,7 +554,7 @@ fn step_activating(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (Stat
         }
         Event::ActionFailed(id, code) => {
             if snapshot.is_activation_step_done(id) == Some(false) {
-                snapshot.last_failure = Some((id, code));
+                snapshot.note_failure(id, code);
             }
             (State::Activating(snapshot), Vec::new())
         }
@@ -598,8 +623,8 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
     match event {
         Event::ReactionRemoved => {
             snapshot.pending_reactivate = false;
-            if snapshot.last_failure.is_some() || snapshot.restore_emission_due() {
-                snapshot.last_failure = None;
+            // Retry gate: the failed-step set (or a due restore); `last_failure` is informational.
+            if snapshot.retry_due() {
                 let actions = snapshot.retry_release_actions();
                 (State::Releasing(snapshot), actions)
             } else {
@@ -612,8 +637,7 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
                 let fresh = Snapshot::new_from_context(ctx);
                 let actions = fresh.pending_activation_actions();
                 (State::Activating(fresh), actions)
-            } else if snapshot.last_failure.is_some() || snapshot.restore_emission_due() {
-                snapshot.last_failure = None;
+            } else if snapshot.retry_due() {
                 let actions = snapshot.retry_release_actions();
                 (State::Releasing(snapshot), actions)
             } else {
@@ -658,9 +682,6 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
                     if snapshot.restore_emission_due() {
                         snapshot.restore_in_flight = true;
                         snapshot.last_emitted_restore_plan = snapshot.restore_plan.clone();
-                        if snapshot.last_failure.map(|(f, _)| f) == Some(ActionId::RestoreRoles) {
-                            snapshot.last_failure = None;
-                        }
                         actions.push(Action::RestoreRoles(snapshot.restore_plan.clone()));
                     }
                 }
@@ -676,6 +697,7 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
                     return (State::Releasing(snapshot), Vec::new());
                 }
                 snapshot.restore_in_flight = false;
+                snapshot.failed_steps.retain(|f| *f != id);
                 if snapshot.last_failure.map(|(f, _)| f) == Some(id) {
                     snapshot.last_failure = None;
                 }
@@ -711,11 +733,11 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
                 if snapshot.restore_in_flight {
                     snapshot.restore_in_flight = false;
                     if !snapshot.roles_restored {
-                        snapshot.last_failure = Some((id, code));
+                        snapshot.note_failure(id, code);
                     }
                 }
             } else if snapshot.is_release_step_done(id) == Some(false) {
-                snapshot.last_failure = Some((id, code));
+                snapshot.note_failure(id, code);
             }
             (State::Releasing(snapshot), Vec::new())
         }
