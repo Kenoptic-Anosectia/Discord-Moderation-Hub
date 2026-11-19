@@ -1766,4 +1766,309 @@ mod tests {
             assert_eq!(still_active.snapshot().unwrap().last_failure, None);
         }
     }
+
+    /// Runtime model: every emitted action stays outstanding until reported; RestoreRoles runs
+    /// serially (FIFO) and every acknowledged payload is recorded.
+    #[derive(Default)]
+    struct Runtime {
+        restore: Vec<Vec<RoleId>>,
+        others: Vec<ActionId>,
+        acked: Vec<Vec<RoleId>>,
+        safeword_removed: bool,
+    }
+
+    impl Runtime {
+        fn absorb(&mut self, actions: &[Action]) {
+            for a in actions {
+                match a {
+                    Action::RestoreRoles(p) => self.restore.push(p.clone()),
+                    other => self.others.push(other.id()),
+                }
+            }
+        }
+
+        fn idle(&self) -> bool {
+            self.restore.is_empty() && self.others.is_empty()
+        }
+
+        /// Reports one outstanding action as done; returns the event delivered.
+        fn ack_next(&mut self) -> Option<Event> {
+            if !self.restore.is_empty() {
+                self.acked.push(self.restore.remove(0));
+                Some(Event::ActionDone(ActionId::RestoreRoles))
+            } else if !self.others.is_empty() {
+                let id = self.others.remove(0);
+                self.safeword_removed |= id == ActionId::RemoveSafewordRole;
+                Some(Event::ActionDone(id))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn drive(state: &mut State, rt: &mut Runtime, event: Event, ctx: &Context) -> Vec<Action> {
+        let (next, actions) = step(state, event, ctx);
+        *state = next;
+        rt.absorb(&actions);
+        actions
+    }
+
+    fn fail(state: &State, id: ActionId, ctx: &Context) -> State {
+        step(
+            state,
+            Event::ActionFailed(id, FailureCode::TransientHttp),
+            ctx,
+        )
+        .0
+    }
+
+    /// Active(held=[101]) -> ReactionRemoved; returns the Releasing state (nothing acked yet).
+    fn fresh_releasing(ctx: &Context) -> State {
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, ctx);
+        step(&active, Event::ReactionRemoved, ctx).0
+    }
+
+    #[test]
+    fn grant_after_remove_and_restore_failures_keeps_the_remove_safeword_retry() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = fresh_releasing(&ctx);
+        let s = fail(&releasing, ActionId::RemoveSafewordRole, &ctx);
+        let s = fail(&s, ActionId::RestoreRoles, &ctx);
+        let (s, grant_actions) = step(&s, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert_eq!(
+            grant_actions,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+
+        // Retry while the grown restore is in flight: every other unacked step comes back.
+        let (s, retry) = step(&s, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            retry,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released)
+            ]
+        );
+        let (inactive, follow_up) = acknowledge_all(
+            s,
+            &[
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ],
+            &ctx,
+        );
+        assert!(follow_up.is_empty());
+        assert_eq!(inactive, State::Inactive);
+
+        // Same, but the grown restore fails again: the retry carries every step and the plan.
+        let s = fail(&releasing, ActionId::RemoveSafewordRole, &ctx);
+        let s = fail(&s, ActionId::RestoreRoles, &ctx);
+        let (s, _) = step(&s, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        let s = fail(&s, ActionId::RestoreRoles, &ctx);
+        let (s, retry) = step(&s, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            retry,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released)
+            ]
+        );
+        let (s, _) = acknowledge_all(s, &retry, &ctx);
+        assert_eq!(s, State::Inactive);
+    }
+
+    #[test]
+    fn interleaved_clear_and_dm_failures_are_never_forgotten_by_later_failures() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let mut s = fresh_releasing(&ctx);
+        for id in [
+            ActionId::ClearSnapshot,
+            ActionId::RemoveSafewordRole,
+            ActionId::SendReleasedDm,
+            ActionId::RestoreRoles,
+        ] {
+            s = fail(&s, id, &ctx);
+        }
+        let (s, grant) = step(&s, Event::GrantDuringActive(ROLE_MEDIA), &ctx);
+        assert_eq!(
+            grant,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEDIA])]
+        );
+        // The grant did not forget the earlier failures: the retry re-emits the other steps.
+        let (s, retry) = step(&s, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            retry,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released)
+            ]
+        );
+        // Everything fails again, including the grown restore: one retry brings all back.
+        let s = fail(&s, ActionId::ClearSnapshot, &ctx);
+        let s = fail(&s, ActionId::SendReleasedDm, &ctx);
+        let s = fail(&s, ActionId::RestoreRoles, &ctx);
+        let (s, retry2) = step(&s, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            retry2,
+            vec![
+                Action::RemoveSafewordRole,
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEDIA]),
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released)
+            ]
+        );
+        let (inactive, _) = acknowledge_all(
+            s,
+            &[
+                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEDIA]),
+                Action::RemoveSafewordRole,
+                Action::ClearSnapshot,
+                Action::SendDm(DmKind::Released),
+            ],
+            &ctx,
+        );
+        assert_eq!(inactive, State::Inactive);
+    }
+
+    #[test]
+    fn liveness_release_always_reaches_inactive_under_retry_and_ack_runtime() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let grantable = [ROLE_MEMBER, ROLE_MEDIA, ROLE_FEMDOM];
+        for seed in 1u64..=300 {
+            let mut rng = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut next = move || {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (rng >> 33) as usize
+            };
+            let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+            let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+            let mut state = active;
+            let mut rt = Runtime::default();
+            drive(&mut state, &mut rt, Event::ReactionRemoved, &ctx);
+            let mut last_plan: Vec<RoleId> = Vec::new();
+            let track = |st: &State, plan: &mut Vec<RoleId>| {
+                if let State::Releasing(s) = st {
+                    *plan = s.restore_plan.clone();
+                }
+            };
+            for _ in 0..16 {
+                // Alphabet: grant, ack/fail of every release step id, retry trigger.
+                let event = match next() % 8 {
+                    0 => Event::GrantDuringActive(grantable[next() % 3]),
+                    1 => rt.ack_next().unwrap_or(Event::ReactionRemoved),
+                    2 if !rt.restore.is_empty() => {
+                        rt.restore.remove(0);
+                        Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp)
+                    }
+                    3..=6 if !rt.others.is_empty() => {
+                        let id = rt.others.remove(next() % rt.others.len());
+                        if next() % 3 == 0 {
+                            rt.safeword_removed |= id == ActionId::RemoveSafewordRole;
+                            Event::ActionDone(id)
+                        } else {
+                            Event::ActionFailed(id, FailureCode::TransientHttp)
+                        }
+                    }
+                    _ => Event::ReactionRemoved,
+                };
+                track(&state, &mut last_plan);
+                drive(&mut state, &mut rt, event, &ctx);
+                track(&state, &mut last_plan);
+                assert!(
+                    rt.restore.len() <= 1,
+                    "seed {seed}: two RestoreRoles in flight"
+                );
+            }
+            // Liveness: the runtime acks everything emitted and re-delivers the retry trigger.
+            for _round in 0..10 {
+                while let Some(ev) = rt.ack_next() {
+                    track(&state, &mut last_plan);
+                    drive(&mut state, &mut rt, ev, &ctx);
+                    track(&state, &mut last_plan);
+                }
+                if state == State::Inactive {
+                    break;
+                }
+                let emitted = drive(&mut state, &mut rt, Event::ReactionRemoved, &ctx);
+                track(&state, &mut last_plan);
+                assert!(
+                    !emitted.is_empty() || !rt.idle(),
+                    "seed {seed}: machine went quiet with unacknowledged steps: {state:?}"
+                );
+            }
+            assert_eq!(
+                state,
+                State::Inactive,
+                "seed {seed}: release did not finish"
+            );
+            assert!(
+                rt.safeword_removed,
+                "seed {seed}: safeword role never removed"
+            );
+            for role in &last_plan {
+                assert!(
+                    rt.acked.iter().any(|p| p.contains(role)),
+                    "seed {seed}: role {role} never in an acknowledged RestoreRoles"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn liveness_activation_always_reaches_active_under_retry_and_ack_runtime() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_MEMBER]);
+        for seed in 1u64..=300 {
+            let mut rng = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut next = move || {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (rng >> 33) as usize
+            };
+            let mut state = State::Inactive;
+            let mut rt = Runtime::default();
+            drive(&mut state, &mut rt, Event::ReactionAdded, &ctx);
+            for _ in 0..14 {
+                // Alphabet: ack/fail of every activation step id, retry trigger.
+                let event = if !rt.others.is_empty() && next() % 4 != 0 {
+                    let id = rt.others.remove(next() % rt.others.len());
+                    if next() % 3 == 0 {
+                        Event::ActionDone(id)
+                    } else {
+                        Event::ActionFailed(id, FailureCode::TransientHttp)
+                    }
+                } else {
+                    Event::ReactionAdded
+                };
+                drive(&mut state, &mut rt, event, &ctx);
+            }
+            for _round in 0..10 {
+                while let Some(ev) = rt.ack_next() {
+                    drive(&mut state, &mut rt, ev, &ctx);
+                }
+                if matches!(state, State::Active(_)) {
+                    break;
+                }
+                let emitted = drive(&mut state, &mut rt, Event::ReactionAdded, &ctx);
+                assert!(
+                    !emitted.is_empty() || !rt.idle(),
+                    "seed {seed}: machine went quiet with unacknowledged steps: {state:?}"
+                );
+            }
+            assert!(matches!(state, State::Active(_)), "seed {seed}: {state:?}");
+        }
+    }
 }
