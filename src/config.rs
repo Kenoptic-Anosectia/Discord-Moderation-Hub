@@ -40,7 +40,8 @@ impl std::error::Error for EnvFileError {}
 
 /// Loads the environment file for the current working directory.
 ///
-/// See [`load_env_from`] for the precedence rules.
+/// RED STATE: the old hand written search is back, so the tests can show what
+/// it does wrong.
 pub fn load_env() -> Result<PathBuf, EnvFileError> {
     let start = env::current_dir().map_err(|_| EnvFileError::Unreadable)?;
     load_env_from(&start)
@@ -48,10 +49,6 @@ pub fn load_env() -> Result<PathBuf, EnvFileError> {
 
 /// Loads the nearest environment file, starting at `start` and walking up to the
 /// filesystem root.
-///
-/// The real process environment wins: a value that is already set in the
-/// environment is never replaced by the file. Only variables that the
-/// environment does not hold are taken from the file.
 pub fn load_env_from(start: &Path) -> Result<PathBuf, EnvFileError> {
     let path = find_env_file(start).ok_or(EnvFileError::NotFound)?;
     dotenvy::from_path(&path).map_err(|_| EnvFileError::Unreadable)?;
@@ -70,6 +67,15 @@ fn find_env_file(start: &Path) -> Option<PathBuf> {
         current = directory.parent();
     }
     None
+}
+
+/// Turns a failure of the environment file search into a stable reason.
+fn env_file_error(error: dotenvy::Error) -> EnvFileError {
+    if error.not_found() {
+        EnvFileError::NotFound
+    } else {
+        EnvFileError::Unreadable
+    }
 }
 
 #[derive(Clone)]
@@ -95,17 +101,34 @@ impl fmt::Debug for Config {
     /// placeholder so that a `{:?}` of the configuration can never put the token
     /// into a log line, a panic message or a bug report. Every other field is
     /// shown, so the output stays useful for diagnosing a misconfigured bot.
+    ///
+    /// The fields are taken apart without a rest pattern, so a field that is
+    /// added later does not compile until it is listed here and a decision is
+    /// made about whether it has to be hidden.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Config {
+            // The token is listed so that the list stays complete, and it is
+            // never bound to a name that could reach the output.
+            discord_token: _,
+            log_channel_id,
+            age_role_1,
+            age_role_2,
+            reaction_role_db_path,
+            staff_role_id,
+            tickets,
+            ticket_archive_retention,
+            ticket_privacy_lockdown,
+        } = self;
         f.debug_struct("Config")
             .field("discord_token", &REDACTED)
-            .field("log_channel_id", &self.log_channel_id)
-            .field("age_role_1", &self.age_role_1)
-            .field("age_role_2", &self.age_role_2)
-            .field("reaction_role_db_path", &self.reaction_role_db_path)
-            .field("staff_role_id", &self.staff_role_id)
-            .field("tickets", &self.tickets)
-            .field("ticket_archive_retention", &self.ticket_archive_retention)
-            .field("ticket_privacy_lockdown", &self.ticket_privacy_lockdown)
+            .field("log_channel_id", log_channel_id)
+            .field("age_role_1", age_role_1)
+            .field("age_role_2", age_role_2)
+            .field("reaction_role_db_path", reaction_role_db_path)
+            .field("staff_role_id", staff_role_id)
+            .field("tickets", tickets)
+            .field("ticket_archive_retention", ticket_archive_retention)
+            .field("ticket_privacy_lockdown", ticket_privacy_lockdown)
             .finish()
     }
 }
@@ -259,7 +282,7 @@ fn parse_staff_role(raw: Option<&str>) -> Option<u64> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
     /// Set on the child process so it knows it is the helper and not the driver.
@@ -278,6 +301,14 @@ mod tests {
             .join("t_86edb88e-tests")
     }
 
+    /// Scratch directory of a single test.
+    ///
+    /// Every test gets its own subtree, so the environment file of one test can
+    /// never be found by the search of another test.
+    fn scratch_dir_of(test: &str) -> PathBuf {
+        scratch_dir().join(test)
+    }
+
     fn is_child() -> bool {
         env::var_os(CHILD_MARKER).is_some()
     }
@@ -288,6 +319,14 @@ mod tests {
     /// reading and changing it in a dedicated process keeps the other tests of this
     /// binary unaffected.
     fn run_child(name: &str, vars: &[(&str, &str)]) -> Output {
+        run_child_in(name, None, vars)
+    }
+
+    /// Runs one test of this binary in a child process that starts in `directory`.
+    ///
+    /// The working directory decides where the environment file is searched for,
+    /// so the child is the only way to exercise the search from a known place.
+    fn run_child_in(name: &str, directory: Option<&Path>, vars: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env::current_exe().expect("test binary path"));
         command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
         command.env(CHILD_MARKER, "1");
@@ -296,6 +335,9 @@ mod tests {
         command.env_remove(RETENTION_DAYS_KEY);
         command.env_remove(REAL_ENV_SENTINEL);
         command.env_remove(FILE_ONLY_SENTINEL);
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         for (key, value) in vars {
             command.env(key, value);
         }
@@ -323,8 +365,9 @@ mod tests {
     fn env_file_does_not_override_the_real_environment() {
         const NAME: &str = "config::tests::env_file_does_not_override_the_real_environment";
 
-        let directory = scratch_dir().join("env-precedence");
-        fs::create_dir_all(directory.join("nested")).expect("scratch directory");
+        let directory = scratch_dir_of("env-precedence");
+        let nested = directory.join("nested");
+        fs::create_dir_all(&nested).expect("scratch directory");
         let env_file = directory.join(ENV_FILE_NAME);
         fs::write(
             &env_file,
@@ -338,10 +381,10 @@ mod tests {
                 Ok("from_environment"),
                 "the child must start with the exported value"
             );
-            let loaded = load_env_from(&directory.join("nested")).expect("environment file loads");
+            let loaded = load_env().expect("environment file loads");
             assert_eq!(
                 loaded, env_file,
-                "the nearest environment file above the start directory is used"
+                "the nearest environment file above the working directory is used"
             );
             assert_eq!(
                 env::var(REAL_ENV_SENTINEL).as_deref(),
@@ -356,8 +399,114 @@ mod tests {
             return;
         }
 
-        let output = run_child(NAME, &[(REAL_ENV_SENTINEL, "from_environment")]);
+        let output = run_child_in(NAME, Some(&nested), &[(REAL_ENV_SENTINEL, "from_environment")]);
         assert_child_ok(&output, NAME);
+    }
+
+    /// The environment file is searched for from the working directory, walking
+    /// up to the nearest one, and the loader must agree with dotenvy about which
+    /// file that is.
+    ///
+    /// The search itself belongs to dotenvy: the loader must not reimplement it,
+    /// because a hand written search can fail open when the metadata of a
+    /// candidate cannot be read.
+    #[test]
+    fn load_env_finds_the_nearest_file_above_the_working_directory() {
+        const NAME: &str = "config::tests::load_env_finds_the_nearest_file_above_the_working_directory";
+
+        let directory = scratch_dir_of("env-search");
+        let nested = directory.join("nested");
+        fs::create_dir_all(&nested).expect("scratch directory");
+        let env_file = directory.join(ENV_FILE_NAME);
+        fs::write(&env_file, format!("{FILE_ONLY_SENTINEL}=from_file\n")).expect("environment file");
+
+        if is_child() {
+            let loaded = load_env().expect("environment file loads");
+            let expected = dotenvy::dotenv().expect("dotenvy finds the same file");
+            assert_eq!(
+                loaded, expected,
+                "the loader must use the file dotenvy finds"
+            );
+            assert_eq!(
+                loaded, env_file,
+                "the nearest environment file above the working directory is used"
+            );
+            assert_eq!(
+                env::var(FILE_ONLY_SENTINEL).as_deref(),
+                Ok("from_file"),
+                "the values of the environment file are loaded"
+            );
+            return;
+        }
+
+        let output = run_child_in(NAME, Some(&nested), &[]);
+        assert_child_ok(&output, NAME);
+    }
+
+    /// A broken environment file must stop the load instead of letting another
+    /// file take its place.
+    ///
+    /// The nearest file is unusable, so the loader must report the failure. It
+    /// must not keep walking up and load a different file: a file that cannot be
+    /// read is a failure, not a reason to look somewhere else.
+    #[test]
+    fn load_env_fails_closed_when_the_environment_file_cannot_be_used() {
+        const NAME: &str = "config::tests::load_env_fails_closed_when_the_environment_file_cannot_be_used";
+
+        let directory = scratch_dir_of("env-broken");
+        let tree = directory.join("tree");
+        let nested = tree.join("nested");
+        fs::create_dir_all(&nested).expect("scratch directory");
+        // The nearest file cannot be parsed.
+        fs::write(tree.join(ENV_FILE_NAME), "this line has no equals sign\n")
+            .expect("environment file");
+        // A usable file further up must not be used instead.
+        fs::write(
+            directory.join(ENV_FILE_NAME),
+            format!("{FILE_ONLY_SENTINEL}=from_parent\n"),
+        )
+        .expect("environment file");
+
+        if is_child() {
+            let error = load_env().expect_err("the broken environment file must fail");
+            assert_eq!(error, EnvFileError::Unreadable);
+            assert!(
+                env::var(FILE_ONLY_SENTINEL).is_err(),
+                "no environment file may be loaded when the nearest one is broken"
+            );
+            return;
+        }
+
+        let output = run_child_in(NAME, Some(&nested), &[]);
+        assert_child_ok(&output, NAME);
+    }
+
+    /// Without an environment file the loader must say so, and it must not
+    /// invent a path.
+    ///
+    /// The search walks up to the root of the drive, so the machine may hold an
+    /// environment file above the scratch tree. The reason the loader reports
+    /// is therefore pinned where it is decided: the mapping of the error that
+    /// the search reports when it finds nothing.
+    #[test]
+    fn a_missing_environment_file_is_reported_as_not_found() {
+        let missing = dotenvy::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "path not found",
+        ));
+        assert_eq!(env_file_error(missing), EnvFileError::NotFound);
+    }
+
+    /// Any other failure of the search is an unreadable file, not a missing one.
+    #[test]
+    fn an_unreadable_environment_file_is_reported_as_unreadable() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = dotenvy::Error::Io(std::io::Error::new(kind, "cannot read"));
+            assert_eq!(env_file_error(error), EnvFileError::Unreadable);
+        }
     }
 
     /// `LOG_CHANNEL_ID` must be a real Discord id.
@@ -475,7 +624,15 @@ mod tests {
     /// stable code rather than the value itself.
     #[test]
     fn discord_id_rejects_zero_and_reports_a_stable_code() {
-        for rejected in ["0", "-1", "not-a-number", ""] {
+        for rejected in [
+            "0",
+            "-1",
+            "not-a-number",
+            "",
+            " 123",
+            "123 ",
+            "18446744073709551616",
+        ] {
             let error = parse_discord_id(rejected).expect_err("the value is rejected");
             assert_eq!(error, ConfigValueCode::InvalidDiscordId);
             // The code never carries the rejected value.
@@ -485,6 +642,43 @@ mod tests {
             parse_discord_id("1234567890123456789"),
             Ok(1234567890123456789)
         );
+    }
+
+    /// The `Debug` output must mention every field of the configuration.
+    ///
+    /// The manual implementation lists the fields one by one, so a field that
+    /// is added later shows up here as a missing entry instead of being
+    /// silently dropped from the output.
+    #[test]
+    fn config_debug_output_lists_every_field() {
+        let config = Config {
+            discord_token: "synthetic-token".to_string(),
+            log_channel_id: 1234567890123456789,
+            age_role_1: 111,
+            age_role_2: 222,
+            reaction_role_db_path: "reaction_roles.sqlite".to_string(),
+            staff_role_id: Some(333),
+            tickets: None,
+            ticket_archive_retention: RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+        };
+        let rendered = format!("{config:?}");
+        for field in [
+            "discord_token",
+            "log_channel_id",
+            "age_role_1",
+            "age_role_2",
+            "reaction_role_db_path",
+            "staff_role_id",
+            "tickets",
+            "ticket_archive_retention",
+            "ticket_privacy_lockdown",
+        ] {
+            assert!(
+                rendered.contains(field),
+                "the output must mention {field}: {rendered}"
+            );
+        }
     }
 
     #[test]
