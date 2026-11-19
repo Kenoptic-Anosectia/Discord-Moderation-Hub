@@ -13,7 +13,7 @@ use crate::archive_safety::{
 };
 use serde::{Deserialize, Serialize};
 use serenity::all::Message;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,20 @@ impl Default for Limits {
         }
     }
 }
+
+/// Per-message cap in ESCAPED output bytes (content plus embed text, after HTML escaping, so a
+/// quote-only message cannot expand 6x past it). Discord allows about 60 KiB of text per message,
+/// so 256 KiB never cuts a legitimate message but bounds an abusive one.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 256 * 1024;
+/// Total cap in ESCAPED output bytes of message TEXT in one transcript. It bounds message text
+/// only: per-message markup (wrapper, uncapped author name, per-embed blockquote/div wrappers
+/// emitted even after the budget is spent) is NOT capped, so the rendered transcript has no bound
+/// here (see NOT fixed in docs/verification/ARCHIVE-BOUNDS.md; follow-up SF5). Later messages
+/// stay listed (id, author, time) but their text is replaced by [`TRUNCATION_MARKER`].
+pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 32 * 1024 * 1024;
+/// Stable plain-ASCII marker appended where text was cut; needs no escaping and can never form
+/// the `data-mid="` attribute that `verify` indexes.
+pub const TRUNCATION_MARKER: &str = "[truncated: archive text limit]";
 
 // ---------- history ----------
 /// Paginated read-only message history provider for a single Discord ticket channel.
@@ -147,6 +161,67 @@ pub fn esc(s: &str) -> String {
     }
     o
 }
+/// Per-message text budget: writes escaped text straight into the transcript (no intermediate
+/// copies), cutting at a char boundary and appending [`TRUNCATION_MARKER`] once the budget is
+/// spent. The budget counts ESCAPED output bytes, so escaped text cannot exceed the cap; truncation
+/// stops before the first escape unit (e.g. `&quot;`) that does not fit.
+struct MsgText {
+    start: usize,
+    left: usize,
+    /// True once this message hit its budget; later parts of the message are omitted.
+    cut: bool,
+}
+impl MsgText {
+    /// Budget is the per-message cap, further limited by what remains of the transcript total.
+    fn new(total_left: usize) -> Self {
+        let b = MAX_MESSAGE_TEXT_BYTES.min(total_left);
+        Self {
+            start: b,
+            left: b,
+            cut: false,
+        }
+    }
+    /// Escaped bytes consumed so far (to be deducted from the transcript total).
+    fn used(&self) -> usize {
+        self.start - self.left
+    }
+    /// Appends the HTML-escaped prefix of `s` that fits, then the marker if anything was cut.
+    fn put(&mut self, h: &mut String, s: &str) {
+        for c in s.chars() {
+            let n = esc_len(c);
+            if n > self.left {
+                self.cut = true;
+                self.left = 0;
+                h.push_str(TRUNCATION_MARKER);
+                return;
+            }
+            self.left -= n;
+            esc_char(h, c);
+        }
+    }
+}
+/// Escaped byte length of one char (must match [`esc_char`]).
+fn esc_len(c: char) -> usize {
+    match c {
+        '&' | '\'' => 5,
+        '<' | '>' => 4,
+        '"' => 6,
+        '\0' => 0,
+        c => c.len_utf8(),
+    }
+}
+/// Appends the escaped form of one char (see [`esc`]) without allocating a temporary.
+fn esc_char(o: &mut String, c: char) {
+    match c {
+        '&' => o.push_str("&amp;"),
+        '<' => o.push_str("&lt;"),
+        '>' => o.push_str("&gt;"),
+        '"' => o.push_str("&quot;"),
+        '\'' => o.push_str("&#39;"),
+        '\0' => {}
+        c => o.push(c),
+    }
+}
 /// Manifest metadata record for a single archived attachment file under `assets/`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssetEntry {
@@ -180,6 +255,14 @@ pub fn render_transcript(ticket: i64, messages: &[Message], assets: &[AssetEntry
         "<h1>Ticket {ticket}</h1><p>{} messages</p>\n",
         messages.len()
     ));
+    // First entry wins, matching the previous linear `find`.
+    let mut by_attachment: HashMap<(u64, u64), &AssetEntry> = HashMap::new();
+    for x in assets {
+        by_attachment
+            .entry((x.attachment_id, x.message_id))
+            .or_insert(x);
+    }
+    let mut total_left = MAX_TRANSCRIPT_TEXT_BYTES;
     for m in messages {
         h.push_str(&format!(
             "<div class=\"m\" data-mid=\"{}\"><div class=\"meta\">{} (id {}{}) at {}",
@@ -193,7 +276,10 @@ pub fn render_transcript(ticket: i64, messages: &[Message], assets: &[AssetEntry
             h.push_str(&format!(" (edited {})", esc(&e.to_string())));
         }
         h.push_str("</div>");
-        h.push_str(&format!("<pre>{}</pre>", esc(&m.content)));
+        let mut t = MsgText::new(total_left);
+        h.push_str("<pre>");
+        t.put(&mut h, &m.content);
+        h.push_str("</pre>");
         for e in &m.embeds {
             h.push_str("<blockquote>");
             for part in [
@@ -205,19 +291,26 @@ pub fn render_transcript(ticket: i64, messages: &[Message], assets: &[AssetEntry
             .into_iter()
             .flatten()
             {
-                h.push_str(&format!("<div>{}</div>", esc(part)));
+                if !t.cut {
+                    h.push_str("<div>");
+                    t.put(&mut h, part);
+                    h.push_str("</div>");
+                }
             }
             for f in &e.fields {
-                h.push_str(&format!(
-                    "<div><b>{}</b>: {}</div>",
-                    esc(&f.name),
-                    esc(&f.value)
-                ));
+                if !t.cut {
+                    h.push_str("<div><b>");
+                    t.put(&mut h, &f.name);
+                    h.push_str("</b>: ");
+                    t.put(&mut h, &f.value);
+                    h.push_str("</div>");
+                }
             }
             h.push_str("</blockquote>");
         }
+        total_left -= t.used();
         for a in &m.attachments {
-            match assets.iter().find(|x| x.attachment_id == a.id.get() && x.message_id == m.id.get()) {
+            match by_attachment.get(&(a.id.get(), m.id.get())) {
                 Some(x) => h.push_str(&format!(
                     "<div class=\"meta\">attachment: {} ({} bytes) <a href=\"assets/{}\">{}</a></div>",
                     esc(&a.filename), x.len, esc(&x.file), esc(&x.file)
@@ -283,12 +376,13 @@ fn ids_hash(messages: &[Message]) -> String {
 pub fn content_fingerprint(messages: &[Message]) -> String {
     let mut ms: Vec<&Message> = messages.iter().collect();
     ms.sort_by_key(|m| m.id.get());
-    let mut s = String::new();
+    // Stream into the hasher instead of materializing the whole fingerprint input (same bytes).
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut put = |x: &str| {
-        s.push_str(&x.len().to_string());
-        s.push(':');
-        s.push_str(x);
-        s.push('\n');
+        ctx.update(x.len().to_string().as_bytes());
+        ctx.update(b":");
+        ctx.update(x.as_bytes());
+        ctx.update(b"\n");
     };
     for m in ms {
         put(&m.id.get().to_string());
@@ -324,7 +418,11 @@ pub fn content_fingerprint(messages: &[Message]) -> String {
             ));
         }
     }
-    sha256_hex(s.as_bytes())
+    ctx.finish()
+        .as_ref()
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 // ---------- attachments ----------
@@ -723,8 +821,19 @@ pub fn verify(
         return Err(ArchiveError::Verify);
     }
     let html = String::from_utf8_lossy(&tbytes);
+    // One pass over the transcript collects every `data-mid="<value>"`; each expected id is then
+    // an O(1) lookup. Equivalent to the former per-id `contains(data-mid="<id>")` scan: an id
+    // matches only if some attribute value equals its decimal form exactly.
+    const MID: &str = "data-mid=\"";
+    let present: HashSet<&str> = html
+        .match_indices(MID)
+        .filter_map(|(i, _)| {
+            let rest = &html[i + MID.len()..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .collect();
     for id in expected_ids {
-        if !html.contains(&format!("data-mid=\"{id}\"")) {
+        if !present.contains(id.to_string().as_str()) {
             return Err(ArchiveError::Verify);
         }
     }
