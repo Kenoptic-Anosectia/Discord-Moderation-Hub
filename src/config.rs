@@ -49,11 +49,12 @@ pub fn load_env() -> Result<PathBuf, EnvFileError> {
 /// Loads the nearest environment file, starting at `start` and walking up to the
 /// filesystem root.
 ///
-/// The values in the file are applied to the process environment, replacing any
-/// value that the environment already holds.
+/// The real process environment wins: a value that is already set in the
+/// environment is never replaced by the file. Only variables that the
+/// environment does not hold are taken from the file.
 pub fn load_env_from(start: &Path) -> Result<PathBuf, EnvFileError> {
     let path = find_env_file(start).ok_or(EnvFileError::NotFound)?;
-    dotenvy::from_path_override(&path).map_err(|_| EnvFileError::Unreadable)?;
+    dotenvy::from_path(&path).map_err(|_| EnvFileError::Unreadable)?;
     Ok(path)
 }
 
@@ -71,7 +72,7 @@ fn find_env_file(start: &Path) -> Option<PathBuf> {
     None
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub discord_token: String,
     pub log_channel_id: u64,
@@ -82,6 +83,31 @@ pub struct Config {
     pub tickets: Option<Settings>,
     pub ticket_archive_retention: RetentionPolicy,
     pub ticket_privacy_lockdown: bool,
+}
+
+/// Placeholder printed instead of a secret value.
+const REDACTED: &str = "<redacted>";
+
+impl fmt::Debug for Config {
+    /// Prints the configuration without its secrets.
+    ///
+    /// The bot token is the only credential in this struct; it is replaced by a
+    /// placeholder so that a `{:?}` of the configuration can never put the token
+    /// into a log line, a panic message or a bug report. Every other field is
+    /// shown, so the output stays useful for diagnosing a misconfigured bot.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("discord_token", &REDACTED)
+            .field("log_channel_id", &self.log_channel_id)
+            .field("age_role_1", &self.age_role_1)
+            .field("age_role_2", &self.age_role_2)
+            .field("reaction_role_db_path", &self.reaction_role_db_path)
+            .field("staff_role_id", &self.staff_role_id)
+            .field("tickets", &self.tickets)
+            .field("ticket_archive_retention", &self.ticket_archive_retention)
+            .field("ticket_privacy_lockdown", &self.ticket_privacy_lockdown)
+            .finish()
+    }
 }
 
 impl Config {
@@ -97,7 +123,7 @@ impl Config {
             };
         Ok(Self {
             discord_token: required_string("DISCORD_TOKEN")?,
-            log_channel_id: required_u64("LOG_CHANNEL_ID")?,
+            log_channel_id: required_discord_id("LOG_CHANNEL_ID")?,
             age_role_1: required_u64("AGE_ROLE_1")?,
             age_role_2: required_u64("AGE_ROLE_2")?,
             reaction_role_db_path: optional_string("REACTION_ROLE_DB_PATH")
@@ -161,6 +187,67 @@ fn required_u64(key: &str) -> Result<u64, Error> {
     let raw = required_string(key)?;
     raw.parse::<u64>()
         .map_err(|_| format!("Environment variable {} must be a valid u64", key).into())
+}
+
+/// Stable reason why a configuration value was rejected.
+///
+/// The variants are codes, not messages: they never carry the offending value
+/// or any other text taken from the environment, so they are safe to log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigValueCode {
+    /// The value is not a usable Discord id: it is not a number, it is negative
+    /// or it is zero.
+    InvalidDiscordId,
+}
+
+/// A configuration value that could not be used.
+///
+/// Carries the name of the variable and a stable code. It never carries the
+/// rejected value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigValueError {
+    /// Name of the environment variable that held the unusable value.
+    pub key: &'static str,
+    /// Stable code describing why the value was rejected.
+    pub code: ConfigValueCode,
+}
+
+impl fmt::Display for ConfigValueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code {
+            ConfigValueCode::InvalidDiscordId => {
+                write!(
+                    f,
+                    "Environment variable {} is not a valid Discord id",
+                    self.key
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigValueError {}
+
+/// Reads a required Discord id from the environment.
+///
+/// A Discord id is a snowflake: a non-zero unsigned 64 bit number. Zero is not
+/// a usable id, so a variable set to zero is treated the same way as a missing
+/// or unparsable one: the configuration does not load and the bot refuses to
+/// start instead of pointing its logger at a channel that does not exist.
+fn required_discord_id(key: &'static str) -> Result<u64, Error> {
+    let raw = required_string(key)?;
+    parse_discord_id(&raw).map_err(|code| Box::new(ConfigValueError { key, code }) as Error)
+}
+
+/// Parses a Discord id.
+///
+/// Zero is not a usable id: it is rejected with the same code as a value that
+/// is not a number at all.
+fn parse_discord_id(raw: &str) -> Result<u64, ConfigValueCode> {
+    match raw.parse::<u64>() {
+        Ok(id) if id != 0 => Ok(id),
+        _ => Err(ConfigValueCode::InvalidDiscordId),
+    }
 }
 
 fn parse_staff_role(raw: Option<&str>) -> Option<u64> {
@@ -281,6 +368,7 @@ mod tests {
     fn log_channel_id_must_be_a_valid_discord_id() {
         const NAME: &str = "config::tests::log_channel_id_must_be_a_valid_discord_id";
         const EXPECT_OK: &str = "SF3_EXPECT_OK";
+        const EXPECT_SET: &str = "SF3_EXPECT_SET";
         const VALID: u64 = 1234567890123456789;
 
         // label, value to export (None means the variable is not set), loads?
@@ -294,6 +382,7 @@ mod tests {
 
         if is_child() {
             let expect_ok = env::var(EXPECT_OK).as_deref() == Ok("1");
+            let is_set = env::var(EXPECT_SET).as_deref() == Ok("1");
             match Config::from_env() {
                 Ok(config) => {
                     assert!(expect_ok, "the configuration must not load");
@@ -309,6 +398,22 @@ mod tests {
                         message.contains("LOG_CHANNEL_ID"),
                         "the error must name the variable: {message}"
                     );
+                    if is_set {
+                        // A value that was set but is not usable carries a stable
+                        // code, and never the value itself.
+                        let value_error = err
+                            .downcast_ref::<ConfigValueError>()
+                            .expect("the error carries a stable code");
+                        assert_eq!(value_error.key, "LOG_CHANNEL_ID");
+                        assert_eq!(value_error.code, ConfigValueCode::InvalidDiscordId);
+                    } else {
+                        // A missing variable keeps the existing missing-variable
+                        // failure, which is not a value rejection.
+                        assert!(
+                            err.downcast_ref::<ConfigValueError>().is_none(),
+                            "a missing variable is not an invalid value: {message}"
+                        );
+                    }
                 }
             }
             return;
@@ -320,6 +425,7 @@ mod tests {
                 ("AGE_ROLE_1", "111"),
                 ("AGE_ROLE_2", "222"),
                 (EXPECT_OK, if expect_ok { "1" } else { "0" }),
+                (EXPECT_SET, if value.is_some() { "1" } else { "0" }),
             ];
             if let Some(value) = value {
                 vars.push(("LOG_CHANNEL_ID", value));
@@ -340,9 +446,15 @@ mod tests {
             age_role_2: 222,
             reaction_role_db_path: "reaction_roles.sqlite".to_string(),
             staff_role_id: Some(333),
-            tickets: None,
-            ticket_archive_retention: RetentionPolicy::Disabled,
-            ticket_privacy_lockdown: false,
+            tickets: Some(Settings {
+                guild: 100,
+                staff: 200,
+                support_category: 300,
+                age_category: 400,
+                db_path: "tickets.sqlite".to_string(),
+            }),
+            ticket_archive_retention: RetentionPolicy::AfterDays(30),
+            ticket_privacy_lockdown: true,
         };
         let rendered = format!("{:?}", config);
         assert!(
@@ -352,6 +464,26 @@ mod tests {
         assert!(
             rendered.contains("1234567890123456789"),
             "values that are not secret stay visible: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED),
+            "the secret is replaced by a placeholder: {rendered}"
+        );
+    }
+
+    /// A Discord id must be a non-zero number, and a rejected value must carry a
+    /// stable code rather than the value itself.
+    #[test]
+    fn discord_id_rejects_zero_and_reports_a_stable_code() {
+        for rejected in ["0", "-1", "not-a-number", ""] {
+            let error = parse_discord_id(rejected).expect_err("the value is rejected");
+            assert_eq!(error, ConfigValueCode::InvalidDiscordId);
+            // The code never carries the rejected value.
+            assert!(!format!("{error:?}").contains(rejected) || rejected.is_empty());
+        }
+        assert_eq!(
+            parse_discord_id("1234567890123456789"),
+            Ok(1234567890123456789)
         );
     }
 
