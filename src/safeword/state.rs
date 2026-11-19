@@ -1325,165 +1325,145 @@ mod tests {
         assert!(follow_up.is_empty());
     }
 
-    #[test]
-    fn grant_during_releasing_defers_before_restore_ack_and_ignores_after_or_when_disabled() {
-        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
-        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
-        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
-        let (releasing, initial_rel_actions) = step(&active, Event::ReactionRemoved, &ctx);
-        assert_eq!(
-            initial_rel_actions,
-            vec![
-                Action::RemoveSafewordRole,
-                Action::RestoreRoles(vec![ROLE_VERIFIED]),
-                Action::ClearSnapshot,
-                Action::SendDm(DmKind::Released),
-            ]
-        );
-
-        // (a) Grant while RestoreRoles is in flight -> emits second RestoreRoles with late role,
-        // and release does not complete after only the first RestoreRoles ack.
-        let (rel_in_flight, _) = step(
-            &releasing,
-            Event::ActionDone(ActionId::RemoveSafewordRole),
-            &ctx,
-        );
-        let (rel_in_flight_granted, in_flight_actions) =
-            step(&rel_in_flight, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
-        assert_eq!(
-            in_flight_actions,
-            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
-        );
-        let (rel_after_other_acks, _) = acknowledge_all(
-            rel_in_flight_granted,
-            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
-            &ctx,
-        );
-        let (still_releasing_after_first_ack, first_ack_actions) = step(
-            &rel_after_other_acks,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &ctx,
-        );
-        assert!(first_ack_actions.is_empty());
-        assert!(matches!(
-            still_releasing_after_first_ack,
-            State::Releasing(_)
-        ));
-        let (completed_after_second_ack, second_ack_actions) = step(
-            &still_releasing_after_first_ack,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &ctx,
-        );
-        assert!(second_ack_actions.is_empty());
-        assert_eq!(completed_after_second_ack, State::Inactive);
-
-        // (b) Grant before any release step is acked -> emitted RestoreRoles contains the late role.
-        let (rel_before, actions_before) =
-            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
-        assert_eq!(
-            actions_before,
-            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
-        );
-        // Also when initial restore_plan was empty, the first/only emitted RestoreRoles contains the late role.
-        let empty_ctx = sample_ctx(vec![]);
-        let (act_empty, act_empty_actions) =
-            step(&State::Inactive, Event::ReactionAdded, &empty_ctx);
-        let (active_empty, _) = acknowledge_all(act_empty, &act_empty_actions, &empty_ctx);
-        let (rel_empty, rel_empty_actions) =
-            step(&active_empty, Event::ReactionRemoved, &empty_ctx);
-        assert!(!rel_empty_actions
-            .iter()
-            .any(|a| matches!(a, Action::RestoreRoles(_))));
-        let (rel_empty_granted, empty_grant_actions) = step(
-            &rel_empty,
-            Event::GrantDuringActive(ROLE_VERIFIED),
-            &empty_ctx,
-        );
-        assert_eq!(
-            empty_grant_actions,
-            vec![Action::RestoreRoles(vec![ROLE_VERIFIED])]
-        );
-        let (rel_empty_mid, _) = acknowledge_all(rel_empty_granted, &rel_empty_actions, &empty_ctx);
-        assert!(matches!(rel_empty_mid, State::Releasing(_)));
-        let (rel_empty_done, _) = step(
-            &rel_empty_mid,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &empty_ctx,
-        );
-        assert_eq!(rel_empty_done, State::Inactive);
-
-        // Subject to struck/deleted/protected filters and restricted_roles check:
-        let mut protected_ctx = ctx.clone();
-        protected_ctx.protected_roles = vec![ROLE_FEMDOM];
-        let (_rel_prot, prot_actions) = step(
-            &rel_before,
-            Event::GrantDuringActive(ROLE_FEMDOM),
-            &protected_ctx,
-        );
-        assert!(prot_actions.is_empty());
-        let (_rel_unrestricted, unres_actions) = step(
-            &rel_before,
-            Event::GrantDuringActive(ROLE_UNRESTRICTED),
-            &ctx,
-        );
-        assert!(unres_actions.is_empty());
-
-        // (e) Post-ack grant is still ignored after all outstanding RestoreRoles are acknowledged.
-        let (rel_one_ack, _) = step(&rel_before, Event::ActionDone(ActionId::RestoreRoles), &ctx);
-        let (rel_all_restore_acked, _) = step(
-            &rel_one_ack,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &ctx,
-        );
-        let (rel_after_grant, post_ack_actions) = step(
-            &rel_all_restore_acked,
-            Event::GrantDuringActive(ROLE_MEDIA),
-            &ctx,
-        );
-        assert!(post_ack_actions.is_empty());
-        assert_eq!(
-            rel_after_grant.snapshot().unwrap().restore_plan,
-            vec![ROLE_VERIFIED, ROLE_MEMBER]
-        );
-
-        // (f) When defer_grants = false: GrantDuringActive during Releasing is unchanged (emits nothing).
-        let mut no_defer_ctx = ctx.clone();
-        no_defer_ctx.defer_grants = false;
-        let (rel_no_defer, no_defer_actions) = step(
-            &releasing,
-            Event::GrantDuringActive(ROLE_MEMBER),
-            &no_defer_ctx,
-        );
-        assert!(no_defer_actions.is_empty());
-        let (inactive_no_defer, _) =
-            acknowledge_all(rel_no_defer, &initial_rel_actions, &no_defer_ctx);
-        assert_eq!(inactive_no_defer, State::Inactive);
-    }
-
-    #[test]
-    fn grant_during_releasing_two_late_grants_and_failure_retry_uses_grown_plan() {
-        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
-        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
-        let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
-
-        // (c) Two late grants while RestoreRoles is unacknowledged emit growing role lists
-        // and require all three RestoreRoles emissions to be acknowledged before completion.
-        let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
+    /// Active(held=[101]) -> ReactionRemoved -> RemoveSafewordRole acked; RestoreRoles([101]) in flight.
+    fn releasing_with_restore_in_flight(ctx: &Context) -> State {
+        let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, ctx);
+        let (active, _) = acknowledge_all(activating, &act_actions, ctx);
+        let (releasing, actions) = step(&active, Event::ReactionRemoved, ctx);
+        assert_eq!(actions[1], Action::RestoreRoles(vec![ROLE_VERIFIED]));
         let (releasing, _) = step(
             &releasing,
             Event::ActionDone(ActionId::RemoveSafewordRole),
+            ctx,
+        );
+        releasing
+    }
+
+    fn restore_done(state: &State, ctx: &Context) -> (State, Vec<Action>) {
+        step(state, Event::ActionDone(ActionId::RestoreRoles), ctx)
+    }
+
+    fn restore_failed(state: &State, ctx: &Context) -> (State, Vec<Action>) {
+        step(
+            state,
+            Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp),
+            ctx,
+        )
+    }
+
+    fn restore_payloads(actions: &[Action]) -> Vec<Vec<RoleId>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::RestoreRoles(roles) => Some(roles.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grant_while_restore_in_flight_emits_nothing_then_one_follow_up_after_ack() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = releasing_with_restore_in_flight(&ctx);
+
+        // (1) Grant while E1 is in flight emits NOTHING.
+        let (releasing, grant_actions) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert!(grant_actions.is_empty());
+        let (releasing, _) = acknowledge_all(
+            releasing,
+            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
             &ctx,
         );
-        let (releasing, grant1_actions) =
-            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        // Ack of E1 emits E2 containing the late role; the step is not done.
+        let (releasing, follow_up) = restore_done(&releasing, &ctx);
         assert_eq!(
-            grant1_actions,
+            follow_up,
             vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
         );
-        let (releasing, grant2_actions) =
-            step(&releasing, Event::GrantDuringActive(ROLE_MEDIA), &ctx);
+        assert!(matches!(releasing, State::Releasing(_)));
+        // Only the ack of E2 closes the release.
+        let (done, tail) = restore_done(&releasing, &ctx);
+        assert!(tail.is_empty());
+        assert_eq!(done, State::Inactive);
+
+        // Grant before any release step is acked behaves the same (E1 is already in flight).
+        let (active_state, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+        let (active, _) = acknowledge_all(active_state, &act_actions, &ctx);
+        let (rel, _) = step(&active, Event::ReactionRemoved, &ctx);
+        let (rel, early) = step(&rel, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert!(early.is_empty());
+        let (rel, follow_up) = restore_done(&rel, &ctx);
         assert_eq!(
-            grant2_actions,
+            restore_payloads(&follow_up),
+            vec![vec![ROLE_VERIFIED, ROLE_MEMBER]]
+        );
+        assert!(matches!(rel, State::Releasing(_)));
+
+        // Empty initial plan: no restore in flight, so the grant emits RestoreRoles itself.
+        let empty_ctx = sample_ctx(vec![]);
+        let (act, act_actions) = step(&State::Inactive, Event::ReactionAdded, &empty_ctx);
+        let (active, _) = acknowledge_all(act, &act_actions, &empty_ctx);
+        let (rel, rel_actions) = step(&active, Event::ReactionRemoved, &empty_ctx);
+        assert!(restore_payloads(&rel_actions).is_empty());
+        let (rel, emitted) = step(&rel, Event::GrantDuringActive(ROLE_VERIFIED), &empty_ctx);
+        assert_eq!(emitted, vec![Action::RestoreRoles(vec![ROLE_VERIFIED])]);
+        let (rel, _) = acknowledge_all(rel, &rel_actions, &empty_ctx);
+        assert!(matches!(rel, State::Releasing(_)));
+        let (rel, tail) = restore_done(&rel, &empty_ctx);
+        assert!(tail.is_empty());
+        assert_eq!(rel, State::Inactive);
+
+        // Filters, post-ack ignore and defer_grants=false are unchanged.
+        let releasing = releasing_with_restore_in_flight(&ctx);
+        let mut protected_ctx = ctx.clone();
+        protected_ctx.protected_roles = vec![ROLE_FEMDOM];
+        let (after_protected, prot) = step(
+            &releasing,
+            Event::GrantDuringActive(ROLE_FEMDOM),
+            &protected_ctx,
+        );
+        assert!(prot.is_empty());
+        let (_, restore_follow_up) = restore_done(&after_protected, &protected_ctx);
+        assert!(restore_follow_up.is_empty());
+        let (_, unres) = step(
+            &releasing,
+            Event::GrantDuringActive(ROLE_UNRESTRICTED),
+            &ctx,
+        );
+        assert!(unres.is_empty());
+        let (acked, _) = restore_done(&releasing, &ctx);
+        let (after_grant, post_ack) = step(&acked, Event::GrantDuringActive(ROLE_MEDIA), &ctx);
+        assert!(post_ack.is_empty());
+        assert_eq!(
+            after_grant.snapshot().unwrap().restore_plan,
+            vec![ROLE_VERIFIED]
+        );
+        let mut no_defer = ctx.clone();
+        no_defer.defer_grants = false;
+        let (still, no_defer_actions) =
+            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &no_defer);
+        assert!(no_defer_actions.is_empty());
+        let (still, follow) = restore_done(&still, &no_defer);
+        assert!(follow.is_empty());
+        let (still, _) = acknowledge_all(
+            still,
+            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
+            &no_defer,
+        );
+        assert_eq!(still, State::Inactive);
+    }
+
+    #[test]
+    fn two_late_grants_coalesce_into_exactly_one_follow_up() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = releasing_with_restore_in_flight(&ctx);
+        let (releasing, g1) = step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        let (releasing, g2) = step(&releasing, Event::GrantDuringActive(ROLE_MEDIA), &ctx);
+        assert!(g1.is_empty() && g2.is_empty());
+        let (releasing, follow_up) = restore_done(&releasing, &ctx);
+        assert_eq!(
+            follow_up,
             vec![Action::RestoreRoles(vec![
                 ROLE_VERIFIED,
                 ROLE_MEMBER,
@@ -1495,62 +1475,87 @@ mod tests {
             &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
             &ctx,
         );
-        let (releasing, _) = step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
         assert!(matches!(releasing, State::Releasing(_)));
-        let (releasing, _) = step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
-        assert!(matches!(releasing, State::Releasing(_)));
-        let (done_three_acks, _) =
-            step(&releasing, Event::ActionDone(ActionId::RestoreRoles), &ctx);
-        assert_eq!(done_three_acks, State::Inactive);
-
-        // (d) Failure of the first RestoreRoles then retry uses the grown plan (never the older list).
-        let (rel_d, _) = step(&active, Event::ReactionRemoved, &ctx);
-        let (rel_d, _) = step(
-            &rel_d,
-            Event::ActionDone(ActionId::RemoveSafewordRole),
-            &ctx,
-        );
-        let (rel_d, late_grant_actions) = step(&rel_d, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
-        assert_eq!(
-            late_grant_actions,
-            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
-        );
-        let (rel_d_failed, _) = step(
-            &rel_d,
-            Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp),
-            &ctx,
-        );
-        assert_eq!(
-            restart_action(&rel_d_failed, false),
-            RestartAction::Execute(Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]))
-        );
-        let (rel_d_retried, retry_actions) = step(&rel_d_failed, Event::ReactionRemoved, &ctx);
-        assert_eq!(
-            retry_actions,
-            vec![
-                Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER]),
-                Action::ClearSnapshot,
-                Action::SendDm(DmKind::Released),
-            ]
-        );
-        let (rel_d_done, _) = acknowledge_all(rel_d_retried, &retry_actions, &ctx);
-        assert_eq!(rel_d_done, State::Inactive);
+        let (done, tail) = restore_done(&releasing, &ctx);
+        assert!(tail.is_empty());
+        assert_eq!(done, State::Inactive);
     }
 
     #[test]
-    fn grant_during_releasing_with_pending_reactivate_starts_only_after_all_restore_acks() {
-        // (g) Combined with pending_reactivate: re-activation starts only after all restore acks.
+    fn failure_with_late_grant_retries_current_plan_and_its_ack_completes() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = releasing_with_restore_in_flight(&ctx);
+        let (releasing, grant) = step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert!(grant.is_empty());
+        let (failed, none) = restore_failed(&releasing, &ctx);
+        assert!(none.is_empty());
+        assert_eq!(
+            restart_action(&failed, false),
+            RestartAction::Trigger(Event::ReactionRemoved)
+        );
+        let (retried, retry_actions) = step(&failed, Event::ReactionRemoved, &ctx);
+        assert_eq!(
+            restore_payloads(&retry_actions),
+            vec![vec![ROLE_VERIFIED, ROLE_MEMBER]]
+        );
+        // A retry is not enough: state stays Releasing until the retry is acked.
+        assert!(matches!(retried, State::Releasing(_)));
+        let (done, _) = acknowledge_all(retried, &retry_actions, &ctx);
+        assert_eq!(done, State::Inactive);
+    }
+
+    #[test]
+    fn failure_then_late_grant_then_retry_reaches_inactive_without_stuck_restart() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = releasing_with_restore_in_flight(&ctx);
+        let (failed, _) = restore_failed(&releasing, &ctx);
+        // Nothing is in flight now, so the grant emits the current plan itself.
+        let (granted, emitted) = step(&failed, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert_eq!(
+            emitted,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
+        );
+        // Retry trigger must not put a second RestoreRoles in flight.
+        let (retried, retry_actions) = step(&granted, Event::ReactionRemoved, &ctx);
+        assert!(restore_payloads(&retry_actions).is_empty());
+        let (retried, _) = acknowledge_all(
+            retried,
+            &[Action::ClearSnapshot, Action::SendDm(DmKind::Released)],
+            &ctx,
+        );
+        assert!(matches!(retried, State::Releasing(_)));
+        let (done, tail) = restore_done(&retried, &ctx);
+        assert!(tail.is_empty());
+        assert_eq!(done, State::Inactive);
+        assert_eq!(done.snapshot(), None);
+        assert_eq!(restart_action(&done, false), RestartAction::NoOp);
+    }
+
+    #[test]
+    fn stray_restore_ack_with_nothing_in_flight_changes_nothing() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let releasing = releasing_with_restore_in_flight(&ctx);
+        let (acked, _) = restore_done(&releasing, &ctx);
+        // RestoreRoles was acknowledged; a second ack has nothing in flight.
+        let (after, actions) = restore_done(&acked, &ctx);
+        assert!(actions.is_empty());
+        assert_eq!(after, acked);
+        // Also after a failure with nothing re-emitted.
+        let (failed, _) = restore_failed(&releasing, &ctx);
+        let (after_failed, actions) = restore_done(&failed, &ctx);
+        assert!(actions.is_empty());
+        assert_eq!(after_failed, failed);
+    }
+
+    #[test]
+    fn grant_during_releasing_with_pending_reactivate_starts_only_after_final_restore_ack() {
         let ctx = sample_ctx(vec![ROLE_VERIFIED]);
         let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
         let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
         let (releasing, _) = step(&active, Event::ReactionRemoved, &ctx);
         let (releasing, _) = step(&releasing, Event::ReactionAdded, &ctx);
-        let (releasing, late_actions) =
-            step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
-        assert_eq!(
-            late_actions,
-            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
-        );
+        let (releasing, late) = step(&releasing, Event::GrantDuringActive(ROLE_MEMBER), &ctx);
+        assert!(late.is_empty());
         let (releasing, _) = acknowledge_all(
             releasing,
             &[
@@ -1560,23 +1565,14 @@ mod tests {
             ],
             &ctx,
         );
-
-        // First RestoreRoles ack must NOT trigger re-activation yet.
         let reactivate_ctx = sample_ctx(vec![ROLE_VERIFIED, ROLE_MEMBER]);
-        let (still_releasing, first_ack_actions) = step(
-            &releasing,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &reactivate_ctx,
+        let (still, follow_up) = restore_done(&releasing, &reactivate_ctx);
+        assert_eq!(
+            follow_up,
+            vec![Action::RestoreRoles(vec![ROLE_VERIFIED, ROLE_MEMBER])]
         );
-        assert!(first_ack_actions.is_empty());
-        assert!(matches!(still_releasing, State::Releasing(_)));
-
-        // Second RestoreRoles ack completes the release and starts the fresh activation.
-        let (reactivating, react_actions) = step(
-            &still_releasing,
-            Event::ActionDone(ActionId::RestoreRoles),
-            &reactivate_ctx,
-        );
+        assert!(matches!(still, State::Releasing(_)));
+        let (reactivating, react_actions) = restore_done(&still, &reactivate_ctx);
         assert!(matches!(reactivating, State::Activating(_)));
         assert_eq!(
             react_actions,
@@ -1587,6 +1583,102 @@ mod tests {
                 Action::SendDm(DmKind::Activated),
             ]
         );
+    }
+
+    #[test]
+    fn bounded_random_sequences_keep_one_restore_in_flight_and_always_complete() {
+        let ctx = sample_ctx(vec![ROLE_VERIFIED]);
+        let grantable = [ROLE_MEMBER, ROLE_MEDIA, ROLE_FEMDOM];
+        for seed in 1u64..=300 {
+            let mut rng = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut next = move || {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (rng >> 33) as usize
+            };
+            let (activating, act_actions) = step(&State::Inactive, Event::ReactionAdded, &ctx);
+            let (active, _) = acknowledge_all(activating, &act_actions, &ctx);
+            let (mut state, first) = step(&active, Event::ReactionRemoved, &ctx);
+            // Runtime model: serial queue of RestoreRoles payloads emitted but not yet reported,
+            // plus unreported non-restore release actions.
+            let mut restore_queue: Vec<Vec<RoleId>> = restore_payloads(&first);
+            let mut others: Vec<ActionId> = first
+                .iter()
+                .filter(|a| !matches!(a, Action::RestoreRoles(_)))
+                .map(Action::id)
+                .collect();
+            let mut acked: Vec<Vec<RoleId>> = Vec::new();
+            let mut last_plan: Vec<RoleId> = Vec::new();
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                assert!(steps < 200, "seed {seed}: did not terminate");
+                let random_phase = steps <= 12;
+                let op = if random_phase { next() % 5 } else { 99 };
+                let event = match op {
+                    0 => Event::GrantDuringActive(grantable[next() % 3]),
+                    1 if !restore_queue.is_empty() => {
+                        acked.push(restore_queue.remove(0));
+                        Event::ActionDone(ActionId::RestoreRoles)
+                    }
+                    2 if !restore_queue.is_empty() => {
+                        restore_queue.remove(0);
+                        Event::ActionFailed(ActionId::RestoreRoles, FailureCode::TransientHttp)
+                    }
+                    3 => Event::ReactionRemoved,
+                    4 if !others.is_empty() => Event::ActionDone(others.remove(0)),
+                    1..=4 => continue,
+                    _ => {
+                        // Drain phase: report everything, then retry-trigger if still stuck.
+                        if !restore_queue.is_empty() {
+                            acked.push(restore_queue.remove(0));
+                            Event::ActionDone(ActionId::RestoreRoles)
+                        } else if !others.is_empty() {
+                            Event::ActionDone(others.remove(0))
+                        } else {
+                            Event::ReactionRemoved
+                        }
+                    }
+                };
+                let (next_state, actions) = step(&state, event, &ctx);
+                if let Some(s) = state.snapshot() {
+                    last_plan = s.restore_plan.clone();
+                }
+                state = next_state;
+                if let Some(s) = state.snapshot() {
+                    last_plan = s.restore_plan.clone();
+                }
+                restore_queue.extend(restore_payloads(&actions));
+                for a in &actions {
+                    if !matches!(a, Action::RestoreRoles(_)) && !others.contains(&a.id()) {
+                        others.push(a.id());
+                    }
+                }
+                assert!(
+                    restore_queue.len() <= 1,
+                    "seed {seed}: more than one RestoreRoles in flight"
+                );
+                if state == State::Inactive {
+                    break;
+                }
+                assert!(
+                    random_phase
+                        || !actions.is_empty()
+                        || !restore_queue.is_empty()
+                        || !others.is_empty(),
+                    "seed {seed}: fully acknowledged release did not reach Inactive"
+                );
+            }
+            for role in &last_plan {
+                assert!(
+                    acked.iter().any(|p| p.contains(role)),
+                    "seed {seed}: role {role} never in an acknowledged payload"
+                );
+            }
+        }
     }
 
     #[test]
