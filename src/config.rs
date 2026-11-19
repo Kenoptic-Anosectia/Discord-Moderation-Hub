@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::{env, ffi::OsStr};
 
 use crate::tickets::{
@@ -40,36 +40,25 @@ impl std::error::Error for EnvFileError {}
 
 /// Loads the environment file for the current working directory.
 ///
-/// RED STATE: the old hand written search is back, so the tests can show what
-/// it does wrong.
+/// The search is the one of `dotenvy`: the nearest file named `.env` at or
+/// above the working directory, walking up to the root of the drive. The search
+/// is not reimplemented here on purpose. A hand written search decides with
+/// `Path::is_file`, which answers `false` for every error and therefore keeps
+/// walking up when the metadata of a candidate cannot be read. That fails open:
+/// the bot would silently load a different file, maybe the one of another bot.
+/// `dotenvy` stops with an error in that case, and the loader reports it.
+///
+/// The real process environment wins: a value that is already set in the
+/// environment is never replaced by the file. Only variables that the
+/// environment does not hold are taken from the file.
 pub fn load_env() -> Result<PathBuf, EnvFileError> {
-    let start = env::current_dir().map_err(|_| EnvFileError::Unreadable)?;
-    load_env_from(&start)
-}
-
-/// Loads the nearest environment file, starting at `start` and walking up to the
-/// filesystem root.
-pub fn load_env_from(start: &Path) -> Result<PathBuf, EnvFileError> {
-    let path = find_env_file(start).ok_or(EnvFileError::NotFound)?;
-    dotenvy::from_path(&path).map_err(|_| EnvFileError::Unreadable)?;
-    Ok(path)
-}
-
-/// Finds the nearest environment file, starting at `start` and walking up to the
-/// filesystem root.
-fn find_env_file(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(directory) = current {
-        let candidate = directory.join(ENV_FILE_NAME);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        current = directory.parent();
-    }
-    None
+    dotenvy::dotenv().map_err(env_file_error)
 }
 
 /// Turns a failure of the environment file search into a stable reason.
+///
+/// The reason is a code: it never carries the path of the file or any text
+/// that came from it.
 fn env_file_error(error: dotenvy::Error) -> EnvFileError {
     if error.not_found() {
         EnvFileError::NotFound
@@ -399,7 +388,11 @@ mod tests {
             return;
         }
 
-        let output = run_child_in(NAME, Some(&nested), &[(REAL_ENV_SENTINEL, "from_environment")]);
+        let output = run_child_in(
+            NAME,
+            Some(&nested),
+            &[(REAL_ENV_SENTINEL, "from_environment")],
+        );
         assert_child_ok(&output, NAME);
     }
 
@@ -412,13 +405,15 @@ mod tests {
     /// candidate cannot be read.
     #[test]
     fn load_env_finds_the_nearest_file_above_the_working_directory() {
-        const NAME: &str = "config::tests::load_env_finds_the_nearest_file_above_the_working_directory";
+        const NAME: &str =
+            "config::tests::load_env_finds_the_nearest_file_above_the_working_directory";
 
         let directory = scratch_dir_of("env-search");
         let nested = directory.join("nested");
         fs::create_dir_all(&nested).expect("scratch directory");
         let env_file = directory.join(ENV_FILE_NAME);
-        fs::write(&env_file, format!("{FILE_ONLY_SENTINEL}=from_file\n")).expect("environment file");
+        fs::write(&env_file, format!("{FILE_ONLY_SENTINEL}=from_file\n"))
+            .expect("environment file");
 
         if is_child() {
             let loaded = load_env().expect("environment file loads");
@@ -451,7 +446,8 @@ mod tests {
     /// read is a failure, not a reason to look somewhere else.
     #[test]
     fn load_env_fails_closed_when_the_environment_file_cannot_be_used() {
-        const NAME: &str = "config::tests::load_env_fails_closed_when_the_environment_file_cannot_be_used";
+        const NAME: &str =
+            "config::tests::load_env_fails_closed_when_the_environment_file_cannot_be_used";
 
         let directory = scratch_dir_of("env-broken");
         let tree = directory.join("tree");
