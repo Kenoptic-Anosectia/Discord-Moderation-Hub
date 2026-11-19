@@ -74,11 +74,12 @@ impl Default for Limits {
     }
 }
 
-/// Per-message cap (bytes, content plus embed text) rendered into the transcript. Discord limits
-/// content to 4,000 characters and embeds to 6,000, so 64 KiB never cuts a legitimate message but
-/// bounds an abusive one.
-pub const MAX_MESSAGE_TEXT_BYTES: usize = 64 * 1024;
-/// Total cap (bytes) of message text rendered into one transcript; later messages stay listed
+/// Per-message cap in ESCAPED output bytes (content plus embed text, after HTML escaping, so a
+/// quote-only message cannot expand 6x past it). Discord allows about 60 KiB of text per message,
+/// so 256 KiB never cuts a legitimate message but bounds an abusive one.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 256 * 1024;
+/// Total cap in ESCAPED output bytes of message text in one transcript, so the rendered transcript
+/// stays well under 64 MiB (per-message markup is extra); later messages stay listed
 /// (id, author, time) but their text is replaced by [`TRUNCATION_MARKER`].
 pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 32 * 1024 * 1024;
 /// Stable plain-ASCII marker appended where text was cut; needs no escaping and can never form
@@ -183,31 +184,39 @@ impl MsgText {
     }
     /// Appends the HTML-escaped prefix of `s` that fits, then the marker if anything was cut.
     fn put(&mut self, h: &mut String, s: &str) {
-        let mut take = s.len().min(self.left);
-        while !s.is_char_boundary(take) {
-            take -= 1;
-        }
-        esc_into(h, &s[..take]);
-        self.left -= take;
-        if take < s.len() {
-            self.cut = true;
-            self.left = 0;
-            h.push_str(TRUNCATION_MARKER);
+        for c in s.chars() {
+            let n = esc_len(c);
+            if n > self.left {
+                self.cut = true;
+                self.left = 0;
+                h.push_str(TRUNCATION_MARKER);
+                return;
+            }
+            self.left -= n;
+            esc_char(h, c);
         }
     }
 }
-/// Appends the escaped form of `s` (see [`esc`]) to `o` without allocating a temporary.
-fn esc_into(o: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => o.push_str("&amp;"),
-            '<' => o.push_str("&lt;"),
-            '>' => o.push_str("&gt;"),
-            '"' => o.push_str("&quot;"),
-            '\'' => o.push_str("&#39;"),
-            '\0' => {}
-            c => o.push(c),
-        }
+/// Escaped byte length of one char (must match [`esc_char`]).
+fn esc_len(c: char) -> usize {
+    match c {
+        '&' | '\'' => 5,
+        '<' | '>' => 4,
+        '"' => 6,
+        '\0' => 0,
+        c => c.len_utf8(),
+    }
+}
+/// Appends the escaped form of one char (see [`esc`]) without allocating a temporary.
+fn esc_char(o: &mut String, c: char) {
+    match c {
+        '&' => o.push_str("&amp;"),
+        '<' => o.push_str("&lt;"),
+        '>' => o.push_str("&gt;"),
+        '"' => o.push_str("&quot;"),
+        '\'' => o.push_str("&#39;"),
+        '\0' => {}
+        c => o.push(c),
     }
 }
 /// Manifest metadata record for a single archived attachment file under `assets/`.

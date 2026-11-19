@@ -1,30 +1,30 @@
 # Archive bounds (audit HIGH x2)
-
 Files changed: `src/tickets/archive.rs`, `src/tickets/archive_tests.rs`. No callers changed (no signature changed).
 
-## 1. `verify()` quadratic id scan — reproduced
-- Was: one `html.contains(data-mid="<id>")` scan of the transcript per expected id (O(ids x size)).
-- Fix: one pass (`match_indices`) collects every `data-mid="<value>"` into a `HashSet`; each id is an O(1)
-  lookup. Same exact-match semantics (an id passes only if an attribute value equals it), same `Verify` error,
-  every other check untouched. `render_transcript`'s per-attachment `assets.iter().find` also became a map.
-- Test: `verify_scales_linearly_with_message_count` compares 5,000 vs 20,000 messages (ratio < 10; quadratic
-  = ~16x, linear = ~4x, best of 3, no absolute seconds). RED: 25.0x (1.7s -> 41.9s). Missing/prefix ids still
-  rejected (`verify_still_rejects_missing_and_partial_ids`).
+## 1. `verify()` quadratic id scan - reproduced
+- Was: one `html.contains(data-mid="<id>")` scan per expected id (O(ids x size)).
+- Fix: one pass (`match_indices`) collects every `data-mid="<value>"` into a `HashSet`; ids are O(1) lookups.
+  Same exact-match semantics, same `Verify` error, every other check untouched. `render_transcript`'s
+  per-attachment `find` also became a map (first entry wins).
+- Test `verify_scales_linearly_with_message_count`: 5,000 vs 20,000 messages, ratio < 10 (best of 3, no absolute
+  seconds). RED measured ~25x; fixed code measured about 4-6x, so the margin is ~1.6x, not wide.
+  `verify_still_rejects_missing_and_partial_ids` keeps missing/prefix ids rejected.
 
-## 2. Unbounded message text, ~3x copies on publish — reproduced
-- Caps (bytes of raw text, content + embed text): `MAX_MESSAGE_TEXT_BYTES` = 64 KiB per message (Discord allows
-  ~4k chars content / 6k per embed), `MAX_TRANSCRIPT_TEXT_BYTES` = 32 MiB per transcript. Text past a cap is cut
-  at a char boundary and followed by `TRUNCATION_MARKER` (`[truncated: archive text limit]`, plain ASCII, cannot
-  form `data-mid="`). Every message stays listed, so ids and `message_count` still verify.
-- Copies: text is escaped straight into the one transcript `String` (no per-field `esc()` temporaries);
-  `content_fingerprint` streams into the SHA-256 context instead of building a full copy (identical digest).
-- Tests: legacy transcript captured from the unmodified writer verifies and short messages render byte-identical;
-  oversized message truncated + archive verifies; UTF-8 boundary; total cap with 576 max-size messages
-  (RED: 36 MB transcript); fingerprint still covers the untruncated text.
+- Caps count ESCAPED output bytes (so `"` -> `&quot;` cannot amplify 6x past them): `MAX_MESSAGE_TEXT_BYTES` =
+  256 KiB per message (Discord text is ~60 KiB), `MAX_TRANSCRIPT_TEXT_BYTES` = 32 MiB per transcript, so the
+  rendered text stays <= 32 MiB plus markup (< 64 MiB). Text past a cap stops BEFORE the first escape unit that
+  does not fit (never inside `&quot;`) and `TRUNCATION_MARKER` (`[truncated: archive text limit]`) is written once.
+  Every message stays listed, so ids and `message_count` still verify.
+- Copies: text is escaped straight into the one transcript `String`; `content_fingerprint` streams into the
+  SHA-256 context (identical digest).
+- Tests: legacy transcript from the unmodified writer verifies and short messages render byte-identical;
+  oversized message truncated + archive verifies; UTF-8 boundary; total cap with plain text AND all-quote /
+  all-ampersand input asserting the RENDERED length; per-message cap for `" & ' <`; 6-byte unit with 5 left is
+  dropped whole, exact fill is not marked.
 
 ## NOT fixed / depends on wiring
-- Truncation is a rendering bound only: `content_fingerprint` (the pre-delete stability check) still hashes
-  full text, and fetched `Message`s are still held whole in memory by `fetch_all` (bounded by `max_messages`,
-  not by bytes). Author names, filenames and embed `Debug` strings in the fingerprint are not capped.
-- Escaped output can be up to 6x the raw cap (`&quot;`); the cap counts raw bytes.
+- Truncation is render-only: `content_fingerprint` still hashes full text; author names, filenames and embed
+  `Debug` strings are not capped. Embed parts after a cut are omitted without their own marker.
+- `fetch_all` holds whole `Message`s bounded by `max_messages` (200,000) not bytes: ~60 KiB x 200,000 = ~11.6 GiB
+  worst case BEFORE rendering. Not bounded here; a follow-up card is needed. Markup per message is uncapped.
 - `verify` still reads the whole transcript and each asset into memory.

@@ -808,7 +808,10 @@ fn truncation_never_splits_an_escape_sequence() {
     msgs[0].content = format!("{}\"", "a".repeat(MAX_MESSAGE_TEXT_BYTES - 5));
     let h = render_transcript(7, &msgs, &[]);
     let pre = first_pre(&h);
-    assert!(!pre.contains('&'), "partial or whole escape kept: {pre:.20}");
+    assert!(
+        !pre.contains('&'),
+        "partial or whole escape kept: {pre:.20}"
+    );
     assert!(pre.ends_with(TRUNCATION_MARKER));
     // Exactly filling the budget is not a cut: no marker.
     msgs[0].content = format!("{}\"", "a".repeat(MAX_MESSAGE_TEXT_BYTES - 6));
