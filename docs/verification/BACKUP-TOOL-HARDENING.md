@@ -18,6 +18,6 @@ Tests: `python -m unittest discover -s tests/ops -p test_offline_sqlite_backup.p
 
 ## NOT fixed / limits
 - The manifest is unsigned: a schema-identical foreign DB with its own valid manifest passes; `tool_version` and `source_hint` are recorded, never checked.
-- A sidecar created between the `lexists` check and the open is not excluded (TOCTOU); needs a local attacker with write access.
-- Out of scope (SF6): publish-by-inode TOCTOU, `resolve()` of the destination, Python 3.12 floor for `Path.is_junction`.
+- TOCTOU, exactly: `verify` checks for sidecars, then opens by path; a sidecar or main-file swap in that window is not excluded (needs a local writer). `restore` no longer re-opens the source to certify it: it copies the bytes it hashed and compares them to the manifest (see BACKUP-TOOL-FOLLOWUP.md). `verify` itself is unchanged.
+- SF6 follow-up (publish-by-inode, `..`, Python floor): see BACKUP-TOOL-FOLLOWUP.md.
 - A source that already has FK violations backs up but fails `verify`. Nothing in the Rust bot calls this tool.

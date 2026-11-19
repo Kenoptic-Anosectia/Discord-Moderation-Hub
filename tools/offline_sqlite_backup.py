@@ -1,6 +1,6 @@
 """Explicit, offline SQLite backup. Standard library only; no discovery or retention."""
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -14,6 +14,7 @@ TOOL_VERSION = '2'
 MANIFEST_SUFFIX = '.manifest.json'
 MANIFEST_KEYS = {'sha256', 'tables', 'schema_hash', 'tool_version', 'source_hint'}
 MANIFEST_LIMIT = 1 << 20
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 
 
 class OperationError(Exception):
@@ -135,8 +136,19 @@ def verify(path):
     return result
 
 
+def is_junction(path):
+    """Path.is_junction needs Python 3.12; older interpreters use the reparse tag."""
+    native = getattr(path, 'is_junction', None)
+    if native is not None:
+        return native()
+    try:
+        return getattr(os.lstat(path), 'st_reparse_tag', 0) == IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
 def refuse_destination(source, destination):
-    if (any(p.is_symlink() or p.is_junction()
+    if (any(p.is_symlink() or is_junction(p)
             for p in (destination, *destination.parents))
             or any(os.path.lexists(str(destination) + suffix)
             for suffix in ('', '-wal', '-shm', '-journal', MANIFEST_SUFFIX))
@@ -144,34 +156,102 @@ def refuse_destination(source, destination):
         raise OperationError()
 
 
+def same_file(first, second):
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def fd_sha256(fd):
+    """Hash the file behind an open descriptor, not whatever its path names now."""
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        block = os.read(fd, 1 << 20)
+        if not block:
+            return digest.hexdigest()
+        digest.update(block)
+
+
+@contextmanager
+def staging(destination):
+    """A private temp file beside the destination; the descriptor stays open throughout."""
+    fd, name = tempfile.mkstemp(prefix='.sqlite-backup-', suffix='.tmp',
+                                dir=destination.parent)
+    temporary = Path(name)
+    try:
+        yield fd, temporary
+    finally:
+        os.close(fd)
+        temporary.unlink()
+
+
+def publish(fd, temporary, destination, manifest):
+    """Link the temp, then require the published name to be the inode we wrote and hashed.
+
+    os.link re-resolves the temp path, so the identity is compared afterwards; on a
+    mismatch (or any later failure) the name this call created is removed again.
+    """
+    held = os.fstat(fd)
+    if not same_file(held, os.lstat(temporary)):
+        raise OperationError('publish_mismatch')
+    # Hard-link publication is atomic create-if-absent, never rename/replace.
+    os.link(temporary, destination)
+    try:
+        if not same_file(held, os.lstat(destination)):
+            raise OperationError('publish_mismatch')
+        write_manifest(destination, manifest)
+    except BaseException:
+        destination.unlink()
+        raise
+
+
 def backup(source, destination):
     source = Path(source).resolve(strict=True)
     destination = Path(destination).absolute()
     refuse_destination(source, destination)
-    temporary = None
-    published = False
-    try:
-        with closing(open_source(source)) as src:
-            fd, name = tempfile.mkstemp(prefix='.sqlite-backup-', suffix='.tmp', dir=destination.parent)
-            temporary = Path(name)
-            os.close(fd)
-            with closing(sqlite3.connect(temporary)) as dst:
-                src.backup(dst)
-                result = check(dst)
-                manifest = build_manifest(dst, None, source)
-            manifest['sha256'] = file_sha256(temporary)
-            # Hard-link publication is atomic create-if-absent, never rename/replace.
-            os.link(temporary, destination)
-            published = True
-            write_manifest(destination, manifest)
-        return result
-    except BaseException:
-        if published:
-            destination.unlink()
-        raise
-    finally:
-        if temporary is not None:
-            temporary.unlink()
+    with closing(open_source(source)) as src, staging(destination) as (fd, temporary):
+        with closing(sqlite3.connect(temporary)) as dst:
+            src.backup(dst)
+            result = check(dst)
+            manifest = build_manifest(dst, None, source)
+        manifest['sha256'] = fd_sha256(fd)
+        publish(fd, temporary, destination, manifest)
+    return result
+
+
+def copy_verified(source, fd, expected):
+    """Copy the bytes that are hashed, refusing unless they match the manifest."""
+    digest = hashlib.sha256()
+    with open(os.open(source, os.O_RDONLY | getattr(os, 'O_BINARY', 0)
+                      | getattr(os, 'O_NOFOLLOW', 0)), 'rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+            write_all(fd, block)
+    if digest.hexdigest() != expected or fd_sha256(fd) != expected:
+        raise OperationError('checksum_mismatch')
+
+
+def restore(source, destination):
+    source = Path(source).resolve(strict=True)
+    destination = Path(destination).absolute()
+    refuse_destination(source, destination)
+    verify(source)
+    manifest = load_manifest(source)
+    with staging(destination) as (fd, temporary):
+        copy_verified(source, fd, manifest['sha256'])
+        uri = temporary.as_uri() + '?mode=ro&immutable=1'
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as copy:
+            result = check(copy)
+            fresh = build_manifest(copy, manifest['sha256'], source)
+        if any(fresh[key] != manifest[key] for key in ('tables', 'schema_hash')):
+            raise OperationError('checksum_mismatch')
+        publish(fd, temporary, destination, fresh)
+    return result
 
 
 class SafeParser(argparse.ArgumentParser):
@@ -202,16 +282,14 @@ def main(argv=None):
         else:
             if args.destination is None:
                 raise OperationError()
-            if args.operation == 'restore':
-                # Destination refusals stay plain; then refuse any unverifiable source.
-                refuse_destination(Path(args.source).resolve(strict=True),
-                                   Path(args.destination).absolute())
-                verify(args.source)
-            result = backup(args.source, args.destination)
+            # Restore refuses destination problems and unverifiable sources, then
+            # copies the verified bytes themselves (never a re-serialisation).
+            operation = restore if args.operation == 'restore' else backup
+            result = operation(args.source, args.destination)
     except OperationError as error:
         fail(error.code)
         return 1
-    except (OSError, sqlite3.Error, ValueError):
+    except Exception:  # fail closed and quiet: never print a traceback or a path
         fail(None)
         return 1
     print(json.dumps(result, sort_keys=True))
