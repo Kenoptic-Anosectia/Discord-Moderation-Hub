@@ -32,7 +32,9 @@ impl DeletedBy {
     pub fn field_text(&self) -> String {
         match self {
             DeletedBy::Executor(id) => format!("<@{id}>"),
-            DeletedBy::User => "User".to_string(),
+            // Owner rule (Ava, 2026-11-18): an audit entry found -> its executor; no entry ->
+            // `User (assumed)`, because nothing in the audit log points to anyone else.
+            DeletedBy::User => "User (assumed)".to_string(),
             DeletedBy::BotAuthor => "Bot (author)".to_string(),
             DeletedBy::AuditUnavailable => "Unknown (audit log unavailable)".to_string(),
             DeletedBy::NotCached => "Unknown (message not cached)".to_string(),
@@ -122,6 +124,13 @@ impl LastSeenCounts {
 /// else it is baselined as fully given. The map also tracks the last observed count; pending
 /// credits are spendable only while the entry is fresh, its count rose, or it was active within
 /// `CREDIT_TTL_MS`. Failed lookups consume nothing and are never `User`.
+///
+/// When several matching entries have a pending credit, an entry whose count ROSE since the
+/// last observation wins: the rise is the only per-deletion evidence the audit log gives, so
+/// it identifies the executor of this deletion. Only if no entry rose do the leftover credits
+/// of older bursts decide (most pending credits, then the freshest entry id). A deletion by
+/// one moderator is therefore never credited to a different moderator just because that other
+/// moderator left surplus credits behind.
 pub fn attribute_deletion(
     author_id: u64,
     author_is_bot: bool,
@@ -135,8 +144,14 @@ pub fn attribute_deletion(
         Err(AuditLookupFailed) => return DeletedBy::AuditUnavailable,
     };
 
-    // best = (pending credits, entry id, executor)
-    let mut best: Option<(u64, u64, u64)> = None;
+    // best = (count rose, pending credits, entry id, executor)
+    //
+    // The count rise is the only per-deletion evidence Discord gives: an entry whose count
+    // increased since the bot last observed it records a NEW deletion by that executor. An
+    // entry whose count merely stayed the same only has leftover surplus credits from an
+    // earlier burst, so it must never outrank an entry that actually rose - otherwise a
+    // moderator's deletion is credited to a different moderator.
+    let mut best: Option<(bool, u64, u64, u64)> = None;
     for e in entries {
         let matches = e.target_id == Some(author_id) && e.channel_id == Some(channel_id);
         if !matches {
@@ -177,13 +192,13 @@ pub fn attribute_deletion(
         if pending == 0 {
             continue;
         }
-        if best.is_none_or(|b| (pending, e.id) > (b.0, b.1)) {
-            best = Some((pending, e.id, e.executor_id));
+        if best.is_none_or(|b| (rose, pending, e.id) > (b.0, b.1, b.2)) {
+            best = Some((rose, pending, e.id, e.executor_id));
         }
     }
 
     match best {
-        Some((_, id, executor)) => {
+        Some((_, _, id, executor)) => {
             // Consume exactly one credit from the chosen entry only.
             if let Some(mut st) = seen.state(id) {
                 st.given += 1;
@@ -218,6 +233,19 @@ mod tests {
         }
     }
 
+    /// An entry with an explicit creation timestamp, for sequences that are observed at a
+    /// later point in time than `NOW`.
+    fn entry_at(id: u64, exec: u64, count: u64, created_ms: u64) -> AuditEntryLite {
+        AuditEntryLite {
+            id,
+            executor_id: exec,
+            target_id: Some(AUTHOR),
+            channel_id: Some(CHAN),
+            count,
+            created_ms,
+        }
+    }
+
     fn run(is_bot: bool, entries: &[AuditEntryLite], seen: &mut LastSeenCounts) -> DeletedBy {
         attribute_deletion(AUTHOR, is_bot, CHAN, NOW, Ok(entries), seen)
     }
@@ -235,8 +263,67 @@ mod tests {
         let mut seen = LastSeenCounts::new();
         assert_eq!(run(false, &[], &mut seen), DeletedBy::User);
         assert_eq!(run(true, &[], &mut seen), DeletedBy::BotAuthor);
-        assert_eq!(DeletedBy::User.field_text(), "User");
+        // Owner rule (Ava, 2026-11-18): no audit entry -> the field says `User (assumed)`.
+        assert_eq!(DeletedBy::User.field_text(), "User (assumed)");
         assert_eq!(DeletedBy::BotAuthor.field_text(), "Bot (author)");
+    }
+
+    /// SF4 / audit CARD-011: a moderator's deletion is credited to the WRONG moderator.
+    ///
+    /// Exact event sequence:
+    /// 1. MOD_A bulk-deletes 5 messages by AUTHOR in CHAN -> audit entry id 10, count 5.
+    /// 2. The bot observes that entry: one credit is consumed, MOD_A is credited, and the
+    ///    entry keeps 4 surplus credits that stay spendable while it is active.
+    /// 3. Nine seconds later MOD_B deletes one more message by AUTHOR in CHAN. Discord
+    ///    creates a SEPARATE audit entry id 11, count 1, executor MOD_B.
+    /// 4. The bot's next lookup sees both entries. Entry 10's count did NOT change (no new
+    ///    deletion by MOD_A), while entry 11's count rose from never-seen to 1 - the direct
+    ///    evidence that MOD_B performed the deletion now being logged.
+    ///
+    /// The tie-break must follow that evidence, otherwise MOD_B's deletion is logged as
+    /// MOD_A's: a wrong accusation against a moderator.
+    #[test]
+    fn deletion_is_credited_to_the_moderator_whose_entry_count_rose() {
+        let mut seen = LastSeenCounts::new();
+
+        // Step 1+2: MOD_A's bulk delete is observed and credited. The entry was created
+        // 1s before NOW.
+        let a_only = [entry_at(10, MOD_A, 5, NOW - 1_000)];
+        assert_eq!(run(false, &a_only, &mut seen), DeletedBy::Executor(MOD_A));
+
+        // Step 3+4: MOD_B deletes another message of the same author in the same channel,
+        // 9s after the first lookup. Entry 10 is now 10s old (stale by id age) but still
+        // active (a credit was just consumed), so it keeps 4 surplus credits; entry 11 was
+        // created 0.5s ago and its count rose from never-seen to 1.
+        let later = NOW + 9_000;
+        let both = [
+            entry_at(10, MOD_A, 5, NOW - 1_000), // no new deletion by MOD_A: count unchanged
+            entry_at(11, MOD_B, 1, later - 500), // MOD_B deleted a message: count rose
+        ];
+        let credited = attribute_deletion(AUTHOR, false, CHAN, later, Ok(&both), &mut seen);
+        assert_eq!(
+            credited,
+            DeletedBy::Executor(MOD_B),
+            "the deletion whose audit entry count rose must be credited to its executor"
+        );
+    }
+
+    /// OWNER RULE (Ava, 2026-11-18): an audit entry found -> its executor; no entry -> the
+    /// field shows `User (assumed)`, because nothing in the audit log points to anyone else.
+    /// The enum variant and the attribution logic stay as they are; only the rendered text
+    /// of the unattributed case changes.
+    #[test]
+    fn unattributed_case_renders_user_assumed_and_attributed_case_renders_the_executor() {
+        // Unattributed: no audit entry at all -> `User (assumed)`.
+        let mut seen = LastSeenCounts::new();
+        assert_eq!(run(false, &[], &mut seen), DeletedBy::User);
+        assert_eq!(DeletedBy::User.field_text(), "User (assumed)");
+
+        // Attributed: a matching audit entry still renders its executor.
+        let mut seen = LastSeenCounts::new();
+        let e = [entry(1, MOD_A, 1, 1000)];
+        assert_eq!(run(false, &e, &mut seen), DeletedBy::Executor(MOD_A));
+        assert_eq!(DeletedBy::Executor(MOD_A).field_text(), "<@901>");
     }
 
     #[test]

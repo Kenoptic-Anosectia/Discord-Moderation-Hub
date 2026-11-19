@@ -381,10 +381,320 @@ mod tests {
         assert_eq!(registration["options"][0]["required"], true);
         assert_eq!(registration["options"][0]["type"], 6); // Discord USER option
     }
+
+    // ---------------------------------------------------------------------
+    // SF4: DM events must never reach the guild log channel.
+    //
+    // The logger's production routing seam is `guarded_log`: it runs the log-write sink
+    // only for events that are provably guild events. These tests drive that real seam
+    // with synthetic events whose guild id is absent (DM / group DM) and with the same
+    // events carrying a guild id, and observe whether the sink ran.
+    // ---------------------------------------------------------------------
+
+    /// Synthetic guild id used by the logger scope tests.
+    const SYNTHETIC_GUILD: u64 = 900_001;
+    /// Synthetic DM channel id used by the logger scope tests.
+    const SYNTHETIC_DM_CHANNEL: u64 = 900_002;
+    /// Synthetic guild channel id used by the logger scope tests.
+    const SYNTHETIC_GUILD_CHANNEL: u64 = 900_003;
+
+    /// A synthetic message-create event in the given channel, with the given guild id.
+    fn synthetic_message(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        let mut m = serenity::Message::default();
+        m.id = serenity::MessageId::new(900_010);
+        m.channel_id = serenity::ChannelId::new(ch);
+        m.guild_id = guild.map(serenity::GuildId::new);
+        m.content = "SYNTHETIC private DM text".to_string();
+        serenity::FullEvent::Message { new_message: m }
+    }
+
+    /// A synthetic message-update event in the given channel, with the given guild id.
+    fn synthetic_update(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        let mut payload = serde_json::json!({
+            "id": "900011",
+            "channel_id": ch.to_string(),
+            "content": "SYNTHETIC private DM text",
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        serenity::FullEvent::MessageUpdate {
+            old_if_available: None,
+            new: None,
+            event: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    /// A synthetic message-delete event in the given channel, with the given guild id.
+    fn synthetic_delete(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        serenity::FullEvent::MessageDelete {
+            channel_id: serenity::ChannelId::new(ch),
+            deleted_message_id: serenity::MessageId::new(900_012),
+            guild_id: guild.map(serenity::GuildId::new),
+        }
+    }
+
+    /// A synthetic bulk-delete event in the given channel, with the given guild id.
+    fn synthetic_bulk_delete(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        serenity::FullEvent::MessageDeleteBulk {
+            channel_id: serenity::ChannelId::new(ch),
+            multiple_deleted_messages_ids: vec![serenity::MessageId::new(900_013)],
+            guild_id: guild.map(serenity::GuildId::new),
+        }
+    }
+
+    /// A synthetic voice-state event with the given guild id.
+    fn synthetic_voice(guild: Option<u64>) -> serenity::FullEvent {
+        let mut payload = serde_json::json!({
+            "user_id": "900014",
+            "session_id": "synthetic",
+            "deaf": false,
+            "mute": false,
+            "self_deaf": false,
+            "self_mute": false,
+            "self_video": false,
+            "suppress": false,
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        serenity::FullEvent::VoiceStateUpdate {
+            old: None,
+            new: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    /// A synthetic invite-create event for the given channel, with the given guild id.
+    fn synthetic_invite_create(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        let mut payload = serde_json::json!({
+            "channel_id": ch.to_string(),
+            "code": "SYNTHETIC",
+            "created_at": "2026-01-01T00:00:00Z",
+            "max_age": 0,
+            "max_uses": 0,
+            "temporary": false,
+            "uses": 0,
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        serenity::FullEvent::InviteCreate {
+            data: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    /// A synthetic invite-delete event for the given channel, with the given guild id.
+    fn synthetic_invite_delete(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        let mut payload = serde_json::json!({
+            "channel_id": ch.to_string(),
+            "code": "SYNTHETIC",
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        serenity::FullEvent::InviteDelete {
+            data: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    /// A synthetic reaction-add event for the given channel, with the given guild id.
+    fn synthetic_reaction(ch: u64, guild: Option<u64>) -> serenity::FullEvent {
+        let mut payload = serde_json::json!({
+            "channel_id": ch.to_string(),
+            "message_id": "900015",
+            "user_id": "900016",
+            "emoji": {"name": "x"},
+            "burst": false,
+            "burst_colours": [],
+            "type": 0,
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        serenity::FullEvent::ReactionAdd {
+            add_reaction: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    /// Every logger path that can see an event with no guild id (DM / group DM).
+    fn synthetic_dm_events() -> Vec<serenity::FullEvent> {
+        vec![
+            synthetic_message(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_update(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_delete(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_bulk_delete(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_voice(None),
+            synthetic_invite_create(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_invite_delete(SYNTHETIC_DM_CHANNEL, None),
+            synthetic_reaction(SYNTHETIC_DM_CHANNEL, None),
+        ]
+    }
+
+    /// The same logger paths carrying a guild id: these are ordinary guild events.
+    fn synthetic_guild_events() -> Vec<serenity::FullEvent> {
+        vec![
+            synthetic_message(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_update(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_delete(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_bulk_delete(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_voice(Some(SYNTHETIC_GUILD)),
+            synthetic_invite_create(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_invite_delete(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+            synthetic_reaction(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD)),
+        ]
+    }
+
+    /// Drives the REAL production routing seam and reports how often the log-write sink ran.
+    async fn sink_runs(event: &serenity::FullEvent) -> (usize, bool) {
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let out = guarded_log(event, || async {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        (
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            out.is_some(),
+        )
+    }
+
+    /// Proves an event with no guild id (DM / group DM) never reaches the guild log channel:
+    /// the production seam performs zero log writes for every logger path that can see one.
+    /// Fails if any DM path starts writing to the log channel again.
+    #[tokio::test]
+    async fn dm_events_never_reach_the_guild_log_channel() {
+        for ev in synthetic_dm_events() {
+            let (runs, ran) = sink_runs(&ev).await;
+            assert_eq!(runs, 0, "DM event must not write to the log channel");
+            assert!(!ran, "DM event must not run the log sink");
+        }
+    }
+
+    /// Proves the fix does not silence ordinary guild logging: the same paths carrying a
+    /// guild id still run the log-write sink exactly once. Fails if the guard is too broad.
+    #[tokio::test]
+    async fn guild_events_still_reach_the_guild_log_channel() {
+        for ev in synthetic_guild_events() {
+            let (runs, ran) = sink_runs(&ev).await;
+            assert_eq!(runs, 1, "guild event must still write to the log channel");
+            assert!(ran, "guild event must still run the log sink");
+        }
+    }
+
+    /// Proves the content-bearing DM path (message edit) is skipped, so the DM's before and
+    /// after text can never be mirrored into the guild log channel. Fails if the update arm
+    /// starts handling DM events again.
+    #[tokio::test]
+    async fn dm_message_update_never_mirrors_content_into_the_log_channel() {
+        let dm_update = synthetic_update(SYNTHETIC_DM_CHANNEL, None);
+        let (runs, _) = sink_runs(&dm_update).await;
+        assert_eq!(runs, 0);
+
+        // The same edit in a guild is still logged.
+        let guild_update = synthetic_update(SYNTHETIC_GUILD_CHANNEL, Some(SYNTHETIC_GUILD));
+        let (runs, _) = sink_runs(&guild_update).await;
+        assert_eq!(runs, 1);
+    }
+
+    /// Proves the DM message-delete path is skipped, so cached DM content can never be
+    /// mirrored into the guild log channel. Fails if the delete arm handles DMs again.
+    #[tokio::test]
+    async fn dm_message_delete_never_mirrors_cached_content_into_the_log_channel() {
+        let (runs, _) = sink_runs(&synthetic_delete(SYNTHETIC_DM_CHANNEL, None)).await;
+        assert_eq!(runs, 0);
+        let (runs, _) = sink_runs(&synthetic_bulk_delete(SYNTHETIC_DM_CHANNEL, None)).await;
+        assert_eq!(runs, 0);
+
+        let (runs, _) = sink_runs(&synthetic_delete(
+            SYNTHETIC_GUILD_CHANNEL,
+            Some(SYNTHETIC_GUILD),
+        ))
+        .await;
+        assert_eq!(runs, 1);
+        let (runs, _) = sink_runs(&synthetic_bulk_delete(
+            SYNTHETIC_GUILD_CHANNEL,
+            Some(SYNTHETIC_GUILD),
+        ))
+        .await;
+        assert_eq!(runs, 1);
+    }
+
+    /// Proves a DM message-create event is not cached for later mirroring: the production
+    /// seam skips it, so no DM content is retained for a later log write. Fails if the
+    /// create path starts handling DM events again.
+    #[tokio::test]
+    async fn dm_message_create_is_not_cached_for_later_mirroring() {
+        let (runs, _) = sink_runs(&synthetic_message(SYNTHETIC_DM_CHANNEL, None)).await;
+        assert_eq!(runs, 0);
+        let (runs, _) = sink_runs(&synthetic_message(
+            SYNTHETIC_GUILD_CHANNEL,
+            Some(SYNTHETIC_GUILD),
+        ))
+        .await;
+        assert_eq!(runs, 1);
+    }
 }
 
 fn build_log_footer() -> CreateEmbedFooter {
     CreateEmbedFooter::new("SKYNET // NETWORK CORE • Logger")
+}
+
+/// Guild scope of an event, for the guild log channel.
+///
+/// The guild log channel is a shared staff channel. Only an event that is provably a guild
+/// event may be written there: an event with no guild id (a DM or group DM) is private and
+/// must never appear in a staff channel, not even without its message body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildScope {
+    /// The payload proves a guild id: the event may be written to the guild log channel.
+    Guild,
+    /// The payload carries no guild id (a DM or group DM): the event must never be written
+    /// to the guild log channel, and its content must never appear there.
+    NotGuild,
+}
+
+/// Classifies an event for the guild log channel.
+///
+/// Fails closed: an event is `Guild` only when its payload proves a guild id. A DM or group
+/// DM carries none and is `NotGuild`. Interaction events are not channel-logging paths (the
+/// ticket runtime handles them and they never write to the log channel), so they stay
+/// `Guild` and are not affected by this guard.
+fn guild_scope(event: &serenity::FullEvent) -> GuildScope {
+    let guild_id = match event {
+        serenity::FullEvent::Message { new_message } => new_message.guild_id,
+        serenity::FullEvent::MessageUpdate { event, new, .. } => event
+            .guild_id
+            .or_else(|| new.as_ref().and_then(|m| m.guild_id)),
+        serenity::FullEvent::MessageDelete { guild_id, .. } => *guild_id,
+        serenity::FullEvent::MessageDeleteBulk { guild_id, .. } => *guild_id,
+        serenity::FullEvent::VoiceStateUpdate { new, .. } => new.guild_id,
+        serenity::FullEvent::InviteCreate { data } => data.guild_id,
+        serenity::FullEvent::InviteDelete { data } => data.guild_id,
+        serenity::FullEvent::ReactionAdd { add_reaction } => add_reaction.guild_id,
+        serenity::FullEvent::ReactionRemove { removed_reaction } => removed_reaction.guild_id,
+        // Everything else (roles, members, channels, threads, interactions) is a guild-only
+        // event or is not a channel-logging path at all.
+        _ => return GuildScope::Guild,
+    };
+    match guild_id {
+        Some(_) => GuildScope::Guild,
+        None => GuildScope::NotGuild,
+    }
+}
+
+/// Production routing seam for the general logger.
+///
+/// Runs the sink only for events that are provably guild events. An event with no guild id
+/// (a DM or group DM) is skipped, so neither its metadata nor its content can reach the
+/// guild log channel. The sink runs at most once.
+async fn guarded_log<F, Fut, T>(event: &serenity::FullEvent, sink: F) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if guild_scope(event) == GuildScope::NotGuild {
+        return None;
+    }
+    Some(sink().await)
 }
 
 async fn log_to_channel_with_files(
@@ -1262,6 +1572,22 @@ async fn event_handler(
 }
 
 async fn log_event(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    data: &Data,
+) -> Result<(), Error> {
+    // Fail closed: an event with no guild id (a DM or group DM) is never a guild event and
+    // must not reach the guild log channel. Its content must never appear there either, so
+    // the whole logger body - cache insertion, embed construction and the log write - runs
+    // only behind this guard.
+    let outcome = guarded_log(event, || log_event_body(ctx, event, data)).await;
+    outcome.unwrap_or(Ok(()))
+}
+
+/// The general logger body: builds the log embed and writes it to the guild log channel.
+///
+/// Only reached for events that are provably guild events (see `guarded_log`).
+async fn log_event_body(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
     data: &Data,
