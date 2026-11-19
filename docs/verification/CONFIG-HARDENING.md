@@ -20,7 +20,7 @@ error, so it walked up and loaded another `.env`. It is deleted; `dotenvy::doten
 The search tests drive a child process in its own working directory: the loader returns the file dotenvy finds; a broken nearest file is an 
 error.
 **Limit of the round-2 evidence.** They also pass against the old `is_file` walk, so RED commit `3fdc7d2` is green: they cannot tell the 
-old walk from `dotenvy::dotenv()` here. The `PermissionDenied` fail-open path was verified only by a reviewer.s out-of-tree ACL probe, not 
+old walk from `dotenvy::dotenv()` here. The `PermissionDenied` fail-open path was verified only by a reviewer's out-of-tree ACL probe, not 
 by a repo test; round 2 is structural hardening whose only in-repo evidence is the round-1 RED.
 **NOT fixed / limits.** A malformed `.env` line still lets the variables *before* it be loaded (verified: `BEFORE=loaded`, `AFTER=none` and 
 a bad third line leaves both set, then errors); pre-existing dotenvy behaviour, and its error text never reaches output (`env_file_error` 
