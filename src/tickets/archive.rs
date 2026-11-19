@@ -161,7 +161,8 @@ pub fn esc(s: &str) -> String {
 }
 /// Per-message text budget: writes escaped text straight into the transcript (no intermediate
 /// copies), cutting at a char boundary and appending [`TRUNCATION_MARKER`] once the budget is
-/// spent. The budget counts raw (pre-escape) bytes, so escaped output is at most 6x the cap.
+/// spent. The budget counts ESCAPED output bytes, so escaped text cannot exceed the cap; truncation
+/// stops before the first escape unit (e.g. `&quot;`) that does not fit.
 struct MsgText {
     start: usize,
     left: usize,
@@ -178,7 +179,7 @@ impl MsgText {
             cut: false,
         }
     }
-    /// Raw bytes consumed so far (to be deducted from the transcript total).
+    /// Escaped bytes consumed so far (to be deducted from the transcript total).
     fn used(&self) -> usize {
         self.start - self.left
     }

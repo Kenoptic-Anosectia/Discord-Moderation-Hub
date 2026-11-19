@@ -731,11 +731,7 @@ async fn total_transcript_text_is_capped_and_all_ids_remain() {
     let out = publish(&root, &input(&m, &d, 1)).unwrap();
     let dir = root.path().join(&out.dir_name);
     let html = std::fs::read_to_string(dir.join("transcript.html")).unwrap();
-    assert!(
-        html.len() < MAX_TRANSCRIPT_TEXT_BYTES + n * 1024,
-        "transcript {} bytes not bounded",
-        html.len()
-    );
+    assert_text_and_markup_bounded(&html, &m, n);
     assert!(html.contains(TRUNCATION_MARKER));
     let ids: Vec<u64> = m.iter().map(|x| x.id.get()).collect();
     assert_eq!(out.messages as usize, n);
@@ -788,16 +784,64 @@ fn total_cap_counts_escaped_bytes_for_quote_and_ampersand() {
             x.content = ch.to_string().repeat(MAX_MESSAGE_TEXT_BYTES);
         }
         let h = render_transcript(7, &msgs, &[]);
-        assert!(
-            h.len() < MAX_TRANSCRIPT_TEXT_BYTES + n * 1024,
-            "{ch}: rendered {} bytes not bounded",
-            h.len()
-        );
-        assert!(h.len() < 64 * 1024 * 1024);
+        assert_text_and_markup_bounded(&h, &msgs, n);
         assert!(h.contains(TRUNCATION_MARKER));
         for x in &msgs {
             assert!(h.contains(&format!("data-mid=\"{}\"", x.id.get())));
         }
+    }
+}
+
+/// Sum of the escaped text inside every `<pre>` (truncation markers excluded).
+fn pre_text_len(h: &str) -> usize {
+    let mut total = 0;
+    let mut rest = h;
+    while let Some(a) = rest.find("<pre>") {
+        let body = &rest[a + 5..];
+        let e = body.find("</pre>").unwrap();
+        total += body[..e].len();
+        rest = &body[e..];
+    }
+    total - h.matches(TRUNCATION_MARKER).count() * TRUNCATION_MARKER.len()
+}
+
+/// Asserts only what the code enforces: escaped text <= MAX_TRANSCRIPT_TEXT_BYTES, and rendered
+/// length <= cap + a named markup allowance (the same fixture rendered with empty text) + one
+/// truncation marker per message. Markup itself is NOT capped (follow-up SF5).
+fn assert_text_and_markup_bounded(html: &str, msgs: &[Message], n: usize) {
+    assert!(pre_text_len(html) <= MAX_TRANSCRIPT_TEXT_BYTES);
+    let mut empty = msgs.to_vec();
+    for x in empty.iter_mut() {
+        x.content.clear();
+    }
+    let markup_allowance = render_transcript(7, &empty, &[]).len();
+    let allowed = MAX_TRANSCRIPT_TEXT_BYTES + markup_allowance + n * TRUNCATION_MARKER.len();
+    assert!(
+        html.len() <= allowed,
+        "rendered {} > allowed {}",
+        html.len(),
+        allowed
+    );
+}
+
+/// `esc_len`/`esc_char` are hand-kept copies of the `esc` table: they must agree everywhere.
+#[test]
+fn esc_len_and_esc_char_match_esc_for_every_char() {
+    let mut chars: Vec<char> = (0u32..=0x07FF).filter_map(char::from_u32).collect();
+    chars.extend([
+        '\u{800}',
+        '\u{FFFF}',
+        '\u{10000}',
+        '\u{10FFFF}',
+        '\u{FEFF}',
+        'é',
+        '😀',
+    ]);
+    for c in chars {
+        let mut o = String::new();
+        esc_char(&mut o, c);
+        assert_eq!(esc_len(c), o.len(), "esc_len drift for {c:?}");
+        assert_eq!(o, esc(&c.to_string()), "esc_char drift for {c:?}");
     }
 }
 
