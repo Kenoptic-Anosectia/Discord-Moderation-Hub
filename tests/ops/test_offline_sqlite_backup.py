@@ -292,5 +292,154 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(list(actual.iterdir()), [])
 
 
+SCRATCH = Path(__file__).resolve().parents[2] / 'target' / 'sf1-backup-tool-tests'
+
+
+class HardeningTests(unittest.TestCase):
+    """WAL completeness (finding 1) and manifest verification (finding 2)."""
+
+    def setUp(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=SCRATCH)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / 'synthetic.sqlite'
+        self.destination = self.root / 'backup.sqlite'
+        self.manifest = Path(str(self.destination) + '.manifest.json')
+        with closing(sqlite3.connect(self.source)) as db:
+            db.executescript(
+                'CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);'
+                'CREATE TABLE child(id INTEGER PRIMARY KEY,'
+                ' parent_id INTEGER REFERENCES parent(id), note TEXT);')
+            db.executemany('INSERT INTO parent VALUES (?, ?)', [(1, 'a'), (2, 'b')])
+            db.executemany('INSERT INTO child VALUES (?, ?, ?)',
+                           [(1, 1, 'x'), (2, 2, 'y')])
+            db.commit()
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, str(TOOL), *map(str, args)],
+                              capture_output=True, text=True, timeout=15)
+
+    def code(self, result):
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, '')
+        body = json.loads(result.stderr)
+        self.assertEqual(body['status'], 'failed')
+        return body.get('code')
+
+    def make_backup(self):
+        result = self.cli('backup', self.source, self.destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cli('verify', self.destination).returncode, 0)
+
+    def rehash(self):
+        """Model an attacker who also rewrites the manifest checksum."""
+        data = json.loads(self.manifest.read_text())
+        data['sha256'] = hashlib.sha256(self.destination.read_bytes()).hexdigest()
+        self.manifest.write_text(json.dumps(data))
+
+    def edit(self, sql):
+        with closing(sqlite3.connect(self.destination)) as db:
+            db.execute('PRAGMA foreign_keys=OFF')
+            db.execute(sql)
+            db.commit()
+
+    def test_wal_only_rows_are_in_backup_and_manifest(self):
+        with closing(sqlite3.connect(self.source)) as writer:
+            self.assertEqual(writer.execute('PRAGMA journal_mode=WAL').fetchone(), ('wal',))
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute('INSERT INTO parent VALUES (3, ?)', ('wal-only-a',))
+            writer.execute('INSERT INTO child VALUES (3, 3, ?)', ('wal-only-b',))
+            writer.commit()
+            self.assertGreater(Path(str(self.source) + '-wal').stat().st_size, 0)
+            self.make_backup()
+        with closing(sqlite3.connect(self.destination)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM parent').fetchone(), (3,))
+            self.assertEqual(db.execute('SELECT count(*) FROM child').fetchone(), (3,))
+        self.assertEqual(json.loads(self.manifest.read_text())['tables'],
+                         {'child': 3, 'parent': 3})
+
+    def test_wal_without_shm_is_refused_not_read_immutable(self):
+        wal = Path(str(self.source) + '-wal')
+        shm = Path(str(self.source) + '-shm')
+        kept = self.root / 'kept-wal.bin'
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute('INSERT INTO parent VALUES (3, ?)', ('wal-only',))
+            writer.commit()
+            kept.write_bytes(wal.read_bytes())
+        # Writer closed: sidecars are gone. Recreate a WAL holding committed
+        # frames but no shm; it must be refused, never read as immutable.
+        wal.write_bytes(kept.read_bytes())
+        shm.unlink(missing_ok=True)
+        result = self.cli('backup', self.source, self.destination)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.destination.exists())
+
+    def test_backup_writes_manifest(self):
+        self.make_backup()
+        data = json.loads(self.manifest.read_text())
+        self.assertEqual(data['sha256'], hashlib.sha256(self.destination.read_bytes()).hexdigest())
+        self.assertEqual(data['tables'], {'child': 2, 'parent': 2})
+        self.assertRegex(data['schema_hash'], r'^[0-9a-f]{64}$')
+        self.assertTrue(data['tool_version'])
+        self.assertTrue(data['source_hint'])
+        self.assertNotIn('synthetic', self.manifest.read_text())
+
+    def test_existing_manifest_is_refused_and_preserved(self):
+        self.manifest.write_bytes(b'owned-sentinel')
+        self.assertEqual(self.cli('backup', self.source, self.destination).returncode, 1)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.manifest.read_bytes(), b'owned-sentinel')
+
+    def test_flipped_byte_fails_checksum(self):
+        self.make_backup()
+        data = bytearray(self.destination.read_bytes())
+        data[-1] ^= 0xFF
+        self.destination.write_bytes(bytes(data))
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'checksum_mismatch')
+
+    def test_deleted_row_fails_row_counts(self):
+        self.make_backup()
+        self.edit('DELETE FROM child WHERE id=2')
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'checksum_mismatch')
+        self.rehash()
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'row_count_mismatch')
+
+    def test_foreign_key_violation_fails(self):
+        self.make_backup()
+        self.edit('UPDATE child SET parent_id=99 WHERE id=2')
+        self.rehash()
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'foreign_key_violation')
+
+    def test_foreign_database_fails(self):
+        self.make_backup()
+        foreign = self.root / 'foreign.sqlite'
+        with closing(sqlite3.connect(foreign)) as db:
+            db.execute('CREATE TABLE other(id INTEGER PRIMARY KEY)')
+            db.commit()
+        self.destination.write_bytes(foreign.read_bytes())
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'checksum_mismatch')
+        self.rehash()
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'schema_mismatch')
+
+    def test_missing_and_malformed_manifest(self):
+        self.make_backup()
+        self.manifest.write_text('{"sha256": "private-marker"')
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'manifest_invalid')
+        self.manifest.write_text('{"tables": 1}')
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'manifest_invalid')
+        self.manifest.unlink()
+        self.assertEqual(self.code(self.cli('verify', self.destination)), 'manifest_missing')
+
+    def test_failures_never_echo_private_content(self):
+        self.make_backup()
+        self.edit("UPDATE parent SET name='private-marker' WHERE id=1")
+        result = self.cli('verify', self.destination)
+        self.assertNotIn('private-marker', result.stdout + result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
