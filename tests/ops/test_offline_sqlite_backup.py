@@ -34,7 +34,7 @@ class BackupTests(unittest.TestCase):
         self.destination = self.root / 'backup.sqlite'
 
     def cli(self, *args):
-        return subprocess.run([sys.executable, str(TOOL), *map(str, args)],
+        return subprocess.run([sys.executable, '-B', str(TOOL), *map(str, args)],
                               capture_output=True, text=True, timeout=15)
 
     def snapshot(self, path):
@@ -320,7 +320,7 @@ class HardeningTests(unittest.TestCase):
             db.commit()
 
     def cli(self, *args):
-        return subprocess.run([sys.executable, str(TOOL), *map(str, args)],
+        return subprocess.run([sys.executable, '-B', str(TOOL), *map(str, args)],
                               capture_output=True, text=True, timeout=15)
 
     def code(self, result):
@@ -576,6 +576,32 @@ class FollowupTests(unittest.TestCase):
         self.assertEqual(json.loads(err), {'code': 'checksum_mismatch', 'status': 'failed'})
         self.assert_nothing_published(self.restored)
 
+    def test_restore_refuses_source_and_manifest_pair_swapped_after_verify(self):
+        module = self.module()
+        real_verify = module.verify
+        bad = self.root / 'bad.sqlite'
+        with closing(sqlite3.connect(bad)) as db:
+            db.execute('CREATE TABLE parent(id INTEGER PRIMARY KEY)')
+            db.execute('CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id))')
+            db.execute('INSERT INTO child VALUES (1, 99)')
+            db.commit()
+        badcopy = self.root / 'badcopy.sqlite'
+        module.backup(bad, badcopy)  # backup does not run foreign_key_check
+        self.assertRaises(module.OperationError, module.verify, badcopy)
+
+        def verify_then_swap_pair(path):
+            result = real_verify(path)
+            self.backup_file.write_bytes(badcopy.read_bytes())
+            module.manifest_path(self.backup_file).write_bytes(
+                module.manifest_path(badcopy).read_bytes())
+            return result
+
+        with mock.patch.object(module, 'verify', verify_then_swap_pair):
+            code, out, err = self.run_main(module, 'restore', self.backup_file, self.restored)
+        self.assertEqual((code, out), (1, ''))
+        self.assertEqual(json.loads(err)['status'], 'failed')
+        self.assert_nothing_published(self.restored)
+
     def test_restore_output_is_byte_identical_to_verified_source(self):
         module = self.module()
         code, _, err = self.run_main(module, 'restore', self.backup_file, self.restored)
@@ -692,7 +718,7 @@ class FollowupTests(unittest.TestCase):
             'def boom(*a): raise RuntimeError(sys.argv[2] + "private-marker")\n'
             'm.verify = boom\n'
             'sys.exit(m.main(["verify", sys.argv[2]]))\n')
-        result = subprocess.run([sys.executable, str(runner), str(TOOL), str(self.backup_file)],
+        result = subprocess.run([sys.executable, '-B', str(runner), str(TOOL), str(self.backup_file)],
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(json.loads(result.stderr), {'status': 'failed'})
