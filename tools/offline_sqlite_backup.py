@@ -114,6 +114,9 @@ def load_manifest(path):
 def verify(path):
     """Recompute everything the manifest claims; each failure has its own code."""
     path = Path(path).resolve(strict=True)
+    # The checksum covers only the main file; a planted sidecar would overlay it.
+    if any(os.path.lexists(str(path) + suffix) for suffix in ('-wal', '-shm', '-journal')):
+        raise OperationError('sidecar_present')
     with closing(open_source(path)) as db:
         try:
             manifest = load_manifest(path)
@@ -132,15 +135,19 @@ def verify(path):
     return result
 
 
-def backup(source, destination):
-    source = Path(source).resolve(strict=True)
-    destination = Path(destination).absolute()
+def refuse_destination(source, destination):
     if (any(p.is_symlink() or p.is_junction()
             for p in (destination, *destination.parents))
             or any(os.path.lexists(str(destination) + suffix)
             for suffix in ('', '-wal', '-shm', '-journal', MANIFEST_SUFFIX))
             or destination.resolve() == source):
         raise OperationError()
+
+
+def backup(source, destination):
+    source = Path(source).resolve(strict=True)
+    destination = Path(destination).absolute()
+    refuse_destination(source, destination)
     temporary = None
     published = False
     try:
@@ -195,6 +202,11 @@ def main(argv=None):
         else:
             if args.destination is None:
                 raise OperationError()
+            if args.operation == 'restore':
+                # Destination refusals stay plain; then refuse any unverifiable source.
+                refuse_destination(Path(args.source).resolve(strict=True),
+                                   Path(args.destination).absolute())
+                verify(args.source)
             result = backup(args.source, args.destination)
     except OperationError as error:
         fail(error.code)
