@@ -126,13 +126,27 @@ def verify(path):
             raise
         if file_sha256(path) != manifest['sha256']:
             raise OperationError('checksum_mismatch')
-        result = check(db)
-        if schema_hash(db) != manifest['schema_hash']:
-            raise OperationError('schema_mismatch')
-        if table_counts(db) != manifest['tables']:
-            raise OperationError('row_count_mismatch')
-        if db.execute('PRAGMA foreign_key_check').fetchall():
-            raise OperationError('foreign_key_violation')
+        result = check_against(db, manifest)
+    return Verified(result, manifest)
+
+
+class Verified(dict):
+    """verify's result, carrying the exact manifest it checked."""
+
+    def __init__(self, result, manifest):
+        super().__init__(result)
+        self.manifest = manifest
+
+
+def check_against(db, manifest):
+    """The full verify check set (everything except the file hash) for one manifest."""
+    result = check(db)
+    if schema_hash(db) != manifest['schema_hash']:
+        raise OperationError('schema_mismatch')
+    if table_counts(db) != manifest['tables']:
+        raise OperationError('row_count_mismatch')
+    if db.execute('PRAGMA foreign_key_check').fetchall():
+        raise OperationError('foreign_key_violation')
     return result
 
 
@@ -240,16 +254,13 @@ def restore(source, destination):
     source = Path(source).resolve(strict=True)
     destination = Path(destination).absolute()
     refuse_destination(source, destination)
-    verify(source)
-    manifest = load_manifest(source)
+    manifest = verify(source).manifest  # the one manifest that was checked
     with staging(destination) as (fd, temporary):
         copy_verified(source, fd, manifest['sha256'])
         uri = temporary.as_uri() + '?mode=ro&immutable=1'
         with closing(sqlite3.connect(uri, uri=True, timeout=5)) as copy:
-            result = check(copy)
+            result = check_against(copy, manifest)
             fresh = build_manifest(copy, manifest['sha256'], source)
-        if any(fresh[key] != manifest[key] for key in ('tables', 'schema_hash')):
-            raise OperationError('checksum_mismatch')
         publish(fd, temporary, destination, fresh)
     return result
 
