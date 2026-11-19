@@ -2602,7 +2602,7 @@ fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    match dotenvy::dotenv_override() {
+    match config::load_env() {
         Ok(path) => println!("Loaded .env from: {}", path.display()),
         Err(err) => println!("Could not load .env: {}", err),
     }

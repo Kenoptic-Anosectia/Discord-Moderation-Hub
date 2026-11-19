@@ -1,3 +1,5 @@
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::{env, ffi::OsStr};
 
 use crate::tickets::{
@@ -5,6 +7,69 @@ use crate::tickets::{
     retention::{parse_retention, RetentionPolicy, RETENTION_DAYS_KEY},
 };
 use crate::Error;
+
+/// Name of the environment file the bot looks for.
+pub const ENV_FILE_NAME: &str = ".env";
+
+/// Why the environment file could not be loaded.
+///
+/// The variants are stable codes: they never carry the offending value or any
+/// other user supplied text, so the reason can be logged safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvFileError {
+    /// No environment file was found in the start directory or any of its parents.
+    NotFound,
+    /// An environment file was found but it could not be read or parsed.
+    Unreadable,
+}
+
+impl fmt::Display for EnvFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(
+                f,
+                "no {} file was found in the working directory or any parent directory",
+                ENV_FILE_NAME
+            ),
+            Self::Unreadable => write!(f, "the {} file could not be read", ENV_FILE_NAME),
+        }
+    }
+}
+
+impl std::error::Error for EnvFileError {}
+
+/// Loads the environment file for the current working directory.
+///
+/// See [`load_env_from`] for the precedence rules.
+pub fn load_env() -> Result<PathBuf, EnvFileError> {
+    let start = env::current_dir().map_err(|_| EnvFileError::Unreadable)?;
+    load_env_from(&start)
+}
+
+/// Loads the nearest environment file, starting at `start` and walking up to the
+/// filesystem root.
+///
+/// The values in the file are applied to the process environment, replacing any
+/// value that the environment already holds.
+pub fn load_env_from(start: &Path) -> Result<PathBuf, EnvFileError> {
+    let path = find_env_file(start).ok_or(EnvFileError::NotFound)?;
+    dotenvy::from_path_override(&path).map_err(|_| EnvFileError::Unreadable)?;
+    Ok(path)
+}
+
+/// Finds the nearest environment file, starting at `start` and walking up to the
+/// filesystem root.
+fn find_env_file(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(directory) = current {
+        let candidate = directory.join(ENV_FILE_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        current = directory.parent();
+    }
+    None
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -106,6 +171,190 @@ fn parse_staff_role(raw: Option<&str>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    /// Set on the child process so it knows it is the helper and not the driver.
+    const CHILD_MARKER: &str = "SF3_CONFIG_TEST_CHILD";
+
+    /// Synthetic variable that the driver exports and the environment file also sets.
+    const REAL_ENV_SENTINEL: &str = "SF3_REAL_ENV_SENTINEL";
+
+    /// Synthetic variable that only the environment file sets.
+    const FILE_ONLY_SENTINEL: &str = "SF3_FILE_ONLY_SENTINEL";
+
+    /// Scratch directory for this card's temporary files.
+    fn scratch_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("t_86edb88e-tests")
+    }
+
+    fn is_child() -> bool {
+        env::var_os(CHILD_MARKER).is_some()
+    }
+
+    /// Runs one test of this binary in a child process with `vars` in its environment.
+    ///
+    /// The child process is used because the environment is process global state:
+    /// reading and changing it in a dedicated process keeps the other tests of this
+    /// binary unaffected.
+    fn run_child(name: &str, vars: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env::current_exe().expect("test binary path"));
+        command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
+        command.env(CHILD_MARKER, "1");
+        command.env_remove("LOG_CHANNEL_ID");
+        command.env_remove("TICKETS_ENABLED");
+        command.env_remove(RETENTION_DAYS_KEY);
+        command.env_remove(REAL_ENV_SENTINEL);
+        command.env_remove(FILE_ONLY_SENTINEL);
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        command.output().expect("child process runs")
+    }
+
+    /// Asserts the child ran the expected single test and that it passed.
+    fn assert_child_ok(output: &Output, label: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child {label} failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "child {label} did not run exactly one test:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The real process environment must win over the values in the environment file.
+    ///
+    /// A stale `.env` must not be able to replace a deliberately exported variable.
+    #[test]
+    fn env_file_does_not_override_the_real_environment() {
+        const NAME: &str = "config::tests::env_file_does_not_override_the_real_environment";
+
+        let directory = scratch_dir().join("env-precedence");
+        fs::create_dir_all(directory.join("nested")).expect("scratch directory");
+        let env_file = directory.join(ENV_FILE_NAME);
+        fs::write(
+            &env_file,
+            format!("{REAL_ENV_SENTINEL}=from_file\n{FILE_ONLY_SENTINEL}=from_file\n"),
+        )
+        .expect("environment file");
+
+        if is_child() {
+            assert_eq!(
+                env::var(REAL_ENV_SENTINEL).as_deref(),
+                Ok("from_environment"),
+                "the child must start with the exported value"
+            );
+            let loaded = load_env_from(&directory.join("nested")).expect("environment file loads");
+            assert_eq!(
+                loaded, env_file,
+                "the nearest environment file above the start directory is used"
+            );
+            assert_eq!(
+                env::var(REAL_ENV_SENTINEL).as_deref(),
+                Ok("from_environment"),
+                "the exported environment must win over the environment file"
+            );
+            assert_eq!(
+                env::var(FILE_ONLY_SENTINEL).as_deref(),
+                Ok("from_file"),
+                "values that are not exported must still be loaded from the environment file"
+            );
+            return;
+        }
+
+        let output = run_child(NAME, &[(REAL_ENV_SENTINEL, "from_environment")]);
+        assert_child_ok(&output, NAME);
+    }
+
+    /// `LOG_CHANNEL_ID` must be a real Discord id.
+    ///
+    /// Zero, negative and non numeric values are rejected the same way a missing
+    /// value is, and only a real id lets the configuration load.
+    #[test]
+    fn log_channel_id_must_be_a_valid_discord_id() {
+        const NAME: &str = "config::tests::log_channel_id_must_be_a_valid_discord_id";
+        const EXPECT_OK: &str = "SF3_EXPECT_OK";
+        const VALID: u64 = 1234567890123456789;
+
+        // label, value to export (None means the variable is not set), loads?
+        let cases: [(&str, Option<&str>, bool); 5] = [
+            ("zero", Some("0"), false),
+            ("negative", Some("-1"), false),
+            ("non numeric", Some("not-a-number"), false),
+            ("not set", None, false),
+            ("valid", Some("1234567890123456789"), true),
+        ];
+
+        if is_child() {
+            let expect_ok = env::var(EXPECT_OK).as_deref() == Ok("1");
+            match Config::from_env() {
+                Ok(config) => {
+                    assert!(expect_ok, "the configuration must not load");
+                    assert_eq!(config.log_channel_id, VALID);
+                }
+                Err(err) => {
+                    assert!(
+                        !expect_ok,
+                        "the configuration must load but it failed: {err}"
+                    );
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("LOG_CHANNEL_ID"),
+                        "the error must name the variable: {message}"
+                    );
+                }
+            }
+            return;
+        }
+
+        for (label, value, expect_ok) in cases {
+            let mut vars = vec![
+                ("DISCORD_TOKEN", "synthetic-token"),
+                ("AGE_ROLE_1", "111"),
+                ("AGE_ROLE_2", "222"),
+                (EXPECT_OK, if expect_ok { "1" } else { "0" }),
+            ];
+            if let Some(value) = value {
+                vars.push(("LOG_CHANNEL_ID", value));
+            }
+            let output = run_child(NAME, &vars);
+            assert_child_ok(&output, &format!("{NAME} [{label}]"));
+        }
+    }
+
+    /// The `Debug` output of the configuration must never contain the bot token.
+    #[test]
+    fn config_debug_output_never_contains_the_token() {
+        const TOKEN: &str = "synthetic-token-must-never-be-printed";
+        let config = Config {
+            discord_token: TOKEN.to_string(),
+            log_channel_id: 1234567890123456789,
+            age_role_1: 111,
+            age_role_2: 222,
+            reaction_role_db_path: "reaction_roles.sqlite".to_string(),
+            staff_role_id: Some(333),
+            tickets: None,
+            ticket_archive_retention: RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+        };
+        let rendered = format!("{:?}", config);
+        assert!(
+            !rendered.contains(TOKEN),
+            "the token must not be printed: {rendered}"
+        );
+        assert!(
+            rendered.contains("1234567890123456789"),
+            "values that are not secret stay visible: {rendered}"
+        );
+    }
+
     #[test]
     fn tickets_are_optional_default_off_and_require_complete_valid_settings() {
         let lookup = |key: &str| {
