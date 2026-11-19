@@ -1,7 +1,9 @@
 """Owned synthetic fixtures only; run with standard-library unittest discovery."""
+import contextlib
 from contextlib import closing
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -512,6 +515,187 @@ class HardeningTests(unittest.TestCase):
         restored = self.root / 'restored.sqlite'
         self.assertEqual(self.cli('restore', self.destination, restored).returncode, 0)
         self.assertEqual(self.cli('verify', restored).returncode, 0)
+
+
+FOLLOWUP_SCRATCH = Path(__file__).resolve().parents[2] / 'target' / 'sf6-backup-followup-tests'
+
+
+class FollowupTests(unittest.TestCase):
+    """SF6: restore copies verified bytes, publish by inode, `..`, old interpreters."""
+
+    def setUp(self):
+        FOLLOWUP_SCRATCH.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=FOLLOWUP_SCRATCH)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / 'synthetic.sqlite'
+        self.backup_file = self.root / 'backup.sqlite'
+        self.restored = self.root / 'restored.sqlite'
+        self.make_db(self.source, 'genuine-row')
+        self.module().backup(self.source, self.backup_file)
+
+    def module(self):
+        spec = importlib.util.spec_from_file_location('offline_backup', TOOL)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def make_db(self, path, value):
+        with closing(sqlite3.connect(path)) as db:
+            db.execute('CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT)')
+            db.execute('INSERT INTO sample VALUES (1, ?)', (value,))
+            db.commit()
+
+    def run_main(self, module, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = module.main([str(a) for a in args])
+        return code, out.getvalue(), err.getvalue()
+
+    def assert_nothing_published(self, target):
+        self.assertFalse(target.exists())
+        self.assertFalse(Path(str(target) + '.manifest.json').exists())
+        self.assertEqual(list(self.root.glob('.sqlite-backup-*')), [])
+
+    # Finding 1: restore must not certify bytes it did not verify.
+    def test_restore_refuses_source_swapped_after_verify(self):
+        module = self.module()
+        real_verify = module.verify
+        evil = self.root / 'evil.sqlite'
+        self.make_db(evil, 'swapped-in-unverified-row')
+
+        def verify_then_swap(path):
+            result = real_verify(path)
+            self.backup_file.write_bytes(evil.read_bytes())
+            return result
+
+        with mock.patch.object(module, 'verify', verify_then_swap):
+            code, out, err = self.run_main(module, 'restore', self.backup_file, self.restored)
+        self.assertEqual((code, out), (1, ''))
+        self.assertEqual(json.loads(err), {'code': 'checksum_mismatch', 'status': 'failed'})
+        self.assert_nothing_published(self.restored)
+
+    def test_restore_output_is_byte_identical_to_verified_source(self):
+        module = self.module()
+        code, _, err = self.run_main(module, 'restore', self.backup_file, self.restored)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.restored.read_bytes(), self.backup_file.read_bytes())
+        self.assertEqual(module.verify(self.restored)['status'], 'ok')
+
+    # Finding 2: publish the inode that was written and hashed, never a re-resolved path.
+    def substituting_link(self):
+        other = self.root / 'substitute.bin'
+        other.write_bytes(b'owned-substitute')
+        real_link = os.link
+
+        def link(source, destination):
+            real_link(other, destination)
+
+        return link
+
+    def test_backup_refuses_substituted_temp_inode(self):
+        module = self.module()
+        with mock.patch.object(module.os, 'link', self.substituting_link()):
+            with self.assertRaises(module.OperationError):
+                module.backup(self.source, self.root / 'out.sqlite')
+        self.assert_nothing_published(self.root / 'out.sqlite')
+
+    def test_restore_refuses_substituted_temp_inode(self):
+        module = self.module()
+        with mock.patch.object(module.os, 'link', self.substituting_link()):
+            code, out, err = self.run_main(module, 'restore', self.backup_file, self.restored)
+        self.assertEqual((code, out), (1, ''))
+        self.assertEqual(json.loads(err)['status'], 'failed')
+        self.assert_nothing_published(self.restored)
+
+    # Finding 3: `..` in the destination.
+    def test_dotdot_destination_resolving_to_source_is_refused(self):
+        module = self.module()
+        (self.root / 'sub').mkdir()
+        before = self.source.read_bytes()
+        for operation, middle in (('backup', 'sub'), ('restore', 'sub'),
+                                  ('backup', 'missing'), ('restore', 'missing')):
+            with self.subTest(operation=operation, middle=middle):
+                origin = self.source if operation == 'backup' else self.backup_file
+                dest = self.root / middle / '..' / origin.name
+                code, out, err = self.run_main(module, operation, origin, dest)
+                self.assertEqual((code, out), (1, ''))
+                self.assertEqual(json.loads(err), {'status': 'failed'})
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertEqual(list(self.root.glob('.sqlite-backup-*')), [])
+
+    def test_dotdot_destination_publishes_at_resolved_location(self):
+        module = self.module()
+        (self.root / 'sub').mkdir()
+        dest = self.root / 'sub' / '..' / 'viadotdot.sqlite'
+        code, _, err = self.run_main(module, 'backup', self.source, dest)
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / 'viadotdot.sqlite').is_file())
+        self.assertTrue((self.root / 'viadotdot.sqlite.manifest.json').is_file())
+
+    def test_dotdot_does_not_hide_a_symlinked_or_junction_parent(self):
+        module = self.module()
+        (self.root / 'sub').mkdir()
+        real = Path.is_symlink
+        dest = self.root / 'sub' / '..' / 'blocked.sqlite'
+        with mock.patch.object(Path, 'is_symlink',
+                               lambda path: path.name == 'sub' or real(path)):
+            code, _, _ = self.run_main(module, 'backup', self.source, dest)
+        self.assertEqual(code, 1)
+        self.assert_nothing_published(self.root / 'blocked.sqlite')
+
+    # Finding 4: interpreters without Path.is_junction, and any unexpected exception.
+    def without_is_junction(self):
+        def missing(path):
+            raise AttributeError('is_junction')
+        return mock.patch.object(Path, 'is_junction', property(missing))
+
+    def test_interpreter_without_is_junction_still_works_and_stays_quiet(self):
+        module = self.module()
+        with self.without_is_junction():
+            code, out, err = self.run_main(module, 'backup', self.source, self.root / 'old.sqlite')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, '')
+        self.assertEqual(self.root.joinpath('old.sqlite').read_bytes()[:16], b'SQLite format 3\x00')
+
+    def test_junction_fallback_recognises_mount_point_reparse_tag(self):
+        module = self.module()
+        junction = types.SimpleNamespace(st_reparse_tag=0xA0000003)
+        plain = types.SimpleNamespace()
+        with self.without_is_junction():
+            with mock.patch.object(module.os, 'lstat', return_value=junction):
+                self.assertTrue(module.is_junction(self.root))
+            with mock.patch.object(module.os, 'lstat', return_value=plain):
+                self.assertFalse(module.is_junction(self.root))
+
+    def test_unexpected_exception_becomes_content_free_failure(self):
+        module = self.module()
+        for operation in ('backup', 'verify', 'restore'):
+            with self.subTest(operation=operation):
+                args = [operation, self.backup_file] + ([] if operation == 'verify' else [self.restored])
+                boom = RuntimeError(str(self.root) + 'private-marker')
+                with mock.patch.object(module, 'verify', side_effect=boom), \
+                     mock.patch.object(module, 'open_source', side_effect=boom):
+                    code, out, err = self.run_main(module, *args)
+                self.assertEqual((code, out), (1, ''))
+                self.assertEqual(json.loads(err), {'status': 'failed'})
+                self.assertNotIn('private-marker', err)
+                self.assertNotIn(str(self.root), err)
+
+    def test_unexpected_exception_subprocess_has_no_traceback(self):
+        runner = self.root / 'run.py'
+        runner.write_text(
+            'import importlib.util, sys\n'
+            'spec = importlib.util.spec_from_file_location("t", sys.argv[1])\n'
+            'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n'
+            'def boom(*a): raise RuntimeError(sys.argv[2] + "private-marker")\n'
+            'm.verify = boom\n'
+            'sys.exit(m.main(["verify", sys.argv[2]]))\n')
+        result = subprocess.run([sys.executable, str(runner), str(TOOL), str(self.backup_file)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr), {'status': 'failed'})
 
 
 if __name__ == '__main__':
