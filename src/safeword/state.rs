@@ -124,6 +124,10 @@ pub struct Snapshot {
     /// Release step acknowledgements.
     pub safeword_removed: bool,
     pub roles_restored: bool,
+    /// Number of emitted `RestoreRoles` actions currently in flight during `Releasing`.
+    pub restore_in_flight: usize,
+    /// Payload of the most recently emitted `RestoreRoles` action during `Releasing`.
+    pub last_emitted_restore_plan: Vec<RoleId>,
     pub snapshot_cleared: bool,
     pub release_dm_sent: bool,
     /// Most recent unrecovered action failure.
@@ -217,6 +221,8 @@ impl Snapshot {
             pending_reactivate: false,
             safeword_removed: false,
             roles_restored: true,
+            restore_in_flight: 0,
+            last_emitted_restore_plan: Vec::new(),
             snapshot_cleared: false,
             release_dm_sent: false,
             last_failure: None,
@@ -290,6 +296,8 @@ impl Snapshot {
         self.last_failure = None;
         self.safeword_removed = false;
         self.roles_restored = restore_plan.is_empty();
+        self.restore_in_flight = usize::from(!restore_plan.is_empty());
+        self.last_emitted_restore_plan = restore_plan.clone();
         self.snapshot_cleared = false;
         self.release_dm_sent = false;
         self.restore_plan = restore_plan;
@@ -405,7 +413,14 @@ impl Snapshot {
     fn mark_release_step_done(&mut self, id: ActionId) -> bool {
         match id {
             ActionId::RemoveSafewordRole => self.safeword_removed = true,
-            ActionId::RestoreRoles => self.roles_restored = true,
+            ActionId::RestoreRoles => {
+                self.restore_in_flight = self.restore_in_flight.saturating_sub(1);
+                if self.restore_in_flight == 0
+                    && self.last_emitted_restore_plan == self.restore_plan
+                {
+                    self.roles_restored = true;
+                }
+            }
             ActionId::ClearSnapshot => self.snapshot_cleared = true,
             ActionId::SendReleasedDm => self.release_dm_sent = true,
             _ => return false,
@@ -558,7 +573,9 @@ fn step_active(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State, V
             (State::Active(snapshot), Vec::new())
         }
         Event::ActionFailed(id, code) => {
-            if id == ActionId::SaveSnapshot || snapshot.is_activation_step_done(id) == Some(false) {
+            // Only SaveSnapshot can be pending in Active (emitted on Strike/RoleDeleted/GrantDuringActive);
+            // all initial activation steps are already acknowledged before reaching Active.
+            if id == ActionId::SaveSnapshot {
                 snapshot.last_failure = Some((id, code));
             }
             (State::Active(snapshot), Vec::new())
@@ -573,6 +590,10 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             if snapshot.last_failure.is_some() {
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_release_actions();
+                if !snapshot.roles_restored && !snapshot.restore_plan.is_empty() {
+                    snapshot.restore_in_flight += 1;
+                    snapshot.last_emitted_restore_plan = snapshot.restore_plan.clone();
+                }
                 (State::Releasing(snapshot), actions)
             } else {
                 (State::Releasing(snapshot), Vec::new())
@@ -587,6 +608,10 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             } else if snapshot.last_failure.is_some() {
                 snapshot.last_failure = None;
                 let actions = snapshot.pending_release_actions();
+                if !snapshot.roles_restored && !snapshot.restore_plan.is_empty() {
+                    snapshot.restore_in_flight += 1;
+                    snapshot.last_emitted_restore_plan = snapshot.restore_plan.clone();
+                }
                 (State::Releasing(snapshot), actions)
             } else {
                 (State::Releasing(snapshot), Vec::new())
@@ -596,8 +621,10 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             snapshot.apply_strike(role);
             if !snapshot.roles_restored && ctx.filter_restore {
                 snapshot.restore_plan.retain(|&r| r != role);
+                snapshot.last_emitted_restore_plan.retain(|&r| r != role);
                 if snapshot.restore_plan.is_empty() {
                     snapshot.roles_restored = true;
+                    snapshot.restore_in_flight = 0;
                 }
             }
             (State::Releasing(snapshot), Vec::new())
@@ -606,24 +633,34 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
             snapshot.apply_role_deleted(role);
             if !snapshot.roles_restored && ctx.filter_restore {
                 snapshot.restore_plan.retain(|&r| r != role);
+                snapshot.last_emitted_restore_plan.retain(|&r| r != role);
                 if snapshot.restore_plan.is_empty() {
                     snapshot.roles_restored = true;
+                    snapshot.restore_in_flight = 0;
                 }
             }
             (State::Releasing(snapshot), Vec::new())
         }
         Event::GrantDuringActive(role) => {
+            let mut actions = Vec::new();
             if (!snapshot.roles_restored
                 || (!snapshot.safeword_removed && snapshot.restore_plan.is_empty()))
                 && ctx.restricted_roles.contains(&role)
             {
                 let changed = snapshot.apply_deferred_grant(role, ctx);
                 if changed {
-                    snapshot.restore_plan = snapshot.compute_restore_roles(ctx);
+                    let new_plan = snapshot.compute_restore_roles(ctx);
+                    let plan_grew = new_plan != snapshot.restore_plan && !new_plan.is_empty();
+                    snapshot.restore_plan = new_plan;
                     snapshot.roles_restored = snapshot.restore_plan.is_empty();
+                    if plan_grew {
+                        snapshot.restore_in_flight += 1;
+                        snapshot.last_emitted_restore_plan = snapshot.restore_plan.clone();
+                        actions.push(Action::RestoreRoles(snapshot.restore_plan.clone()));
+                    }
                 }
             }
-            (State::Releasing(snapshot), Vec::new())
+            (State::Releasing(snapshot), actions)
         }
         Event::ActionDone(id) => {
             if snapshot.mark_release_step_done(id) && snapshot.release_complete() {
@@ -640,6 +677,11 @@ fn step_releasing(mut snapshot: Snapshot, event: Event, ctx: &Context) -> (State
         }
         Event::ActionFailed(id, code) => {
             if snapshot.is_release_step_done(id) == Some(false) {
+                if id == ActionId::RestoreRoles {
+                    // Actions carry no emission id: the retry re-emits the CURRENT plan, so
+                    // every older in-flight emission is treated as superseded.
+                    snapshot.restore_in_flight = 0;
+                }
                 snapshot.last_failure = Some((id, code));
             }
             (State::Releasing(snapshot), Vec::new())

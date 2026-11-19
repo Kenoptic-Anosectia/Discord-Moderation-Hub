@@ -9,9 +9,12 @@ Pure, Discord-free state machine (`src/safeword/{mod,state}.rs`) replacing the Y
 - **Last-reaction-event-wins & crash recovery:** `ActionDone(id)` / `ActionFailed(id, code)` track per-step progress (including unacknowledged steps in `Active`) so retries never repeat completed actions. In `Activating`, `ReactionRemoved` sets `pending_release` (completes activation then releases) and a later `ReactionAdded` clears it so the member ends `Active`; duplicate or out-of-order replays are reconciled by the runtime via `restart_action(state, reaction_present_now)`.
 - **Re-add during `Releasing` (`pending_reactivate`):** `ReactionAdded` in `Releasing` sets `pending_reactivate` (cleared by a later `ReactionRemoved`); when release completes with `pending_reactivate` set, `step` continues straight into a fresh `Activating` snapshot from `ctx.held_roles` (which the runtime must supply current at that event) and emits its activation actions.
 
+- **In-flight RestoreRoles (round 3):** a deferred grant in `Releasing` before the RestoreRoles ack re-emits `RestoreRoles(full current plan)`; `restore_in_flight` counts emissions and the release closes only when all are acked and the last payload equals the plan. A failed RestoreRoles retries the CURRENT plan (older in-flight emissions are treated as superseded; actions carry no emission id). A grant deferred before re-activation is applied by RestoreRoles, not carried into the fresh snapshot; the runtime must pass CURRENT held roles on the re-activation event or the member is left unprotected. In `Active` only `SaveSnapshot` can be pending, so only its failure is recorded.
+
 ## Tested & RED Evidence
 - Round 1 RED commit `222701a` (10 of 12 `safeword::state::tests::*` failed against stub `step`/`restart_action`/`is_actionable`) -> GREEN commit `3c74c26` (13 passing tests).
 - Round 2 RED commit `6029afc` (3 new round-2 tests failed before fix: `reaction_added_during_releasing_reactivates_on_completion_and_respects_last_event_wins`, `grant_during_releasing_defers_before_restore_ack_and_ignores_after_or_when_disabled`, `action_failed_in_active_records_last_failure_for_any_unacknowledged_step`; 14 passed) -> GREEN: all 17 `safeword::state::tests::*` pass (including `remove_then_readd_during_activating_cancels_pending_release_and_ends_active`).
+- Round 3 RED commit `7569cd3` (in-flight RestoreRoles tests) -> GREEN: all `safeword::state::tests::*` pass.
 
 ## Config Keys (Read by Wiring / SW3, Not Here)
 - `SAFEWORD_MODE` (default `off`; any value other than `off|shadow|live` fails closed to `off`).
