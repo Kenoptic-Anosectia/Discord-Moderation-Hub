@@ -78,9 +78,11 @@ impl Default for Limits {
 /// quote-only message cannot expand 6x past it). Discord allows about 60 KiB of text per message,
 /// so 256 KiB never cuts a legitimate message but bounds an abusive one.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 256 * 1024;
-/// Total cap in ESCAPED output bytes of message text in one transcript, so the rendered transcript
-/// stays well under 64 MiB (per-message markup is extra); later messages stay listed
-/// (id, author, time) but their text is replaced by [`TRUNCATION_MARKER`].
+/// Total cap in ESCAPED output bytes of message TEXT in one transcript. It bounds message text
+/// only: per-message markup (wrapper, uncapped author name, per-embed blockquote/div wrappers
+/// emitted even after the budget is spent) is NOT capped, so the rendered transcript has no bound
+/// here (see NOT fixed in docs/verification/ARCHIVE-BOUNDS.md; follow-up SF5). Later messages
+/// stay listed (id, author, time) but their text is replaced by [`TRUNCATION_MARKER`].
 pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 32 * 1024 * 1024;
 /// Stable plain-ASCII marker appended where text was cut; needs no escaping and can never form
 /// the `data-mid="` attribute that `verify` indexes.
