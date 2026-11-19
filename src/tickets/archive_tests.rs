@@ -753,3 +753,67 @@ fn fingerprint_still_covers_untruncated_text() {
     b[0].content = format!("{}Y", "A".repeat(MAX_MESSAGE_TEXT_BYTES * 2));
     assert_ne!(content_fingerprint(&a), content_fingerprint(&b));
 }
+
+/// Text inside the first `<pre>` of a rendered transcript.
+fn first_pre(h: &str) -> &str {
+    let a = h.find("<pre>").unwrap() + 5;
+    &h[a..a + h[a..].find("</pre>").unwrap()]
+}
+
+/// Escaping amplifies (`"` -> 6 bytes, `&` -> 5): the caps count ESCAPED bytes, so one message
+/// of escaping characters renders to at most the per-message cap plus the marker.
+#[test]
+fn per_message_cap_counts_escaped_bytes() {
+    for (ch, _) in [('"', 6), ('&', 5), ('\'', 5), ('<', 4)] {
+        let mut msgs = Pages::new(1).msgs;
+        msgs[0].content = ch.to_string().repeat(MAX_MESSAGE_TEXT_BYTES * 2);
+        let h = render_transcript(7, &msgs, &[]);
+        let pre = first_pre(&h);
+        assert!(pre.ends_with(TRUNCATION_MARKER), "{ch}: marker missing");
+        assert!(
+            pre.len() <= MAX_MESSAGE_TEXT_BYTES + TRUNCATION_MARKER.len(),
+            "{ch}: escaped text {} bytes over cap",
+            pre.len()
+        );
+    }
+}
+
+/// Total cap over many all-quote / all-ampersand messages is enforced on the RENDERED length.
+#[test]
+fn total_cap_counts_escaped_bytes_for_quote_and_ampersand() {
+    for ch in ['"', '&'] {
+        let n = MAX_TRANSCRIPT_TEXT_BYTES / MAX_MESSAGE_TEXT_BYTES + 40;
+        let mut msgs = Pages::new(n).msgs;
+        for x in msgs.iter_mut() {
+            x.content = ch.to_string().repeat(MAX_MESSAGE_TEXT_BYTES);
+        }
+        let h = render_transcript(7, &msgs, &[]);
+        assert!(
+            h.len() < MAX_TRANSCRIPT_TEXT_BYTES + n * 1024,
+            "{ch}: rendered {} bytes not bounded",
+            h.len()
+        );
+        assert!(h.len() < 64 * 1024 * 1024);
+        assert!(h.contains(TRUNCATION_MARKER));
+        for x in &msgs {
+            assert!(h.contains(&format!("data-mid=\"{}\"", x.id.get())));
+        }
+    }
+}
+
+/// Never cut inside an escape sequence: a 6-byte unit with only 5 bytes left is dropped whole.
+#[test]
+fn truncation_never_splits_an_escape_sequence() {
+    let mut msgs = Pages::new(1).msgs;
+    msgs[0].content = format!("{}\"", "a".repeat(MAX_MESSAGE_TEXT_BYTES - 5));
+    let h = render_transcript(7, &msgs, &[]);
+    let pre = first_pre(&h);
+    assert!(!pre.contains('&'), "partial or whole escape kept: {pre:.20}");
+    assert!(pre.ends_with(TRUNCATION_MARKER));
+    // Exactly filling the budget is not a cut: no marker.
+    msgs[0].content = format!("{}\"", "a".repeat(MAX_MESSAGE_TEXT_BYTES - 6));
+    let h = render_transcript(7, &msgs, &[]);
+    let pre = first_pre(&h);
+    assert!(pre.ends_with("&quot;"));
+    assert!(!pre.contains(TRUNCATION_MARKER));
+}
