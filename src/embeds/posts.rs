@@ -1298,6 +1298,30 @@ mod tests {
         assert_eq!(stored.record.guild, GUILD);
     }
 
+    /// An `Edit` plan for a key that has no recorded row is refused: there is no
+    /// post to edit, so writing a row would invent one.
+    #[test]
+    fn an_edit_without_a_recorded_row_is_refused() {
+        let conn = mem_db();
+        assert_eq!(
+            apply(&conn, &Plan::Edit { message: MESSAGE }, &record(HASH_A), 1).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        assert!(list(&conn).unwrap().is_empty());
+    }
+
+    /// A `Recreate` plan for a key that has no recorded row is refused for the same
+    /// reason: there is nothing to recreate.
+    #[test]
+    fn a_recreate_without_a_recorded_row_is_refused() {
+        let conn = mem_db();
+        assert_eq!(
+            apply(&conn, &Plan::Recreate, &record(HASH_A), 1).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        assert!(list(&conn).unwrap().is_empty());
+    }
+
     /// A `Create` plan for a key that has no row writes the row.
     #[test]
     fn a_create_for_an_unknown_key_writes_the_row() {
