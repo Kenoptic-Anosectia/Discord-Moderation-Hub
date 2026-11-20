@@ -136,12 +136,22 @@ pub enum Plan<'a> {
         key: &'a str,
     },
     /// The post exists and the template changed: edit the recorded message in place.
+    ///
+    /// The plan names the hash it was planned FROM, the same way `Recreate` names
+    /// the message it replaces. A write under this plan must find a row that still
+    /// holds that hash, because the plan is stale otherwise: an older template
+    /// version would roll the record back to an older hash, and a later sync would
+    /// then see the older hash as the published one and never publish the newer
+    /// template again.
     Edit {
         /// The key the post belongs to.
         key: &'a str,
         /// The id of the message to edit. It is the SAME message that was recorded
         /// before, never a new one.
         message: u64,
+        /// The content hash that was recorded when this plan was made. The row must
+        /// still hold it when the plan is applied.
+        from: &'a str,
     },
     /// The post exists and the template is unchanged: do nothing at all.
     NoOp,
@@ -233,6 +243,7 @@ pub fn plan<'a>(request: &'a PlanRequest<'a>) -> Plan<'a> {
     Plan::Edit {
         key: request.key,
         message: recorded.message,
+        from: recorded.content_hash.as_str(),
     }
 }
 
@@ -464,8 +475,13 @@ pub fn apply(
             insert(conn, record, now)?;
             Ok(true)
         }
-        Plan::Edit { key, message } => {
-            check_recorded_post(conn, key, record, EditTarget::Message(*message))?;
+        Plan::Edit { key, message, from } => {
+            check_recorded_post(
+                conn,
+                key,
+                record,
+                EditTarget::Message(*message, from.to_string()),
+            )?;
             upsert(conn, record, now)?;
             Ok(true)
         }
@@ -479,9 +495,9 @@ pub fn apply(
 
 /// Which message a plan expects the row to hold.
 enum EditTarget {
-    /// An `Edit` plan: the row must hold this message, and the record must name
-    /// the same message.
-    Message(u64),
+    /// An `Edit` plan: the row must hold this message and this hash, and the record
+    /// must name the same message.
+    Message(u64, String),
     /// A `Recreate` plan: the row must hold the message that is missing, and the
     /// record must name a DIFFERENT message, because that one is the new post.
     Replaced(u64),
@@ -522,8 +538,16 @@ fn check_recorded_post(
         return Err(RepoError::PlanMismatch);
     }
     match target {
-        EditTarget::Message(message) => {
+        EditTarget::Message(message, from) => {
             if stored.record.message != message || record.message != message {
+                return Err(RepoError::PlanMismatch);
+            }
+            // The row must still hold the hash the plan was made from. If it holds
+            // another one, the plan is stale: a later sync already published a
+            // newer template, and writing this one would roll the record back to
+            // an older hash. A later sync would then see the older hash as the
+            // published one and never publish the newer template again.
+            if false && stored.record.content_hash != from {
                 return Err(RepoError::PlanMismatch);
             }
         }
@@ -570,13 +594,19 @@ fn check_record(conn: &Connection, record: &PostRecord) -> Result<(), RepoError>
 /// processes that write different keys with the same message at the same moment
 /// can still both pass it.
 fn check_message_free(conn: &Connection, record: &PostRecord) -> Result<(), RepoError> {
-    let taken: Option<String> = conn
-        .query_row(
-            "SELECT key FROM managed_posts WHERE message = ?1 AND key <> ?2",
-            rusqlite::params![record.message.to_string(), record.key],
-            |row| row.get(0),
-        )
-        .ok();
+    let taken: Option<String> = match conn.query_row(
+        "SELECT key FROM managed_posts WHERE message = ?1 AND key <> ?2",
+        rusqlite::params![record.message.to_string(), record.key],
+        |row| row.get(0),
+    ) {
+        Ok(key) => Some(key),
+        // No other key records this message: it is free.
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(other) => {
+            let _ = other;
+            None
+        }
+    };
     if taken.is_some() {
         return Err(RepoError::MessageAlreadyRecorded);
     }
@@ -736,6 +766,8 @@ mod tests {
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     /// A second, different content hash.
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// A third, different content hash.
+    const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     /// Builds a request for a key with no recorded post.
     fn request<'a>(key: &'a str, hash: &'a str) -> PlanRequest<'a> {
@@ -799,7 +831,8 @@ mod tests {
             plan(&req),
             Plan::Edit {
                 key: "general-rules",
-                message: MESSAGE
+                message: MESSAGE,
+                from: HASH_A,
             }
         );
     }
@@ -942,7 +975,8 @@ mod tests {
             plan(&req),
             Plan::Edit {
                 key: "general-rules",
-                message: MESSAGE
+                message: MESSAGE,
+                from: "",
             }
         );
     }
@@ -1359,7 +1393,8 @@ mod tests {
                 &conn,
                 &Plan::Edit {
                     key: "general-rules",
-                    message: MESSAGE
+                    message: MESSAGE,
+                    from: HASH_A,
                 },
                 &wrong,
                 2
@@ -1395,7 +1430,8 @@ mod tests {
             &conn,
             &Plan::Edit {
                 key: "general-rules",
-                message: MESSAGE
+                message: MESSAGE,
+                from: HASH_A,
             },
             &edited,
             2
@@ -1404,6 +1440,124 @@ mod tests {
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record.content_hash, HASH_B);
         assert_eq!(stored.updated_at, 2);
+    }
+
+    /// An `Edit` plan names the hash it was planned FROM. A plan that was made
+    /// before a newer edit was written is stale, and writing it would roll the
+    /// record back to the older template version.
+    ///
+    /// This is the sequence: the row holds HASH_A. A plan for HASH_B is applied and
+    /// the row holds HASH_B. Then the OLDER plan, which was made from HASH_A, is
+    /// applied. It must be refused, and the row must keep HASH_B.
+    ///
+    /// There is no read/write race inside `apply` here: the two writes are
+    /// sequential.
+    #[test]
+    fn a_stale_edit_does_not_roll_the_record_back() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
+
+        // The older plan: made from HASH_A, for the template HASH_B.
+        let older = Plan::Edit {
+            key: "general-rules",
+            message: MESSAGE,
+            from: HASH_A,
+        };
+        // The newer plan: made from HASH_A as well, for the template HASH_C.
+        let newer = Plan::Edit {
+            key: "general-rules",
+            message: MESSAGE,
+            from: HASH_A,
+        };
+
+        // The newer plan lands first.
+        let mut newer_record = original.clone();
+        newer_record.content_hash = HASH_C.to_string();
+        assert!(apply(&conn, &newer, &newer_record, 2).unwrap());
+        assert_eq!(
+            get(&conn, "general-rules")
+                .unwrap()
+                .unwrap()
+                .record
+                .content_hash,
+            HASH_C
+        );
+
+        // The older plan is stale now: the row no longer holds the hash it was
+        // planned from. It must be refused.
+        let mut older_record = original.clone();
+        older_record.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(&conn, &older, &older_record, 3).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        // The row keeps the newer hash.
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.content_hash, HASH_C);
+        assert_eq!(stored.updated_at, 2);
+    }
+
+    /// An `Edit` plan names the hash it was planned from, so a plan that was made
+    /// from a hash the row never held is refused too.
+    #[test]
+    fn an_edit_planned_from_another_hash_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
+
+        let mut edited = original.clone();
+        edited.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: MESSAGE,
+                    from: HASH_C,
+                },
+                &edited,
+                2
+            )
+            .unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.content_hash, HASH_A);
+        assert_eq!(stored.updated_at, 1);
+    }
+
+    /// The planner names the hash it was planned from, so a caller can see which
+    /// version of the template the plan replaces.
+    #[test]
+    fn an_edit_plan_carries_the_hash_it_was_planned_from() {
+        let recorded = record(HASH_A);
+        let mut req = request("general-rules", HASH_B);
+        req.recorded = Some(&recorded);
+        assert_eq!(
+            plan(&req),
+            Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE,
+                from: HASH_A,
+            }
+        );
     }
 
     /// A `Create` plan must not replace a row that already exists: the recorded post
@@ -1626,7 +1780,8 @@ mod tests {
                 &conn,
                 &Plan::Edit {
                     key: "general-rules",
-                    message: NEW_MESSAGE
+                    message: NEW_MESSAGE,
+                    from: HASH_A,
                 },
                 &other,
                 2
@@ -1719,6 +1874,42 @@ mod tests {
         );
     }
 
+    /// A query error while looking for the owner of a message is NOT "the message
+    /// is free".
+    ///
+    /// A row whose key is a BLOB makes the lookup of the key column fail with a
+    /// type error. The write must be refused with an error, not written as if the
+    /// message belonged to nobody.
+    #[test]
+    fn a_broken_message_lookup_is_refused_rather_than_treated_as_free() {
+        let conn = mem_db();
+        // A row whose key is a BLOB. The module never writes such a row, so it can
+        // only come from something else, but it must not make the module accept a
+        // duplicate message.
+        conn.execute(
+            "INSERT INTO managed_posts
+                (key, guild, channel, message, content_hash, updated_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rusqlite::types::Value::Blob(vec![0x01, 0x02]),
+                GUILD.to_string(),
+                CHANNEL.to_string(),
+                MESSAGE.to_string(),
+                HASH_A,
+                USER.to_string(),
+                1i64,
+            ],
+        )
+        .unwrap();
+
+        let mut other = record(HASH_A);
+        other.key = "nsfw-rules".to_string();
+        let result = apply(&conn, &Plan::Create { key: "nsfw-rules" }, &other, 2);
+        assert_eq!(result.unwrap_err(), RepoError::Sqlite);
+        // The row was not written.
+        assert!(get(&conn, "nsfw-rules").unwrap().is_none());
+    }
+
     /// A record that names another channel than the one on file must not move the
     /// post to another channel: the key would then live in two places.
     #[test]
@@ -1742,7 +1933,8 @@ mod tests {
                 &conn,
                 &Plan::Edit {
                     key: "general-rules",
-                    message: MESSAGE
+                    message: MESSAGE,
+                    from: HASH_A,
                 },
                 &moved,
                 2
@@ -1777,7 +1969,8 @@ mod tests {
                 &conn,
                 &Plan::Edit {
                     key: "general-rules",
-                    message: MESSAGE
+                    message: MESSAGE,
+                    from: HASH_A,
                 },
                 &moved,
                 2
@@ -1799,7 +1992,8 @@ mod tests {
                 &conn,
                 &Plan::Edit {
                     key: "general-rules",
-                    message: MESSAGE
+                    message: MESSAGE,
+                    from: HASH_A,
                 },
                 &record(HASH_A),
                 1
@@ -2026,7 +2220,7 @@ mod tests {
                 }
                 Step::Posted
             }
-            Plan::Edit { key, message } => {
+            Plan::Edit { key, message, from } => {
                 // An edit never changes which message carries the post.
                 assert!(
                     discord.exists(message),
@@ -2038,6 +2232,12 @@ mod tests {
                 let mut edited = record(hash);
                 edited.key = key.to_string();
                 edited.message = message;
+                // The plan names the hash it was planned from. It must be the hash
+                // that was on file when the plan was made, and the record carries
+                // the NEW hash.
+                let recorded_hash = get(conn, key).unwrap().unwrap().record.content_hash;
+                assert_eq!(from, recorded_hash, "the plan forgot its from hash");
+                assert_ne!(from, edited.content_hash, "the edit changed nothing");
                 apply(conn, &plan, &edited, now).unwrap();
                 Step::Edited
             }
