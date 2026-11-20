@@ -62,6 +62,12 @@ pub enum TemplateErrorKind {
     DescriptionTooLong,
     /// The template carried more than [`MAX_FIELDS`] fields.
     TooManyFields,
+    /// A field name was empty or only whitespace. Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    FieldNameEmpty,
+    /// A field value was empty or only whitespace. Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    FieldValueEmpty,
     /// A field name was longer than [`MAX_FIELD_NAME_CHARS`].
     FieldNameTooLong,
     /// A field value was longer than [`MAX_FIELD_VALUE_CHARS`].
@@ -83,6 +89,8 @@ impl TemplateErrorKind {
             TemplateErrorKind::TitleTooLong => "title_too_long",
             TemplateErrorKind::DescriptionTooLong => "description_too_long",
             TemplateErrorKind::TooManyFields => "too_many_fields",
+            TemplateErrorKind::FieldNameEmpty => "field_name_empty",
+            TemplateErrorKind::FieldValueEmpty => "field_value_empty",
             TemplateErrorKind::FieldNameTooLong => "field_name_too_long",
             TemplateErrorKind::FieldValueTooLong => "field_value_too_long",
             TemplateErrorKind::FooterTooLong => "footer_too_long",
@@ -794,5 +802,115 @@ mod tests {
         let b = r#"{"title":"x\ndescription=y"}"#;
         assert_ne!(expect_ok(a).canonical(), expect_ok(b).canonical());
         assert_ne!(expect_ok(a).content_hash(), expect_ok(b).content_hash());
+    }
+
+    /// A field with an empty name is refused: Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    #[test]
+    fn an_empty_field_name_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"","value":"b"}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A field name that is only whitespace is refused as well.
+    #[test]
+    fn a_whitespace_only_field_name_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"   ","value":"b"}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A field with an empty value is refused.
+    #[test]
+    fn an_empty_field_value_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"a","value":""}]}"#,
+            TemplateErrorKind::FieldValueEmpty,
+        );
+    }
+
+    /// A field value that is only whitespace is refused as well.
+    #[test]
+    fn a_whitespace_only_field_value_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"a","value":"  "}]}"#,
+            TemplateErrorKind::FieldValueEmpty,
+        );
+    }
+
+    /// Both parts of a field can be empty; the name is reported first.
+    #[test]
+    fn a_field_with_both_parts_empty_reports_the_name() {
+        expect_err(
+            r#"{"fields":[{"name":"","value":""}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A colour of zero and NO colour are two different requests, so they must not
+    /// share a hash: otherwise a template that adds a colour would be skipped.
+    #[test]
+    fn colour_zero_and_no_colour_hash_differently() {
+        let none = expect_ok(r#"{"title":"t"}"#);
+        let zero = expect_ok(r#"{"title":"t","color":0}"#);
+        assert_ne!(none.content_hash(), zero.content_hash());
+        assert_ne!(none.canonical(), zero.canonical());
+        assert_eq!(none.color, None);
+        assert_eq!(zero.color, Some(0));
+    }
+
+    /// Two different colours hash differently, and a colour hashes differently from
+    /// the absence of one.
+    #[test]
+    fn colours_hash_differently() {
+        let zero = expect_ok(r#"{"title":"t","color":0}"#).content_hash();
+        let one = expect_ok(r#"{"title":"t","color":1}"#).content_hash();
+        let none = expect_ok(r#"{"title":"t"}"#).content_hash();
+        assert_ne!(zero, one);
+        assert_ne!(zero, none);
+        assert_ne!(one, none);
+    }
+
+    /// The same key twice in one document is refused: the last value must not
+    /// silently replace the first one.
+    #[test]
+    fn a_duplicate_json_key_is_refused() {
+        expect_err(
+            r#"{"title":"first","title":"second"}"#,
+            TemplateErrorKind::InvalidJson,
+        );
+        expect_err(
+            r#"{"fields":[{"name":"a","value":"1","value":"2"}]}"#,
+            TemplateErrorKind::InvalidJson,
+        );
+    }
+
+    /// The ten codes of the previous round and the two new ones are all distinct and
+    /// stable.
+    #[test]
+    fn error_codes_are_distinct_and_stable_after_the_new_codes() {
+        let all = [
+            TemplateErrorKind::InvalidJson,
+            TemplateErrorKind::EmptyTemplate,
+            TemplateErrorKind::TitleTooLong,
+            TemplateErrorKind::DescriptionTooLong,
+            TemplateErrorKind::TooManyFields,
+            TemplateErrorKind::FieldNameEmpty,
+            TemplateErrorKind::FieldValueEmpty,
+            TemplateErrorKind::FieldNameTooLong,
+            TemplateErrorKind::FieldValueTooLong,
+            TemplateErrorKind::FooterTooLong,
+            TemplateErrorKind::AuthorNameTooLong,
+            TemplateErrorKind::TotalTooLong,
+        ];
+        let mut codes: Vec<_> = all.iter().map(|kind| kind.code()).collect();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), all.len());
+        assert_eq!(TemplateErrorKind::FieldNameEmpty.code(), "field_name_empty");
+        assert_eq!(TemplateErrorKind::FieldValueEmpty.code(), "field_value_empty");
     }
 }

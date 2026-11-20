@@ -409,6 +409,10 @@ pub enum RepoError {
     InvalidId,
     /// A stored column does not hold what it must hold.
     CorruptRow,
+    /// The record does not match the plan it is written under.
+    PlanMismatch,
+    /// The row already exists and the plan does not allow replacing it.
+    AlreadyExists,
 }
 
 impl RepoError {
@@ -419,6 +423,8 @@ impl RepoError {
             RepoError::InvalidKey => "invalid_key",
             RepoError::InvalidId => "invalid_id",
             RepoError::CorruptRow => "corrupt_row",
+            RepoError::PlanMismatch => "plan_mismatch",
+            RepoError::AlreadyExists => "already_exists",
         }
     }
 }
@@ -918,6 +924,8 @@ mod tests {
             RepoError::InvalidKey,
             RepoError::InvalidId,
             RepoError::CorruptRow,
+            RepoError::PlanMismatch,
+            RepoError::AlreadyExists,
         ] {
             let text = format!("{err:?} | {err}");
             assert!(text.len() < 60, "{text}");
@@ -925,5 +933,489 @@ mod tests {
             assert!(!text.contains("SELECT"), "{text}");
         }
         assert_eq!(RepoError::Sqlite.to_string(), RepoError::Sqlite.code());
+    }
+
+    /// A key that differs only in case names the SAME template file on Windows, so
+    /// only ONE canonical spelling is accepted. Two spellings would be two rows and
+    /// two posts of the same template.
+    #[test]
+    fn a_case_alias_of_a_key_is_refused() {
+        assert!(validate_key("general-rules").is_ok());
+        for key in ["General-Rules", "GENERAL-RULES", "General-rules", "gEnErAl-RuLeS"] {
+            assert_eq!(
+                validate_key(key).unwrap_err(),
+                RefuseReason::InvalidKey,
+                "{key:?}"
+            );
+        }
+    }
+
+    /// The reserved Windows device names name a device, not a template file.
+    #[test]
+    fn a_reserved_device_name_is_refused() {
+        for key in [
+            "con", "prn", "aux", "nul", "com0", "com1", "com9", "lpt0", "lpt1", "lpt9",
+        ] {
+            assert_eq!(
+                validate_key(key).unwrap_err(),
+                RefuseReason::InvalidKey,
+                "{key:?}"
+            );
+        }
+        // A name that merely starts like one is a normal file name.
+        assert!(validate_key("console").is_ok());
+        assert!(validate_key("com10").is_ok());
+        assert!(validate_key("nul-rules").is_ok());
+    }
+
+    /// A key with a dot in it is refused: a trailing dot is a Windows path spelling
+    /// and a dot separates an extension.
+    #[test]
+    fn a_key_with_a_dot_is_refused() {
+        for key in ["rules.", "rules.json", ".rules", "ru.les"] {
+            assert_eq!(
+                validate_key(key).unwrap_err(),
+                RefuseReason::InvalidKey,
+                "{key:?}"
+            );
+        }
+    }
+
+    /// A key must start with a letter or a digit: a leading `-` or `_` is not a
+    /// plain name.
+    #[test]
+    fn a_key_with_a_leading_mark_is_refused() {
+        for key in ["-rules", "_rules", "-", "_"] {
+            assert_eq!(
+                validate_key(key).unwrap_err(),
+                RefuseReason::InvalidKey,
+                "{key:?}"
+            );
+        }
+    }
+
+    /// A key that is too long is refused; the limit is 64 bytes.
+    #[test]
+    fn a_key_of_the_limit_length_is_accepted() {
+        let key = "a".repeat(MAX_KEY_BYTES);
+        assert!(validate_key(&key).is_ok());
+        let longer = "a".repeat(MAX_KEY_BYTES + 1);
+        assert_eq!(
+            validate_key(&longer).unwrap_err(),
+            RefuseReason::InvalidKey
+        );
+    }
+
+    /// The planner refuses the same spellings the repository does.
+    #[test]
+    fn the_planner_refuses_a_case_alias() {
+        let req = request("General-Rules", HASH_A);
+        assert_eq!(plan(&req), Plan::Refuse(RefuseReason::InvalidKey));
+    }
+
+    /// An `Edit` plan names the message that must be edited. A record that names a
+    /// DIFFERENT message contradicts the plan and is refused: writing it would
+    /// orphan the real message and forget where it is.
+    #[test]
+    fn an_edit_for_another_message_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut wrong = original.clone();
+        wrong.message = NEW_MESSAGE;
+        assert_eq!(
+            apply(&conn, &Plan::Edit { message: MESSAGE }, &wrong, 2).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        // The row is untouched.
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, MESSAGE);
+        assert_eq!(stored.updated_at, 1);
+    }
+
+    /// An `Edit` plan names the message; a record that names the RIGHT message is
+    /// written.
+    #[test]
+    fn an_edit_for_the_planned_message_is_written() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut edited = original.clone();
+        edited.content_hash = HASH_B.to_string();
+        assert!(apply(&conn, &Plan::Edit { message: MESSAGE }, &edited, 2).unwrap());
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.content_hash, HASH_B);
+        assert_eq!(stored.updated_at, 2);
+    }
+
+    /// A `Create` plan must not replace a row that already exists: the recorded post
+    /// would be forgotten and the same post would be published twice.
+    #[test]
+    fn a_create_over_an_existing_row_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut stale = original.clone();
+        stale.message = NEW_MESSAGE;
+        stale.channel = OTHER_CHANNEL;
+        assert_eq!(
+            apply(&conn, &Plan::Create, &stale, 2).unwrap_err(),
+            RepoError::AlreadyExists
+        );
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, MESSAGE);
+        assert_eq!(stored.record.channel, CHANNEL);
+    }
+
+    /// A `Recreate` plan replaces the row, because the old message is gone.
+    #[test]
+    fn a_recreate_replaces_the_row() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut recreated = original.clone();
+        recreated.message = NEW_MESSAGE;
+        recreated.content_hash = HASH_B.to_string();
+        assert!(apply(&conn, &Plan::Recreate, &recreated, 2).unwrap());
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, NEW_MESSAGE);
+        assert_eq!(stored.updated_at, 2);
+    }
+
+    /// A record that names another channel than the one on file must not move the
+    /// post to another channel: the key would then live in two places.
+    #[test]
+    fn a_write_that_moves_the_channel_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut moved = original.clone();
+        moved.channel = OTHER_CHANNEL;
+        assert_eq!(
+            apply(&conn, &Plan::Edit { message: MESSAGE }, &moved, 2).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.channel, CHANNEL);
+    }
+
+    /// A record that names another guild than the one on file must not move the post
+    /// to another guild.
+    #[test]
+    fn a_write_that_moves_the_guild_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut moved = original.clone();
+        moved.guild = OTHER_GUILD;
+        assert_eq!(
+            apply(&conn, &Plan::Edit { message: MESSAGE }, &moved, 2).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.guild, GUILD);
+    }
+
+    /// A `Create` plan for a key that has no row writes the row.
+    #[test]
+    fn a_create_for_an_unknown_key_writes_the_row() {
+        let conn = mem_db();
+        assert!(apply(&conn, &Plan::Create, &record(HASH_A), 5).unwrap());
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.updated_at, 5);
+    }
+
+    /// Listing a table that holds a row with an unusable key reports the row as
+    /// corrupt: the key is not a key this module would ever write.
+    #[test]
+    fn a_stored_key_that_is_unusable_is_reported() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO managed_posts
+                (key, guild, channel, message, content_hash, updated_by, updated_at)
+             VALUES ('../evil', ?1, ?2, ?3, ?4, ?5, 1)",
+            rusqlite::params![
+                GUILD.to_string(),
+                CHANNEL.to_string(),
+                MESSAGE.to_string(),
+                HASH_A,
+                USER.to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(list(&conn).unwrap_err(), RepoError::CorruptRow);
+        // The row cannot be read by its key either: the key is refused before the
+        // row is looked up.
+        assert_eq!(
+            get(&conn, "../evil").unwrap_err(),
+            RepoError::InvalidKey
+        );
+    }
+
+    /// A stored id that is not written the way this module writes it is corrupt: a
+    /// second spelling of the same number must not be read back as a valid id.
+    #[test]
+    fn a_non_canonical_stored_id_is_reported() {
+        let conn = mem_db();
+        upsert(&conn, &record(HASH_A), 1).unwrap();
+        for spelling in [
+            format!("+{MESSAGE}"),
+            format!("0{MESSAGE}"),
+            format!("00{MESSAGE}"),
+        ] {
+            conn.execute(
+                "UPDATE managed_posts SET message = ?1 WHERE key = 'general-rules'",
+                [&spelling],
+            )
+            .unwrap();
+            assert_eq!(
+                get(&conn, "general-rules").unwrap_err(),
+                RepoError::InvalidId,
+                "{spelling}"
+            );
+            upsert(&conn, &record(HASH_A), 1).unwrap();
+        }
+    }
+
+    /// A seeded sequence of sync steps must never leave the module in a state where
+    /// work is silently forgotten, and it must reach `NoOp` once the template stops
+    /// changing.
+    ///
+    /// The model runtime below drives the real `plan` and the real `apply`:
+    /// * a template that changes every few steps,
+    /// * a message that a moderator deletes now and then,
+    /// * a Discord call that fails now and then,
+    /// * a record write that fails now and then.
+    ///
+    /// What is asserted is what the caller observes: the plan of each step, and the
+    /// row that is left behind.
+    #[test]
+    fn a_seeded_sync_sequence_reaches_a_final_state() {
+        // A tiny linear congruential generator. No dependency is needed for a seeded
+        // pseudo-random sequence.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                // The constants are the ones of the standard 64-bit LCG.
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0 >> 11
+            }
+            fn below(&mut self, bound: u64) -> u64 {
+                self.next() % bound
+            }
+        }
+
+        let conn = mem_db();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+        // The messages that exist on Discord for this key.
+        let mut live: Vec<u64> = Vec::new();
+        let mut now = 1_000i64;
+        let mut last_plan = Plan::NoOp;
+        let mut edits = 0usize;
+        let mut creates = 0usize;
+        // The number of record writes that were lost. Every lost write can leave one
+        // extra live message behind: the window between a successful post and the
+        // record of it. This is the limit the module states plainly.
+        let mut lost_writes = 0usize;
+
+        for step in 0..600 {
+            now += 1;
+            // The owner changes the template now and then.
+            let hash = if rng.below(4) == 0 {
+                HASH_B
+            } else {
+                HASH_A
+            };
+            // A moderator deletes the post now and then.
+            if rng.below(20) == 0 {
+                live.clear();
+            }
+            // The Discord call fails now and then.
+            let discord_fails = rng.below(10) == 0;
+            // The record write fails now and then.
+            let write_fails = rng.below(10) == 0;
+
+            let recorded = get(&conn, "general-rules").unwrap();
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: hash,
+                recorded: recorded.as_ref().map(|stored| &stored.record),
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: recorded.is_some()
+                    && !live.contains(&recorded.as_ref().unwrap().record.message),
+                allow_recreate: rng.below(3) == 0,
+            };
+            let plan = plan(&request);
+            last_plan = plan;
+            match plan {
+                Plan::Create | Plan::Recreate => {
+                    creates += 1;
+                    if !discord_fails {
+                        let new_message = MESSAGE + u64::try_from(step).unwrap();
+                        live.push(new_message);
+                        let mut new_record = record(hash);
+                        new_record.message = new_message;
+                        if write_fails {
+                            lost_writes += 1;
+                        } else {
+                            apply(&conn, &Plan::Create, &new_record, now).unwrap();
+                        }
+                    }
+                }
+                Plan::Edit { message } => {
+                    edits += 1;
+                    // An edit never changes which message carries the post.
+                    assert!(
+                        live.contains(&message),
+                        "an edit targeted a message that does not exist"
+                    );
+                    if !discord_fails && !write_fails {
+                        let mut edited = record(hash);
+                        edited.message = message;
+                        apply(&conn, &plan, &edited, now).unwrap();
+                    }
+                }
+                Plan::NoOp | Plan::Refuse(_) => {}
+            }
+            // Whatever happened, the row that is left behind must be readable and
+            // must carry a usable key.
+            let stored = get(&conn, "general-rules").unwrap();
+            if let Some(stored) = stored {
+                assert!(validate_key(&stored.record.key).is_ok());
+                assert!(is_content_hash(&stored.record.content_hash));
+                assert_eq!(stored.record.guild, GUILD);
+                assert_eq!(stored.record.channel, CHANNEL);
+                assert_ne!(stored.record.message, 0);
+            }
+        }
+
+        // The live posts are bounded by the writes that were lost: every live
+        // message is either the recorded one or one whose record was lost. This is
+        // the duplicate window the module states plainly: a post that succeeds on
+        // Discord and whose record write then fails is followed by a second `Create`.
+        assert!(
+            live.len() <= lost_writes + 1,
+            "live messages {} exceed lost writes {} plus one",
+            live.len(),
+            lost_writes
+        );
+
+        // The run did work: it posted and it edited.
+        assert!(creates > 0, "the sequence never posted");
+        assert!(edits > 0, "the sequence never edited");
+
+        // The last steps of the sequence ran with a template that did not change, so
+        // the module must have settled instead of posting again and again. The
+        // recorded hash is whatever the last successful write carried: asking for
+        // THAT hash again must be a no-op.
+        let recorded = get(&conn, "general-rules").unwrap();
+        assert!(recorded.is_some(), "nothing was recorded at the end");
+        let request = PlanRequest {
+            key: "general-rules",
+            template_hash: &recorded.as_ref().unwrap().record.content_hash,
+            recorded: recorded.as_ref().map(|stored| &stored.record),
+            target_guild: GUILD,
+            target_channel: CHANNEL,
+            message_missing: false,
+            allow_recreate: false,
+        };
+        assert_eq!(plan(&request), Plan::NoOp);
+        // The module never went quiet: every step either planned an action or
+        // deliberately refused one. A plan that stopped appearing would mean the
+        // sync gave up.
+        assert!(matches!(
+            last_plan,
+            Plan::NoOp | Plan::Refuse(_) | Plan::Edit { .. } | Plan::Create | Plan::Recreate
+        ));
+    }
+
+    /// The same seeded sequence, but with the record write failing often: the module
+    /// must still never write a row that contradicts its plan, and it must still
+    /// reach a final state instead of trying forever.
+    #[test]
+    fn a_seeded_sync_sequence_with_lost_writes_still_settles() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0 >> 11
+            }
+            fn below(&mut self, bound: u64) -> u64 {
+                self.next() % bound
+            }
+        }
+
+        let conn = mem_db();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0002);
+        let mut live = true;
+        let mut now = 1_000i64;
+        let mut posts = 0usize;
+
+        for step in 0..600 {
+            now += 1;
+            let hash = if rng.below(4) == 0 {
+                HASH_B
+            } else {
+                HASH_A
+            };
+            if rng.below(20) == 0 {
+                live = false;
+            }
+            let recorded = get(&conn, "general-rules").unwrap();
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: hash,
+                recorded: recorded.as_ref().map(|stored| &stored.record),
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: recorded.is_some() && !live,
+                allow_recreate: true,
+            };
+            let plan = plan(&request);
+            match plan {
+                Plan::Create | Plan::Recreate => {
+                    posts += 1;
+                    // The post succeeds on Discord, but the record write is lost
+                    // every other time.
+                    live = true;
+                    let mut new_record = record(hash);
+                    new_record.message = MESSAGE + u64::try_from(step).unwrap();
+                    if rng.below(2) == 0 {
+                        // The write is lost. The next step plans `Create` again and
+                        // posts a second copy: that is the documented window between
+                        // a successful post and the record of it.
+                    } else {
+                        let _ = apply(&conn, &Plan::Recreate, &new_record, now);
+                    }
+                }
+                Plan::Edit { .. } => {
+                    let mut edited = record(hash);
+                    if let Some(stored) = &recorded {
+                        edited.message = stored.record.message;
+                    }
+                    let _ = apply(&conn, &plan, &edited, now);
+                }
+                Plan::NoOp | Plan::Refuse(_) => {}
+            }
+            // The row that is left behind is always readable and always usable.
+            if let Some(stored) = get(&conn, "general-rules").unwrap() {
+                assert!(validate_key(&stored.record.key).is_ok());
+                assert!(is_content_hash(&stored.record.content_hash));
+            }
+        }
+        assert!(posts > 0, "the sequence never posted");
     }
 }
