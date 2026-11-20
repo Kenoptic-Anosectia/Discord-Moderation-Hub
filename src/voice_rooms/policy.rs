@@ -1,17 +1,103 @@
 //! Pure decision logic for temporary user-created voice rooms.
 //!
-//! SCAFFOLD: public types only, no behaviour yet (RED commit).
+//! This module is the Discord-free core of the voice-room feature that replaces the old
+//! Chai bot: a member joins a hub channel, the bot creates a room for them in a
+//! configured category, and the room is temporary - it is deleted once it has been
+//! empty for a grace period.
+//!
+//! Everything here is a pure function of plain facts. There is no serenity type, no
+//! I/O, no clock read and no randomness: `now` and every id are passed in by the
+//! caller.
+//!
+//! Security notes:
+//! * A room name is attacker-controlled text that ends up in a channel title. The
+//!   sanitiser removes mentions, invite links, URLs, control characters and
+//!   zero-width characters, so a name can never ping a role or smuggle an invite.
+//! * The permission overwrites of a room are the category's overwrites plus one
+//!   bounded owner overwrite. The owner rights are a compile-time constant that never
+//!   contains `MANAGE_ROLES`, `MANAGE_CHANNELS` or `ADMINISTRATOR`, so an owner
+//!   cannot escalate: the bot performs the renames, not the owner.
+//! * A permit is refused when the member could not already view the category, so an
+//!   owner cannot use a permit to walk a member around the verification or the
+//!   safeword gating of the area.
+//! * A channel that the policy does not track is never deleted, so a voice channel
+//!   the bot did not create is never touched.
+//!
+//! Errors and deny reasons are stable enum codes. They never carry room names, user
+//! names or ids, so nothing private can leak through an error path.
+//!
+//! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
 
 use std::collections::HashMap;
+use std::fmt;
+
+/// Environment key that switches the feature on.
+///
+/// Default: `off`. Read by the wiring card, not by this module.
+pub const KEY_MODE: &str = "VOICE_ROOMS_MODE";
+/// Environment key holding the hub channel id a member joins to ask for a room.
+///
+/// Default: unset (the feature then has no hub and creates nothing).
+pub const KEY_HUB_CHANNEL_ID: &str = "VOICE_ROOM_HUB_CHANNEL_ID";
+/// Environment key holding the category id the rooms are created in.
+///
+/// Default: unset (the feature then has no category and creates nothing).
+pub const KEY_CATEGORY_ID: &str = "VOICE_ROOM_CATEGORY_ID";
+/// Environment key holding how many rooms one member may own at the same time.
+///
+/// Default: [`DEFAULT_PER_USER_CAP`].
+pub const KEY_PER_USER_CAP: &str = "VOICE_ROOM_PER_USER_CAP";
+/// Environment key holding how many rooms may exist at the same time.
+///
+/// Default: [`DEFAULT_GLOBAL_CAP`].
+pub const KEY_GLOBAL_CAP: &str = "VOICE_ROOM_GLOBAL_CAP";
+/// Environment key holding the create cooldown in seconds.
+///
+/// Default: [`DEFAULT_CREATE_COOLDOWN_SECS`].
+pub const KEY_CREATE_COOLDOWN_SECS: &str = "VOICE_ROOM_CREATE_COOLDOWN_SECS";
+/// Environment key holding the empty-room grace period in seconds.
+///
+/// Default: [`DEFAULT_EMPTY_GRACE_SECS`].
+pub const KEY_EMPTY_GRACE_SECS: &str = "VOICE_ROOM_EMPTY_GRACE_SECS";
+/// Environment key holding the name used when the cleaned name is empty.
+///
+/// Default: [`DEFAULT_ROOM_NAME`].
+pub const KEY_DEFAULT_NAME: &str = "VOICE_ROOM_DEFAULT_NAME";
+/// Environment key holding how many renames one room may be given inside the window.
+///
+/// Default: [`DEFAULT_RENAME_BUDGET`].
+pub const KEY_RENAME_BUDGET: &str = "VOICE_ROOM_RENAME_BUDGET";
+/// Environment key holding the width of the rename window in seconds.
+///
+/// Default: [`DEFAULT_RENAME_WINDOW_SECS`].
+pub const KEY_RENAME_WINDOW_SECS: &str = "VOICE_ROOM_RENAME_WINDOW_SECS";
+
+/// Default number of rooms one member may own at the same time.
+pub const DEFAULT_PER_USER_CAP: usize = 1;
+/// Default number of rooms that may exist at the same time.
+pub const DEFAULT_GLOBAL_CAP: usize = 25;
+/// Default create cooldown in seconds.
+pub const DEFAULT_CREATE_COOLDOWN_SECS: i64 = 30;
+/// Default empty-room grace period in seconds.
+pub const DEFAULT_EMPTY_GRACE_SECS: i64 = 60;
+/// Default name of a room whose cleaned name is empty.
+pub const DEFAULT_ROOM_NAME: &str = "Voice Room";
+/// Default number of renames one room may be given inside the window.
+pub const DEFAULT_RENAME_BUDGET: u32 = 2;
+/// Default width of the rename window in seconds.
+pub const DEFAULT_RENAME_WINDOW_SECS: i64 = 600;
+
+/// Longest room name Discord accepts, counted in characters.
+pub const MAX_NAME_CHARS: usize = 100;
 
 /// Permission bit for `CONNECT`, at Discord's bit position.
 pub const CONNECT: u64 = 1 << 20;
 /// Permission bit for `SPEAK`, at Discord's bit position.
 pub const SPEAK: u64 = 1 << 21;
-/// Permission bit for `MOVE_MEMBERS`, at Discord's bit position.
-pub const MOVE_MEMBERS: u64 = 1 << 24;
 /// Permission bit for `MUTE_MEMBERS`, at Discord's bit position.
 pub const MUTE_MEMBERS: u64 = 1 << 22;
+/// Permission bit for `MOVE_MEMBERS`, at Discord's bit position.
+pub const MOVE_MEMBERS: u64 = 1 << 24;
 /// Permission bit for `MANAGE_CHANNELS`, at Discord's bit position.
 pub const MANAGE_CHANNELS: u64 = 1 << 4;
 /// Permission bit for `MANAGE_ROLES`, at Discord's bit position.
@@ -20,6 +106,10 @@ pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const ADMINISTRATOR: u64 = 1 << 3;
 
 /// Permissions the owner of a room may hold.
+///
+/// The owner may connect, speak, move members and mute members. The owner may not
+/// manage the channel: the bot performs the rename and the delete, so the rename
+/// budget cannot be spent by hand.
 pub const OWNER_RIGHTS: u64 = CONNECT | SPEAK | MOVE_MEMBERS | MUTE_MEMBERS;
 
 /// Permissions that must never be granted to a room owner.
@@ -38,6 +128,10 @@ pub const FORBIDDEN_OWNER_RIGHTS: u64 = MANAGE_ROLES | MANAGE_CHANNELS | ADMINIS
 pub const LEGACY_MANAGE_PERMISSIONS: u64 = 1 << 45;
 
 /// The rename budget Discord enforces, exposed as data.
+///
+/// The exact Discord limit is not verified here; the runtime passes the number it
+/// enforces and the policy never plans more renames inside the window than the
+/// budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenameBudget {
     /// How many renames may be planned inside the window.
@@ -46,9 +140,20 @@ pub struct RenameBudget {
     pub window_secs: i64,
 }
 
+impl Default for RenameBudget {
+    fn default() -> Self {
+        Self {
+            max_renames: DEFAULT_RENAME_BUDGET,
+            window_secs: DEFAULT_RENAME_WINDOW_SECS,
+        }
+    }
+}
+
 /// Validated configuration of the voice-room feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceRoomConfig {
+    /// The guild the feature serves. A join from another guild is out of scope.
+    pub guild_id: u64,
     /// The channel a member joins to ask for a room.
     pub hub_channel_id: u64,
     /// The category the room is created in.
@@ -85,6 +190,8 @@ pub struct Room {
 }
 
 /// The state the policy reads.
+///
+/// The runtime owns this state and persists it; the policy only reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoiceRoomState {
     /// The tracked rooms.
@@ -93,6 +200,18 @@ pub struct VoiceRoomState {
     pub last_create: HashMap<u64, i64>,
     /// When each room was renamed, in epoch seconds.
     pub renames: Vec<(u64, i64)>,
+}
+
+impl VoiceRoomState {
+    /// Returns the tracked room with the given channel id.
+    pub fn room(&self, channel_id: u64) -> Option<&Room> {
+        self.rooms.iter().find(|r| r.channel_id == channel_id)
+    }
+
+    /// Counts the rooms the given member owns.
+    pub fn owned_room_count(&self, owner_id: u64) -> usize {
+        self.rooms.iter().filter(|r| r.owner_id == owner_id).count()
+    }
 }
 
 /// The plain facts about a member joining a voice channel.
@@ -188,6 +307,12 @@ impl DenyReason {
     }
 }
 
+impl fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
 /// The decision for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -204,12 +329,53 @@ pub enum Decision {
 }
 
 /// Decides whether a hub join creates a room.
+///
+/// The order of the checks is the order of the rules: a join that is not a hub join
+/// never reaches the caps, and the caps are checked before the cooldown so that a
+/// member who is already at their cap is told the cap and not the cooldown.
 pub fn decide_join(
     event: &JoinEvent,
     config: &VoiceRoomConfig,
     state: &VoiceRoomState,
 ) -> Decision {
-    Decision::Deny(DenyReason::GlobalCapReached)
+    if event.user_id == 0 {
+        return Decision::Deny(DenyReason::InvalidUserId);
+    }
+    if event.guild_id != config.guild_id {
+        return Decision::Deny(DenyReason::GuildMismatch);
+    }
+    if event.channel_id != config.hub_channel_id {
+        return Decision::Deny(DenyReason::NotHubChannel);
+    }
+    if state.owned_room_count(event.user_id) >= config.per_user_cap {
+        return Decision::Deny(DenyReason::PerUserCapReached);
+    }
+    if state.rooms.len() >= config.global_cap {
+        return Decision::Deny(DenyReason::GlobalCapReached);
+    }
+    if let Some(last) = state.last_create.get(&event.user_id) {
+        if event.at - *last < config.create_cooldown_secs {
+            return Decision::Deny(DenyReason::CreateCooldown);
+        }
+    }
+    Decision::Create(CreatePlan {
+        name: sanitize_name(&config.default_name, &config.default_name),
+        overwrites: build_overwrites(config, event.user_id),
+    })
+}
+
+/// Builds the overwrite plan of a new room.
+///
+/// The plan is the category's overwrites plus one owner overwrite. The owner rights
+/// are the [`OWNER_RIGHTS`] constant; no input can widen them.
+pub fn build_overwrites(config: &VoiceRoomConfig, owner_id: u64) -> Vec<RoomOverwrite> {
+    let mut overwrites = config.category_overwrites.clone();
+    overwrites.push(RoomOverwrite {
+        target: OverwriteTarget::Member(owner_id),
+        allow: OWNER_RIGHTS,
+        deny: FORBIDDEN_OWNER_RIGHTS,
+    });
+    overwrites
 }
 
 /// Decides whether an owner may permit a member.
@@ -225,10 +391,30 @@ pub fn decide_permit(
     member_can_view_category: bool,
     state: &VoiceRoomState,
 ) -> Decision {
-    Decision::Deny(DenyReason::CategoryNotVisible)
+    let room = match state.room(channel_id) {
+        Some(room) => room,
+        None => return Decision::Deny(DenyReason::UntrackedChannel),
+    };
+    if requester_id == 0 || member_id == 0 {
+        return Decision::Deny(DenyReason::InvalidUserId);
+    }
+    if requester_id != room.owner_id {
+        return Decision::Deny(DenyReason::NotRoomOwner);
+    }
+    if member_id == room.owner_id {
+        return Decision::Deny(DenyReason::AlreadyPermitted);
+    }
+    if !member_can_view_category {
+        return Decision::Deny(DenyReason::CategoryNotVisible);
+    }
+    Decision::Allow
 }
 
 /// Decides what a leaving member leaves behind.
+///
+/// The owner leaving a room that still holds members makes the room claimable. An
+/// empty room is only cleaned up once its grace period has elapsed; the runtime
+/// records `empty_since` when the room first becomes empty and calls again later.
 pub fn decide_leave(
     channel_id: u64,
     user_id: u64,
@@ -236,10 +422,33 @@ pub fn decide_leave(
     config: &VoiceRoomConfig,
     state: &VoiceRoomState,
 ) -> Decision {
-    Decision::Cleanup(channel_id)
+    let room = match state.room(channel_id) {
+        Some(room) => room,
+        None => return Decision::Deny(DenyReason::UntrackedChannel),
+    };
+    if user_id == 0 {
+        return Decision::Deny(DenyReason::InvalidUserId);
+    }
+    if user_id != room.owner_id {
+        return Decision::Deny(DenyReason::NotRoomOwner);
+    }
+    if room.occupants > 0 {
+        return Decision::Claimable(channel_id);
+    }
+    // The room is empty. The grace period starts when the room first became empty;
+    // until it has elapsed the room stays.
+    let empty_since = room.empty_since.unwrap_or(now);
+    if now - empty_since >= config.empty_grace_secs {
+        return Decision::Cleanup(channel_id);
+    }
+    Decision::Deny(DenyReason::EmptyGraceNotElapsed)
 }
 
 /// Decides whether a room may be renamed.
+///
+/// The rename budget is counted per room inside its window: a room that was renamed
+/// twice inside the window may not be renamed a third time until the window has
+/// passed. The budget is data, so the runtime enforces the same number.
 pub fn decide_rename(
     channel_id: u64,
     owner_id: u64,
@@ -247,12 +456,226 @@ pub fn decide_rename(
     config: &VoiceRoomConfig,
     state: &VoiceRoomState,
 ) -> Decision {
-    Decision::Deny(DenyReason::RenameBudgetExhausted)
+    let room = match state.room(channel_id) {
+        Some(room) => room,
+        None => return Decision::Deny(DenyReason::UntrackedChannel),
+    };
+    if owner_id == 0 {
+        return Decision::Deny(DenyReason::InvalidUserId);
+    }
+    if owner_id != room.owner_id {
+        return Decision::Deny(DenyReason::NotRoomOwner);
+    }
+    let used = state
+        .renames
+        .iter()
+        .filter(|(renamed_channel, at)| {
+            *renamed_channel == channel_id && now - *at < config.rename_budget.window_secs
+        })
+        .count();
+    if used >= config.rename_budget.max_renames as usize {
+        return Decision::Deny(DenyReason::RenameBudgetExhausted);
+    }
+    Decision::Allow
 }
 
 /// Cleans a room name.
+///
+/// The cleaning removes, in this order: the mention tokens `<@..>`, `<@&..>` and
+/// `<#..>`, the `@everyone` and `@here` words, the control and zero-width
+/// characters, and every link (a URL, a `www.` host, an invite link, and an invite
+/// host that was spread across spaces). What is left is trimmed, shortened to
+/// [`MAX_NAME_CHARS`] characters and, when it is empty, replaced by `default_name`.
 pub fn sanitize_name(raw: &str, default_name: &str) -> String {
-    raw.to_string()
+    let cleaned = strip_links(&strip_invisible(&strip_mentions(raw)));
+    let cleaned = if cleaned.trim().is_empty() {
+        strip_links(&strip_invisible(&strip_mentions(default_name)))
+    } else {
+        cleaned
+    };
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return DEFAULT_ROOM_NAME.to_string();
+    }
+    truncate_chars(cleaned, MAX_NAME_CHARS)
+}
+
+/// Removes the mention tokens and the `@everyone` and `@here` words.
+fn strip_mentions(raw: &str) -> String {
+    let without_tokens = strip_mention_tokens(raw);
+    strip_everyone_and_here(&without_tokens)
+}
+
+/// Removes the `<@..>`, `<@&..>` and `<#..>` tokens.
+fn strip_mention_tokens(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '<' {
+            if let Some(end) = find_token_end(&chars, index) {
+                let inner: String = chars[index + 1..end].iter().collect();
+                if inner.starts_with('@') || inner.starts_with('#') {
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Finds the `>` that closes a mention token, if there is one close by.
+fn find_token_end(chars: &[char], start: usize) -> Option<usize> {
+    // A mention token is short; a longer run of text is not a token.
+    const MAX_TOKEN_CHARS: usize = 64;
+    let limit = chars.len().min(start + MAX_TOKEN_CHARS);
+    (start + 1..limit).find(|&i| chars[i] == '>')
+}
+
+/// Removes the `@everyone` and `@here` words, whatever their case.
+fn strip_everyone_and_here(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '@' {
+            if let Some(len) = mention_word_len(&chars, index) {
+                index += len;
+                continue;
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Returns the length of the `@everyone` or `@here` word at `start`, if there is one.
+fn mention_word_len(chars: &[char], start: usize) -> Option<usize> {
+    let rest: String = chars[start + 1..].iter().collect();
+    let lowered = rest.to_ascii_lowercase();
+    for word in ["everyone", "here"] {
+        if lowered.starts_with(word) {
+            let after = rest[word.len()..].chars().next();
+            let is_word_end = after.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if is_word_end {
+                return Some(1 + word.len());
+            }
+        }
+    }
+    None
+}
+
+/// Removes the control and the zero-width characters.
+fn strip_invisible(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && !is_zero_width(*c))
+        .collect()
+}
+
+/// True for the characters that are invisible but still occupy a position.
+fn is_zero_width(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Removes the links: URLs, `www.` hosts and invite links.
+fn strip_links(raw: &str) -> String {
+    let segments: Vec<&str> = raw.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(segments.len());
+    let mut index = 0;
+    while index < segments.len() {
+        if is_link_like(segments[index]) {
+            index += 1;
+            continue;
+        }
+        // An invite host that was spread across spaces is still an invite host.
+        if let Some(end) = split_invite_run(&segments, index) {
+            index = end + 1;
+            continue;
+        }
+        kept.push(segments[index]);
+        index += 1;
+    }
+    kept.join(" ")
+}
+
+/// True when the segment is a URL, a `www.` host or an invite link.
+fn is_link_like(segment: &str) -> bool {
+    let lowered = segment.to_ascii_lowercase();
+    if lowered.contains("://") || lowered.starts_with("www.") {
+        return true;
+    }
+    if contains_invite_host(&lowered) {
+        return true;
+    }
+    match lowered.find('/') {
+        Some(slash) => {
+            let host = &lowered[..slash];
+            looks_like_host(host)
+        }
+        None => false,
+    }
+}
+
+/// True when the text carries one of the known invite hosts.
+fn contains_invite_host(lowered: &str) -> bool {
+    const INVITE_HOSTS: [&str; 4] = [
+        "discord.gg/",
+        "discord.com/invite/",
+        "discordapp.com/invite/",
+        "discord.new/",
+    ];
+    INVITE_HOSTS.iter().any(|host| lowered.contains(host))
+}
+
+/// True when the text looks like a host name such as `example.invalid`.
+fn looks_like_host(host: &str) -> bool {
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    let last_label = host.rsplit('.').next().unwrap_or_default();
+    last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Finds the run of segments that, joined without spaces, starts with an invite host.
+///
+/// The run starts at `start` and is the shortest one that spells an invite host.
+fn split_invite_run(segments: &[&str], start: usize) -> Option<usize> {
+    let mut joined = String::new();
+    for (offset, segment) in segments.iter().enumerate().skip(start) {
+        joined.push_str(&segment.to_ascii_lowercase());
+        if contains_invite_host(&joined) {
+            return Some(offset);
+        }
+        // The host cannot be longer than a domain and a code; stop early.
+        if joined.len() > 64 {
+            break;
+        }
+    }
+    None
+}
+
+/// Shortens the text to `limit` characters, counted in characters and not in bytes.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars()
+        .take(limit)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -274,6 +697,7 @@ mod tests {
 
     fn cfg() -> VoiceRoomConfig {
         VoiceRoomConfig {
+            guild_id: GUILD,
             hub_channel_id: HUB,
             category_id: CATEGORY,
             default_name: "Voice Room".to_string(),
@@ -449,13 +873,13 @@ mod tests {
     /// The reason codes are stable machine codes and carry no text.
     #[test]
     fn deny_reason_codes_are_stable_and_carry_no_text() {
-        assert_eq!(
-            DenyReason::PerUserCapReached.code(),
-            "per_user_cap_reached"
-        );
+        assert_eq!(DenyReason::PerUserCapReached.code(), "per_user_cap_reached");
         assert_eq!(DenyReason::GlobalCapReached.code(), "global_cap_reached");
         assert_eq!(DenyReason::CreateCooldown.code(), "create_cooldown");
-        assert_eq!(DenyReason::CategoryNotVisible.code(), "category_not_visible");
+        assert_eq!(
+            DenyReason::CategoryNotVisible.code(),
+            "category_not_visible"
+        );
         assert_eq!(
             DenyReason::RenameBudgetExhausted.code(),
             "rename_budget_exhausted"
@@ -557,7 +981,10 @@ mod tests {
         assert_eq!(sanitize_name("@everyone", "Voice Room"), "Voice Room");
         assert_eq!(sanitize_name("", "Voice Room"), "Voice Room");
         assert_eq!(sanitize_name("   ", "Voice Room"), "Voice Room");
-        assert_eq!(sanitize_name("\u{200B}\u{0000}", "Voice Room"), "Voice Room");
+        assert_eq!(
+            sanitize_name("\u{200B}\u{0000}", "Voice Room"),
+            "Voice Room"
+        );
     }
 
     /// A name that is longer than the limit is shortened to the limit.
@@ -604,7 +1031,11 @@ mod tests {
     /// The overwrite plan carries the category overwrites unchanged.
     #[test]
     fn overwrite_plan_carries_the_category_overwrites() {
-        let plan = expect_create(&decide_join(&join(OWNER, T0), &cfg(), &state_with(Vec::new())));
+        let plan = expect_create(&decide_join(
+            &join(OWNER, T0),
+            &cfg(),
+            &state_with(Vec::new()),
+        ));
         let category = &cfg().category_overwrites;
         for expected in category {
             assert!(
@@ -617,7 +1048,11 @@ mod tests {
     /// The owner overwrite grants exactly the four bounded owner rights.
     #[test]
     fn owner_overwrite_grants_exactly_the_bounded_owner_rights() {
-        let plan = expect_create(&decide_join(&join(OWNER, T0), &cfg(), &state_with(Vec::new())));
+        let plan = expect_create(&decide_join(
+            &join(OWNER, T0),
+            &cfg(),
+            &state_with(Vec::new()),
+        ));
         let owner = plan
             .overwrites
             .iter()
@@ -633,7 +1068,11 @@ mod tests {
     /// No overwrite of the plan ever grants an escalating permission.
     #[test]
     fn no_overwrite_ever_grants_an_escalating_permission() {
-        let plan = expect_create(&decide_join(&join(OWNER, T0), &cfg(), &state_with(Vec::new())));
+        let plan = expect_create(&decide_join(
+            &join(OWNER, T0),
+            &cfg(),
+            &state_with(Vec::new()),
+        ));
         for overwrite in &plan.overwrites {
             assert_eq!(
                 overwrite.allow & FORBIDDEN_OWNER_RIGHTS,
@@ -651,7 +1090,11 @@ mod tests {
     /// The owner overwrite denies the escalating permissions as well.
     #[test]
     fn owner_overwrite_denies_the_escalating_permissions() {
-        let plan = expect_create(&decide_join(&join(OWNER, T0), &cfg(), &state_with(Vec::new())));
+        let plan = expect_create(&decide_join(
+            &join(OWNER, T0),
+            &cfg(),
+            &state_with(Vec::new()),
+        ));
         let owner = plan
             .overwrites
             .iter()
@@ -669,7 +1112,11 @@ mod tests {
             allow: MANAGE_ROLES | MANAGE_CHANNELS,
             deny: 0,
         });
-        let plan = expect_create(&decide_join(&join(OWNER, T0), &config, &state_with(Vec::new())));
+        let plan = expect_create(&decide_join(
+            &join(OWNER, T0),
+            &config,
+            &state_with(Vec::new()),
+        ));
         let owner = plan
             .overwrites
             .iter()
@@ -791,14 +1238,12 @@ mod tests {
         assert_eq!(expect_deny(&decision), DenyReason::UntrackedChannel);
     }
 
-    /// A room that was emptied but whose owner is still present is not cleaned up.
+    /// A room that becomes empty at this very moment starts its grace period: it is
+    /// not cleaned up yet.
     #[test]
-    fn an_empty_room_with_a_present_owner_is_not_cleaned_up() {
-        let mut state = state_with(vec![room(OWNER, 0, Some(T0))]);
-        // The owner is still connected, so the room is not abandoned.
-        state.rooms[0].owner_id = OWNER;
-        let decision = decide_leave(ROOM, OWNER, T0 + 600, &cfg(), &state);
-        // The owner is still the owner and the room is empty: the grace period governs.
+    fn a_room_that_just_became_empty_is_not_cleaned_up_yet() {
+        let state = state_with(vec![room(OWNER, 0, None)]);
+        let decision = decide_leave(ROOM, OWNER, T0, &cfg(), &state);
         assert_eq!(expect_deny(&decision), DenyReason::EmptyGraceNotElapsed);
     }
 
