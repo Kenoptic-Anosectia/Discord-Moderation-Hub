@@ -1,9 +1,26 @@
 //! Durable, restart-safe job queue on top of `storage` (feature `"jobs"`).
 //!
-//! RED stage: types and signatures exist, behaviour is deliberately absent.
+//! Synchronous and Discord-free. Every function takes the connection and the
+//! current time (`now`, unix seconds) from the caller: no clock is read and no
+//! randomness is used. Errors are stable codes ([`QueueError`]); neither
+//! errors, `Debug` output of results, nor the restart [`Report`] carry payload
+//! text.
+//!
+//! Lifecycle: `pending` -> `running` (claim, compare-and-swap) -> `done`, or
+//! back to `pending` with backoff ([`fail`]), or `failed` once
+//! [`RetryPolicy::max_attempts`] claims have been used. A restart turns jobs
+//! found `running` into `pending` (kind is `RunAgain`) or `abandoned`
+//! (`AtMostOnce` or unregistered kind) via [`reconcile_after_restart`].
+//!
+//! Dedupe: `dedupe_key` is UNIQUE for the life of the row; rows are never
+//! deleted by this module. Scheduling a key that already exists, in ANY state
+//! (including done, failed or abandoned), creates nothing and returns
+//! [`ScheduleOutcome::Duplicate`] with the existing id and state; the original
+//! kind, payload and due time are kept. A caller that wants a later
+//! recurrence must put the cycle into the key.
 
 use crate::storage::{self, Migration, StorageError};
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub const FEATURE: &str = "jobs";
 pub const MAX_KIND_LEN: usize = 64;
@@ -11,6 +28,7 @@ pub const MAX_DEDUPE_KEY_LEN: usize = 128;
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
 pub const MAX_CODE_LEN: usize = 48;
 
+/// Stable `last_error_code` values written by this module itself.
 pub const CODE_PAYLOAD_MALFORMED: &str = "payload_malformed";
 pub const CODE_INVALID_CODE: &str = "invalid_error_code";
 pub const CODE_RESTART_RERUN: &str = "restart_rerun";
@@ -18,28 +36,54 @@ pub const CODE_RESTART_AT_MOST_ONCE: &str = "restart_at_most_once";
 pub const CODE_RESTART_UNREGISTERED: &str = "restart_unregistered_kind";
 pub const CODE_RESTART_MAX_ATTEMPTS: &str = "restart_max_attempts";
 
+/// Migration list for feature `"jobs"`. Apply with [`init`].
 pub const MIGRATIONS: [Migration; 1] = [Migration {
     version: 1,
-    sql: "SELECT 1;",
+    sql: "CREATE TABLE jobs (\
+            id INTEGER PRIMARY KEY, \
+            kind TEXT NOT NULL CHECK (typeof(kind) = 'text'), \
+            dedupe_key TEXT NOT NULL UNIQUE CHECK (typeof(dedupe_key) = 'text'), \
+            payload_json TEXT NOT NULL CHECK (typeof(payload_json) = 'text'), \
+            due_at INTEGER NOT NULL CHECK (typeof(due_at) = 'integer'), \
+            state TEXT NOT NULL CHECK (state IN ('pending','running','done','failed','abandoned')), \
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (typeof(attempts) = 'integer' AND attempts >= 0), \
+            last_error_code TEXT, \
+            updated_at INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')\
+          ); \
+          CREATE INDEX jobs_state_due ON jobs (state, due_at, id);",
 }];
 
 /// Stable error codes. Never carries SQL text, payload text or ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
+    /// Any SQLite engine error (message deliberately dropped).
     Sqlite,
+    /// Any error from the storage layer (migration refusal etc.).
     Storage(StorageError),
     InvalidKind,
     InvalidDedupeKey,
     PayloadTooLarge,
+    /// A time argument was negative.
     InvalidTime,
     InvalidPolicy,
     NotFound,
+    /// The job exists but is not `running` (complete/fail on a stale handle).
     NotRunning,
 }
 
 impl QueueError {
     pub fn code(&self) -> &'static str {
-        "todo"
+        match self {
+            QueueError::Sqlite => "sqlite_error",
+            QueueError::Storage(_) => "storage_error",
+            QueueError::InvalidKind => "invalid_kind",
+            QueueError::InvalidDedupeKey => "invalid_dedupe_key",
+            QueueError::PayloadTooLarge => "payload_too_large",
+            QueueError::InvalidTime => "invalid_time",
+            QueueError::InvalidPolicy => "invalid_policy",
+            QueueError::NotFound => "not_found",
+            QueueError::NotRunning => "not_running",
+        }
     }
 }
 
@@ -74,29 +118,66 @@ pub enum JobState {
 
 impl JobState {
     pub fn as_str(&self) -> &'static str {
-        "todo"
+        match self {
+            JobState::Pending => "pending",
+            JobState::Running => "running",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+            JobState::Abandoned => "abandoned",
+        }
     }
-    pub fn from_db(_s: &str) -> Option<JobState> {
-        None
+
+    pub fn from_db(s: &str) -> Option<JobState> {
+        Some(match s {
+            "pending" => JobState::Pending,
+            "running" => JobState::Running,
+            "done" => JobState::Done,
+            "failed" => JobState::Failed,
+            "abandoned" => JobState::Abandoned,
+            _ => return None,
+        })
     }
+
+    /// `done`, `failed` and `abandoned` never change again through this module.
     pub fn is_terminal(&self) -> bool {
-        false
+        matches!(
+            self,
+            JobState::Done | JobState::Failed | JobState::Abandoned
+        )
     }
 }
 
+/// What a restart does to a job found `running`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
+    /// Idempotent effect: run it again.
     RunAgain,
+    /// Irreversible effect: never repeat; abandon and report.
     AtMostOnce,
 }
 
-/// Caller-provided table of `(kind, policy)`.
+/// Caller-provided table of `(kind, policy)`; no hidden global state.
 pub type KindTable<'a> = &'a [(&'a str, RestartPolicy)];
 
-pub fn policy_for(_table: KindTable<'_>, _kind: &str) -> Option<RestartPolicy> {
-    None
+/// Policy for `kind`. A kind missing from the table is `None` (reconcile
+/// treats it as at-most-once). If the table lists a kind more than once and any
+/// entry says `AtMostOnce`, the result is `AtMostOnce`.
+pub fn policy_for(table: KindTable<'_>, kind: &str) -> Option<RestartPolicy> {
+    let mut found = None;
+    for (k, p) in table {
+        if *k == kind {
+            if *p == RestartPolicy::AtMostOnce {
+                return Some(RestartPolicy::AtMostOnce);
+            }
+            found = Some(*p);
+        }
+    }
+    found
 }
 
+/// Retry rules for [`fail`] and [`reconcile_after_restart`]. A job may be
+/// claimed at most `max_attempts` times; the delay after claim number `n` is
+/// `min(cap_secs, base_secs * 2^(n-1))`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub base_secs: i64,
@@ -110,48 +191,80 @@ impl RetryPolicy {
         cap_secs: 600,
         max_attempts: 5,
     };
+
+    /// `max_attempts >= 1`, `base_secs >= 1`, `cap_secs >= base_secs`.
     pub fn validate(&self) -> Result<(), QueueError> {
-        Err(QueueError::Sqlite)
+        if self.max_attempts == 0 || self.base_secs < 1 || self.cap_secs < self.base_secs {
+            return Err(QueueError::InvalidPolicy);
+        }
+        Ok(())
     }
-    pub fn backoff_secs(&self, _attempts: i64) -> i64 {
-        0
+
+    /// Delay after claim number `attempts` (1-based). Saturating: no overflow
+    /// or shift panic for any input.
+    pub fn backoff_secs(&self, attempts: i64) -> i64 {
+        let n = attempts.saturating_sub(1).max(0);
+        if n >= 62 {
+            return self.cap_secs;
+        }
+        self.base_secs.saturating_mul(1i64 << n).min(self.cap_secs)
     }
 }
 
+/// Input of [`schedule`].
 #[derive(Debug, Clone, Copy)]
 pub struct NewJob<'a> {
+    /// `[a-z0-9_]`, 1..=64 bytes.
     pub kind: &'a str,
+    /// Printable ASCII without spaces (`0x21..=0x7e`), 1..=128 bytes.
     pub dedupe_key: &'a str,
+    /// At most [`MAX_PAYLOAD_BYTES`]. Should be a JSON object; anything else is
+    /// stored and then failed at claim time with [`CODE_PAYLOAD_MALFORMED`].
     pub payload_json: &'a str,
     pub due_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleOutcome {
-    Created { id: i64 },
-    Duplicate { id: i64, state: JobState },
+    Created {
+        id: i64,
+    },
+    /// The key already exists (in any state); nothing was written.
+    Duplicate {
+        id: i64,
+        state: JobState,
+    },
 }
 
+/// A job handed to a worker. `Debug` is redacted: it never prints the payload.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaimedJob {
     pub id: i64,
     pub kind: String,
     pub payload_json: String,
+    /// Claims used so far, including this one.
     pub attempts: i64,
 }
 
 impl std::fmt::Debug for ClaimedJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClaimedJob")
+        f.debug_struct("ClaimedJob")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("attempts", &self.attempts)
+            .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClaimBatch {
+    /// Jobs this caller won, in `(due_at, id)` order.
     pub claimed: Vec<ClaimedJob>,
+    /// Jobs whose payload was refused; they are now `failed`.
     pub payload_failed: Vec<i64>,
 }
 
+/// Read-only view of a row. Deliberately has no payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobView {
     pub id: i64,
@@ -160,21 +273,28 @@ pub struct JobView {
     pub due_at: i64,
     pub state: JobState,
     pub attempts: i64,
+    /// Diagnostic only: never used to decide whether to retry.
     pub last_error_code: Option<String>,
     pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailOutcome {
+    /// Back to `pending`, claimable at `due_at`.
     Retry { due_at: i64, attempts: i64 },
+    /// `max_attempts` reached: terminal `failed`.
     Failed { attempts: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileOutcome {
+    /// `RunAgain`: pending again, due now.
     Requeued,
+    /// `AtMostOnce`: abandoned, not re-run.
     AbandonedAtMostOnce,
+    /// Kind not in the caller's table: abandoned, not re-run.
     AbandonedUnregistered,
+    /// `RunAgain` but all attempts were already used: terminal `failed`.
     FailedMaxAttempts,
 }
 
@@ -185,63 +305,346 @@ pub struct ReconcileEntry {
     pub outcome: ReconcileOutcome,
 }
 
+/// Every job found `running` and what was done to it. No payload text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Report {
     pub entries: Vec<ReconcileEntry>,
 }
 
 impl Report {
+    /// The entries that were abandoned (and so must be surfaced to staff).
     pub fn abandoned(&self) -> Vec<&ReconcileEntry> {
-        Vec::new()
+        self.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.outcome,
+                    ReconcileOutcome::AbandonedAtMostOnce | ReconcileOutcome::AbandonedUnregistered
+                )
+            })
+            .collect()
     }
 }
 
-pub fn init(_conn: &mut Connection) -> Result<(), QueueError> {
-    let _ = storage::BUSY_TIMEOUT_MS;
-    Err(QueueError::Sqlite)
+fn valid_token(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+fn valid_dedupe_key(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_DEDUPE_KEY_LEN && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+fn check_time(t: i64) -> Result<(), QueueError> {
+    if t < 0 {
+        Err(QueueError::InvalidTime)
+    } else {
+        Ok(())
+    }
+}
+
+/// A payload is plainly valid only if it is within the size cap and parses as
+/// one JSON object. Everything else (scalars, arrays, trailing text, too deep)
+/// is refused as a class.
+fn payload_is_plain_object(text: &str) -> bool {
+    text.len() <= MAX_PAYLOAD_BYTES
+        && matches!(
+            serde_json::from_str::<serde_json::Value>(text),
+            Ok(serde_json::Value::Object(_))
+        )
+}
+
+/// Create the `jobs` table through the storage migration runner (idempotent).
+pub fn init(conn: &mut Connection) -> Result<(), QueueError> {
+    storage::migrate(conn, FEATURE, &MIGRATIONS)?;
+    Ok(())
+}
+
+/// Insert a pending job, or report the existing one for this `dedupe_key`.
 pub fn schedule(
-    _conn: &Connection,
-    _job: &NewJob<'_>,
-    _now: i64,
+    conn: &Connection,
+    job: &NewJob<'_>,
+    now: i64,
 ) -> Result<ScheduleOutcome, QueueError> {
-    Err(QueueError::Sqlite)
+    if !valid_token(job.kind, MAX_KIND_LEN) {
+        return Err(QueueError::InvalidKind);
+    }
+    if !valid_dedupe_key(job.dedupe_key) {
+        return Err(QueueError::InvalidDedupeKey);
+    }
+    if job.payload_json.len() > MAX_PAYLOAD_BYTES {
+        return Err(QueueError::PayloadTooLarge);
+    }
+    check_time(job.due_at)?;
+    check_time(now)?;
+    let inserted = conn.execute(
+        "INSERT INTO jobs (kind, dedupe_key, payload_json, due_at, state, attempts, \
+         last_error_code, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', 0, NULL, ?5) \
+         ON CONFLICT(dedupe_key) DO NOTHING",
+        params![job.kind, job.dedupe_key, job.payload_json, job.due_at, now],
+    )?;
+    if inserted == 1 {
+        return Ok(ScheduleOutcome::Created {
+            id: conn.last_insert_rowid(),
+        });
+    }
+    let (id, state): (i64, String) = conn.query_row(
+        "SELECT id, state FROM jobs WHERE dedupe_key = ?1",
+        [job.dedupe_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let state = JobState::from_db(&state).ok_or(QueueError::Sqlite)?;
+    Ok(ScheduleOutcome::Duplicate { id, state })
 }
 
-pub fn try_claim(_conn: &Connection, _id: i64, _now: i64) -> Result<bool, QueueError> {
-    Err(QueueError::Sqlite)
+/// The compare-and-swap: ONE statement moves `pending` -> `running`, bumps
+/// `attempts` and stamps `updated_at`; the rows-affected count decides the
+/// winner. Returns `true` only for the caller whose statement changed the row.
+pub fn try_claim(conn: &Connection, id: i64, now: i64) -> Result<bool, QueueError> {
+    check_time(now)?;
+    let n = conn.execute(
+        "UPDATE jobs SET state = 'running', attempts = attempts + 1, updated_at = ?2 \
+         WHERE id = ?1 AND state = 'pending' AND due_at <= ?2",
+        params![id, now],
+    )?;
+    Ok(n == 1)
 }
 
-pub fn claim_due(_conn: &Connection, _now: i64, _limit: u32) -> Result<ClaimBatch, QueueError> {
-    Err(QueueError::Sqlite)
+/// Claim up to `limit` due jobs (`due_at <= now`), earliest first, ties by id.
+/// `limit` caps the candidates examined: a candidate whose payload is refused,
+/// or that another claimer wins first, uses one slot without being returned.
+pub fn claim_due(conn: &Connection, now: i64, limit: u32) -> Result<ClaimBatch, QueueError> {
+    check_time(now)?;
+    let mut batch = ClaimBatch::default();
+    if limit == 0 {
+        return Ok(batch);
+    }
+    let candidates: Vec<(i64, String, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, payload_json, attempts FROM jobs \
+             WHERE state = 'pending' AND due_at <= ?1 ORDER BY due_at, id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, i64::from(limit)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (id, kind, payload_json, attempts) in candidates {
+        if !payload_is_plain_object(&payload_json) {
+            let n = conn.execute(
+                "UPDATE jobs SET state = 'failed', attempts = attempts + 1, \
+                 last_error_code = ?3, updated_at = ?2 \
+                 WHERE id = ?1 AND state = 'pending' AND due_at <= ?2",
+                params![id, now, CODE_PAYLOAD_MALFORMED],
+            )?;
+            if n == 1 {
+                batch.payload_failed.push(id);
+            }
+        } else if try_claim(conn, id, now)? {
+            batch.claimed.push(ClaimedJob {
+                id,
+                kind,
+                payload_json,
+                attempts: attempts + 1,
+            });
+        }
+    }
+    Ok(batch)
 }
 
-pub fn complete(_conn: &Connection, _id: i64, _now: i64) -> Result<(), QueueError> {
-    Err(QueueError::Sqlite)
+fn missing_job_error(conn: &Connection, id: i64) -> Result<QueueError, QueueError> {
+    let exists: Option<i64> = conn
+        .query_row("SELECT 1 FROM jobs WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    Ok(if exists.is_some() {
+        QueueError::NotRunning
+    } else {
+        QueueError::NotFound
+    })
 }
 
+/// `running` -> `done`. Refused (`NotRunning`/`NotFound`) for any other state.
+pub fn complete(conn: &Connection, id: i64, now: i64) -> Result<(), QueueError> {
+    check_time(now)?;
+    let n = conn.execute(
+        "UPDATE jobs SET state = 'done', updated_at = ?2 WHERE id = ?1 AND state = 'running'",
+        params![id, now],
+    )?;
+    if n == 1 {
+        Ok(())
+    } else {
+        Err(missing_job_error(conn, id)?)
+    }
+}
+
+/// Record a failed run of a `running` job. Retry (back to `pending` at
+/// `now + backoff`) while claims used `< max_attempts`; otherwise `failed`.
+/// The retry decision comes from the per-job `attempts` count, not from the
+/// error code. A `code` that is not `[a-z0-9_]{1,48}` is stored as
+/// [`CODE_INVALID_CODE`] so a bad code cannot leave the job stuck running.
 pub fn fail(
-    _conn: &Connection,
-    _id: i64,
-    _code: &str,
-    _now: i64,
-    _policy: &RetryPolicy,
+    conn: &Connection,
+    id: i64,
+    code: &str,
+    now: i64,
+    policy: &RetryPolicy,
 ) -> Result<FailOutcome, QueueError> {
-    Err(QueueError::Sqlite)
+    policy.validate()?;
+    check_time(now)?;
+    let attempts: Option<i64> = conn
+        .query_row(
+            "SELECT attempts FROM jobs WHERE id = ?1 AND state = 'running'",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(attempts) = attempts else {
+        return Err(missing_job_error(conn, id)?);
+    };
+    let code = if valid_token(code, MAX_CODE_LEN) {
+        code
+    } else {
+        CODE_INVALID_CODE
+    };
+    let exhausted = attempts >= i64::from(policy.max_attempts);
+    let due_at = now.saturating_add(policy.backoff_secs(attempts));
+    // `attempts = ?3` makes this a CAS on the run we just read: if the row
+    // changed between the read and this write, nothing is updated. It does not
+    // identify the worker: a stale `fail` from an earlier run is not detectable.
+    let n = if exhausted {
+        conn.execute(
+            "UPDATE jobs SET state = 'failed', last_error_code = ?4, updated_at = ?2 \
+             WHERE id = ?1 AND state = 'running' AND attempts = ?3",
+            params![id, now, attempts, code],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE jobs SET state = 'pending', due_at = ?5, last_error_code = ?4, \
+             updated_at = ?2 WHERE id = ?1 AND state = 'running' AND attempts = ?3",
+            params![id, now, attempts, code, due_at],
+        )?
+    };
+    if n != 1 {
+        return Err(QueueError::NotRunning);
+    }
+    Ok(if exhausted {
+        FailOutcome::Failed { attempts }
+    } else {
+        FailOutcome::Retry { due_at, attempts }
+    })
 }
 
-pub fn get(_conn: &Connection, _id: i64) -> Result<Option<JobView>, QueueError> {
-    Err(QueueError::Sqlite)
+type JobRow = (i64, String, String, i64, String, i64, Option<String>, i64);
+
+/// Read one job (no payload).
+pub fn get(conn: &Connection, id: i64) -> Result<Option<JobView>, QueueError> {
+    let row: Option<JobRow> = conn
+        .query_row(
+            "SELECT id, kind, dedupe_key, due_at, state, attempts, last_error_code, updated_at \
+             FROM jobs WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, kind, dedupe_key, due_at, state, attempts, last_error_code, updated_at)) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(JobView {
+        id,
+        kind,
+        dedupe_key,
+        due_at,
+        state: JobState::from_db(&state).ok_or(QueueError::Sqlite)?,
+        attempts,
+        last_error_code,
+        updated_at,
+    }))
 }
 
+/// Resolve every job found `running` after a restart. Call it once at startup,
+/// BEFORE any worker claims: there is no lease, so a `running` job of a live
+/// worker would be indistinguishable from a crashed one.
+///
+/// - `RunAgain` kind with claims left: `pending`, due at `min(due_at, now)`.
+/// - `RunAgain` kind with `attempts >= max_attempts`: `failed` (a job that
+///   crashes the process every time cannot loop forever).
+/// - `AtMostOnce` or a kind missing from `table`: `abandoned`, and reported.
+///
+/// Each job is resolved with its own compare-and-swap (`WHERE state='running'`),
+/// so a failure midway can be repaired by calling this again.
 pub fn reconcile_after_restart(
-    _conn: &Connection,
-    _now: i64,
-    _table: KindTable<'_>,
-    _retry: &RetryPolicy,
+    conn: &Connection,
+    now: i64,
+    table: KindTable<'_>,
+    retry: &RetryPolicy,
 ) -> Result<Report, QueueError> {
-    Err(QueueError::Sqlite)
+    retry.validate()?;
+    check_time(now)?;
+    let running: Vec<(i64, String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, kind, attempts FROM jobs WHERE state = 'running' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut report = Report::default();
+    for (id, kind, attempts) in running {
+        let (outcome, n) = match policy_for(table, &kind) {
+            Some(RestartPolicy::RunAgain) if attempts < i64::from(retry.max_attempts) => (
+                ReconcileOutcome::Requeued,
+                conn.execute(
+                    "UPDATE jobs SET state = 'pending', due_at = MIN(due_at, ?2), \
+                     last_error_code = ?3, updated_at = ?2 WHERE id = ?1 AND state = 'running'",
+                    params![id, now, CODE_RESTART_RERUN],
+                )?,
+            ),
+            Some(RestartPolicy::RunAgain) => (
+                ReconcileOutcome::FailedMaxAttempts,
+                set_terminal(conn, id, now, "failed", CODE_RESTART_MAX_ATTEMPTS)?,
+            ),
+            Some(RestartPolicy::AtMostOnce) => (
+                ReconcileOutcome::AbandonedAtMostOnce,
+                set_terminal(conn, id, now, "abandoned", CODE_RESTART_AT_MOST_ONCE)?,
+            ),
+            None => (
+                ReconcileOutcome::AbandonedUnregistered,
+                set_terminal(conn, id, now, "abandoned", CODE_RESTART_UNREGISTERED)?,
+            ),
+        };
+        if n == 1 {
+            report.entries.push(ReconcileEntry { id, kind, outcome });
+        }
+    }
+    Ok(report)
+}
+
+/// `state` is one of two literals chosen by this module, never caller input.
+fn set_terminal(
+    conn: &Connection,
+    id: i64,
+    now: i64,
+    state: &'static str,
+    code: &'static str,
+) -> Result<usize, QueueError> {
+    let n = conn.execute(
+        "UPDATE jobs SET state = ?3, last_error_code = ?4, updated_at = ?2 \
+         WHERE id = ?1 AND state = 'running'",
+        params![id, now, state, code],
+    )?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -723,6 +1126,7 @@ mod tests {
     fn hostile_error_code_is_replaced_by_a_stable_code_and_job_still_progresses() {
         let c = mem();
         let id = created(&c, "rerun", "h", 0, 0);
+        let mut now = 1;
         claim_due(&c, 1, 1).unwrap();
         let hostile = "user said: hello <@123> DROP TABLE jobs;";
         assert!(matches!(
@@ -740,8 +1144,9 @@ mod tests {
             "é",
             "a\nb",
         ] {
-            claim_due(&c, 1_000_000, 1).unwrap();
-            fail(&c, id, code, 1_000_000, &D).unwrap();
+            now += 10_000;
+            assert_eq!(ids(&claim_due(&c, now, 1).unwrap()), vec![id]);
+            fail(&c, id, code, now, &D).unwrap();
             assert_eq!(
                 get(&c, id).unwrap().unwrap().last_error_code.as_deref(),
                 Some(CODE_INVALID_CODE),
@@ -995,7 +1400,8 @@ mod tests {
         let b = claim_due(&c, 100, 10).unwrap();
         assert_eq!(ids(&b), vec![r]);
         assert_eq!(b.claimed[0].attempts, 2);
-        assert!(claim_due(&c, i64::MAX, 10).unwrap().claimed.is_empty());
+        assert!(!try_claim(&c, o, i64::MAX).unwrap());
+        assert!(!try_claim(&c, u, i64::MAX).unwrap());
         // a second reconcile finds nothing new to report except the re-claimed r
         let again = reconcile_after_restart(&c, 101, TABLE, &D).unwrap();
         assert_eq!(again.entries.len(), 1);
@@ -1228,7 +1634,6 @@ mod tests {
             let mut reported_abandoned: HashSet<i64> = HashSet::new();
             let mut crashed_no_rerun: HashSet<i64> = HashSet::new();
             let mut terminal_seen: HashMap<i64, JobState> = HashMap::new();
-            let mut key_n = 0u64;
 
             let check_terminal_stable =
                 |conn: &Connection, seen: &mut HashMap<i64, JobState>, ids: &[i64]| {
@@ -1246,7 +1651,7 @@ mod tests {
                 match rng.below(10) {
                     0..=2 => {
                         // schedule; a small key space forces duplicates
-                        key_n = rng.below(40);
+                        let key_n = rng.below(40);
                         let kind = kinds[rng.below(3) as usize];
                         let key = format!("k{key_n}");
                         let payload = if rng.below(8) == 0 {
