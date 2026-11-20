@@ -12,10 +12,3 @@
 #![allow(dead_code)]
 
 pub mod render;
-
-pub use render::{
-    render_welcome, welcome_policy, IdMap, MemberContext, RenderedEmbed, RenderedField,
-    RenderedWelcome, SkipReason, TemplateError, TemplateErrorKind, WelcomeTemplate,
-    MAX_DESCRIPTION_CHARS, MAX_EMBED_FIELDS, MAX_EMBED_TOTAL_CHARS, MAX_FIELD_NAME_CHARS,
-    MAX_FIELD_VALUE_CHARS, MAX_FOOTER_CHARS, MAX_TITLE_CHARS,
-};
