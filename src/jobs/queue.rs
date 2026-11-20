@@ -20,6 +20,7 @@
 //! recurrence must put the cycle into the key.
 
 use crate::storage::{self, Migration, StorageError};
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 
 pub const FEATURE: &str = "jobs";
@@ -266,7 +267,8 @@ impl std::fmt::Debug for ClaimedJob {
 pub struct ClaimBatch {
     /// Jobs this caller won, in `(due_at, id)` order.
     pub claimed: Vec<ClaimedJob>,
-    /// Jobs whose payload was refused; they are now `failed`.
+    /// Jobs refused at claim (malformed payload, or a stored kind that is not a
+    /// plain token); they are now `failed` and the others in the call went on.
     pub payload_failed: Vec<i64>,
 }
 
@@ -341,6 +343,17 @@ fn valid_token(s: &str, max: usize) -> bool {
 
 fn valid_dedupe_key(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_DEDUPE_KEY_LEN && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// Read a TEXT column as raw bytes and convert it here, so one row holding
+/// invalid UTF-8 (only possible when written around this API: the schema checks
+/// `typeof` but not encoding) cannot make a whole query fail. Anything that is
+/// not valid UTF-8 text (including NULL) reads as `None`.
+fn text_col(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match r.get_ref(i)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(str::to_owned),
+        _ => None,
+    })
 }
 
 fn check_time(t: i64) -> Result<(), QueueError> {
@@ -427,28 +440,43 @@ pub fn claim_due(conn: &Connection, now: i64, limit: u32) -> Result<ClaimBatch, 
     if limit == 0 {
         return Ok(batch);
     }
-    let candidates: Vec<(i64, String, String, i64)> = {
+    let candidates: Vec<(i64, Option<String>, Option<String>, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, kind, payload_json, attempts FROM jobs \
              WHERE state = 'pending' AND due_at <= ?1 ORDER BY due_at, id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![now, i64::from(limit)], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, text_col(r, 1)?, text_col(r, 2)?, r.get(3)?))
         })?;
         rows.collect::<Result<_, _>>()?
     };
     for (id, kind, payload_json, attempts) in candidates {
-        if !payload_is_plain_object(&payload_json) {
+        // Judge each row on its own: a bad row is failed, the rest go on.
+        let kind = kind.filter(|k| valid_token(k, MAX_KIND_LEN));
+        let payload_ok = payload_json.as_deref().is_some_and(payload_is_plain_object);
+        let refusal = if kind.is_none() {
+            Some(CODE_KIND_MALFORMED)
+        } else if !payload_ok {
+            Some(CODE_PAYLOAD_MALFORMED)
+        } else {
+            None
+        };
+        if let Some(code) = refusal {
             let n = conn.execute(
                 "UPDATE jobs SET state = 'failed', attempts = attempts + 1, \
                  last_error_code = ?3, updated_at = ?2 \
                  WHERE id = ?1 AND state = 'pending' AND due_at <= ?2",
-                params![id, now, CODE_PAYLOAD_MALFORMED],
+                params![id, now, code],
             )?;
             if n == 1 {
                 batch.payload_failed.push(id);
             }
-        } else if try_claim(conn, id, now)? {
+            continue;
+        }
+        let (Some(kind), Some(payload_json)) = (kind, payload_json) else {
+            continue;
+        };
+        if try_claim(conn, id, now)? {
             batch.claimed.push(ClaimedJob {
                 id,
                 kind,
@@ -542,7 +570,16 @@ pub fn fail(
     })
 }
 
-type JobRow = (i64, String, String, i64, String, i64, Option<String>, i64);
+type JobRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+    i64,
+    Option<String>,
+    i64,
+);
 
 /// Read one job (no payload).
 pub fn get(conn: &Connection, id: i64) -> Result<Option<JobView>, QueueError> {
@@ -554,12 +591,12 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<JobView>, QueueError> {
             |r| {
                 Ok((
                     r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
+                    text_col(r, 1)?,
+                    text_col(r, 2)?,
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
-                    r.get(6)?,
+                    text_col(r, 6)?,
                     r.get(7)?,
                 ))
             },
@@ -571,8 +608,12 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<JobView>, QueueError> {
     };
     Ok(Some(JobView {
         id,
-        kind,
-        dedupe_key,
+        kind: kind
+            .filter(|k| valid_token(k, MAX_KIND_LEN))
+            .unwrap_or_else(|| KIND_PLACEHOLDER.to_string()),
+        dedupe_key: dedupe_key
+            .filter(|k| valid_dedupe_key(k))
+            .unwrap_or_else(|| KEY_PLACEHOLDER.to_string()),
         due_at,
         state: JobState::from_db(&state).ok_or(QueueError::Sqlite)?,
         attempts,
@@ -600,15 +641,18 @@ pub fn reconcile_after_restart(
 ) -> Result<Report, QueueError> {
     retry.validate()?;
     check_time(now)?;
-    let running: Vec<(i64, String, i64)> = {
+    let running: Vec<(i64, Option<String>, i64)> = {
         let mut stmt = conn
             .prepare("SELECT id, kind, attempts FROM jobs WHERE state = 'running' ORDER BY id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, text_col(r, 1)?, r.get(2)?)))?;
         rows.collect::<Result<_, _>>()?
     };
     let mut report = Report::default();
     for (id, kind, attempts) in running {
-        let (outcome, n) = match policy_for(table, &kind) {
+        // A kind that is not a plain token (or not UTF-8) cannot be in the
+        // caller's table: fail closed (abandoned, reported) without echoing it.
+        let kind = kind.filter(|k| valid_token(k, MAX_KIND_LEN));
+        let (outcome, n) = match kind.as_deref().and_then(|k| policy_for(table, k)) {
             Some(RestartPolicy::RunAgain) if attempts < i64::from(retry.max_attempts) => (
                 ReconcileOutcome::Requeued,
                 conn.execute(
@@ -631,7 +675,11 @@ pub fn reconcile_after_restart(
             ),
         };
         if n == 1 {
-            report.entries.push(ReconcileEntry { id, kind, outcome });
+            report.entries.push(ReconcileEntry {
+                id,
+                kind: kind.unwrap_or_else(|| KIND_PLACEHOLDER.to_string()),
+                outcome,
+            });
         }
     }
     Ok(report)
