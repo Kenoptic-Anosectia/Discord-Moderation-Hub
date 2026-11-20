@@ -725,8 +725,11 @@ impl Ledger {
             let end = segment.end.max(start);
             let mut cursor = start;
             while cursor < end {
+                // The boundary is the start of the next UTC day. It is always strictly
+                // after the cursor, so the loop advances. The guard below makes that a
+                // property of the loop and not only of `next_day_start`.
                 let boundary = next_day_start(cursor);
-                let stop = end.min(boundary);
+                let stop = end.min(boundary.max(cursor + 1));
                 if !segment.self_deaf || cfg.count_self_deafened() {
                     outcome.sessions.push(VoiceSession {
                         user_id,
