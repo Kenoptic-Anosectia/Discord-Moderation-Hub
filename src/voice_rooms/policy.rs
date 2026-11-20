@@ -987,6 +987,21 @@ mod tests {
         );
     }
 
+    /// A default name that is itself empty after cleaning falls back to the built-in
+    /// default, so a room always has a name.
+    #[test]
+    fn an_empty_default_name_falls_back_to_the_built_in_default() {
+        assert_eq!(sanitize_name("", "@everyone"), DEFAULT_ROOM_NAME);
+        assert_eq!(sanitize_name("", ""), DEFAULT_ROOM_NAME);
+    }
+
+    /// The built-in default name is itself clean, so the fallback is a real name.
+    #[test]
+    fn the_built_in_default_name_is_clean() {
+        assert_eq!(sanitize_name("", DEFAULT_ROOM_NAME), DEFAULT_ROOM_NAME);
+        assert!(!DEFAULT_ROOM_NAME.contains('@'));
+    }
+
     /// A name that is longer than the limit is shortened to the limit.
     #[test]
     fn long_name_is_shortened_to_the_limit() {
