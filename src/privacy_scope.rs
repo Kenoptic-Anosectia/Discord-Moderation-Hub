@@ -207,7 +207,10 @@ mod tests {
         let scope = Scope::new(vec![EXCLUDED_THREAD_PARENT], vec![], vec![]);
         let facts = base_facts(NORMAL_CHANNEL, Some(EXCLUDED_THREAD_PARENT));
         let decision = may_log(&scope, &facts);
-        assert_eq!(decision, LogDecision::Skip(SkipReason::ExcludedParentChannel));
+        assert_eq!(
+            decision,
+            LogDecision::Skip(SkipReason::ExcludedParentChannel)
+        );
     }
 
     // RED: channel inside an excluded category is skipped.
@@ -282,7 +285,10 @@ mod tests {
             old_parent_id: None,
             new_parent_id: None,
         };
-        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::UnknownLookup));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
+        );
     }
 
     // RED: flash channel IDs are merged into the exclusion set.
@@ -298,7 +304,10 @@ mod tests {
     // Verify LogDecision variants are distinct (always passes).
     #[test]
     fn log_decision_variants_are_distinct() {
-        assert_ne!(LogDecision::Allow, LogDecision::Skip(SkipReason::ExcludedChannel));
+        assert_ne!(
+            LogDecision::Allow,
+            LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
         assert_ne!(
             LogDecision::Skip(SkipReason::ExcludedChannel),
             LogDecision::Skip(SkipReason::ExcludedCategory)
@@ -325,7 +334,10 @@ mod tests {
         let facts = base_facts(NORMAL_CHANNEL, Some(EXCLUDED_THREAD_PARENT));
         let decision = may_log(&scope, &facts);
         // Excluded channel check runs first (rule 1 before rule 3).
-        assert_eq!(decision, LogDecision::Skip(SkipReason::ExcludedParentChannel));
+        assert_eq!(
+            decision,
+            LogDecision::Skip(SkipReason::ExcludedParentChannel)
+        );
     }
 
     // Adversarial: zero ids in exclusion vectors are harmless.
@@ -341,7 +353,10 @@ mod tests {
     fn duplicate_ids_in_exclusion_lists_deduplicate() {
         let scope = Scope::new(vec![EXCLUDED_CHANNEL, EXCLUDED_CHANNEL], vec![], vec![]);
         let facts = base_facts(EXCLUDED_CHANNEL, Some(NORMAL_CATEGORY));
-        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
     }
 
     // Rule 4: move with only new_parent set (channel added to a category).
@@ -387,19 +402,21 @@ mod tests {
             Some(NORMAL_CATEGORY),
         );
         // parent_id itself is checked (rule 3) before move checks.
-        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedCategory));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedCategory)
+        );
     }
 
     // Adversarial: excluded channel takes priority over all other checks.
     #[test]
     fn excluded_channel_before_category_check() {
-        let scope = Scope::new(
-            vec![EXCLUDED_CHANNEL],
-            vec![EXCLUDED_CATEGORY],
-            vec![],
-        );
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![EXCLUDED_CATEGORY], vec![]);
         let facts = base_facts(EXCLUDED_CHANNEL, Some(EXCLUDED_CATEGORY));
-        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
     }
 
     // Rule 4: move where BOTH old and new are excluded categories.
@@ -444,6 +461,9 @@ mod tests {
         // If the implementation incorrectly checked categories instead of channels,
         // this would return Allow because EXCLUDED_CHANNEL is not in categories.
         // The correct behaviour is Skip(ExcludedChannel).
-        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
     }
 }
