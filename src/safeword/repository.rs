@@ -4,9 +4,11 @@
 //! Writes are compare-and-swap on `version`. Holds no Discord types and reads no clock:
 //! the caller passes ids and `now`.
 
-use super::state::State;
+use super::state::{ActionId, FailureCode, RoleId, Snapshot, State};
 use crate::storage::{self, Migration, StorageError};
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Row version. `0` means "no row yet"; the first successful write produces `1`.
@@ -94,35 +96,388 @@ impl Repository {
         Ok(Self { conn })
     }
 
-    /// STUB (RED phase).
-    pub fn load(&self, _guild: u64, _user: u64) -> Result<Option<(State, Version)>, RepoError> {
-        let _ = &self.conn;
-        Ok(None)
+    /// Loads one member. `Ok(None)` means no row (treat as `Inactive` at version 0).
+    /// A row that cannot be read back exactly is an error, never a default state.
+    pub fn load(&self, guild: u64, user: u64) -> Result<Option<(State, Version)>, RepoError> {
+        let Some(raw) = read_raw(&self.conn, guild, user)? else {
+            return Ok(None);
+        };
+        let version = stored_version(&raw)?;
+        Ok(Some((decode_state(&raw)?, version)))
     }
 
-    /// STUB (RED phase).
+    /// Compare-and-swap write. Applies only when the stored version equals `expected_version`
+    /// (`0` = no row). Returns the new version, or `Stale` with nothing written. A row that
+    /// cannot be decoded is reported as an error and left as it is, not overwritten.
     pub fn store(
         &mut self,
-        _guild: u64,
-        _user: u64,
-        _state: &State,
-        _expected_version: Version,
-        _now: i64,
+        guild: u64,
+        user: u64,
+        state: &State,
+        expected_version: Version,
+        now: i64,
     ) -> Result<NewVersion, RepoError> {
-        Err(RepoError::Storage(StorageError::Sqlite))
+        let write = Write {
+            key: (guild, user),
+            encoded: encode_state(state)?,
+            expected_version,
+            now,
+            create_if_missing: true,
+        };
+        self.write(&write)
     }
 
-    /// STUB (RED phase).
+    /// Compare-and-swap reset to `Inactive`. The row is kept (empty, version bumped) rather than
+    /// deleted, so a writer that read an older version, or "no row", can never write over it.
+    /// Clearing a member with no row and `expected_version == 0` writes nothing and returns `0`.
     pub fn clear(
         &mut self,
-        _guild: u64,
-        _user: u64,
-        _expected_version: Version,
-        _now: i64,
+        guild: u64,
+        user: u64,
+        expected_version: Version,
+        now: i64,
     ) -> Result<NewVersion, RepoError> {
-        Err(RepoError::Storage(StorageError::Sqlite))
+        let write = Write {
+            key: (guild, user),
+            encoded: encode_state(&State::Inactive)?,
+            expected_version,
+            now,
+            create_if_missing: false,
+        };
+        self.write(&write)
+    }
+
+    fn write(&mut self, w: &Write) -> Result<NewVersion, RepoError> {
+        let new_version = w
+            .expected_version
+            .checked_add(1)
+            .filter(|v| i64::try_from(*v).is_ok())
+            .ok_or(RepoError::InvalidVersion)?;
+        let (guild, user) = (w.key.0.to_string(), w.key.1.to_string());
+        // IMMEDIATE: take the write lock before reading, so the version we check is the version
+        // we replace. A losing writer waits (busy timeout) and then sees the winner's version.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match read_raw(&tx, w.key.0, w.key.1)? {
+            None if w.expected_version != 0 => return Err(RepoError::Stale),
+            None if !w.create_if_missing => return Ok(0),
+            None => {
+                tx.execute(
+                    "INSERT INTO safeword_state (guild, user, state, snapshot_json, struck_json, \
+                     deferred_json, version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        guild,
+                        user,
+                        w.encoded.state,
+                        w.encoded.snapshot,
+                        w.encoded.struck,
+                        w.encoded.deferred,
+                        new_version as i64,
+                        w.now
+                    ],
+                )?;
+            }
+            Some(raw) => {
+                if stored_version(&raw)? != w.expected_version {
+                    return Err(RepoError::Stale);
+                }
+                decode_state(&raw)?; // never overwrite a row we cannot read
+                let changed = tx.execute(
+                    "UPDATE safeword_state SET state = ?3, snapshot_json = ?4, struck_json = ?5, \
+                     deferred_json = ?6, version = ?7, updated_at = ?8 \
+                     WHERE guild = ?1 AND user = ?2 AND version = ?9",
+                    params![
+                        guild,
+                        user,
+                        w.encoded.state,
+                        w.encoded.snapshot,
+                        w.encoded.struck,
+                        w.encoded.deferred,
+                        new_version as i64,
+                        w.now,
+                        w.expected_version as i64
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(RepoError::Stale);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(new_version)
     }
 }
+
+/// One compare-and-swap write request.
+struct Write {
+    key: (u64, u64),
+    encoded: Encoded,
+    expected_version: Version,
+    now: i64,
+    create_if_missing: bool,
+}
+
+/// The four stored text columns for one state.
+struct Encoded {
+    state: &'static str,
+    snapshot: String,
+    struck: String,
+    deferred: String,
+}
+
+/// Raw column values, read untyped so a wrong-typed value is reported, not coerced.
+struct RawRow {
+    state: Value,
+    snapshot: Value,
+    struck: Value,
+    deferred: Value,
+    version: Value,
+}
+
+fn read_raw(conn: &Connection, guild: u64, user: u64) -> Result<Option<RawRow>, RepoError> {
+    Ok(conn
+        .query_row(
+            "SELECT state, snapshot_json, struck_json, deferred_json, version \
+             FROM safeword_state WHERE guild = ?1 AND user = ?2",
+            params![guild.to_string(), user.to_string()],
+            |r| {
+                Ok(RawRow {
+                    state: r.get(0)?,
+                    snapshot: r.get(1)?,
+                    struck: r.get(2)?,
+                    deferred: r.get(3)?,
+                    version: r.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn stored_version(raw: &RawRow) -> Result<Version, RepoError> {
+    match raw.version {
+        Value::Integer(v) if v >= 1 => Ok(v as u64),
+        _ => Err(RepoError::CorruptRow),
+    }
+}
+
+fn text_of(v: &Value) -> Result<&str, RepoError> {
+    match v {
+        Value::Text(t) => Ok(t),
+        _ => Err(RepoError::CorruptRow),
+    }
+}
+
+const INACTIVE: &str = "inactive";
+const ACTIVATING: &str = "activating";
+const ACTIVE: &str = "active";
+const RELEASING: &str = "releasing";
+const EMPTY_OBJECT: &str = "{}";
+const EMPTY_LIST: &str = "[]";
+
+fn encode_state(state: &State) -> Result<Encoded, RepoError> {
+    let (name, snapshot) = match state {
+        State::Inactive => {
+            return Ok(Encoded {
+                state: INACTIVE,
+                snapshot: EMPTY_OBJECT.to_string(),
+                struck: EMPTY_LIST.to_string(),
+                deferred: EMPTY_LIST.to_string(),
+            })
+        }
+        State::Activating(s) => (ACTIVATING, s),
+        State::Active(s) => (ACTIVE, s),
+        State::Releasing(s) => (RELEASING, s),
+    };
+    let (dto, struck, deferred) = SnapshotDto::split(snapshot);
+    let json = |r: Result<String, serde_json::Error>| r.map_err(|_| RepoError::CorruptJson);
+    Ok(Encoded {
+        state: name,
+        snapshot: json(serde_json::to_string(&dto))?,
+        struck: json(serde_json::to_string(&struck))?,
+        deferred: json(serde_json::to_string(&deferred))?,
+    })
+}
+
+/// Parses a row strictly: known state text, exact JSON shapes, nothing defaulted except the
+/// fields documented on `SnapshotDto`.
+fn decode_state(raw: &RawRow) -> Result<State, RepoError> {
+    let name = text_of(&raw.state)?;
+    if !matches!(name, INACTIVE | ACTIVATING | ACTIVE | RELEASING) {
+        return Err(RepoError::UnknownState);
+    }
+    let (snapshot, struck, deferred) = (
+        text_of(&raw.snapshot)?,
+        text_of(&raw.struck)?,
+        text_of(&raw.deferred)?,
+    );
+    if name == INACTIVE {
+        // An inactive member carries no protection data; anything else is a damaged row.
+        return if (snapshot, struck, deferred) == (EMPTY_OBJECT, EMPTY_LIST, EMPTY_LIST) {
+            Ok(State::Inactive)
+        } else {
+            Err(RepoError::CorruptRow)
+        };
+    }
+    let parse = |e: serde_json::Error| {
+        let _ = e; // error text may echo stored JSON; keep only the code
+        RepoError::CorruptJson
+    };
+    let dto: SnapshotDto = serde_json::from_str(snapshot).map_err(parse)?;
+    let struck: Vec<RoleId> = serde_json::from_str(struck).map_err(parse)?;
+    let deferred: Vec<RoleId> = serde_json::from_str(deferred).map_err(parse)?;
+    let snapshot = dto.join(struck, deferred);
+    Ok(match name {
+        ACTIVATING => State::Activating(snapshot),
+        ACTIVE => State::Active(snapshot),
+        _ => State::Releasing(snapshot),
+    })
+}
+
+/// Stored form of `Snapshot` minus `struck_roles` and `deferred_roles`, which have their own
+/// columns. A private mirror, so `state.rs` stays free of serde. Unknown keys are refused (a
+/// newer build's data is not silently dropped). Only the fields added to SW1 after its first
+/// round (`failed_steps`, `restore_in_flight`, `last_emitted_restore_plan`) may be absent; they
+/// default to empty/false. Every other field is required.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotDto {
+    saved_roles: Vec<RoleId>,
+    original_roles: Vec<RoleId>,
+    deleted_roles: Vec<RoleId>,
+    restore_plan: Vec<RoleId>,
+    snapshot_saved: bool,
+    roles_removed: bool,
+    safeword_added: bool,
+    dm_sent: bool,
+    pending_release: bool,
+    pending_reactivate: bool,
+    safeword_removed: bool,
+    roles_restored: bool,
+    #[serde(default)]
+    restore_in_flight: bool,
+    #[serde(default)]
+    last_emitted_restore_plan: Vec<RoleId>,
+    snapshot_cleared: bool,
+    release_dm_sent: bool,
+    last_failure: Option<FailureDto>,
+    #[serde(default)]
+    failed_steps: Vec<ActionIdDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailureDto {
+    step: ActionIdDto,
+    code: FailureCodeDto,
+}
+
+impl SnapshotDto {
+    /// Splits a snapshot into this DTO plus the struck and deferred lists. Destructures every
+    /// field, so adding a field to `Snapshot` fails to compile here until it is persisted.
+    fn split(s: &Snapshot) -> (Self, Vec<RoleId>, Vec<RoleId>) {
+        let Snapshot {
+            saved_roles,
+            original_roles,
+            struck_roles,
+            deleted_roles,
+            deferred_roles,
+            restore_plan,
+            snapshot_saved,
+            roles_removed,
+            safeword_added,
+            dm_sent,
+            pending_release,
+            pending_reactivate,
+            safeword_removed,
+            roles_restored,
+            restore_in_flight,
+            last_emitted_restore_plan,
+            snapshot_cleared,
+            release_dm_sent,
+            last_failure,
+            failed_steps,
+        } = s.clone();
+        let dto = Self {
+            saved_roles,
+            original_roles,
+            deleted_roles,
+            restore_plan,
+            snapshot_saved,
+            roles_removed,
+            safeword_added,
+            dm_sent,
+            pending_release,
+            pending_reactivate,
+            safeword_removed,
+            roles_restored,
+            restore_in_flight,
+            last_emitted_restore_plan,
+            snapshot_cleared,
+            release_dm_sent,
+            last_failure: last_failure.map(|(step, code)| FailureDto {
+                step: step.into(),
+                code: code.into(),
+            }),
+            failed_steps: failed_steps.into_iter().map(Into::into).collect(),
+        };
+        (dto, struck_roles, deferred_roles)
+    }
+
+    fn join(self, struck_roles: Vec<RoleId>, deferred_roles: Vec<RoleId>) -> Snapshot {
+        Snapshot {
+            saved_roles: self.saved_roles,
+            original_roles: self.original_roles,
+            struck_roles,
+            deleted_roles: self.deleted_roles,
+            deferred_roles,
+            restore_plan: self.restore_plan,
+            snapshot_saved: self.snapshot_saved,
+            roles_removed: self.roles_removed,
+            safeword_added: self.safeword_added,
+            dm_sent: self.dm_sent,
+            pending_release: self.pending_release,
+            pending_reactivate: self.pending_reactivate,
+            safeword_removed: self.safeword_removed,
+            roles_restored: self.roles_restored,
+            restore_in_flight: self.restore_in_flight,
+            last_emitted_restore_plan: self.last_emitted_restore_plan,
+            snapshot_cleared: self.snapshot_cleared,
+            release_dm_sent: self.release_dm_sent,
+            last_failure: self.last_failure.map(|f| (f.step.into(), f.code.into())),
+            failed_steps: self.failed_steps.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Generates a serde mirror of a fieldless SW1 enum with exhaustive conversions both ways, so a
+/// new SW1 variant fails to compile here instead of being lost.
+macro_rules! mirror_enum {
+    ($dto:ident <-> $real:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Serialize, Deserialize, Clone, Copy)]
+        #[serde(rename_all = "snake_case")]
+        enum $dto { $($variant),+ }
+        impl From<$real> for $dto {
+            fn from(v: $real) -> Self {
+                match v { $($real::$variant => Self::$variant),+ }
+            }
+        }
+        impl From<$dto> for $real {
+            fn from(v: $dto) -> Self {
+                match v { $($dto::$variant => Self::$variant),+ }
+            }
+        }
+    };
+}
+
+mirror_enum!(ActionIdDto <-> ActionId {
+    SaveSnapshot, RemoveRoles, AddSafewordRole, SendActivatedDm,
+    RemoveSafewordRole, RestoreRoles, ClearSnapshot, SendReleasedDm,
+});
+mirror_enum!(FailureCodeDto <-> FailureCode {
+    StorageError, MissingPermissions, HierarchyRejected, RateLimited,
+    DmClosed, TransientHttp, UnknownRole,
+});
 
 #[cfg(test)]
 mod tests {
@@ -849,7 +1204,15 @@ mod tests {
             .unwrap_err();
         for e in [e1, e2, e3, e4] {
             let t = format!("{e:?} | {e} | {}", e.code());
-            for needle in ["marker", "secret", "SELECT", "111", "222", "snapshot", "{"] {
+            for needle in [
+                "marker",
+                "secret",
+                "SELECT",
+                "111",
+                "222",
+                "snapshot_json",
+                "{",
+            ] {
                 assert!(!t.contains(needle), "leaked {needle:?} in {t}");
             }
         }
@@ -966,7 +1329,7 @@ mod tests {
                     return true;
                 }
                 let roll = self.rng.next();
-                if i < 400 && roll % 13 == 0 {
+                if i < 400 && roll.is_multiple_of(13) {
                     self.reaction = !self.reaction;
                     let e = if self.reaction {
                         Event::ReactionAdded
@@ -974,10 +1337,10 @@ mod tests {
                         Event::ReactionRemoved
                     };
                     self.apply(e);
-                } else if roll % 9 == 0 {
+                } else if roll.is_multiple_of(9) {
                     self.restart(true);
                 } else if let Some(a) = self.queue.pop_front() {
-                    let e = if self.rng.next() % 4 == 0 {
+                    let e = if self.rng.next().is_multiple_of(4) {
                         Event::ActionFailed(a.id(), FailureCode::TransientHttp)
                     } else {
                         Event::ActionDone(a.id())
