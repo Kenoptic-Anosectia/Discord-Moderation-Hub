@@ -308,7 +308,10 @@ pub fn plan_click(request: &PlanRequest) -> Result<Plan, PlanError> {
                 .collect();
             if holds_option {
                 // Not a toggle: the group keeps its choice. Extra options held
-                // from before are cleaned up.
+                // from before are removed on this click unless `decide_removal`
+                // denies the removal; then the extra option stays and
+                // `RemovalDenied` is reported, so the member can still hold two
+                // options of the group.
                 plan.skipped.push((option, Reason::AlreadySelected));
                 for other in others {
                     remove_or_skip(&mut plan, ctx, other);
@@ -471,6 +474,22 @@ mod tests {
         assert!(p.add.is_empty());
         assert_eq!(p.remove, vec![2004]);
         assert_eq!(p.skipped, vec![(2002, Reason::AlreadySelected)]);
+    }
+
+    #[test]
+    fn exclusive_repair_with_denied_removal_keeps_extra_and_reports_it() {
+        let mut e = env();
+        e.edit(2001, |r| r.position = BOT_TOP); // bot cannot touch this role
+        let p = run(&menu(), &click(&[2001, 2002], "pick", 2002), &e);
+        assert!(p.add.is_empty());
+        assert!(p.remove.is_empty(), "the unreachable extra option stays");
+        assert_eq!(
+            p.skipped,
+            vec![
+                (2002, Reason::AlreadySelected),
+                (2001, Reason::RemovalDenied(DenyReason::AtOrAboveBot)),
+            ]
+        );
     }
 
     #[test]
