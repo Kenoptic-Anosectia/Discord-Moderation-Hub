@@ -18,6 +18,9 @@
 //! Limits, stated plainly:
 //! * The plan never names a message that was not recorded, and [`apply`] refuses a
 //!   record that contradicts its plan.
+//! * A plan is refused when the row no longer holds what the plan was made from:
+//!   an `Edit` names the hash it was planned from, a `Recreate` names the message it
+//!   replaces. A stale plan is refused, so it cannot roll the record back.
 //! * The plan cannot know whether a post that was just made really exists, and it
 //!   cannot know whether the record of a post was written. A post that succeeds on
 //!   Discord and whose record write then fails leaves the table without a row, so
@@ -27,6 +30,10 @@
 //! * [`apply`] reads the row and then writes it. It is not an atomic
 //!   compare-and-swap, so two writers of the same key can still race between the
 //!   read and the write. The card for this module asks for simple upserts.
+//! * Refusing a stale plan does not fix two OVERLAPPING Discord calls. When two
+//!   syncs of one key edit the same message at the same moment, the last Discord
+//!   edit and the last record write can disagree. The caller must run at most one
+//!   sync per key at a time.
 //!
 //! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
 
@@ -547,7 +554,7 @@ fn check_recorded_post(
             // newer template, and writing this one would roll the record back to
             // an older hash. A later sync would then see the older hash as the
             // published one and never publish the newer template again.
-            if false && stored.record.content_hash != from {
+            if stored.record.content_hash != from {
                 return Err(RepoError::PlanMismatch);
             }
         }
@@ -602,10 +609,9 @@ fn check_message_free(conn: &Connection, record: &PostRecord) -> Result<(), Repo
         Ok(key) => Some(key),
         // No other key records this message: it is free.
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(other) => {
-            let _ = other;
-            None
-        }
+        // Any other error is NOT "the message is free". Treating it as free would
+        // let two keys record one message, so the error is reported.
+        Err(other) => return Err(RepoError::from(other)),
     };
     if taken.is_some() {
         return Err(RepoError::MessageAlreadyRecorded);
@@ -1560,6 +1566,73 @@ mod tests {
         );
     }
 
+    /// Two syncs of one key that plan from the SAME row: the second write must not
+    /// roll the record back to the older template version.
+    ///
+    /// This is the sequence the reviewer described. The row holds HASH_A. Sync A
+    /// plans an edit for HASH_B, sync B plans an edit for HASH_C, and both plans
+    /// were made from the row that holds HASH_A. The two writes land in the
+    /// opposite order to the Discord calls: Discord shows HASH_B last, so the
+    /// record must hold HASH_B as well.
+    ///
+    /// Without the `from` guard the record would end up holding HASH_C while
+    /// Discord shows HASH_B, and `plan(HASH_B)` would then return `NoOp` for ever:
+    /// a changed rules template would never be published again and nothing would
+    /// report it.
+    #[test]
+    fn two_syncs_of_one_key_cannot_roll_the_record_back() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
+
+        // Both plans are made from the row that holds HASH_A.
+        let mut req_b = request("general-rules", HASH_B);
+        req_b.recorded = Some(&original);
+        let plan_b = plan(&req_b);
+        let mut req_c = request("general-rules", HASH_C);
+        req_c.recorded = Some(&original);
+        let plan_c = plan(&req_c);
+        assert_eq!(
+            plan_b,
+            Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE,
+                from: HASH_A,
+            }
+        );
+        assert_eq!(plan_b, plan_c, "the two plans must be the same shape");
+
+        // The Discord calls land in the order B then C, so Discord shows HASH_C.
+        let mut record_c = original.clone();
+        record_c.content_hash = HASH_C.to_string();
+        assert!(apply(&conn, &plan_c, &record_c, 2).unwrap());
+
+        // The record write of sync B lands LAST, but its plan is stale: the row no
+        // longer holds the hash it was planned from.
+        let mut record_b = original.clone();
+        record_b.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(&conn, &plan_b, &record_b, 3).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+
+        // The row holds HASH_C, which is what Discord shows. A later sync of HASH_C
+        // is therefore a no-op, not a permanent stall.
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.content_hash, HASH_C);
+        let mut req = request("general-rules", HASH_C);
+        req.recorded = Some(&stored.record);
+        assert_eq!(plan(&req), Plan::NoOp);
+    }
+
     /// A `Create` plan must not replace a row that already exists: the recorded post
     /// would be forgotten and the same post would be published twice.
     #[test]
@@ -2116,9 +2189,16 @@ mod tests {
     /// moderator deletes a message by removing its id; the bot posts a message by
     /// adding a new id. An edit never changes the id: that is the whole point of
     /// "edit in place, never duplicate".
+    ///
+    /// The model also remembers WHICH TEMPLATE each live message shows, so a test
+    /// can see the one thing the table cannot: the message on the Discord side and
+    /// the row in the table can disagree.
     #[derive(Default)]
     struct Discord {
         live: Vec<u64>,
+        /// The template hash each live message shows. The index is the position in
+        /// `live`, so a deleted message takes its hash with it.
+        shown: Vec<String>,
         next_id: u64,
     }
 
@@ -2127,6 +2207,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 live: Vec::new(),
+                shown: Vec::new(),
                 next_id: MESSAGE,
             }
         }
@@ -2135,17 +2216,39 @@ mod tests {
         fn post(&mut self) -> u64 {
             self.next_id += 1;
             self.live.push(self.next_id);
+            self.shown.push(HASH_A.to_string());
             self.next_id
         }
 
         /// Deletes the message with the given id, if it exists.
+        ///
+        /// The hash goes with it, so `shown` and `live` stay aligned.
         fn delete(&mut self, id: u64) {
-            self.live.retain(|other| *other != id);
+            let Some(index) = self.live.iter().position(|other| *other == id) else {
+                return;
+            };
+            self.live.remove(index);
+            if index < self.shown.len() {
+                self.shown.remove(index);
+            }
         }
 
         /// True when a message with the given id exists.
         fn exists(&self, id: u64) -> bool {
             self.live.contains(&id)
+        }
+
+        /// Shows a new template on the message with the given id.
+        fn edit(&mut self, id: u64, hash: &str) {
+            if let Some(index) = self.live.iter().position(|other| *other == id) {
+                self.shown[index] = hash.to_string();
+            }
+        }
+
+        /// The template hash the message with the given id shows.
+        fn shows(&self, id: u64) -> Option<&str> {
+            let index = self.live.iter().position(|other| *other == id)?;
+            self.shown.get(index).map(String::as_str)
         }
     }
 
@@ -2215,6 +2318,7 @@ mod tests {
                 let mut new_record = record(hash);
                 new_record.key = key.to_string();
                 new_record.message = message;
+                discord.edit(message, new_record.content_hash.as_str());
                 if !write_fails {
                     apply(conn, &plan, &new_record, now).unwrap();
                 }
@@ -2226,7 +2330,7 @@ mod tests {
                     discord.exists(message),
                     "an edit targeted a message that does not exist"
                 );
-                if discord_fails || write_fails {
+                if discord_fails {
                     return Step::Quiet;
                 }
                 let mut edited = record(hash);
@@ -2238,7 +2342,15 @@ mod tests {
                 let recorded_hash = get(conn, key).unwrap().unwrap().record.content_hash;
                 assert_eq!(from, recorded_hash, "the plan forgot its from hash");
                 assert_ne!(from, edited.content_hash, "the edit changed nothing");
-                apply(conn, &plan, &edited, now).unwrap();
+                // The Discord edit happens BEFORE the record is written. When the
+                // record write is lost, the message on the Discord side shows the
+                // new template while the table still holds the old one: that is
+                // the divergence the module cannot close, and the model keeps it
+                // so a test can see it.
+                discord.edit(message, edited.content_hash.as_str());
+                if !write_fails {
+                    apply(conn, &plan, &edited, now).unwrap();
+                }
                 Step::Edited
             }
             Plan::Recreate { key, replaces } => {
@@ -2254,6 +2366,7 @@ mod tests {
                 let mut new_record = record(hash);
                 new_record.key = key.to_string();
                 new_record.message = message;
+                discord.edit(message, new_record.content_hash.as_str());
                 if !write_fails {
                     apply(conn, &plan, &new_record, now).unwrap();
                 }
@@ -2492,6 +2605,90 @@ mod tests {
                 "step {step}"
             );
         }
+    }
+
+    /// The Discord side and the table CAN disagree, and the module does not hide
+    /// it.
+    ///
+    /// The Discord edit happens BEFORE the record is written. When the record write
+    /// is lost, the message on the Discord side shows the new template while the
+    /// table still holds the old hash. The next sync then plans the same edit
+    /// again, which is the right thing to do: the table is the only truth this
+    /// module has.
+    ///
+    /// This is a limit of the module, not a bug in it: the table cannot record what
+    /// it was not able to write. The wiring card must run one sync per key at a
+    /// time, so that two edits of one key cannot overlap on the Discord side.
+    #[test]
+    fn a_lost_record_write_leaves_the_message_and_the_row_apart() {
+        let conn = mem_db();
+        let mut discord = Discord::new();
+
+        // The first post succeeds and its record is written.
+        sync_step(
+            &conn,
+            &mut discord,
+            &StepRequest {
+                key: "general-rules",
+                hash: HASH_A,
+                allow_recreate: false,
+                discord_fails: false,
+                write_fails: false,
+                now: 1_000,
+            },
+        );
+        let message = get(&conn, "general-rules").unwrap().unwrap().record.message;
+        assert_eq!(discord.shows(message), Some(HASH_A));
+
+        // The template changes. The Discord edit succeeds, the record write is
+        // lost.
+        sync_step(
+            &conn,
+            &mut discord,
+            &StepRequest {
+                key: "general-rules",
+                hash: HASH_B,
+                allow_recreate: false,
+                discord_fails: false,
+                write_fails: true,
+                now: 1_001,
+            },
+        );
+
+        // The message shows the new template, the table still holds the old hash.
+        assert_eq!(discord.shows(message), Some(HASH_B));
+        assert_eq!(
+            get(&conn, "general-rules")
+                .unwrap()
+                .unwrap()
+                .record
+                .content_hash,
+            HASH_A
+        );
+
+        // The next sync plans the edit again, because the table is the only truth
+        // the module has. The second write lands, and the two sides agree again.
+        sync_step(
+            &conn,
+            &mut discord,
+            &StepRequest {
+                key: "general-rules",
+                hash: HASH_B,
+                allow_recreate: false,
+                discord_fails: false,
+                write_fails: false,
+                now: 1_002,
+            },
+        );
+        assert_eq!(
+            get(&conn, "general-rules")
+                .unwrap()
+                .unwrap()
+                .record
+                .content_hash,
+            HASH_B
+        );
+        assert_eq!(discord.shows(message), Some(HASH_B));
     }
 
     /// Once the template stops changing and everything works, the module settles
