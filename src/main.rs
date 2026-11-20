@@ -1,4 +1,5 @@
 mod archive_safety;
+mod bump;
 mod config;
 mod deletion_attribution;
 mod flash;
