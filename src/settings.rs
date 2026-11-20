@@ -11,13 +11,13 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingError {
     /// The key was not set or resolved to `None`.
-    Unset(&'static str),
+    Unset(String),
     /// The value is not one of the accepted tokens.
-    InvalidValue(&'static str),
+    InvalidValue(String),
     /// A numeric value exceeds the allowed range.
-    OutOfRange(&'static str),
+    OutOfRange(String),
     /// A value contains non-ASCII / negative / overflow content.
-    ParseError(&'static str),
+    ParseError(String),
 }
 
 impl fmt::Display for SettingError {
@@ -45,12 +45,16 @@ pub enum Mode {
 
 /// Parse a mode string.  Unset or anything other than off/shadow/live → Off.
 /// Case-insensitive, trimmed.
-pub fn parse_mode(_key: &str, raw: Option<&str>) -> Result<Mode, SettingError> {
-    let trimmed = match raw {
-        Some(s) => s.trim().to_ascii_lowercase(),
+pub fn parse_mode(key: &str, raw: Option<&str>) -> Result<Mode, SettingError> {
+    // key is carried for API consistency; parse_mode never errors, only returns Off.
+    // We reference it to satisfy the compiler — the key would appear in error text
+    // if a future change adds an error path for malformed input.
+    let _settings_key = key;
+    let s = match raw {
+        Some(s) => s.trim(),
         None => return Ok(Mode::Off),
     };
-    match trimmed.as_str() {
+    match s.to_lowercase().as_str() {
         "off" => Ok(Mode::Off),
         "shadow" => Ok(Mode::Shadow),
         "live" => Ok(Mode::Live),
@@ -66,11 +70,13 @@ pub fn parse_mode(_key: &str, raw: Option<&str>) -> Result<Mode, SettingError> {
 ///
 /// Rules:
 /// - Empty or unset → empty Vec.
-/// - Each entry is trimmed; only ASCII digits allowed.
-/// - Rejects 0, negatives, Unicode digits, overflow.
-/// - One bad entry → whole list is an error.
+/// - Each entry is trimmed; must be non-empty and contain only ASCII digits.
+/// - Rejects 0, negatives, Unicode digits, overflow, leading `+`.
+/// - One bad entry → whole list is an error (never silently drop it).
 /// - Result is deduplicated and sorted ascending.
-pub fn parse_id_list(_key: &str, raw: Option<&str>) -> Result<Vec<u64>, SettingError> {
+/// - Empty interior entries (e.g. `"100,,200"` or `","`) are rejected
+///   (fail-closed: a half-deleted id is a bad entry).
+pub fn parse_id_list(key: &str, raw: Option<&str>) -> Result<Vec<u64>, SettingError> {
     let s = match raw {
         Some(s) => s.trim(),
         None => return Ok(Vec::new()),
@@ -81,19 +87,20 @@ pub fn parse_id_list(_key: &str, raw: Option<&str>) -> Result<Vec<u64>, SettingE
     let mut ids = Vec::new();
     for part in s.split(',') {
         let trimmed = part.trim();
+        // Empty entries (from `,,` or leading/trailing commas) are rejected.
         if trimmed.is_empty() {
-            continue;
+            return Err(SettingError::ParseError(key.to_string()));
         }
         // Only ASCII digits allowed — reject negatives, Unicode digits, signs, etc.
-        if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
-            return Err(SettingError::ParseError("id"));
+        if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return Err(SettingError::ParseError(key.to_string()));
         }
         // Parse as u64 — catches overflow
         let val: u64 = trimmed
             .parse()
-            .map_err(|_| SettingError::ParseError("id"))?;
+            .map_err(|_| SettingError::ParseError(key.to_string()))?;
         if val == 0 {
-            return Err(SettingError::ParseError("id"));
+            return Err(SettingError::ParseError(key.to_string()));
         }
         ids.push(val);
     }
@@ -109,27 +116,27 @@ pub fn parse_id_list(_key: &str, raw: Option<&str>) -> Result<Vec<u64>, SettingE
 
 /// Parse a duration in seconds as an integer, bounded to [min, max].
 pub fn parse_duration_secs(
-    _key: &str,
+    key: &str,
     raw: Option<&str>,
     min: u64,
     max: u64,
 ) -> Result<u64, SettingError> {
     let s = match raw {
         Some(s) => s.trim(),
-        None => return Err(SettingError::Unset("duration")),
+        None => return Err(SettingError::Unset(key.to_string())),
     };
     if s.is_empty() {
-        return Err(SettingError::Unset("duration"));
+        return Err(SettingError::Unset(key.to_string()));
     }
-    // Only ASCII digits (no negatives, no Unicode)
+    // Only ASCII digits (no negatives, no Unicode, no leading `+`)
     if !s.chars().all(|c| c.is_ascii_digit()) {
-        return Err(SettingError::ParseError("duration"));
+        return Err(SettingError::ParseError(key.to_string()));
     }
     let val: u64 = s
         .parse()
-        .map_err(|_| SettingError::ParseError("duration"))?;
+        .map_err(|_| SettingError::ParseError(key.to_string()))?;
     if val < min || val > max {
-        return Err(SettingError::OutOfRange("duration"));
+        return Err(SettingError::OutOfRange(key.to_string()));
     }
     Ok(val)
 }
@@ -275,9 +282,34 @@ mod tests {
     }
 
     #[test]
-    fn id_list_whitespace_only_entries_skipped() {
-        let ids = parse_id_list("test_key", Some("100, , 200")).unwrap();
-        assert_eq!(ids, vec![100, 200]);
+    fn id_list_rejects_empty_interior_entries() {
+        // Empty entries from `,,` or leading/trailing commas are rejected.
+        let result = parse_id_list("test_key", Some("100,,200"));
+        assert!(result.is_err());
+        let result = parse_id_list("test_key", Some(","));
+        assert!(result.is_err());
+        let result = parse_id_list("test_key", Some(",100,"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn id_list_rejects_leading_plus() {
+        // Rust's u64::from_str accepts leading `+`, but we reject it.
+        let result = parse_id_list("test_key", Some("+5"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn id_list_accepts_u64_max() {
+        let ids = parse_id_list("test_key", Some("18446744073709551615")).unwrap();
+        assert_eq!(ids, vec![u64::MAX]);
+    }
+
+    #[test]
+    fn duration_leading_plus_is_error() {
+        // Rust's u64::from_str accepts leading `+`, but we reject it.
+        let result = parse_duration_secs("test_key", Some("+60"), 1, 100);
+        assert!(result.is_err());
     }
 
     // ---- Duration tests ----
@@ -332,7 +364,7 @@ mod tests {
 
     #[test]
     fn error_display_contains_key() {
-        let err = SettingError::Unset("MY_KEY");
+        let err = SettingError::Unset("MY_KEY".to_string());
         let display = format!("{}", err);
         assert!(
             display.contains("MY_KEY"),
@@ -411,7 +443,8 @@ mod tests {
 
     #[test]
     fn parse_duration_secs_error_display_contains_key() {
-        let err = parse_duration_secs("FEATURE_X_TIMEOUT_SECS", Some("S3CR3T"), 1, 100).unwrap_err();
+        let err =
+            parse_duration_secs("FEATURE_X_TIMEOUT_SECS", Some("S3CR3T"), 1, 100).unwrap_err();
         let display = format!("{}", err);
         assert!(
             display.contains("FEATURE_X_TIMEOUT_SECS"),
