@@ -1,0 +1,50 @@
+{
+  "content": "Welcome {user_mention} 👋",
+  "embed": {
+    "title": "Welcome to {server}!",
+    "description": "Hey {user_mention}, we're excited to have you here!\n\nYou are our **{member_ordinal}** member. 🎉\n\nPlease read the rules and grab your roles below to get full access.",
+    "fields": [
+      {
+        "name": "📜 Rules (Main)",
+        "value": "Start by reading our primary rules in {channel:rules_main}.\nThese cover server-wide behavior, Discord ToS compliance, and general expectations.",
+        "inline": false
+      },
+      {
+        "name": "📜 Rules (NSFW)",
+        "value": "Then check {channel:rules_nsfw} for extra rules, NSFW-specific guidelines, and channel-specific requirements.",
+        "inline": false
+      },
+      {
+        "name": "🍵 Roles – General & Pings",
+        "value": "Head over to {channel:roles_general} to:\n> • Pick **general roles** (age, region, pronouns, etc.)\n> • Opt in/out of **ping roles** for announcements and events.",
+        "inline": false
+      },
+      {
+        "name": "🍋 Roles – NSFW Roles",
+        "value": "Visit {channel:roles_nsfw} to:\n> • Choose **NSFW roles** so others see what you are interested in\n> • Select **preferred NSFW roles** (Maledom, Femdom, etc.) to unlock NSFW channels and content.",
+        "inline": false
+      },
+      {
+        "name": "🛡️ Roles – Kinks",
+        "value": "Finally, go to {channel:roles_kinks} to:\n> • Select **kink roles** to communicate your interests and preferences\n> • These roles are optional but help others understand your boundaries and desires.",
+        "inline": false
+      },
+      {
+        "name": "📌 Quick Tips",
+        "value": "- Be respectful and follow all rules at all times.\n- Need help? Make a ticket in {channel:tickets}.\n- Use the proper channels for NSFW, Images, and off-topic chat.",
+        "inline": false
+      },
+      {
+        "name": "💬 Community Engagement",
+        "value": "We encourage you to participate in discussions, events, and activities. Your presence makes our community stronger!",
+        "inline": false
+      }
+    ],
+    "footer": {
+      "text": "Welcome aboard, {username} • Total members: {member_count}"
+    },
+    "author": {
+      "name": "{user_mention}"
+    }
+  }
+}

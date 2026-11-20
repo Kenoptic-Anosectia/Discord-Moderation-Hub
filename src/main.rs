@@ -7,6 +7,7 @@ mod safeword;
 mod storage;
 mod text_helpers;
 mod tickets;
+mod welcome;
 
 use config::Config;
 use deletion_attribution::{
