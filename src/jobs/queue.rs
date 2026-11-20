@@ -30,6 +30,12 @@ pub const MAX_CODE_LEN: usize = 48;
 
 /// Stable `last_error_code` values written by this module itself.
 pub const CODE_PAYLOAD_MALFORMED: &str = "payload_malformed";
+pub const CODE_KIND_MALFORMED: &str = "kind_malformed";
+/// Shown in views and reports instead of a stored `kind` that is not a plain
+/// `[a-z0-9_]{1,64}` token (only possible for rows written around this API).
+pub const KIND_PLACEHOLDER: &str = "invalid_kind";
+/// Same, for a stored `dedupe_key` that is not printable ASCII.
+pub const KEY_PLACEHOLDER: &str = "invalid_key";
 pub const CODE_INVALID_CODE: &str = "invalid_error_code";
 pub const CODE_RESTART_RERUN: &str = "restart_rerun";
 pub const CODE_RESTART_AT_MOST_ONCE: &str = "restart_at_most_once";
@@ -1288,6 +1294,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claim_due(&c, 1, 1).unwrap().claimed.len(), 1);
+    }
+
+    // ---- rows written around the API (qa-3 round 1) ----
+
+    /// Insert a row whose `kind`/`payload_json` are given as raw SQL
+    /// expressions (so they can be invalid UTF-8 text: the schema only checks
+    /// `typeof(..) = 'text'`).
+    fn raw_row(c: &Connection, kind_sql: &str, payload_sql: &str, key: &str, state: &str) -> i64 {
+        c.execute(
+            &format!(
+                "INSERT INTO jobs (kind, dedupe_key, payload_json, due_at, state, attempts, updated_at) \
+                 VALUES ({kind_sql}, '{key}', {payload_sql}, 0, '{state}', 1, 0)"
+            ),
+            [],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    #[test]
+    fn try_claim_refuses_a_job_that_is_not_yet_due() {
+        let c = mem();
+        let id = created(&c, "rerun", "later", 100, 0);
+        assert!(!try_claim(&c, id, 99).unwrap(), "one second early");
+        let v = get(&c, id).unwrap().unwrap();
+        assert_eq!(v.state, JobState::Pending);
+        assert_eq!(
+            v.attempts, 0,
+            "a refused claim must not count as an attempt"
+        );
+        assert!(try_claim(&c, id, 100).unwrap(), "exactly due");
+        assert_eq!(state_of(&c, id), JobState::Running);
+    }
+
+    #[test]
+    fn non_utf8_payload_fails_only_that_row_and_other_jobs_are_still_claimed() {
+        let c = mem();
+        let before = created(&c, "rerun", "before", 0, 0);
+        let bad = raw_row(
+            &c,
+            "'rerun'",
+            "CAST(x'7bff7d' AS TEXT)",
+            "bad_payload",
+            "pending",
+        );
+        let after = created(&c, "rerun", "after", 0, 0);
+        let b = claim_due(&c, 10, 10).expect("one bad row must not stop the queue");
+        assert_eq!(ids(&b), vec![before, after]);
+        assert_eq!(b.payload_failed, vec![bad]);
+        let v = get(&c, bad).unwrap().unwrap();
+        assert_eq!(v.state, JobState::Failed);
+        assert_eq!(v.last_error_code.as_deref(), Some(CODE_PAYLOAD_MALFORMED));
+        // and the next call is healthy too (it used to fail on every call)
+        let again = created(&c, "rerun", "later", 5, 0);
+        assert_eq!(ids(&claim_due(&c, 10, 10).unwrap()), vec![again]);
+    }
+
+    #[test]
+    fn bad_kind_at_claim_fails_only_that_row_and_other_jobs_are_still_claimed() {
+        let c = mem();
+        let good = created(&c, "rerun", "good", 5, 0);
+        let non_utf8 = raw_row(&c, "CAST(x'ff' AS TEXT)", "'{}'", "bad_kind_a", "pending");
+        let spaced = raw_row(&c, "'Secret User Text'", "'{}'", "bad_kind_b", "pending");
+        let b = claim_due(&c, 10, 10).expect("one bad row must not stop the queue");
+        assert_eq!(ids(&b), vec![good]);
+        assert_eq!(b.payload_failed, vec![non_utf8, spaced]);
+        for id in [non_utf8, spaced] {
+            let v = get(&c, id).unwrap().unwrap();
+            assert_eq!(v.state, JobState::Failed);
+            assert_eq!(v.last_error_code.as_deref(), Some(CODE_KIND_MALFORMED));
+            assert_eq!(v.kind, KIND_PLACEHOLDER, "stored kind text is not echoed");
+        }
+        assert_eq!(state_of(&c, good), JobState::Running);
+    }
+
+    #[test]
+    fn reconcile_handles_non_utf8_and_hostile_kinds_without_stopping_the_rest() {
+        let c = mem();
+        let once = raw_row(&c, "'once'", "'{}'", "once1", "running");
+        let bad = raw_row(&c, "CAST(x'ff' AS TEXT)", "'{}'", "bad_a", "running");
+        let spaced = raw_row(&c, "'Secret User Text'", "'{}'", "bad_b", "running");
+        let rerun = raw_row(&c, "'rerun'", "'{}'", "rerun1", "running");
+        let rep = reconcile_after_restart(&c, 50, TABLE, &D)
+            .expect("one bad row must not stop reconcile");
+        let by_id: HashMap<i64, &ReconcileEntry> = rep.entries.iter().map(|e| (e.id, e)).collect();
+        assert_eq!(rep.entries.len(), 4, "{rep:?}");
+        assert_eq!(by_id[&once].outcome, ReconcileOutcome::AbandonedAtMostOnce);
+        assert_eq!(by_id[&once].kind, "once");
+        assert_eq!(by_id[&rerun].outcome, ReconcileOutcome::Requeued);
+        for id in [bad, spaced] {
+            assert_eq!(by_id[&id].outcome, ReconcileOutcome::AbandonedUnregistered);
+            assert_eq!(by_id[&id].kind, KIND_PLACEHOLDER);
+            assert_eq!(state_of(&c, id), JobState::Abandoned);
+        }
+        assert_eq!(rep.abandoned().len(), 3);
+        assert!(!format!("{rep:?}").contains("Secret"), "{rep:?}");
+        assert_eq!(state_of(&c, once), JobState::Abandoned);
+        assert_eq!(state_of(&c, rerun), JobState::Pending);
+    }
+
+    #[test]
+    fn get_on_a_row_with_non_utf8_text_columns_does_not_error() {
+        let c = mem();
+        let id = raw_row(&c, "CAST(x'ff' AS TEXT)", "'{}'", "k", "pending");
+        let v = get(&c, id).expect("must not be an engine error").unwrap();
+        assert_eq!(v.kind, KIND_PLACEHOLDER);
+        let id2 = raw_row(&c, "'rerun'", "'{}'", "x", "pending");
+        c.execute(
+            "UPDATE jobs SET dedupe_key = CAST(x'c328' AS TEXT), \
+             last_error_code = CAST(x'fe' AS TEXT) WHERE id = ?1",
+            [id2],
+        )
+        .unwrap();
+        let v2 = get(&c, id2).unwrap().unwrap();
+        assert_eq!(v2.dedupe_key, KEY_PLACEHOLDER);
+        assert_eq!(v2.last_error_code, None);
     }
 
     // ---- input validation ----
