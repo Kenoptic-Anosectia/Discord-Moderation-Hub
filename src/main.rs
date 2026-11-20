@@ -2,6 +2,7 @@ mod archive_safety;
 mod config;
 mod deletion_attribution;
 mod flash;
+mod privacy_scope;
 mod roles;
 mod safeword;
 mod storage;
