@@ -411,7 +411,6 @@ struct Segment {
 struct OpenSession {
     channel_id: u64,
     segments: Vec<Segment>,
-    last_seen_at: i64,
 }
 
 /// The state the voice accounting keeps between events.
@@ -447,6 +446,23 @@ impl Ledger {
     /// The number of open sessions the ledger holds.
     pub fn open_session_count(&self) -> usize {
         self.open.len()
+    }
+
+    /// The channel the member's open session is in, if any.
+    ///
+    /// The persistence card uses this to know where a member was last seen.
+    pub fn open_channel(&self, guild_id: u64, user_id: u64) -> Option<u64> {
+        self.open
+            .get(&(guild_id, user_id))
+            .map(|session| session.channel_id)
+    }
+
+    /// The time of the last update the ledger accepted for the member, if any.
+    ///
+    /// This is the value the persistence card keeps as the heartbeat, so a restart can
+    /// close the session at the last moment the bot was known to be running.
+    pub fn last_seen_at(&self, guild_id: u64, user_id: u64) -> Option<i64> {
+        self.last_seen.get(&(guild_id, user_id)).copied()
     }
 
     /// Accounts one voice state update.
@@ -496,7 +512,6 @@ impl Ledger {
                                 end: event.at,
                                 self_deaf: event.self_deaf,
                             }],
-                            last_seen_at: event.at,
                         });
                     }
                 }
@@ -555,7 +570,6 @@ impl Ledger {
                                     end: event.at,
                                     self_deaf: event.self_deaf,
                                 }],
-                                last_seen_at: event.at,
                             },
                         );
                     }
@@ -580,7 +594,6 @@ impl Ledger {
                             end: event.at,
                             self_deaf: event.self_deaf,
                         });
-                        session.last_seen_at = event.at;
                     }
                 }
             }
@@ -627,7 +640,6 @@ impl Ledger {
                             end: event.at,
                             self_deaf: event.self_deaf,
                         }],
-                        last_seen_at: event.at,
                     },
                 );
             }
@@ -1615,6 +1627,35 @@ mod tests {
         for pair in spans.windows(2) {
             assert!(pair[1].0 >= pair[0].1, "the stretches must not overlap");
         }
+    }
+
+    #[test]
+    fn the_ledger_reports_the_open_channel_and_the_last_seen_time() {
+        let mut ledger = Ledger::new();
+        assert_eq!(ledger.open_channel(GUILD, USER), None);
+        assert_eq!(ledger.last_seen_at(GUILD, USER), None);
+        ledger.apply_voice(&join(T, CHANNEL), &cfg());
+        assert_eq!(ledger.open_channel(GUILD, USER), Some(CHANNEL));
+        assert_eq!(ledger.last_seen_at(GUILD, USER), Some(T));
+        ledger.apply_voice(&move_to(T + 300, CHANNEL, OTHER_CHANNEL), &cfg());
+        assert_eq!(ledger.open_channel(GUILD, USER), Some(OTHER_CHANNEL));
+        assert_eq!(ledger.last_seen_at(GUILD, USER), Some(T + 300));
+        ledger.apply_voice(&leave(T + 900, OTHER_CHANNEL), &cfg());
+        assert_eq!(ledger.open_channel(GUILD, USER), None);
+        // The last accepted update is still known, so a restart could use it.
+        assert_eq!(ledger.last_seen_at(GUILD, USER), Some(T + 900));
+    }
+
+    #[test]
+    fn the_ledger_keeps_the_members_apart() {
+        let mut ledger = Ledger::new();
+        let mut other = join(T, OTHER_CHANNEL);
+        other.user_id = OTHER_USER;
+        ledger.apply_voice(&join(T, CHANNEL), &cfg());
+        ledger.apply_voice(&other, &cfg());
+        assert_eq!(ledger.open_session_count(), 2);
+        assert_eq!(ledger.open_channel(GUILD, USER), Some(CHANNEL));
+        assert_eq!(ledger.open_channel(GUILD, OTHER_USER), Some(OTHER_CHANNEL));
     }
 
     #[test]
