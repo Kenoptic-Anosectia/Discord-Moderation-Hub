@@ -1434,6 +1434,11 @@ mod tests {
         assert_eq!(next_day_start(86_399), 86_400);
         assert_eq!(next_day_start(-1), 0);
         assert_eq!(next_day_start(-86_400), 0);
+        // The next day start is exactly one day later, never the same instant.
+        for at in [0i64, 1, 86_399, 86_400, -1, -86_400, 1_709_640_000] {
+            assert_eq!(next_day_start(at), day_start(at) + 86_400);
+            assert!(next_day_start(at) > at);
+        }
     }
 
     #[test]
