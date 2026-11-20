@@ -360,9 +360,20 @@ struct SnapshotDto {
     last_emitted_restore_plan: Vec<RoleId>,
     snapshot_cleared: bool,
     release_dm_sent: bool,
+    // serde treats a missing `Option` key as `None`; `deserialize_with` makes the key required.
+    #[serde(deserialize_with = "required_option")]
     last_failure: Option<FailureDto>,
     #[serde(default)]
     failed_steps: Vec<ActionIdDto>,
+}
+
+/// Deserializes an `Option` whose key must be present (it may still be `null`).
+fn required_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
 }
 
 #[derive(Serialize, Deserialize)]
