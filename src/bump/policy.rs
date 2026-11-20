@@ -24,6 +24,9 @@ use std::fmt;
 ///
 /// Read by the wiring card, not by this module.
 pub const KEY_BOT_ID: &str = "BUMP_BOT_ID";
+/// Proposed key naming the guild a configuration error refers to. The card lists no guild
+/// key; the wiring card decides where the guild id really comes from.
+pub const KEY_GUILD_ID: &str = "BUMP_GUILD_ID";
 /// Environment key holding the success marker text. Default: [`DEFAULT_SUCCESS_MARKER`].
 pub const KEY_SUCCESS_MARKER: &str = "BUMP_SUCCESS_MARKER";
 /// Environment key holding the reminder interval in seconds. Default: [`DEFAULT_INTERVAL_SECS`].
@@ -172,79 +175,199 @@ pub enum ReminderStatus {
 }
 
 impl BumpConfig {
-    /// Validate and build a configuration. (RED stub: refuses everything.)
+    /// Validate and build a configuration.
+    ///
+    /// Refused: a zero guild or bot id, a marker that is blank, longer than
+    /// [`MAX_MARKER_LEN`] bytes or contains control characters, and an interval outside
+    /// `MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS`. Errors name the key and never echo the value.
     pub fn new(
-        _guild_id: u64,
-        _bot_id: u64,
-        _success_marker: &str,
-        _interval_secs: u64,
+        guild_id: u64,
+        bot_id: u64,
+        success_marker: &str,
+        interval_secs: u64,
     ) -> Result<Self, ConfigError> {
-        Err(ConfigError::new(
-            ConfigErrorKind::InvalidMarker,
-            KEY_SUCCESS_MARKER,
-        ))
+        if guild_id == 0 {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidGuildId,
+                KEY_GUILD_ID,
+            ));
+        }
+        if bot_id == 0 {
+            return Err(ConfigError::new(ConfigErrorKind::InvalidBotId, KEY_BOT_ID));
+        }
+        if success_marker.trim().is_empty()
+            || success_marker.len() > MAX_MARKER_LEN
+            || success_marker.chars().any(char::is_control)
+        {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidMarker,
+                KEY_SUCCESS_MARKER,
+            ));
+        }
+        if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&interval_secs) {
+            return Err(ConfigError::new(
+                ConfigErrorKind::IntervalInvalid,
+                KEY_INTERVAL_SECS,
+            ));
+        }
+        Ok(Self {
+            guild_id,
+            bot_id,
+            success_marker: success_marker.to_string(),
+            interval_secs,
+        })
     }
 
     pub fn guild_id(&self) -> u64 {
         self.guild_id
     }
+
     pub fn bot_id(&self) -> u64 {
         self.bot_id
     }
+
     pub fn success_marker(&self) -> &str {
         &self.success_marker
     }
+
     pub fn interval_secs(&self) -> u64 {
         self.interval_secs
     }
 }
 
-/// Parse the raw `BUMP_INTERVAL_SECS` value. (RED stub.)
-pub fn parse_interval_secs(_raw: Option<&str>) -> Result<u64, ConfigError> {
-    Err(ConfigError::new(
-        ConfigErrorKind::IntervalInvalid,
-        KEY_INTERVAL_SECS,
-    ))
+/// Parse the raw `BUMP_INTERVAL_SECS` value.
+///
+/// `None` (key unset) gives [`DEFAULT_INTERVAL_SECS`]. A present value must be plain ASCII
+/// digits only (no sign, spaces, separators, exponent or non-ASCII digits) and inside
+/// `MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS`; anything else is refused with the key named.
+pub fn parse_interval_secs(raw: Option<&str>) -> Result<u64, ConfigError> {
+    let refused = || ConfigError::new(ConfigErrorKind::IntervalInvalid, KEY_INTERVAL_SECS);
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_INTERVAL_SECS);
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refused());
+    }
+    let value: u64 = raw.parse().map_err(|_| refused())?;
+    if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&value) {
+        return Err(refused());
+    }
+    Ok(value)
 }
 
-/// Decide whether a message is a bump confirmation. (RED stub.)
-pub fn decide(_facts: &MessageFacts, _config: &BumpConfig, _state: &State, _now: i64) -> Decision {
-    Decision::Ignored(IgnoreReason::NoSuccessMarker)
+/// Decide whether `facts` is a genuine bump confirmation observed at `now` (unix seconds).
+///
+/// Pure: the state is not changed; apply a confirmation with [`State::confirmed`] or use
+/// [`observe`].
+pub fn decide(facts: &MessageFacts, config: &BumpConfig, state: &State, now: i64) -> Decision {
+    use IgnoreReason::*;
+    if facts.is_webhook {
+        return Decision::Ignored(Webhook);
+    }
+    if facts.guild_id != Some(config.guild_id) {
+        return Decision::Ignored(WrongGuild);
+    }
+    if facts.author_id != config.bot_id {
+        return Decision::Ignored(NotListingBot);
+    }
+    if !facts.author_is_bot {
+        return Decision::Ignored(NotBotAccount);
+    }
+    if facts.message_id == 0 {
+        return Decision::Ignored(InvalidMessageId);
+    }
+    let marker = config.success_marker.as_str();
+    if !(facts.content.contains(marker) || facts.embeds_text.contains(marker)) {
+        return Decision::Ignored(NoSuccessMarker);
+    }
+    if state
+        .last_message_id
+        .is_some_and(|last| facts.message_id <= last)
+    {
+        return Decision::Ignored(AlreadySeen);
+    }
+    Decision::Confirmed(Confirmation {
+        message_id: facts.message_id,
+        confirmed_at: now,
+        next_due: due_at(now, config),
+    })
+}
+
+/// `start + interval`, saturating at `i64::MAX`.
+fn due_at(start: i64, config: &BumpConfig) -> i64 {
+    // The interval is at most MAX_INTERVAL_SECS, so the cast cannot truncate.
+    start.saturating_add(config.interval_secs as i64)
 }
 
 impl State {
-    /// The state after a confirmation. (RED stub.)
-    pub fn confirmed(&self, _c: &Confirmation) -> State {
-        *self
+    /// The state after `c`: a new cycle starting at `c.confirmed_at`, reminder not yet sent.
+    pub fn confirmed(&self, c: &Confirmation) -> State {
+        State {
+            last_confirmed_at: Some(c.confirmed_at),
+            last_message_id: Some(c.message_id),
+            reminded_for_cycle: false,
+        }
     }
-    /// The state after a manual reset. (RED stub.)
-    pub fn reset(&self, _now: i64) -> State {
-        *self
+
+    /// The state after a manual (owner/staff) reset at `now`: a new cycle starting at `now`,
+    /// reminder not yet sent. The last confirmed message id is kept so an old message cannot
+    /// be replayed to undo the reset.
+    pub fn reset(&self, now: i64) -> State {
+        State {
+            last_confirmed_at: Some(now),
+            last_message_id: self.last_message_id,
+            reminded_for_cycle: false,
+        }
     }
-    /// The state after the reminder was sent. (RED stub.)
+
+    /// The state after the reminder for the current cycle was marked as sent.
     pub fn reminded(&self) -> State {
-        *self
+        State {
+            reminded_for_cycle: true,
+            ..*self
+        }
     }
 }
 
-/// Decide and apply in one step. (RED stub.)
+/// Decide and apply in one step: returns the decision and the state to store. The state is
+/// unchanged unless the decision is [`Decision::Confirmed`].
 pub fn observe(
     facts: &MessageFacts,
     config: &BumpConfig,
     state: &State,
     now: i64,
 ) -> (Decision, State) {
-    (decide(facts, config, state, now), *state)
+    let decision = decide(facts, config, state, now);
+    let next = match &decision {
+        Decision::Confirmed(c) => state.confirmed(c),
+        Decision::Ignored(_) => *state,
+    };
+    (decision, next)
 }
 
-/// Where the current cycle stands. (RED stub.)
-pub fn reminder_status(_state: &State, _config: &BumpConfig, _now: i64) -> ReminderStatus {
-    ReminderStatus::NoCycle
+/// Where the current cycle stands at `now`. The due time is `last_confirmed_at + interval`
+/// using the interval of the `config` passed in (the interval is not stored in the state).
+pub fn reminder_status(state: &State, config: &BumpConfig, now: i64) -> ReminderStatus {
+    let Some(start) = state.last_confirmed_at else {
+        return ReminderStatus::NoCycle;
+    };
+    let due_at = due_at(start, config);
+    if state.reminded_for_cycle {
+        ReminderStatus::AlreadyReminded { due_at }
+    } else if now >= due_at {
+        ReminderStatus::Due { due_at }
+    } else {
+        ReminderStatus::NotYet { due_at }
+    }
 }
 
-/// True when the reminder should be sent now. (RED stub.)
-pub fn due(_state: &State, _config: &BumpConfig, _now: i64) -> bool {
-    false
+/// True when the reminder for the current cycle should be sent at `now`: the due time has
+/// been reached and [`State::reminded`] has not yet been applied to this cycle.
+pub fn due(state: &State, config: &BumpConfig, now: i64) -> bool {
+    matches!(
+        reminder_status(state, config, now),
+        ReminderStatus::Due { .. }
+    )
 }
 
 #[cfg(test)]
