@@ -8,7 +8,7 @@ The Mermaid diagrams render on GitHub. If you read this as plain text, each diag
 
 - A **box** is one real file or folder. A box name like `src/tickets/closer.rs` is the exact path.
 - A **solid arrow** `A --> B` means: code in A really uses or calls code in B (a `use` line or a call). The arrow points at the thing being used.
-- A **dashed arrow** `A -.-> B` means: A declares B with a `mod` line, but nothing calls B. A dashed box is a module in that state.
+- A **dashed arrow** `A -.-> B` means: A declares B with a `mod` line, but nothing calls B. A **dashed grey box** is a module that is NOT WIRED. A **dashed orange box** (section 5 only) is PLANNED: a design, not code. A solid arrow that starts at a dashed grey box is still a real `use`; it only says the unwired file uses something.
 - **WIRED** means the code is called from `main.rs` at startup, in a slash command or in an event handler today. **NOT WIRED** means the module exists and has tests, but only its own tests call it (no production caller). **PLANNED** means it exists only in `consolidation-plan/PLAN.md`, not in the code.
 - A *module* is Rust's word for a unit of code, usually one file or one folder with a `mod.rs`. A *pure* function does no I/O: same inputs always give the same output. *I/O* means touching Discord, SQLite, the disk or the clock.
 
@@ -144,7 +144,7 @@ flowchart TB
   repo -->|"migrate on open"| rclosedb
   rclosedb --> repo
   archive --> safety
-  remove -.->|"uses verify, OwnedRoot"| archive
+  remove -->|"uses verify, OwnedRoot"| archive
 
   classDef unwired stroke-dasharray: 5 5,stroke:#888888,color:#555555
   class remove unwired
@@ -328,9 +328,9 @@ Each entry points at a real example. Lines are at commit `920c48b`.
 7. **`Arc`**: a shared, reference-counted pointer, so many tasks can hold one value safely. `Repository` holds `db: Arc<Connection>` (`src/tickets/repository.rs:24`). `Data` holds `config: Arc<Config>` (`src/main.rs:44`).
 8. **`async` / `.await`**: an `async fn` can pause while it waits (for Discord or SQLite) and let other work run. `.await` is the pause point. `pub async fn close(...)` (`runtime_close.rs:190`) awaits at its first line (`:191`).
 9. **`#[derive(...)]`**: asks the compiler to write common trait code for you (`Clone`, `Debug`, `PartialEq` and so on). `#[derive(Clone)]` on `Repository` (`repository.rs:22`). `#[derive(Clone, Debug, Default, PartialEq, Eq)]` on `State` (`state.rs:142`).
-10. **`mod` and `pub`**: `mod x;` declares a module, so the compiler reads `x.rs`. Without `pub`, things are private. `mod archive_safety;` (`src/main.rs:1`) is private to the crate root. `pub mod archive;` (`src/tickets/mod.rs:1`) lets sibling modules use it. `pub(super)` limits something to the parent module (`runtime_close.rs:161`).
+10. **`mod` and `pub`**: `mod x;` declares a module, so the compiler reads `x.rs`. Without `pub`, things are private. A private item is visible inside its own module and everything nested under it. `mod archive_safety;` (`src/main.rs:1`) sits in the crate root, so every file in the crate can use it: `src/tickets/archive.rs:11` does, as `crate::archive_safety`. `pub` is what lets code *outside* the parent module reach in: `pub mod runtime_close;` (`src/tickets/mod.rs:22`) is why `main.rs:2888` can call `tickets::runtime_close::close`. `pub(super)` limits something to the parent module (`runtime_close.rs:161`).
 11. **Lifetimes and generics** (bonus): `Env<'a, I: CloseIo>` (`closer.rs:123`) borrows its parts for a lifetime `'a` and works with any type `I` that implements `CloseIo`.
 
 ## How this page was checked
 
-See the review request on card `t_449a11fe` for the exact commands. Short version: `use`, `mod` and call edges were checked with `grep`. NOT WIRED claims were checked by grepping for the module name outside the module's own files. Line numbers were read back from the files. **The Mermaid blocks were not rendered**: no Mermaid CLI is installed offline, and the task bans network use. They were re-read against Mermaid syntax by hand.
+See the review request on card `t_449a11fe` for the exact commands. Short version: `use`, `mod` and call edges were checked with `grep`. NOT WIRED claims were checked by grepping for the module name outside the module's own files. Line numbers were read back from the files. The author could not render the Mermaid blocks (no Mermaid CLI offline, network banned) and re-read them by hand. The independent reviewer (qa-3) reports rendering all five blocks offline with the Mermaid bundle that ships with VS Code, with no syntax errors. GitHub's Mermaid version may differ slightly.
