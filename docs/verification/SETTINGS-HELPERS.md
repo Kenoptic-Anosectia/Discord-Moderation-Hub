@@ -9,22 +9,28 @@ Pure parsing helpers in `src/settings.rs`: `parse_mode`, `parse_id_list`, `parse
 3. **Duration** — integer seconds in `[min, max]`. Rejects negatives, Unicode digits, overflow, leading `+`, non-numeric.
 4. **Errors** — `SettingError` carries the key name (`String`) and a stable code. Never echoes values.
 
-## What is tested (38 tests)
+## What is tested (40 tests)
 - Mode: off/shadow/live accepted; case-insensitive; trimmed; `true`/`1`/`yes`/typos → Off; unset → Off.
 - ID list: dedupe, sort, reject 0, reject overflow, reject negative, reject Unicode digits, reject `+5`, empty → empty, one bad entry → error, reject empty interior entries, accept u64 max.
-- Duration: min OK, max OK, below min error, above max error, non-numeric error, negative error, unset error, reject `+60`.
+- Duration: min OK, max OK, below min error, above max error, non-numeric error, negative error, unset error, reject `+60`, reject overflow (u64::MAX+1 with max=u64::MAX), reject longer overflow strings.
 - Error privacy: sentinel `S3CR3T` as value never appears in Display/Debug output.
 - Key-in-display: each parser's error Display contains the key name.
 
-## RED evidence (failing tests before fix commit `0f8bb0c`)
-All 5 key-in-display tests failed: `parse_id_list` returned `"id: parse error"`, `parse_duration_secs` returned `"duration: parse error"` — neither contained the passed key. Fix commit carried `key` into `SettingError` variants.
+## RED evidence (failing tests before fix commit `d714196`)
+The RED commit `0f8bb0c` added 5 key-in-display tests that failed against the old code:
+- `parse_id_list_error_display_contains_key` — Display was `id: parse error` (wrong key)
+- `parse_duration_secs_error_display_contains_key` — Display was `duration: parse error`
+- `parse_duration_unset_error_contains_key` — Display was `duration: unset`
+- `parse_duration_out_of_range_error_contains_key` — Display was `duration: out of range`
+- `parse_id_list_empty_entry_error_contains_key` — FAILED at `unwrap_err()` (old code returned Ok for `100,,200`)
+Fix commit `d714196` carried `key` into `SettingError` variants and fixed empty-entry rejection.
 
 ## Config keys (for wiring card)
 | Key | Default | Safe-failure |
-|-----|---------|-------------|
-| `FEATURE_MODE` | Off | Typo → Off |
-| `PROTECTED_ROLE_IDS` | empty | Bad entry → error (whole list rejected) |
-| `FEATURE_X_TIMEOUT_SECS` | unset → error | Out of range → error |
+|-----|-------|-------------|
+| `<FEATURE>_MODE` | Off | Typo → Off |
+| `<FEATURE>_PROTECTED_ROLE_IDS` | empty | Bad entry → error (whole list rejected) |
+| `<FEATURE>_*_SECS` | unset → error | Out of range → error |
 
 ## NOT done
 No runtime, no Discord commands, no persistence, no `.env` reading (takes closures), no live wiring.

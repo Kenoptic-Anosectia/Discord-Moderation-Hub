@@ -421,12 +421,31 @@ mod tests {
         );
     }
 
-    // ---- Mutation test: break parse_mode to confirm tests catch it ----
-    // If we change the live branch to return Off instead of Live,
-    // mode_live_accepted will fail. This confirms the test is real.
+    #[test]
+    fn duration_rejects_overflow_with_max_u64() {
+        // 18446744073709551616 is u64::MAX + 1.
+        // Use max=u64::MAX so OutOfRange can't mask the overflow.
+        // A mutant that does `s.parse().unwrap_or(min)` would return Ok(0).
+        let result = parse_duration_secs(
+            "FEATURE_X_TIMEOUT_SECS",
+            Some("18446744073709551616"),
+            0,
+            u64::MAX,
+        );
+        assert!(result.is_err());
+    }
 
-    // ---- Mutation test: break parse_id_list to confirm tests catch it ----
-    // If we remove the zero-check, id_list_rejects_zero will fail.
+    #[test]
+    fn duration_rejects_longer_overflow_string() {
+        // A longer string of digits that also overflows u64.
+        let result = parse_duration_secs(
+            "FEATURE_X_TIMEOUT_SECS",
+            Some("184467440737095516150"),
+            0,
+            u64::MAX,
+        );
+        assert!(result.is_err());
+    }
 
     // ---- Parser-specific key-in-display tests (RED: these fail against old code) ----
 
