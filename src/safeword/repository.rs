@@ -992,6 +992,98 @@ mod tests {
         assert_eq!(repo.load(G, U), Ok(Some((activating(), 1))));
     }
 
+    fn stored_snapshot(path: &Path) -> serde_json::Value {
+        let Value::Text(json) = column(path, "snapshot_json") else {
+            panic!("snapshot_json is not text");
+        };
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// A real state (reached by `step`) whose `last_failure` is set.
+    fn state_with_failure() -> State {
+        real_states()
+            .into_iter()
+            .find(|s| snap(s).is_some_and(|x| x.last_failure.is_some()))
+            .expect("a real step sequence leaves last_failure set")
+    }
+
+    /// Keys that an older build did not write; every other snapshot key is required.
+    const LEGACY_KEYS: [&str; 3] = [
+        "failed_steps",
+        "restore_in_flight",
+        "last_emitted_restore_plan",
+    ];
+
+    #[test]
+    fn deleting_any_non_legacy_snapshot_key_is_an_error_and_leaves_the_row_untouched() {
+        let path = scratch("missing-key");
+        let mut repo = open_at(&path);
+        let state = state_with_failure();
+        assert_eq!(repo.store(G, U, &state, 0, NOW), Ok(1));
+        let valid = stored_snapshot(&path);
+        let keys: Vec<String> = valid.as_object().unwrap().keys().cloned().collect();
+        // pins the key list: a new SW1 field must be classified required or legacy here
+        assert_eq!(keys.len(), 18, "snapshot_json keys: {keys:?}");
+        let mut deleted = 0;
+        for key in keys.iter().filter(|k| !LEGACY_KEYS.contains(&k.as_str())) {
+            let mut v = valid.clone();
+            assert!(v.as_object_mut().unwrap().remove(key).is_some());
+            poke(&path, "snapshot_json", text(&v.to_string()));
+            assert_row_survives(
+                &path,
+                &mut repo,
+                RepoError::CorruptJson,
+                &format!("deleted key {key}"),
+            );
+            deleted += 1;
+        }
+        assert_eq!(deleted, 15);
+        for inner in ["step", "code"] {
+            let mut v = valid.clone();
+            let failure = v["last_failure"].as_object_mut().expect("last_failure set");
+            assert!(failure.remove(inner).is_some());
+            poke(&path, "snapshot_json", text(&v.to_string()));
+            assert_row_survives(
+                &path,
+                &mut repo,
+                RepoError::CorruptJson,
+                &format!("deleted last_failure.{inner}"),
+            );
+        }
+        // an unknown key inside last_failure is refused like an unknown top-level key
+        let mut v = valid.clone();
+        v["last_failure"]
+            .as_object_mut()
+            .unwrap()
+            .insert("surprise".into(), serde_json::Value::from(1));
+        poke(&path, "snapshot_json", text(&v.to_string()));
+        assert_row_survives(
+            &path,
+            &mut repo,
+            RepoError::CorruptJson,
+            "unknown key in last_failure",
+        );
+        poke(&path, "snapshot_json", text(&valid.to_string()));
+        assert_eq!(repo.load(G, U), Ok(Some((state, 1))));
+    }
+
+    #[test]
+    fn struck_and_deferred_roles_are_stored_in_their_own_named_columns() {
+        let path = scratch("columns");
+        let mut repo = open_at(&path);
+        let mut state = state_with_failure();
+        let (State::Activating(s) | State::Active(s) | State::Releasing(s)) = &mut state else {
+            panic!("fixture has a snapshot");
+        };
+        s.struck_roles = vec![301, 302];
+        s.deferred_roles = vec![401];
+        let expect = state.clone();
+        assert_eq!(repo.store(G, U, &state, 0, NOW), Ok(1));
+        assert_eq!(column(&path, "struck_json"), text("[301,302]"));
+        assert_eq!(column(&path, "deferred_json"), text("[401]"));
+        assert_eq!(repo.load(G, U), Ok(Some((expect, 1))));
+    }
+
     #[test]
     fn unknown_state_string_is_refused_and_never_becomes_inactive() {
         let path = scratch("unknown-state");
