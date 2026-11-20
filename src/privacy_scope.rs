@@ -584,10 +584,7 @@ mod tests {
         );
         let decision = may_log(&scope, &facts);
         // parent_id is an excluded category → rule 3 fires first.
-        assert_eq!(
-            decision,
-            LogDecision::Skip(SkipReason::ExcludedCategory)
-        );
+        assert_eq!(decision, LogDecision::Skip(SkipReason::ExcludedCategory));
     }
 
     // Rule 4: move between two excluded categories where parent_id is NOT excluded
