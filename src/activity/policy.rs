@@ -1418,6 +1418,33 @@ mod tests {
     }
 
     #[test]
+    fn the_day_start_floors_a_timestamp_before_the_epoch() {
+        // -1 second is inside the day that started 86400 seconds before the epoch. A
+        // truncation towards zero would put it in 1970-01-01 instead.
+        assert_eq!(day_start(-1), -86_400);
+        assert_eq!(day_start(-86_400), -86_400);
+        assert_eq!(day_start(-86_401), -172_800);
+        assert_eq!(day_start(0), 0);
+        assert_eq!(day_start(86_399), 0);
+    }
+
+    #[test]
+    fn the_next_day_start_is_the_day_after_the_day_start() {
+        assert_eq!(next_day_start(0), 86_400);
+        assert_eq!(next_day_start(86_399), 86_400);
+        assert_eq!(next_day_start(-1), 0);
+        assert_eq!(next_day_start(-86_400), 0);
+    }
+
+    #[test]
+    fn the_day_start_is_the_start_of_the_day_the_day_key_names() {
+        for at in [0i64, 1, 86_399, 86_400, -1, -86_400, 1_709_640_000] {
+            let day = utc_day(at);
+            assert_eq!(utc_day(day_start(at)), day);
+        }
+    }
+
+    #[test]
     fn a_bot_in_an_excluded_channel_is_reported_as_the_bot() {
         // The order of the checks is fixed: a bot author is reported as a bot, not as
         // an excluded channel, so the reader knows why it was dropped.
@@ -1593,6 +1620,54 @@ mod tests {
         assert_eq!(moved.anomalies[0].guild_id, GUILD);
         assert_eq!(moved.anomalies[0].user_id, USER);
         assert_eq!(moved.anomalies[0].at, T);
+    }
+
+    #[test]
+    fn each_anomaly_kind_has_its_own_code() {
+        let kinds = [
+            AnomalyKind::MissingOldState,
+            AnomalyKind::DuplicateUpdate,
+            AnomalyKind::OutOfOrderUpdate,
+            AnomalyKind::ChannelMismatch,
+            AnomalyKind::RestartGap,
+            AnomalyKind::UnaccountedChannel,
+        ];
+        let mut codes: Vec<&'static str> = kinds
+            .iter()
+            .map(|kind| {
+                Anomaly {
+                    kind: *kind,
+                    guild_id: GUILD,
+                    user_id: USER,
+                    channel_id: None,
+                    at: 0,
+                }
+                .code()
+            })
+            .collect();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "the codes must be distinct");
+        assert!(codes.contains(&"missing_old_state"));
+        assert!(codes.contains(&"duplicate_update"));
+        assert!(codes.contains(&"out_of_order_update"));
+        assert!(codes.contains(&"channel_mismatch"));
+        assert!(codes.contains(&"restart_gap"));
+        assert!(codes.contains(&"unaccounted_channel"));
+    }
+
+    #[test]
+    fn the_two_restart_anomalies_are_not_the_same_kind() {
+        // A restart closes the session in an unaccounted channel: the channel anomaly
+        // and the restart gap are two different facts about the same restart.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(T, AFK), &cfg());
+        let restart = ledger.note_restart(T + 60, T + 30, &cfg());
+        let kinds: Vec<AnomalyKind> = restart.anomalies.iter().map(|a| a.kind).collect();
+        assert!(kinds.contains(&AnomalyKind::UnaccountedChannel));
+        assert!(kinds.contains(&AnomalyKind::RestartGap));
+        assert_eq!(kinds.len(), 2);
     }
 
     #[test]
