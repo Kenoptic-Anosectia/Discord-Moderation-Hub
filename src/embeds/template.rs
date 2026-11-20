@@ -210,9 +210,11 @@ impl EmbedTemplate {
 
     /// Returns the SHA-256 hex digest of the canonical form.
     ///
-    /// The digest is 64 lowercase hex characters. Two templates with the same rendered
-    /// content always produce the same hash; two templates with different rendered
-    /// content always produce different hashes.
+    /// The digest is 64 lowercase hex characters. The same template always produces
+    /// the same hash, and the hash changes when the rendered content changes. The
+    /// canonical form is injective, so two templates with different content cannot
+    /// share a canonical form; the only way two different templates could share a
+    /// hash is a SHA-256 collision.
     pub fn content_hash(&self) -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, self.canonical().as_bytes());
         to_hex(digest.as_ref())
