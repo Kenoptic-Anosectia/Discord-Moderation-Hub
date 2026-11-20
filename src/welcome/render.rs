@@ -919,9 +919,19 @@ fn clamp_embed(embed: &mut RenderedEmbed) -> bool {
 ///
 /// The parts are shortened in the order [`clamp_embed`] documents. The function
 /// returns true when something was cut.
+///
+/// The loop is bounded by the shape of the embed, not by its length: every pass
+/// either shortens one slot or drops one field, so there is at most one pass per
+/// slot plus one pass per field. The bound is a hard stop, so a future change that
+/// made a pass fail to shorten anything would stop the loop instead of spinning. A
+/// field that cannot keep both a name and a value is dropped rather than emptied,
+/// because Discord rejects a field without a name or without a value.
 fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
     let mut cut = false;
-    loop {
+    // One pass per slot (description, footer, author name, title) plus one pass per
+    // field, and one spare pass for the round that finds the embed fitting.
+    let mut passes_left = embed.fields.len() + 5;
+    while passes_left > 0 {
         let total = embed_total_chars(embed);
         if total <= MAX_EMBED_TOTAL_CHARS {
             break;
@@ -936,6 +946,7 @@ fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
                 if text.is_empty() {
                     embed.description = None;
                 }
+                passes_left -= 1;
                 continue;
             }
         }
@@ -948,6 +959,7 @@ fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
                 if text.is_empty() {
                     embed.footer_text = None;
                 }
+                passes_left -= 1;
                 continue;
             }
         }
@@ -969,10 +981,15 @@ fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
                     shorten_end(&mut field.name, excess - from_value);
                 }
                 cut = true;
+                passes_left -= 1;
                 continue;
             }
+            // The field cannot absorb the whole excess, so it is dropped whole. It is
+            // not emptied in place: an empty field would still count towards the
+            // total and would still be rejected by Discord.
             embed.fields.pop();
             cut = true;
+            passes_left -= 1;
             continue;
         }
 
@@ -984,6 +1001,7 @@ fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
                 if text.is_empty() {
                     embed.author_name = None;
                 }
+                passes_left -= 1;
                 continue;
             }
         }
@@ -996,6 +1014,7 @@ fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
                 if text.is_empty() {
                     embed.title = None;
                 }
+                passes_left -= 1;
                 continue;
             }
         }
@@ -2661,5 +2680,151 @@ mod tests {
         let description = out.embed.description.as_deref().expect("description");
         assert!(description.chars().all(|c| c == 'é'));
         assert!(description.chars().count() <= 4096);
+    }
+
+    /// The embed total is enforced even when every slot is already inside its OWN
+    /// limit.
+    ///
+    /// The template text is 5988 characters, so it loads. The `{server}` placeholders
+    /// expand it: the title, the description and the author name each grow past their
+    /// own limit and are clamped back, and the four clamped slots together are 6168
+    /// characters - more than the 6000 an embed allows. Only the total clamp can
+    /// bring that back.
+    #[test]
+    fn the_embed_total_is_enforced_when_every_slot_is_legal() {
+        let src = format!(
+            "{{\"embed\": {{\"title\": \"{}{{server}}\", \"description\": \"{}{{server}}\", \
+             \"footer\": {{\"text\": \"{}{{server}}\"}}, \
+             \"author\": {{\"name\": \"{}{{server}}\"}}}}}}",
+            "t".repeat(248),
+            "d".repeat(4000),
+            "f".repeat(1460),
+            "a".repeat(248)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        // Every slot is inside its own limit.
+        assert!(
+            out.embed
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                <= 256
+        );
+        assert!(
+            out.embed
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                <= 4096
+        );
+        assert!(
+            out.embed
+                .footer_text
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                <= 2048
+        );
+        assert!(
+            out.embed
+                .author_name
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                <= 256
+        );
+        // The total is enforced even though every slot is legal on its own.
+        let total = rendered_embed_total(&out.embed);
+        assert!(
+            total <= 6000,
+            "the rendered embed total is {total} chars, over the 6000 limit"
+        );
+        assert!(out.truncated, "the cut was not reported");
+    }
+
+    /// The embed total is enforced when the FIELDS are what overflows.
+    ///
+    /// Twenty-four fields of 230 literal characters plus a `{server}` placeholder are
+    /// 5712 characters of template text, so the template loads. The server name
+    /// expands every field value, and the fields together are then over the total.
+    #[test]
+    fn the_embed_total_is_enforced_when_the_fields_overflow() {
+        let src = format!(
+            "{{\"embed\": {{\"fields\": [{}]}}}}",
+            (0..24)
+                .map(|i| format!(
+                    "{{\"name\": \"n{i}\", \"value\": \"{}{{server}}\"}}",
+                    "v".repeat(230)
+                ))
+                .collect::<Vec<String>>()
+                .join(",")
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        // Every field value is inside its own limit, and every field still has a name
+        // and a value.
+        for field in &out.embed.fields {
+            assert!(!field.name.is_empty(), "a field lost its name");
+            assert!(!field.value.is_empty(), "a field lost its value");
+            assert!(field.value.chars().count() <= 1024);
+        }
+        // The total is enforced even though every field is legal on its own.
+        let total = rendered_embed_total(&out.embed);
+        assert!(
+            total <= 6000,
+            "the rendered embed total is {total} chars, over the 6000 limit"
+        );
+        assert!(out.truncated, "the cut was not reported");
+    }
+
+    /// The total clamp keeps an embed that is exactly at the limit whole.
+    #[test]
+    fn the_total_clamp_keeps_an_embed_that_is_exactly_at_the_limit() {
+        // Title 256 + description 4096 + footer 1648 is exactly 6000 characters.
+        let src = format!(
+            "{{\"embed\": {{\"title\": \"{}\", \"description\": \"{}\", \
+             \"footer\": {{\"text\": \"{}\"}}}}}}",
+            "t".repeat(256),
+            "d".repeat(4096),
+            "f".repeat(1648)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let out = render_welcome(&t, &member(), &id_map());
+        assert_eq!(rendered_embed_total(&out.embed), 6000);
+        assert!(
+            !out.truncated,
+            "an embed at the limit was reported as truncated"
+        );
+        assert_eq!(
+            out.embed.footer_text.as_deref().map(|t| t.chars().count()),
+            Some(1648),
+            "the footer was cut"
+        );
+    }
+
+    /// The username cap is applied to the ESCAPED name, so the name keeps as many
+    /// characters as the cap allows. Capping before the escaping would halve the
+    /// visible name, because every special character costs a backslash.
+    #[test]
+    fn the_username_cap_counts_the_escaped_name() {
+        // Thirty-two stars escape to sixty-four characters, which is exactly the cap.
+        let sanitised = sanitize_username(&"*".repeat(5000));
+        assert_eq!(sanitised.chars().count(), 64);
+        assert_eq!(sanitised, "\\*".repeat(32));
+        // A name of plain characters survives whole up to the cap.
+        let plain = sanitize_username(&"a".repeat(5000));
+        assert_eq!(plain.chars().count(), 64);
+        assert!(plain.chars().all(|c| c == 'a'));
     }
 }
