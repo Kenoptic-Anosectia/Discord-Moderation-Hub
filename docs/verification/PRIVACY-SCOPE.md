@@ -15,16 +15,23 @@ no I/O, no clock reads, no randomness.
 7. Empty configuration → Allow (today's behaviour, zero change on wiring)
 8. Flash-channel IDs merged into excluded-channel set
 
-## Tests (22 total)
+## Tests (27 total)
 RED (7/10 initial tests failed against stub): excluded_channel, thread_with_excluded_parent,
 channel_in_excluded_category, move_into_excluded_category, move_out_of_excluded_category,
 unknown_lookup, flash_channel_ids — all returned Allow instead of expected Skip.
-Boundary: empty config allows, DM allowed, zero ids harmless, duplicate ids dedup.
+Boundary: empty_config_allows_uncategorised_channel (ParentResolution::None ≠ Unknown),
+thread_in_excluded_category (category_id field catches grandparent leak),
+unknown_channel_id_fails_closed (Option<u64> channel_id),
+unknown_category_fails_closed, move_into_excluded_category_with_stale_parent (exact
+reason MovedIntoExcludedCategory, not masked by rule 3).
 Adversarial: excluded channel before category, move with only old/new parent,
-normal move still checks parent category, implementation checks channels not categories.
+normal move still checks parent category, implementation checks channels not categories,
+move_between_two_excluded_categories_via_old_parent.
 
-## Config keys (read by wiring card K06)
-- `LOG_EXCLUDED_CHANNEL_IDS` — comma-separated u64 list, default empty, safe failure = drop bad entry
-- `LOG_EXCLUDED_CATEGORY_IDS` — comma-separated u64 list, default empty, safe failure = drop bad entry
+## Config keys (parsed by wiring card W1; K06 writes settings::parse_id_list)
+- `LOG_EXCLUDED_CHANNEL_IDS` — comma-separated u64 list, default empty, safe failure =
+  fail closed (feature/log disabled + alert), never drop the entry
+- `LOG_EXCLUDED_CATEGORY_IDS` — comma-separated u64 list, default empty, safe failure =
+  fail closed (feature/log disabled + alert), never drop the entry
 No runtime integration, no commands, no persistence, no config parsing, no `.env` reading,
 no `Cargo.toml` changes, no dependency additions.
