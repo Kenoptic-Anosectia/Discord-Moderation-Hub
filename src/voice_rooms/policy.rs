@@ -961,6 +961,38 @@ mod tests {
         assert!(!cleaned.contains("https"));
     }
 
+    /// A bare host without a path is a URL too and is removed from the room name.
+    #[test]
+    fn a_bare_host_is_removed() {
+        let cleaned = sanitize_name("example.com party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a bare host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A bare invite host without a path is removed from the room name.
+    #[test]
+    fn a_bare_invite_host_is_removed() {
+        let cleaned = sanitize_name("discord.gg party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("discord.gg"),
+            "a bare invite host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A URL whose scheme was split across spaces is still a URL and is removed.
+    #[test]
+    fn a_url_with_a_split_scheme_is_removed() {
+        let cleaned = sanitize_name("https ://example.invalid/x party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.invalid"),
+            "a split scheme must not smuggle a host into the name: {cleaned:?}"
+        );
+    }
+
     /// A control character is removed from the room name.
     #[test]
     fn control_characters_are_removed() {
@@ -1270,6 +1302,130 @@ mod tests {
         let state = state_with(vec![room(OWNER, 0, Some(T0))]);
         let decision = decide_leave(ROOM, OWNER, T0, &config, &state);
         assert_eq!(decision, Decision::Cleanup(ROOM));
+    }
+
+    /// A room whose owner already left is claimed by nobody, but the member who
+    /// leaves the empty room last must still reach the grace check: the room has to
+    /// be cleaned up after the grace period, whoever leaves last.
+    #[test]
+    fn the_last_member_leaving_an_orphaned_room_reaches_the_grace_check() {
+        // The owner is gone: the room is empty and `empty_since` is set.
+        let state = state_with(vec![room(OWNER, 0, Some(T0))]);
+        let before = decide_leave(ROOM, OTHER_MEMBER, T0 + 59, &cfg(), &state);
+        assert_eq!(
+            expect_deny(&before),
+            DenyReason::EmptyGraceNotElapsed,
+            "an empty room must survive until the grace period has elapsed"
+        );
+        let after = decide_leave(ROOM, OTHER_MEMBER, T0 + 60, &cfg(), &state);
+        assert_eq!(
+            after,
+            Decision::Cleanup(ROOM),
+            "an empty room must be cleaned up after the grace period, whoever leaves last"
+        );
+    }
+
+    /// A member who is not the owner leaving an EMPTY room does not claim it: the
+    /// room is not claimable once it is empty, it is only cleaned up.
+    #[test]
+    fn a_non_owner_leaving_an_empty_room_does_not_claim_it() {
+        let state = state_with(vec![room(OWNER, 0, Some(T0))]);
+        let decision = decide_leave(ROOM, OTHER_MEMBER, T0 + 10, &cfg(), &state);
+        assert_ne!(
+            decision,
+            Decision::Claimable(ROOM),
+            "an empty room must not become claimable"
+        );
+    }
+
+    /// A member who is not the owner leaving a room that still holds members does
+    /// not change the room: it is not theirs to claim.
+    #[test]
+    fn a_non_owner_leaving_a_occupied_room_does_not_claim_it() {
+        let state = state_with(vec![room(OWNER, 3, None)]);
+        let decision = decide_leave(ROOM, OTHER_MEMBER, T0 + 10, &cfg(), &state);
+        assert_eq!(expect_deny(&decision), DenyReason::NotRoomOwner);
+    }
+
+    /// Over a seeded sequence, a room that has become empty is always cleaned up
+    /// once its grace period has elapsed, whoever leaves last. No room may linger
+    /// forever and keep consuming the global cap.
+    #[test]
+    fn a_seeded_sequence_never_leaves_an_empty_room_forever() {
+        let mut config = cfg();
+        config.global_cap = 5;
+        config.per_user_cap = 1;
+        config.create_cooldown_secs = 0;
+        config.empty_grace_secs = 60;
+        let mut state = VoiceRoomState::default();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0002);
+        let mut now = T0;
+        let members = [OWNER, MEMBER, OTHER_MEMBER, 1_000_000_000_000_000_010];
+
+        for step in 0..2_000 {
+            now += 1;
+            let user = members[rng.below(members.len() as u64) as usize];
+            if rng.below(3) == 0 {
+                let event = JoinEvent {
+                    guild_id: GUILD,
+                    user_id: user,
+                    channel_id: HUB,
+                    at: now,
+                };
+                match decide_join(&event, &config, &state) {
+                    Decision::Create(_) => {
+                        let channel_id = 1_000_000_000_000_200_000 + step as u64;
+                        state.rooms.push(Room {
+                            channel_id,
+                            owner_id: user,
+                            created_at: now,
+                            empty_since: None,
+                            occupants: 2,
+                        });
+                        state.last_create.insert(user, now);
+                    }
+                    Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            } else if !state.rooms.is_empty() {
+                let index = rng.below(state.rooms.len() as u64) as usize;
+                let channel_id = state.rooms[index].channel_id;
+                let owner_id = state.rooms[index].owner_id;
+                let leaver = if rng.below(2) == 0 {
+                    owner_id
+                } else {
+                    OTHER_MEMBER
+                };
+                let occupants = state.rooms[index].occupants;
+                match decide_leave(channel_id, leaver, now, &config, &state) {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) => {
+                        state.rooms[index].occupants = occupants.saturating_sub(1);
+                    }
+                    Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+
+            // Every empty room must be cleaned up once its grace has elapsed, even
+            // when the member who leaves last is not the owner.
+            for room in &state.rooms {
+                if room.occupants == 0 {
+                    let empty_since = room.empty_since.unwrap_or(now);
+                    if now - empty_since >= config.empty_grace_secs {
+                        let decision =
+                            decide_leave(room.channel_id, OTHER_MEMBER, now, &config, &state);
+                        assert_eq!(
+                            decision,
+                            Decision::Cleanup(room.channel_id),
+                            "an empty room past its grace must be cleanable by whoever leaves"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
