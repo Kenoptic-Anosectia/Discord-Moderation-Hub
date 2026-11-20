@@ -1,37 +1,30 @@
 # Privacy Scope Module
-
-## What
-`privacy_scope.rs` provides a pure, offline predicate `may_log(scope, event) -> LogDecision`
-that the general logger calls before recording or caching any event. No serenity types,
-no I/O, no clock reads, no randomness.
-
+`privacy_scope.rs` gives `may_log(scope, event) -> LogDecision` — a pure, offline
+predicate the general logger calls before recording or caching anything. No serenity
+types, no I/O, no clock, no randomness.
 ## Rules enforced
 1. Excluded channel → Skip(ExcludedChannel)
 2. Thread whose parent channel is excluded → Skip(ExcludedParentChannel)
-3. Channel inside an excluded category → Skip(ExcludedCategory)
-4. Channel moved into/out of excluded category → Skip(MovedInto/OutExcludedCategory)
-5. DM (no guild_id) → Allow (separate guard handles DMs)
-6. Unknown lookup → Skip(UnknownLookup) — fail closed
-7. Empty configuration → Allow (today's behaviour, zero change on wiring)
+3. Channel in an excluded category, or the excluded category itself → Skip(ExcludedCategory)
+4. Channel moved into/out of an excluded category → Skip(MovedInto/OutExcludedCategory)
+5. DM (no guild_id) → Allow (a separate guard handles DMs)
+6. Unknown lookup → Skip(UnknownLookup), fail closed — only when the scope is non-empty
+7. Empty configuration → Allow, checked BEFORE any lookup
 8. Flash-channel IDs merged into excluded-channel set
-
-## Tests (27 total)
-RED (7/10 initial tests failed against stub): excluded_channel, thread_with_excluded_parent,
-channel_in_excluded_category, move_into_excluded_category, move_out_of_excluded_category,
-unknown_lookup, flash_channel_ids — all returned Allow instead of expected Skip.
-Boundary: empty_config_allows_uncategorised_channel (ParentResolution::None ≠ Unknown),
-thread_in_excluded_category (category_id field catches grandparent leak),
-unknown_channel_id_fails_closed (Option<u64> channel_id),
-unknown_category_fails_closed, move_into_excluded_category_with_stale_parent (exact
-reason MovedIntoExcludedCategory, not masked by rule 3).
-Adversarial: excluded channel before category, move with only old/new parent,
-normal move still checks parent category, implementation checks channels not categories,
-move_between_two_excluded_categories_via_old_parent.
-
-## Config keys (parsed by wiring card W1; K06 writes settings::parse_id_list)
-- `LOG_EXCLUDED_CHANNEL_IDS` — comma-separated u64 list, default empty, safe failure =
-  fail closed (feature/log disabled + alert), never drop the entry
-- `LOG_EXCLUDED_CATEGORY_IDS` — comma-separated u64 list, default empty, safe failure =
-  fail closed (feature/log disabled + alert), never drop the entry
-No runtime integration, no commands, no persistence, no config parsing, no `.env` reading,
-no `Cargo.toml` changes, no dependency additions.
+## Tests (42 in this module)
+RED b13238f: 3 tests failed against 1d63c42 with Skip(UnknownLookup) not Allow —
+empty_config_allows_unknown_parent, _none_channel_id, _unknown_category; that commit also
+moved unknown_lookup_fails_closed, unknown_channel_id_fails_closed and
+unknown_category_fails_closed onto a non-empty scope. RED 6d11c5d: 7 of 10 initial tests
+failed against the stub. The round-2 tests (excluded category itself, move tri-state) had
+no separate RED commit: they need the new `ParentResolution` move fields, which do not
+compile against 1d63c42. Adversarial: u64::MAX ids, zero/duplicate ids, DM with unknown
+lookups, resolved move between ordinary categories, unknown old/new move parent.
+## Config keys (read by wiring card W1; K06 writes settings::parse_id_list)
+`LOG_EXCLUDED_CHANNEL_IDS` and `LOG_EXCLUDED_CATEGORY_IDS` — comma-separated u64 lists,
+default empty. A malformed list must fail closed in W1 (log disabled + alert); the bad
+entry is never dropped. W1 contract: an unresolvable lookup must be passed as
+`ParentResolution::Unknown`, never `None` ("None" = "this channel has no parent").
+## Not done
+No runtime, commands, persistence, config parsing, `.env` reading, `Cargo.toml` changes,
+dependency additions, or production caller.

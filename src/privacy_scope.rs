@@ -14,11 +14,21 @@ use std::collections::HashSet;
 pub fn may_log(scope: &Scope, event: &ChannelFacts) -> LogDecision {
     // Rule 5: DMs (no guild id) are allowed by this predicate.
     // A separate guard already handles DMs; this predicate does not block them.
-    let Some(_guild_id) = event.guild_id else {
+    if event.guild_id.is_none() {
         return LogDecision::Allow;
-    };
+    }
 
-    // Rule 6 (partial): if the channel id itself is unknown, fail closed.
+    // Rule 7: an empty configuration allows everything. This check comes
+    // BEFORE every lookup check on purpose: rule 6's "fail closed" exists so an
+    // unresolvable channel cannot leak past an exclusion, and with nothing
+    // excluded there is nothing to leak past. Returning Allow here is also
+    // what keeps today's behaviour unchanged when the wiring card switches
+    // this predicate on with no ids configured.
+    if scope.excluded_channels.is_empty() && scope.excluded_categories.is_empty() {
+        return LogDecision::Allow;
+    }
+
+    // Rule 6 (channel_id): if the channel id itself is unknown, fail closed.
     let Some(channel_id) = event.channel_id else {
         return LogDecision::Skip(SkipReason::UnknownLookup);
     };
@@ -30,7 +40,7 @@ pub fn may_log(scope: &Scope, event: &ChannelFacts) -> LogDecision {
 
     // Rule 3 (category shortcut): if we have a resolved category and it is
     // excluded, skip immediately — this also covers threads whose grandparent
-    // category is excluded (fixes the privacy leak from round 1).
+    // category is excluded.
     if let ParentResolution::Id(cat_id) = &event.category_id {
         if scope.excluded_categories.contains(cat_id) {
             return LogDecision::Skip(SkipReason::ExcludedCategory);
@@ -39,6 +49,12 @@ pub fn may_log(scope: &Scope, event: &ChannelFacts) -> LogDecision {
     // If category_id is Unknown, fail closed (rule 6).
     if matches!(event.category_id, ParentResolution::Unknown) {
         return LogDecision::Skip(SkipReason::UnknownLookup);
+    }
+
+    // Rule 3 (also): the event may be ON the excluded category itself (a
+    // rename or a permission overwrite on the category channel).
+    if scope.excluded_categories.contains(&channel_id) {
+        return LogDecision::Skip(SkipReason::ExcludedCategory);
     }
 
     // Rule 6 (parent): if we cannot resolve the parent, fail closed.
@@ -64,15 +80,27 @@ pub fn may_log(scope: &Scope, event: &ChannelFacts) -> LogDecision {
 
     // Rule 4: a channel moved into or out of an excluded category is skipped,
     // judged on BOTH the old and the new parent.
-    if let Some(old_parent_id) = event.old_parent_id {
-        if scope.excluded_categories.contains(&old_parent_id) {
+    //
+    // An `Unknown` old parent means the channel may have been moved OUT of an
+    // excluded category (the old parent could not be resolved), and an
+    // `Unknown` new parent means it may have been moved INTO one. Both fail
+    // closed (rules 4 + 6).
+    if let ParentResolution::Id(old_id) = &event.old_parent_id {
+        if scope.excluded_categories.contains(old_id) {
             return LogDecision::Skip(SkipReason::MovedOutOfExcludedCategory);
         }
     }
-    if let Some(new_parent_id) = event.new_parent_id {
-        if scope.excluded_categories.contains(&new_parent_id) {
+    if matches!(event.old_parent_id, ParentResolution::Unknown) {
+        return LogDecision::Skip(SkipReason::UnknownLookup);
+    }
+
+    if let ParentResolution::Id(new_id) = &event.new_parent_id {
+        if scope.excluded_categories.contains(new_id) {
             return LogDecision::Skip(SkipReason::MovedIntoExcludedCategory);
         }
+    }
+    if matches!(event.new_parent_id, ParentResolution::Unknown) {
+        return LogDecision::Skip(SkipReason::UnknownLookup);
     }
 
     LogDecision::Allow
@@ -135,10 +163,10 @@ pub enum ParentResolution {
 /// channel (rule 6).  `parent_id` uses `ParentResolution` to distinguish
 /// "no parent" (top-level channel, rule 7) from "lookup failed" (rule 6).
 /// `category_id` carries the channel's *category* (for threads: the grandparent
-/// category) so that threads inside excluded categories are caught (round-1
-/// fix).  For channel-move events `old_parent_id` and `new_parent_id` describe
-/// the move; at least one of them may be `None` (e.g. a simple category change
-/// where the channel was not previously in any category).
+/// category) so that threads inside excluded categories are caught.  For
+/// channel-move events `old_parent_id` and `new_parent_id` describe the move;
+/// both use `ParentResolution` so that a failed lookup (`Unknown`) is
+/// distinguishable from "the channel was not in a category" (`None`).
 #[derive(Debug, Clone)]
 pub struct ChannelFacts {
     pub guild_id: Option<u64>,
@@ -149,10 +177,20 @@ pub struct ChannelFacts {
     /// `Unknown` (lookup failed).
     pub parent_id: ParentResolution,
     /// The channel's category (for threads: the grandparent category).
-    /// When present and excluded, the event is skipped (rule 3, round-1 fix).
+    /// When present and excluded, the event is skipped (rule 3).
     pub category_id: ParentResolution,
-    pub old_parent_id: Option<u64>,
-    pub new_parent_id: Option<u64>,
+    /// The old parent category on a move event. Uses `ParentResolution` so
+    /// `Unknown` (lookup failed) is distinguishable from `None` (the channel
+    /// was not previously in a category). An `Unknown` old parent means the
+    /// channel may have been moved OUT of an excluded category → Skip
+    /// (rules 4 + 6).
+    pub old_parent_id: ParentResolution,
+    /// The new parent category on a move event. Uses `ParentResolution` so
+    /// `Unknown` (lookup failed) is distinguishable from `None` (the channel
+    /// was not moved into a category). An `Unknown` new parent means the
+    /// channel may have been moved INTO an excluded category → Skip
+    /// (rules 4 + 6).
+    pub new_parent_id: ParentResolution,
 }
 
 /// Decision returned by `may_log`.
@@ -212,8 +250,8 @@ mod tests {
             channel_id: Some(channel),
             parent_id: parent,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         }
     }
 
@@ -221,8 +259,8 @@ mod tests {
         channel: u64,
         parent: ParentResolution,
         category: ParentResolution,
-        old_parent: Option<u64>,
-        new_parent: Option<u64>,
+        old_parent: ParentResolution,
+        new_parent: ParentResolution,
     ) -> ChannelFacts {
         ChannelFacts {
             guild_id: Some(GUILD),
@@ -240,8 +278,8 @@ mod tests {
             channel_id: None,
             parent_id: ParentResolution::None,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         }
     }
 
@@ -297,8 +335,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(EXCLUDED_CATEGORY),
             ParentResolution::None,
-            Some(NORMAL_CATEGORY),
-            Some(EXCLUDED_CATEGORY),
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::Id(EXCLUDED_CATEGORY),
         );
         // parent_id is an excluded category → rule 3 fires first.
         assert_eq!(
@@ -316,8 +354,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(NORMAL_CATEGORY),
             ParentResolution::None,
-            Some(EXCLUDED_CATEGORY),
-            Some(NORMAL_CATEGORY),
+            ParentResolution::Id(EXCLUDED_CATEGORY),
+            ParentResolution::Id(NORMAL_CATEGORY),
         );
         assert_eq!(
             may_log(&scope, &facts),
@@ -335,8 +373,8 @@ mod tests {
             channel_id: Some(DM_CHANNEL),
             parent_id: ParentResolution::None,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
@@ -353,8 +391,8 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::Unknown,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(
             may_log(&scope, &facts),
@@ -412,8 +450,8 @@ mod tests {
             parent_id: ParentResolution::Id(NORMAL_CHANNEL),
             // But the grandparent category is excluded.
             category_id: ParentResolution::Id(EXCLUDED_CATEGORY),
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(
             may_log(&scope, &facts),
@@ -438,14 +476,15 @@ mod tests {
 
     #[test]
     fn unknown_category_fails_closed() {
-        let scope = empty_scope();
+        // Non-empty scope: under an empty scope rule 7 allows everything.
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![], vec![]);
         let facts = ChannelFacts {
             guild_id: Some(GUILD),
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::Id(NORMAL_CATEGORY),
             category_id: ParentResolution::Unknown,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(
             may_log(&scope, &facts),
@@ -465,8 +504,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(NORMAL_CATEGORY),
             ParentResolution::None,
-            None,
-            Some(EXCLUDED_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::Id(EXCLUDED_CATEGORY),
         );
         assert_eq!(
             may_log(&scope, &facts),
@@ -483,8 +522,8 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::None,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
@@ -533,8 +572,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(NORMAL_CATEGORY),
             ParentResolution::None,
-            Some(EXCLUDED_CATEGORY),
-            None,
+            ParentResolution::Id(EXCLUDED_CATEGORY),
+            ParentResolution::None,
         );
         assert_eq!(
             may_log(&scope, &facts),
@@ -550,8 +589,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(EXCLUDED_CATEGORY),
             ParentResolution::None,
-            Some(NORMAL_CATEGORY),
-            Some(NORMAL_CATEGORY),
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::Id(NORMAL_CATEGORY),
         );
         // parent_id itself is checked (rule 3) before move checks.
         assert_eq!(
@@ -582,8 +621,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(ex_cat_2),
             ParentResolution::None,
-            Some(EXCLUDED_CATEGORY),
-            Some(ex_cat_2),
+            ParentResolution::Id(EXCLUDED_CATEGORY),
+            ParentResolution::Id(ex_cat_2),
         );
         let decision = may_log(&scope, &facts);
         // parent_id is an excluded category → rule 3 fires first.
@@ -602,8 +641,8 @@ mod tests {
             NORMAL_CHANNEL,
             ParentResolution::Id(NORMAL_CATEGORY),
             ParentResolution::None,
-            Some(EXCLUDED_CATEGORY),
-            Some(ex_cat_2),
+            ParentResolution::Id(EXCLUDED_CATEGORY),
+            ParentResolution::Id(ex_cat_2),
         );
         let decision = may_log(&scope, &facts);
         assert_eq!(
@@ -662,8 +701,8 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::Unknown,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
@@ -687,8 +726,8 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::None,
             category_id: ParentResolution::Unknown,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
@@ -703,8 +742,8 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::None,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
@@ -720,12 +759,170 @@ mod tests {
             channel_id: Some(NORMAL_CHANNEL),
             parent_id: ParentResolution::Unknown,
             category_id: ParentResolution::None,
-            old_parent_id: None,
-            new_parent_id: None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
         };
         assert_eq!(
             may_log(&scope, &facts),
             LogDecision::Skip(SkipReason::UnknownLookup)
+        );
+    }
+
+    // ---- Round-2 item 3: an event ON the excluded category itself ----
+
+    // A rename or a permission overwrite on the excluded category channel is
+    // an event whose channel id IS the excluded category. It must be skipped,
+    // otherwise a staff-only category's own name reaches the shared log.
+    #[test]
+    fn event_on_excluded_category_itself_is_skipped() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = ChannelFacts {
+            guild_id: Some(GUILD),
+            channel_id: Some(EXCLUDED_CATEGORY),
+            parent_id: ParentResolution::None,
+            category_id: ParentResolution::None,
+            old_parent_id: ParentResolution::None,
+            new_parent_id: ParentResolution::None,
+        };
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedCategory)
+        );
+    }
+
+    // The same id in BOTH sets: the channel check (rule 1) wins because it
+    // runs first, so the caller sees the more specific reason.
+    #[test]
+    fn excluded_channel_wins_over_excluded_category() {
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![EXCLUDED_CHANNEL], vec![]);
+        let facts = base_facts(EXCLUDED_CHANNEL, ParentResolution::None);
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
+    }
+
+    // A category id that is NOT excluded is an ordinary channel.
+    #[test]
+    fn event_on_non_excluded_category_is_allowed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = base_facts(NORMAL_CATEGORY, ParentResolution::None);
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // ---- Round-2 item 2: moves use a tri-state parent ----
+
+    // The old parent could not be resolved: the channel may have been moved
+    // OUT of an excluded category, so fail closed (rules 4 + 6).
+    #[test]
+    fn move_with_unknown_old_parent_fails_closed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::Unknown,
+            ParentResolution::None,
+        );
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
+        );
+    }
+
+    // The new parent could not be resolved: the channel may have been moved
+    // INTO an excluded category, so fail closed (rules 4 + 6).
+    #[test]
+    fn move_with_unknown_new_parent_fails_closed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::None,
+            ParentResolution::Unknown,
+        );
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
+        );
+    }
+
+    // The concrete case the reviewer probed: a channel moved out of a staff
+    // category whose OLD parent is unresolved. Before the tri-state change
+    // `old: None` was read as "had no category" and the event was logged.
+    #[test]
+    fn move_out_of_unresolved_old_parent_fails_closed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::Unknown,
+            ParentResolution::Id(NORMAL_CATEGORY),
+        );
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
+        );
+    }
+
+    // A move whose old parent is Unknown and whose new parent IS an excluded
+    // category still fails closed: the reason is the unknown lookup, because
+    // the "moved into" branch is only reached with a resolved new parent.
+    #[test]
+    fn move_with_unknown_old_parent_and_excluded_new_parent_fails_closed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::Unknown,
+            ParentResolution::Id(EXCLUDED_CATEGORY),
+        );
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
+        );
+    }
+
+    // A fully resolved move between two ordinary categories is allowed.
+    #[test]
+    fn resolved_move_between_ordinary_categories_is_allowed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::None,
+            ParentResolution::Id(NORMAL_CATEGORY),
+            ParentResolution::Id(NORMAL_CATEGORY),
+        );
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // A move event where neither parent is a category (`None` on both) is
+    // allowed: "no previous category" is not an unknown lookup.
+    #[test]
+    fn move_without_any_category_is_allowed() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            ParentResolution::None,
+            ParentResolution::None,
+            ParentResolution::None,
+            ParentResolution::None,
+        );
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Boundary: u64::MAX as a channel id is an ordinary id.
+    #[test]
+    fn u64_max_ids_work() {
+        let scope = Scope::new(vec![u64::MAX], vec![], vec![]);
+        let facts = base_facts(u64::MAX, ParentResolution::Id(NORMAL_CATEGORY));
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::ExcludedChannel)
         );
     }
 }
