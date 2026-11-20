@@ -50,8 +50,16 @@ impl FailCode {
     }
 }
 
-pub fn classify(_error: &WriteError) -> FailCode {
-    FailCode::Other
+/// Map a writer error to a stable code. Only a 404 carrying a known Discord api code is
+/// called a role or member problem; any other combination is `Other` rather than a guess.
+pub fn classify(error: &WriteError) -> FailCode {
+    match (error.status, error.api_code) {
+        (403, _) => FailCode::Forbidden,
+        (429, _) => FailCode::RateLimited,
+        (404, Some(API_CODE_UNKNOWN_ROLE)) => FailCode::UnknownRole,
+        (404, Some(API_CODE_UNKNOWN_MEMBER | API_CODE_UNKNOWN_USER)) => FailCode::UnknownMember,
+        _ => FailCode::Other,
+    }
 }
 
 pub trait RoleWriter {
@@ -104,24 +112,126 @@ pub struct GrantReport {
     pub results: Vec<RoleResult>,
 }
 
-impl GrantReport {
-    pub fn status(&self) -> GrantStatus {
-        GrantStatus::Empty
-    }
-
-    pub fn summary_line(&self) -> String {
-        String::new()
+impl RoleOutcome {
+    fn is_ok(self) -> bool {
+        matches!(self, RoleOutcome::Done | RoleOutcome::NoOp)
     }
 }
 
+impl GrantReport {
+    /// Derived from the per-role results on every call, so it cannot drift from them.
+    /// `Done` and `NoOp` count as ok; `Denied` and `Failed` do not. A mix is `Partial`.
+    pub fn status(&self) -> GrantStatus {
+        let ok = self.results.iter().filter(|r| r.outcome.is_ok()).count();
+        if self.results.is_empty() {
+            GrantStatus::Empty
+        } else if ok == self.results.len() {
+            GrantStatus::AllDone
+        } else if ok == 0 {
+            GrantStatus::AllFailed
+        } else {
+            GrantStatus::Partial
+        }
+    }
+
+    /// One log line built only from numeric ids and stable code strings.
+    pub fn summary_line(&self) -> String {
+        let status = match self.status() {
+            GrantStatus::Empty => "empty",
+            GrantStatus::AllDone => "all_done",
+            GrantStatus::Partial => "partial",
+            GrantStatus::AllFailed => "all_failed",
+        };
+        let roles: Vec<String> = self
+            .results
+            .iter()
+            .map(|r| match r.outcome {
+                RoleOutcome::Done => format!("{}:done", r.role_id),
+                RoleOutcome::NoOp => format!("{}:noop", r.role_id),
+                RoleOutcome::Denied(reason) => format!("{}:denied:{}", r.role_id, reason.code()),
+                RoleOutcome::Failed(code) => format!("{}:failed:{}", r.role_id, code.code()),
+            })
+            .collect();
+        format!(
+            "grant member={} status={status} roles={}",
+            self.member_id,
+            roles.join(",")
+        )
+    }
+}
+
+/// Sleep before retry `retry` (1-based): the writer's hint if any, else a linear backoff,
+/// clamped to `MAX_SLEEP_MS`.
+fn backoff_ms(error: &WriteError, retry: u8) -> u64 {
+    error
+        .retry_after_ms
+        .unwrap_or(DEFAULT_BACKOFF_MS * u64::from(retry))
+        .min(MAX_SLEEP_MS)
+}
+
+/// One role: a first attempt plus at most `MAX_RATE_LIMIT_RETRIES` retries, only for 429.
+fn write_with_retry<W: RoleWriter, S: Sleeper>(
+    writer: &mut W,
+    sleeper: &mut S,
+    member_id: u64,
+    role_id: u64,
+) -> (RoleOutcome, u8) {
+    let mut calls: u8 = 0;
+    let mut retries: u8 = 0;
+    loop {
+        calls += 1;
+        let error = match writer.add_role(member_id, role_id) {
+            Ok(()) => return (RoleOutcome::Done, calls),
+            Err(error) => error,
+        };
+        let code = classify(&error);
+        if code == FailCode::RateLimited && retries < MAX_RATE_LIMIT_RETRIES {
+            retries += 1;
+            sleeper.sleep_ms(backoff_ms(&error, retries));
+            continue;
+        }
+        return (RoleOutcome::Failed(code), calls);
+    }
+}
+
+/// Apply a grant. One result per request item, in request order. Per role: a K03 `Deny`
+/// (on any occurrence of that role id) is `Denied` and never written; an already-held role is
+/// `NoOp`; a repeat of a role seen earlier in the request is not written again (it reports
+/// `NoOp` after a `Done`, otherwise the earlier outcome). A failure does not stop later roles.
 pub fn apply<W: RoleWriter, S: Sleeper>(
-    _writer: &mut W,
-    _sleeper: &mut S,
+    writer: &mut W,
+    sleeper: &mut S,
     request: &GrantRequest,
 ) -> GrantReport {
+    let mut results: Vec<RoleResult> = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let denial = request.items.iter().find_map(|other| match other.decision {
+            Decision::Deny(reason) if other.role_id == item.role_id => Some(reason),
+            _ => None,
+        });
+        let earlier = results.iter().find(|r| r.role_id == item.role_id);
+        let (outcome, writer_calls) = if let Some(reason) = denial {
+            (RoleOutcome::Denied(reason), 0)
+        } else if let Some(prev) = earlier {
+            let repeat = match prev.outcome {
+                RoleOutcome::Done => RoleOutcome::NoOp,
+                other => other,
+            };
+            (repeat, 0)
+        } else if item.already_held {
+            (RoleOutcome::NoOp, 0)
+        } else {
+            write_with_retry(writer, sleeper, request.member_id, item.role_id)
+        };
+        results.push(RoleResult {
+            role_id: item.role_id,
+            outcome,
+            writer_calls,
+        });
+    }
     GrantReport {
         member_id: request.member_id,
-        results: Vec::new(),
+        results,
     }
 }
 
