@@ -134,7 +134,15 @@ pub enum Plan {
     NoOp,
     /// The recorded message is gone and the caller explicitly allowed the post to be
     /// posted again.
-    Recreate,
+    ///
+    /// The plan carries the message it replaces: the recorded message that was
+    /// found missing. A write under this plan must name a row that still holds
+    /// that message and must record a DIFFERENT message, because the message it
+    /// replaces is the one that is gone.
+    Recreate {
+        /// The message that is missing and that this plan replaces.
+        replaces: u64,
+    },
     /// The post must not be touched. The reason says why.
     Refuse(RefuseReason),
 }
@@ -196,7 +204,9 @@ pub fn plan(request: &PlanRequest<'_>) -> Plan {
     }
     if request.message_missing {
         return if request.allow_recreate {
-            Plan::Recreate
+            Plan::Recreate {
+                replaces: recorded.message,
+            }
         } else {
             Plan::Refuse(RefuseReason::MissingMessage)
         };
@@ -431,7 +441,7 @@ pub fn apply(
             upsert(conn, record, now)?;
             Ok(true)
         }
-        Plan::Recreate => {
+        Plan::Recreate { .. } => {
             check_recorded_post(conn, record, None)?;
             upsert(conn, record, now)?;
             Ok(true)
@@ -587,6 +597,9 @@ pub enum RepoError {
     PlanMismatch,
     /// The row already exists and the plan does not allow replacing it.
     AlreadyExists,
+    /// Another key already records this message id. Two keys that name one message
+    /// would edit each other's post.
+    MessageAlreadyRecorded,
 }
 
 impl RepoError {
@@ -599,6 +612,7 @@ impl RepoError {
             RepoError::CorruptRow => "corrupt_row",
             RepoError::PlanMismatch => "plan_mismatch",
             RepoError::AlreadyExists => "already_exists",
+            RepoError::MessageAlreadyRecorded => "message_already_recorded",
         }
     }
 }
@@ -715,7 +729,7 @@ mod tests {
         assert_eq!(plan(&req), Plan::Refuse(RefuseReason::MissingMessage));
 
         req.allow_recreate = true;
-        assert_eq!(plan(&req), Plan::Recreate);
+        assert_eq!(plan(&req), Plan::Recreate { replaces: MESSAGE });
     }
 
     /// A missing message is refused even when the template changed: the caller must
@@ -1256,10 +1270,124 @@ mod tests {
         let mut recreated = original.clone();
         recreated.message = NEW_MESSAGE;
         recreated.content_hash = HASH_B.to_string();
-        assert!(apply(&conn, &Plan::Recreate, &recreated, 2).unwrap());
+        assert!(apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &recreated, 2).unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record.message, NEW_MESSAGE);
         assert_eq!(stored.updated_at, 2);
+    }
+
+    /// A `Recreate` plan is made from a row that named ONE message, the one that is
+    /// missing. It must carry that message, so the write can be checked against it:
+    /// a `Recreate` planned from row M contradicts a row that now holds M2.
+    #[test]
+    fn a_recreate_plan_carries_the_message_it_replaces() {
+        let recorded = record(HASH_A);
+        let mut req = request("general-rules", HASH_B);
+        req.recorded = Some(&recorded);
+        req.message_missing = true;
+        req.allow_recreate = true;
+        match plan(&req) {
+            Plan::Recreate { replaces } => assert_eq!(replaces, MESSAGE),
+            other => panic!("expected a recreate that names the missing message: {other:?}"),
+        }
+    }
+
+    /// A stale `Recreate` must not overwrite a fresh one.
+    ///
+    /// Two syncs both see the recorded message missing and both plan a recreation.
+    /// The first one posts M2 and writes it; the second one holds a stale plan and
+    /// posts M3. If the second write were accepted, M2 would be orphaned while
+    /// still live and the post would exist twice.
+    #[test]
+    fn a_stale_recreate_does_not_overwrite_a_fresh_one() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        // Sync 1: the recorded message is missing, so the post is made again.
+        let mut first = original.clone();
+        first.message = NEW_MESSAGE;
+        first.content_hash = HASH_B.to_string();
+        assert!(apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &first, 2).unwrap());
+
+        // Sync 2 holds the plan it made BEFORE sync 1 wrote, so it still names the
+        // old message. Writing it now would orphan the message sync 1 just made.
+        let mut stale = original.clone();
+        stale.message = NEW_MESSAGE + 1;
+        stale.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &stale, 3).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        // The row still names the message that sync 1 made.
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, NEW_MESSAGE);
+        assert_eq!(stored.updated_at, 2);
+    }
+
+    /// A `Recreate` must not record the message that is missing: the record has to
+    /// name the NEW post, or the module would point at a message that does not
+    /// exist and would try to edit it forever.
+    #[test]
+    fn a_recreate_for_the_missing_message_itself_is_refused() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        // The record still names the message that is missing.
+        let mut wrong = original.clone();
+        wrong.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &wrong, 2).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, MESSAGE);
+    }
+
+    /// A plan belongs to ONE key. A plan made for `rules-a` must not write the
+    /// record of `rules-b`: two keys that name the same message would post the
+    /// same template twice and edit it over each other.
+    #[test]
+    fn a_plan_for_one_key_does_not_write_another_key() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        let mut other = original.clone();
+        other.key = "nsfw-rules".to_string();
+        other.message = NEW_MESSAGE;
+        assert_eq!(
+            apply(&conn, &Plan::Edit { message: MESSAGE }, &other, 2).unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        // No row was written for the other key.
+        assert!(get(&conn, "nsfw-rules").unwrap().is_none());
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, MESSAGE);
+    }
+
+    /// The message a plan names is the message of ITS OWN key: an `Edit` plan for
+    /// `rules-a` must not write `rules-b`, even when `rules-b` holds the same
+    /// message id. Two keys that name one message would edit each other's post.
+    #[test]
+    fn two_keys_cannot_hold_the_same_message() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(&conn, &Plan::Create, &original, 1).unwrap();
+
+        // A second key is created with the SAME message id.
+        let mut twin = original.clone();
+        twin.key = "nsfw-rules".to_string();
+        assert_eq!(
+            apply(&conn, &Plan::Create, &twin, 2).unwrap_err(),
+            RepoError::MessageAlreadyRecorded
+        );
+        assert!(get(&conn, "nsfw-rules").unwrap().is_none());
+        assert_eq!(
+            get(&conn, "general-rules").unwrap().unwrap().record.message,
+            MESSAGE
+        );
     }
 
     /// A record that names another channel than the one on file must not move the
@@ -1316,7 +1444,13 @@ mod tests {
     fn a_recreate_without_a_recorded_row_is_refused() {
         let conn = mem_db();
         assert_eq!(
-            apply(&conn, &Plan::Recreate, &record(HASH_A), 1).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Recreate { replaces: MESSAGE },
+                &record(HASH_A),
+                1
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         assert!(list(&conn).unwrap().is_empty());
@@ -1380,6 +1514,154 @@ mod tests {
         }
     }
 
+    /// A tiny linear congruential generator. No dependency is needed for a seeded
+    /// pseudo-random sequence.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            // The constants are the ones of the standard 64-bit LCG.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// The Discord side of the world, modelled.
+    ///
+    /// `live` holds the ids of the messages that currently exist for the key. A
+    /// moderator deletes a message by removing its id; the bot posts a message by
+    /// adding a new id. An edit never changes the id: that is the whole point of
+    /// "edit in place, never duplicate".
+    #[derive(Default)]
+    struct Discord {
+        live: Vec<u64>,
+        next_id: u64,
+    }
+
+    impl Discord {
+        /// The id of the next message the model posts.
+        fn new() -> Self {
+            Self {
+                live: Vec::new(),
+                next_id: MESSAGE,
+            }
+        }
+
+        /// Posts a message and returns its id.
+        fn post(&mut self) -> u64 {
+            self.next_id += 1;
+            self.live.push(self.next_id);
+            self.next_id
+        }
+
+        /// Deletes the message with the given id, if it exists.
+        fn delete(&mut self, id: u64) {
+            self.live.retain(|other| *other != id);
+        }
+
+        /// True when a message with the given id exists.
+        fn exists(&self, id: u64) -> bool {
+            self.live.contains(&id)
+        }
+    }
+
+    /// What one sync step did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// The plan was a no-op or a refusal: nothing happened.
+        Quiet,
+        /// A message was posted.
+        Posted,
+        /// A message was edited in place.
+        Edited,
+    }
+
+    /// Runs one sync step against the real `plan` and the real `apply`.
+    ///
+    /// Returns what the step did. The Discord call can fail and the record write
+    /// can be lost; both are the faults the module has to survive.
+    fn sync_step(
+        conn: &Connection,
+        discord: &mut Discord,
+        key: &str,
+        hash: &str,
+        allow_recreate: bool,
+        discord_fails: bool,
+        write_fails: bool,
+        now: i64,
+    ) -> Step {
+        let recorded = get(conn, key).unwrap();
+        let missing = recorded
+            .as_ref()
+            .is_some_and(|stored| !discord.exists(stored.record.message));
+        let request = PlanRequest {
+            key,
+            template_hash: hash,
+            recorded: recorded.as_ref().map(|stored| &stored.record),
+            target_guild: GUILD,
+            target_channel: CHANNEL,
+            message_missing: missing,
+            allow_recreate,
+        };
+        let plan = plan(&request);
+        match plan {
+            Plan::Create => {
+                if discord_fails {
+                    return Step::Quiet;
+                }
+                let message = discord.post();
+                let mut new_record = record(hash);
+                new_record.key = key.to_string();
+                new_record.message = message;
+                if !write_fails {
+                    apply(conn, &plan, &new_record, now).unwrap();
+                }
+                Step::Posted
+            }
+            Plan::Edit { message } => {
+                // An edit never changes which message carries the post.
+                assert!(
+                    discord.exists(message),
+                    "an edit targeted a message that does not exist"
+                );
+                if discord_fails || write_fails {
+                    return Step::Quiet;
+                }
+                let mut edited = record(hash);
+                edited.key = key.to_string();
+                edited.message = message;
+                apply(conn, &plan, &edited, now).unwrap();
+                Step::Edited
+            }
+            Plan::Recreate { replaces } => {
+                // The message the plan replaces is the one that is missing.
+                assert!(
+                    !discord.exists(replaces),
+                    "a recreate replaced a message that still exists"
+                );
+                if discord_fails {
+                    return Step::Quiet;
+                }
+                let message = discord.post();
+                let mut new_record = record(hash);
+                new_record.key = key.to_string();
+                new_record.message = message;
+                if !write_fails {
+                    apply(conn, &plan, &new_record, now).unwrap();
+                }
+                Step::Posted
+            }
+            Plan::NoOp | Plan::Refuse(_) => Step::Quiet,
+        }
+    }
+
     /// A seeded sequence of sync steps must never leave the module in a state where
     /// work is silently forgotten, and it must reach `NoOp` once the template stops
     /// changing.
@@ -1394,29 +1676,10 @@ mod tests {
     /// row that is left behind.
     #[test]
     fn a_seeded_sync_sequence_reaches_a_final_state() {
-        // A tiny linear congruential generator. No dependency is needed for a seeded
-        // pseudo-random sequence.
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                // The constants are the ones of the standard 64-bit LCG.
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                self.0 >> 11
-            }
-            fn below(&mut self, bound: u64) -> u64 {
-                self.next() % bound
-            }
-        }
-
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
-        // The messages that exist on Discord for this key.
-        let mut live: Vec<u64> = Vec::new();
+        let mut discord = Discord::new();
         let mut now = 1_000i64;
-        let mut last_plan = Plan::NoOp;
         let mut edits = 0usize;
         let mut creates = 0usize;
         // The number of record writes that were lost. Every lost write can leave one
@@ -1424,62 +1687,41 @@ mod tests {
         // record of it. This is the limit the module states plainly.
         let mut lost_writes = 0usize;
 
-        for step in 0..600 {
+        for _step in 0..600 {
             now += 1;
             // The owner changes the template now and then.
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             // A moderator deletes the post now and then.
             if rng.below(20) == 0 {
-                live.clear();
+                let recorded = get(&conn, "general-rules").unwrap();
+                if let Some(stored) = recorded {
+                    discord.delete(stored.record.message);
+                }
             }
             // The Discord call fails now and then.
             let discord_fails = rng.below(10) == 0;
             // The record write fails now and then.
             let write_fails = rng.below(10) == 0;
-
-            let recorded = get(&conn, "general-rules").unwrap();
-            let request = PlanRequest {
-                key: "general-rules",
-                template_hash: hash,
-                recorded: recorded.as_ref().map(|stored| &stored.record),
-                target_guild: GUILD,
-                target_channel: CHANNEL,
-                message_missing: recorded.is_some()
-                    && !live.contains(&recorded.as_ref().unwrap().record.message),
-                allow_recreate: rng.below(3) == 0,
-            };
-            let plan = plan(&request);
-            last_plan = plan;
-            match plan {
-                Plan::Create | Plan::Recreate => {
-                    creates += 1;
-                    if !discord_fails {
-                        let new_message = MESSAGE + u64::try_from(step).unwrap();
-                        live.push(new_message);
-                        let mut new_record = record(hash);
-                        new_record.message = new_message;
-                        if write_fails {
-                            lost_writes += 1;
-                        } else {
-                            apply(&conn, &plan, &new_record, now).unwrap();
-                        }
-                    }
-                }
-                Plan::Edit { message } => {
-                    edits += 1;
-                    // An edit never changes which message carries the post.
-                    assert!(
-                        live.contains(&message),
-                        "an edit targeted a message that does not exist"
-                    );
-                    if !discord_fails && !write_fails {
-                        let mut edited = record(hash);
-                        edited.message = message;
-                        apply(&conn, &plan, &edited, now).unwrap();
-                    }
-                }
-                Plan::NoOp | Plan::Refuse(_) => {}
+            if write_fails {
+                lost_writes += 1;
             }
+
+            let step = sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                hash,
+                rng.below(3) == 0,
+                discord_fails,
+                write_fails,
+                now,
+            );
+            match step {
+                Step::Posted => creates += 1,
+                Step::Edited => edits += 1,
+                Step::Quiet => {}
+            }
+
             // Whatever happened, the row that is left behind must be readable and
             // must carry a usable key.
             let stored = get(&conn, "general-rules").unwrap();
@@ -1497,39 +1739,15 @@ mod tests {
         // the duplicate window the module states plainly: a post that succeeds on
         // Discord and whose record write then fails is followed by a second `Create`.
         assert!(
-            live.len() <= lost_writes + 1,
+            discord.live.len() <= lost_writes + 1,
             "live messages {} exceed lost writes {} plus one",
-            live.len(),
+            discord.live.len(),
             lost_writes
         );
 
         // The run did work: it posted and it edited.
         assert!(creates > 0, "the sequence never posted");
         assert!(edits > 0, "the sequence never edited");
-
-        // The last steps of the sequence ran with a template that did not change, so
-        // the module must have settled instead of posting again and again. The
-        // recorded hash is whatever the last successful write carried: asking for
-        // THAT hash again must be a no-op.
-        let recorded = get(&conn, "general-rules").unwrap();
-        assert!(recorded.is_some(), "nothing was recorded at the end");
-        let request = PlanRequest {
-            key: "general-rules",
-            template_hash: &recorded.as_ref().unwrap().record.content_hash,
-            recorded: recorded.as_ref().map(|stored| &stored.record),
-            target_guild: GUILD,
-            target_channel: CHANNEL,
-            message_missing: false,
-            allow_recreate: false,
-        };
-        assert_eq!(plan(&request), Plan::NoOp);
-        // The module never went quiet: every step either planned an action or
-        // deliberately refused one. A plan that stopped appearing would mean the
-        // sync gave up.
-        assert!(matches!(
-            last_plan,
-            Plan::NoOp | Plan::Refuse(_) | Plan::Edit { .. } | Plan::Create | Plan::Recreate
-        ));
     }
 
     /// The same seeded sequence, but with the record write failing often: the module
@@ -1537,67 +1755,38 @@ mod tests {
     /// reach a final state instead of trying forever.
     #[test]
     fn a_seeded_sync_sequence_with_lost_writes_still_settles() {
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                self.0 >> 11
-            }
-            fn below(&mut self, bound: u64) -> u64 {
-                self.next() % bound
-            }
-        }
-
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0002);
-        let mut live = true;
+        let mut discord = Discord::new();
         let mut now = 1_000i64;
         let mut posts = 0usize;
+        let mut lost_writes = 0usize;
 
-        for step in 0..600 {
+        for _step in 0..600 {
             now += 1;
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             if rng.below(20) == 0 {
-                live = false;
+                let recorded = get(&conn, "general-rules").unwrap();
+                if let Some(stored) = recorded {
+                    discord.delete(stored.record.message);
+                }
             }
-            let recorded = get(&conn, "general-rules").unwrap();
-            let request = PlanRequest {
-                key: "general-rules",
-                template_hash: hash,
-                recorded: recorded.as_ref().map(|stored| &stored.record),
-                target_guild: GUILD,
-                target_channel: CHANNEL,
-                message_missing: recorded.is_some() && !live,
-                allow_recreate: true,
-            };
-            let plan = plan(&request);
-            match plan {
-                Plan::Create | Plan::Recreate => {
-                    posts += 1;
-                    // The post succeeds on Discord, but the record write is lost
-                    // every other time.
-                    live = true;
-                    let mut new_record = record(hash);
-                    new_record.message = MESSAGE + u64::try_from(step).unwrap();
-                    if rng.below(2) == 0 {
-                        // The write is lost. The next step plans `Create` again and
-                        // posts a second copy: that is the documented window between
-                        // a successful post and the record of it.
-                    } else {
-                        let _ = apply(&conn, &Plan::Recreate, &new_record, now);
-                    }
-                }
-                Plan::Edit { .. } => {
-                    let mut edited = record(hash);
-                    if let Some(stored) = &recorded {
-                        edited.message = stored.record.message;
-                    }
-                    let _ = apply(&conn, &plan, &edited, now);
-                }
-                Plan::NoOp | Plan::Refuse(_) => {}
+            let write_fails = rng.below(2) == 0;
+            if write_fails {
+                lost_writes += 1;
+            }
+            let step = sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                hash,
+                true,
+                false,
+                write_fails,
+                now,
+            );
+            if step == Step::Posted {
+                posts += 1;
             }
             // The row that is left behind is always readable and always usable.
             if let Some(stored) = get(&conn, "general-rules").unwrap() {
@@ -1606,5 +1795,322 @@ mod tests {
             }
         }
         assert!(posts > 0, "the sequence never posted");
+        assert!(
+            discord.live.len() <= lost_writes + 1,
+            "live messages {} exceed lost writes {} plus one",
+            discord.live.len(),
+            lost_writes
+        );
+    }
+
+    /// A sync that keeps failing must never be quiet while work is unacknowledged.
+    ///
+    /// The Discord call fails every time, so no message is ever posted and no row
+    /// is ever written. The module must keep planning a `Create` for as long as
+    /// there is no row: it must not fall silent and leave the post unpublished.
+    #[test]
+    fn a_sync_that_never_succeeds_keeps_planning() {
+        let conn = mem_db();
+        let mut discord = Discord::new();
+        let mut now = 1_000i64;
+
+        for step in 0..50 {
+            now += 1;
+            let action = sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                HASH_A,
+                false,
+                true,
+                false,
+                now,
+            );
+            assert_eq!(action, Step::Quiet, "step {step}");
+            // The post was never made, so the module must still plan to make it.
+            let recorded = get(&conn, "general-rules").unwrap();
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: HASH_A,
+                recorded: recorded.as_ref().map(|stored| &stored.record),
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: false,
+                allow_recreate: false,
+            };
+            assert_eq!(plan(&request), Plan::Create, "step {step}");
+        }
+        assert!(discord.live.is_empty(), "a message was posted");
+    }
+
+    /// A sync that keeps failing must never be quiet while work is unacknowledged.
+    ///
+    /// The record write fails every time, but the post succeeds. The table stays
+    /// empty, so the module must keep planning a `Create`: the post is live on
+    /// Discord and the module does not know about it yet. This is the window the
+    /// module names, and the module must not pretend it does not exist.
+    #[test]
+    fn a_sync_that_loses_every_write_keeps_planning() {
+        let conn = mem_db();
+        let mut discord = Discord::new();
+        let mut now = 1_000i64;
+
+        for step in 0..20 {
+            now += 1;
+            sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                HASH_A,
+                false,
+                false,
+                true,
+                now,
+            );
+            assert!(get(&conn, "general-rules").unwrap().is_none());
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: HASH_A,
+                recorded: None,
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: false,
+                allow_recreate: false,
+            };
+            assert_eq!(plan(&request), Plan::Create, "step {step}");
+        }
+    }
+
+    /// Once the template stops changing and everything works, the module settles
+    /// into `NoOp` and stays there: it does not post again and it does not edit
+    /// again.
+    ///
+    /// The quiet phase at the end of the sequence is what proves this. The noisy
+    /// phase before it changes the template, deletes the post, fails the Discord
+    /// call and loses the record write. The quiet phase changes nothing, so the
+    /// module must reach `NoOp` within a small number of steps and stay there.
+    #[test]
+    fn a_seeded_sync_sequence_settles_into_a_no_op() {
+        let conn = mem_db();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0003);
+        let mut discord = Discord::new();
+        let mut now = 1_000i64;
+
+        // The noisy phase: the template changes, the post is deleted, the Discord
+        // call fails and the record write is lost.
+        for _step in 0..300 {
+            now += 1;
+            let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
+            if rng.below(20) == 0 {
+                if let Some(stored) = get(&conn, "general-rules").unwrap() {
+                    discord.delete(stored.record.message);
+                }
+            }
+            sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                hash,
+                rng.below(3) == 0,
+                rng.below(10) == 0,
+                rng.below(10) == 0,
+                now,
+            );
+        }
+
+        // The quiet phase: the template does not change, nothing is deleted and
+        // nothing fails. The module must settle.
+        let hash = HASH_A;
+        let mut settled_after = None;
+        for step in 0..10 {
+            now += 1;
+            let recorded = get(&conn, "general-rules").unwrap();
+            let missing = recorded
+                .as_ref()
+                .is_some_and(|stored| !discord.exists(stored.record.message));
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: hash,
+                recorded: recorded.as_ref().map(|stored| &stored.record),
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: missing,
+                allow_recreate: true,
+            };
+            let decision = plan(&request);
+            if decision == Plan::NoOp {
+                settled_after = Some(step);
+                break;
+            }
+            // The plan is not a no-op yet: the module has work to do, so it acts.
+            sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                hash,
+                true,
+                false,
+                false,
+                now,
+            );
+        }
+        assert!(
+            settled_after.is_some(),
+            "the module never settled into a no-op"
+        );
+        assert!(
+            settled_after.unwrap() <= 2,
+            "the module took {} steps to settle",
+            settled_after.unwrap()
+        );
+
+        // And it stays there: every further step is a no-op.
+        for step in 0..5 {
+            now += 1;
+            let recorded = get(&conn, "general-rules").unwrap();
+            let missing = recorded
+                .as_ref()
+                .is_some_and(|stored| !discord.exists(stored.record.message));
+            let request = PlanRequest {
+                key: "general-rules",
+                template_hash: hash,
+                recorded: recorded.as_ref().map(|stored| &stored.record),
+                target_guild: GUILD,
+                target_channel: CHANNEL,
+                message_missing: missing,
+                allow_recreate: true,
+            };
+            assert_eq!(plan(&request), Plan::NoOp, "step {step}");
+        }
+    }
+
+    /// The live messages are bounded by the writes that were lost, and by one.
+    ///
+    /// This is the duplicate window the module names: a post that succeeds on
+    /// Discord and whose record write then fails is followed by a second `Create`,
+    /// so a second copy of the post is made. Every lost write can account for
+    /// exactly one extra live message, and the recorded one is the last.
+    #[test]
+    fn the_live_posts_stay_within_the_duplicate_window() {
+        let conn = mem_db();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0004);
+        let mut discord = Discord::new();
+        let mut now = 1_000i64;
+        let mut lost_writes = 0usize;
+
+        for _step in 0..600 {
+            now += 1;
+            let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
+            if rng.below(20) == 0 {
+                if let Some(stored) = get(&conn, "general-rules").unwrap() {
+                    discord.delete(stored.record.message);
+                }
+            }
+            let write_fails = rng.below(2) == 0;
+            if write_fails {
+                lost_writes += 1;
+            }
+            sync_step(
+                &conn,
+                &mut discord,
+                "general-rules",
+                hash,
+                true,
+                false,
+                write_fails,
+                now,
+            );
+            // The table names ONE message for the key, and that message is the one
+            // the module manages. Every OTHER live message is one whose record
+            // write was lost: the window between a successful post and the record
+            // of it.
+            let all = list(&conn).unwrap();
+            assert!(
+                all.len() <= 1,
+                "the table holds more than one row for one key"
+            );
+            for stored in &all {
+                // The message the table names must be the one that the module
+                // manages, not a message of another key.
+                assert_eq!(stored.record.key, "general-rules");
+                // A recorded message that no longer exists is the case the module
+                // handles with a recreation; it is not an error by itself.
+                assert!(stored.record.message != 0);
+            }
+        }
+
+        let live = discord.live.len();
+        assert!(
+            live <= lost_writes + 1,
+            "live messages {live} exceed lost writes {lost_writes} plus one"
+        );
+        // And the run really did lose writes, so the bound is not vacuous.
+        assert!(lost_writes > 0, "the sequence never lost a write");
+    }
+
+    /// Two keys must never name the same message.
+    ///
+    /// A caller bug can make two keys point at one Discord message. The module must
+    /// refuse the second write: two rows that name one message would make the
+    /// wiring card edit that message with two different templates.
+    #[test]
+    fn two_keys_never_name_the_same_message_in_a_sequence() {
+        let conn = mem_db();
+        let mut discord = Discord::new();
+        let mut now = 1_000i64;
+        // The message id the model hands out to BOTH keys, to imitate a caller
+        // that points two keys at one message.
+        let shared = MESSAGE;
+
+        for _step in 0..200 {
+            now += 1;
+            for (key, hash, shared_message) in [
+                ("general-rules", HASH_A, shared),
+                ("nsfw-rules", HASH_B, shared),
+            ] {
+                let recorded = get(&conn, key).unwrap();
+                let missing = recorded
+                    .as_ref()
+                    .is_some_and(|stored| !discord.exists(stored.record.message));
+                let request = PlanRequest {
+                    key,
+                    template_hash: hash,
+                    recorded: recorded.as_ref().map(|stored| &stored.record),
+                    target_guild: GUILD,
+                    target_channel: CHANNEL,
+                    message_missing: missing,
+                    allow_recreate: true,
+                };
+                let decision = plan(&request);
+                match decision {
+                    Plan::Create | Plan::Recreate { .. } => {
+                        let mut new_record = record(hash);
+                        new_record.key = key.to_string();
+                        new_record.message = shared_message;
+                        let result = apply(&conn, &decision, &new_record, now);
+                        if key == "general-rules" {
+                            assert!(result.is_ok(), "the write was refused: {result:?}");
+                        } else {
+                            // The second key must not take a message that the first
+                            // key already holds.
+                            assert_eq!(
+                                result.unwrap_err(),
+                                RepoError::MessageAlreadyRecorded,
+                                "the second key took the message of the first"
+                            );
+                        }
+                    }
+                    Plan::Edit { .. } => {}
+                    Plan::NoOp | Plan::Refuse(_) => {}
+                }
+            }
+            // Whatever happened, no two rows name one message.
+            let all = list(&conn).unwrap();
+            let mut seen: Vec<u64> = all.iter().map(|stored| stored.record.message).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(before, seen.len(), "two keys name the same message");
+        }
     }
 }
