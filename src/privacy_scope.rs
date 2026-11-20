@@ -341,11 +341,13 @@ mod tests {
         assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
     }
 
-    // RED: unknown lookup -> skip.
+    // RED: unknown lookup -> skip (non-empty scope).
     // STUB returns Allow → this FAILS.
+    // Rule 6 only bites when something is actually excluded: under an empty
+    // scope rule 7 allows everything, so this test uses a non-empty scope.
     #[test]
     fn unknown_lookup_fails_closed() {
-        let scope = empty_scope();
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![], vec![]);
         let facts = ChannelFacts {
             guild_id: Some(GUILD),
             channel_id: Some(NORMAL_CHANNEL),
@@ -423,7 +425,8 @@ mod tests {
 
     #[test]
     fn unknown_channel_id_fails_closed() {
-        let scope = empty_scope();
+        // Non-empty scope: under an empty scope rule 7 allows everything.
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![], vec![]);
         let facts = facts_with_channel_none();
         assert_eq!(
             may_log(&scope, &facts),
@@ -638,6 +641,91 @@ mod tests {
         assert_eq!(
             may_log(&scope, &facts),
             LogDecision::Skip(SkipReason::ExcludedChannel)
+        );
+    }
+
+    // ---- Rule 7: an empty configuration allows everything ----
+    //
+    // Rule 7 says an empty configuration allows everything, so the predicate
+    // must not look at any lookup result at all: an unresolvable parent or an
+    // unresolvable channel id must NOT turn into Skip(UnknownLookup), because
+    // that would drop every uncached channel from the general log the moment
+    // the wiring card switches this predicate on.
+
+    // RED: empty scope + unknown parent -> Allow.
+    // On the round-2 code this FAILS with Skip(UnknownLookup).
+    #[test]
+    fn empty_config_allows_unknown_parent() {
+        let scope = empty_scope();
+        let facts = ChannelFacts {
+            guild_id: Some(GUILD),
+            channel_id: Some(NORMAL_CHANNEL),
+            parent_id: ParentResolution::Unknown,
+            category_id: ParentResolution::None,
+            old_parent_id: None,
+            new_parent_id: None,
+        };
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // RED: empty scope + unknown channel id -> Allow.
+    // On the round-2 code this FAILS with Skip(UnknownLookup).
+    #[test]
+    fn empty_config_allows_none_channel_id() {
+        let scope = empty_scope();
+        let facts = facts_with_channel_none();
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // RED: empty scope + unknown category -> Allow.
+    // On the round-2 code this FAILS with Skip(UnknownLookup).
+    #[test]
+    fn empty_config_allows_unknown_category() {
+        let scope = empty_scope();
+        let facts = ChannelFacts {
+            guild_id: Some(GUILD),
+            channel_id: Some(NORMAL_CHANNEL),
+            parent_id: ParentResolution::None,
+            category_id: ParentResolution::Unknown,
+            old_parent_id: None,
+            new_parent_id: None,
+        };
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // RED: empty scope + unknown old/new move parent -> Allow.
+    // On the round-2 code this FAILS with Skip(UnknownLookup).
+    #[test]
+    fn empty_config_allows_unknown_move_parents() {
+        let scope = empty_scope();
+        let facts = ChannelFacts {
+            guild_id: Some(GUILD),
+            channel_id: Some(NORMAL_CHANNEL),
+            parent_id: ParentResolution::None,
+            category_id: ParentResolution::None,
+            old_parent_id: None,
+            new_parent_id: None,
+        };
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Rule 7 is about the *configuration*, not the channel: a scope with one
+    // excluded channel is NOT empty, so an unknown lookup there still fails
+    // closed (rule 6). This pins the boundary between rules 6 and 7.
+    #[test]
+    fn non_empty_config_still_fails_closed_on_unknown_lookup() {
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![], vec![]);
+        let facts = ChannelFacts {
+            guild_id: Some(GUILD),
+            channel_id: Some(NORMAL_CHANNEL),
+            parent_id: ParentResolution::Unknown,
+            category_id: ParentResolution::None,
+            old_parent_id: None,
+            new_parent_id: None,
+        };
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::UnknownLookup)
         );
     }
 }
