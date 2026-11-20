@@ -11,12 +11,23 @@
 //! 2. The joining user's `username` is untrusted. It is stripped of zero-width and
 //!    bidi control characters, neutralised against `@everyone` / `@here` and role or
 //!    user mention syntax, escaped against markdown and capped in length before it is
-//!    placed anywhere. `{user_mention}` is the only way a user mention is produced.
-//! 3. The Discord embed limits are enforced at load: title 256, description 4096, at
-//!    most 25 fields, field name 256, field value 1024, footer 2048, author name 256
-//!    and 6000 characters in total. The limits count characters, not bytes.
-//! 4. A bot member is skipped by [`welcome_policy`].
-//! 5. The rendered output carries no raw id that did not come from the caller's map.
+//!    placed anywhere. The cap applies to the ESCAPED name, so the rendered name is
+//!    never longer than [`MAX_USERNAME_CHARS`]. The server name is caller-supplied
+//!    free text too: it is stripped of control characters, neutralised against the
+//!    mention syntax and capped at [`MAX_SERVER_NAME_CHARS`]. `{user_mention}` is the
+//!    only way a user mention is produced.
+//! 3. The Discord embed limits are checked on the TEMPLATE TEXT at load: title 256,
+//!    description 4096, at most 25 fields, field name 256, field value 1024, footer
+//!    2048, author name 256 and 6000 characters in total. The limits count
+//!    characters, not bytes.
+//! 4. A placeholder EXPANDS at render time, so the template text being inside the
+//!    limits does not mean the rendered text is. The renderer therefore clamps the
+//!    rendered result to the same limits: every slot is shortened to its own limit,
+//!    and the embed is shortened until its total fits 6000 characters. When something
+//!    was cut, [`RenderedWelcome::truncated`] is true. The order in which the embed
+//!    is shortened is fixed and documented on [`clamp_embed`].
+//! 5. A bot member is skipped by [`welcome_policy`].
+//! 6. The rendered output carries no raw id that did not come from the caller's map.
 //!
 //! There is no serenity type, no I/O, no clock read and no randomness: every id, the
 //! member count and the server name are passed in by the caller.
@@ -45,6 +56,13 @@ pub const MAX_FOOTER_CHARS: usize = 2048;
 pub const MAX_CONTENT_CHARS: usize = 2000;
 /// The maximum length of the sanitised username, in characters.
 pub const MAX_USERNAME_CHARS: usize = 64;
+/// The maximum length of the server name, in characters.
+///
+/// The server name is caller-supplied free text, like the username. It is capped so
+/// that one placeholder has a bounded expansion.
+pub const MAX_SERVER_NAME_CHARS: usize = 100;
+/// The maximum number of digits an id can have: a `u64` holds at most twenty.
+const MAX_ID_DIGITS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -93,6 +111,10 @@ pub enum TemplateErrorKind {
     EmptyFieldName,
     /// A field has an empty value.
     EmptyFieldValue,
+    /// A field name is not a string.
+    MalformedFieldName,
+    /// A field value is not a string.
+    MalformedFieldValue,
 }
 
 impl TemplateErrorKind {
@@ -120,6 +142,8 @@ impl TemplateErrorKind {
             TemplateErrorKind::ContentTooLong => "content_too_long",
             TemplateErrorKind::EmptyFieldName => "empty_field_name",
             TemplateErrorKind::EmptyFieldValue => "empty_field_value",
+            TemplateErrorKind::MalformedFieldName => "malformed_field_name",
+            TemplateErrorKind::MalformedFieldValue => "malformed_field_value",
         }
     }
 }
@@ -164,6 +188,11 @@ impl std::error::Error for TemplateError {}
 ///
 /// A key must be a plain word (`[A-Za-z0-9_]+`) and an id must not be zero. The first
 /// id inserted for a key wins, so a caller cannot smuggle a second id into a key.
+///
+/// The caller must hand the SAME map to [`WelcomeTemplate::load`] and to
+/// [`render_welcome`]. A key that the map does not have is refused at load time; a
+/// key that the map does not have at RENDER time renders as an empty string, because
+/// the renderer does not fail a join on a missing id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdMap {
     channels: BTreeMap<String, u64>,
@@ -320,9 +349,12 @@ pub enum SkipReason {
 
 /// A validated welcome template.
 ///
-/// The template was checked at load time: every placeholder is known, every
-/// `{channel:KEY}` and `{role:KEY}` key resolves and every embed limit holds. A
-/// template that loaded can therefore always be rendered.
+/// The template text was checked at load time: every placeholder is known, every
+/// `{channel:KEY}` and `{role:KEY}` key resolves and the template text is inside the
+/// Discord limits. A placeholder still EXPANDS when the template is rendered, so the
+/// rendered result is clamped to those limits by [`render_welcome`]; a template that
+/// loaded can always be rendered, but a long placeholder can cost the owner some of
+/// the template text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WelcomeTemplate {
     content: Option<String>,
@@ -511,14 +543,16 @@ fn parse_field(value: &serde_json::Value, ids: &IdMap) -> Result<RenderedField, 
 
     let name = match obj.get("name") {
         Some(serde_json::Value::String(text)) => text.clone(),
-        _ => return Err(TemplateError::new(TemplateErrorKind::EmptyFieldName)),
+        // A name that is not a string is a malformed field, not an empty name.
+        _ => return Err(TemplateError::new(TemplateErrorKind::MalformedFieldName)),
     };
     if name.is_empty() {
         return Err(TemplateError::new(TemplateErrorKind::EmptyFieldName));
     }
     let value_text = match obj.get("value") {
         Some(serde_json::Value::String(text)) => text.clone(),
-        _ => return Err(TemplateError::new(TemplateErrorKind::EmptyFieldValue)),
+        // A value that is not a string is a malformed field, not an empty value.
+        _ => return Err(TemplateError::new(TemplateErrorKind::MalformedFieldValue)),
     };
     if value_text.is_empty() {
         return Err(TemplateError::new(TemplateErrorKind::EmptyFieldValue));
@@ -776,14 +810,200 @@ fn neutralize_mentions(text: &str) -> String {
 
 /// Sanitises the joining user's name.
 ///
-/// The name is stripped of invisible control characters, capped in length by
-/// characters, escaped against markdown and neutralised against mention syntax. The
-/// result can no longer ping anyone and can no longer forge formatting.
+/// The name is stripped of invisible control characters, escaped against markdown and
+/// neutralised against mention syntax. The RESULT is then capped in length by
+/// characters, so the whole rendered name - escapes included - never exceeds
+/// [`MAX_USERNAME_CHARS`]. The result can no longer ping anyone and can no longer
+/// forge formatting.
 pub fn sanitize_username(username: &str) -> String {
     let stripped = strip_controls(username);
-    let capped: String = stripped.chars().take(MAX_USERNAME_CHARS).collect();
-    let escaped = escape_markdown(&capped);
-    neutralize_mentions(&escaped)
+    let escaped = escape_markdown(&stripped);
+    let neutralised = neutralize_mentions(&escaped);
+    neutralised.chars().take(MAX_USERNAME_CHARS).collect()
+}
+
+/// Sanitises the server name.
+///
+/// The server name is caller-supplied free text, so it is treated like the username:
+/// the invisible control characters are stripped, the mention syntax is neutralised
+/// and the result is capped in length by characters. The markdown is NOT escaped:
+/// the name is the server's own name, chosen by the server owner, and escaping it
+/// would show stray backslashes in every welcome.
+pub fn sanitize_server_name(server_name: &str) -> String {
+    let stripped = strip_controls(server_name);
+    let neutralised = neutralize_mentions(&stripped);
+    neutralised.chars().take(MAX_SERVER_NAME_CHARS).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Clamping the rendered output
+// ---------------------------------------------------------------------------
+
+/// Shortens `text` to at most `max` characters.
+///
+/// The cut is on a character boundary, so a multi-byte character is never split. The
+/// second value of the pair is true when something was cut.
+fn clamp_chars(text: &str, max: usize) -> (String, bool) {
+    let count = text.chars().count();
+    if count <= max {
+        return (text.to_string(), false);
+    }
+    (text.chars().take(max).collect(), true)
+}
+
+/// Shortens `text` by up to `count` characters, from the end.
+///
+/// Returns the number of characters that were removed.
+fn shorten_end(text: &mut String, count: usize) -> usize {
+    let len = text.chars().count();
+    let take = count.min(len);
+    if take == 0 {
+        return 0;
+    }
+    let kept: String = text.chars().take(len - take).collect();
+    *text = kept;
+    take
+}
+
+/// Clamps the rendered embed so that Discord accepts it.
+///
+/// Every slot is first shortened to its own limit. If the embed is still longer than
+/// the Discord total, the parts are shortened in this fixed order:
+///
+/// 1. the description,
+/// 2. the footer text,
+/// 3. the field values and the field names, from the LAST field backwards; a field
+///    that can no longer keep both a name and a value is dropped,
+/// 4. the author name,
+/// 5. the title.
+///
+/// The title is shortened last so that the embed keeps its headline for as long as
+/// possible. The function returns true when something was cut.
+fn clamp_embed(embed: &mut RenderedEmbed) -> bool {
+    let mut cut = false;
+
+    if let Some(text) = embed.title.as_mut() {
+        let (clamped, was_cut) = clamp_chars(text, MAX_TITLE_CHARS);
+        *text = clamped;
+        cut |= was_cut;
+    }
+    if let Some(text) = embed.description.as_mut() {
+        let (clamped, was_cut) = clamp_chars(text, MAX_DESCRIPTION_CHARS);
+        *text = clamped;
+        cut |= was_cut;
+    }
+    for field in &mut embed.fields {
+        let (name, name_cut) = clamp_chars(&field.name, MAX_FIELD_NAME_CHARS);
+        field.name = name;
+        cut |= name_cut;
+        let (value, value_cut) = clamp_chars(&field.value, MAX_FIELD_VALUE_CHARS);
+        field.value = value;
+        cut |= value_cut;
+    }
+    if let Some(text) = embed.footer_text.as_mut() {
+        let (clamped, was_cut) = clamp_chars(text, MAX_FOOTER_CHARS);
+        *text = clamped;
+        cut |= was_cut;
+    }
+    if let Some(text) = embed.author_name.as_mut() {
+        let (clamped, was_cut) = clamp_chars(text, MAX_TITLE_CHARS);
+        *text = clamped;
+        cut |= was_cut;
+    }
+
+    cut |= clamp_embed_total(embed);
+    cut
+}
+
+/// Shortens the embed until its total fits in [`MAX_EMBED_TOTAL_CHARS`].
+///
+/// The parts are shortened in the order [`clamp_embed`] documents. The function
+/// returns true when something was cut.
+fn clamp_embed_total(embed: &mut RenderedEmbed) -> bool {
+    let mut cut = false;
+    loop {
+        let total = embed_total_chars(embed);
+        if total <= MAX_EMBED_TOTAL_CHARS {
+            break;
+        }
+        let excess = total - MAX_EMBED_TOTAL_CHARS;
+
+        // 1. The description.
+        if let Some(text) = embed.description.as_mut() {
+            let removed = shorten_end(text, excess);
+            if removed > 0 {
+                cut = true;
+                if text.is_empty() {
+                    embed.description = None;
+                }
+                continue;
+            }
+        }
+
+        // 2. The footer text.
+        if let Some(text) = embed.footer_text.as_mut() {
+            let removed = shorten_end(text, excess);
+            if removed > 0 {
+                cut = true;
+                if text.is_empty() {
+                    embed.footer_text = None;
+                }
+                continue;
+            }
+        }
+
+        // 3. The last field: its value first, then its name. A field that cannot keep
+        //    both a name and a value is dropped.
+        let last_field = embed
+            .fields
+            .last()
+            .map(|field| (field.name.chars().count(), field.value.chars().count()));
+        if let Some((name_len, value_len)) = last_field {
+            // A field keeps at least one character in its name and in its value.
+            let spare_value = value_len.saturating_sub(1);
+            let spare_name = name_len.saturating_sub(1);
+            if spare_value + spare_name >= excess {
+                if let Some(field) = embed.fields.last_mut() {
+                    let from_value = excess.min(spare_value);
+                    shorten_end(&mut field.value, from_value);
+                    shorten_end(&mut field.name, excess - from_value);
+                }
+                cut = true;
+                continue;
+            }
+            embed.fields.pop();
+            cut = true;
+            continue;
+        }
+
+        // 4. The author name.
+        if let Some(text) = embed.author_name.as_mut() {
+            let removed = shorten_end(text, excess);
+            if removed > 0 {
+                cut = true;
+                if text.is_empty() {
+                    embed.author_name = None;
+                }
+                continue;
+            }
+        }
+
+        // 5. The title.
+        if let Some(text) = embed.title.as_mut() {
+            let removed = shorten_end(text, excess);
+            if removed > 0 {
+                cut = true;
+                if text.is_empty() {
+                    embed.title = None;
+                }
+                continue;
+            }
+        }
+
+        // Nothing is left to shorten: the embed is as small as it can get.
+        break;
+    }
+    cut
 }
 
 // ---------------------------------------------------------------------------
@@ -809,13 +1029,9 @@ pub fn english_ordinal(number: u64) -> String {
 /// The decision for one joining member.
 ///
 /// A bot is skipped: the old YAGPDB command posted the welcome for bots as well, and
-/// that is deliberately not copied.
-pub fn welcome_policy(
-    template: &WelcomeTemplate,
-    member: &MemberContext,
-    ids: &IdMap,
-) -> SkipReason {
-    let _ = (template, ids);
+/// that is deliberately not copied. The decision needs nothing but the member, so the
+/// function takes only the member.
+pub fn welcome_policy(member: &MemberContext) -> SkipReason {
     if member.is_bot {
         SkipReason::Bot
     } else {
@@ -828,6 +1044,11 @@ pub fn welcome_policy(
 /// The member's name is sanitised before it is placed anywhere. `{user_mention}` is
 /// the only way a user mention is produced; `{channel:KEY}` and `{role:KEY}` carry an
 /// id that came from the caller's map, so no other raw id can appear in the output.
+///
+/// The rendered text is clamped to the Discord limits, because a placeholder expands
+/// at render time: a template whose text is exactly at the limit can render past it.
+/// When something was cut, [`RenderedWelcome::truncated`] is true, so the caller can
+/// log it.
 pub fn render_welcome(
     template: &WelcomeTemplate,
     member: &MemberContext,
@@ -836,19 +1057,26 @@ pub fn render_welcome(
     let context = RenderContext {
         user_mention: format!("<@{}>", member.user_id),
         username: sanitize_username(&member.username),
-        server: member.server_name.clone(),
+        server: sanitize_server_name(&member.server_name),
         member_count: member.member_count.to_string(),
         member_ordinal: english_ordinal(member.member_count),
         ids,
     };
 
+    let mut truncated = false;
+
     let content = template
         .content
         .as_deref()
-        .map(|text| render_text(text, &context))
+        .map(|text| {
+            let rendered = render_text(text, &context);
+            let (rendered, was_cut) = clamp_chars(&rendered, MAX_CONTENT_CHARS);
+            truncated |= was_cut;
+            rendered
+        })
         .filter(|text| !text.is_empty());
 
-    let embed = RenderedEmbed {
+    let mut embed = RenderedEmbed {
         title: template
             .embed
             .title
@@ -880,11 +1108,12 @@ pub fn render_welcome(
             .as_deref()
             .map(|text| render_text(text, &context)),
     };
+    truncated |= clamp_embed(&mut embed);
 
     RenderedWelcome {
         content,
         embed,
-        truncated: false,
+        truncated,
     }
 }
 
@@ -1723,6 +1952,31 @@ mod tests {
         assert_eq!(err.kind(), TemplateErrorKind::EmptyFieldValue);
     }
 
+    /// A field name or value that is not a string is a MALFORMED field, not an empty
+    /// one: the two are different mistakes and get different reason codes.
+    #[test]
+    fn a_non_string_field_name_or_value_is_refused_as_malformed() {
+        let src = "{\"embed\": {\"fields\": [{\"name\": 7, \"value\": \"v\"}]}}";
+        let err = WelcomeTemplate::load(src, &id_map()).expect_err("a number name must be refused");
+        assert_eq!(err.kind(), TemplateErrorKind::MalformedFieldName);
+        let src = "{\"embed\": {\"fields\": [{\"name\": \"n\", \"value\": 7}]}}";
+        let err =
+            WelcomeTemplate::load(src, &id_map()).expect_err("a number value must be refused");
+        assert_eq!(err.kind(), TemplateErrorKind::MalformedFieldValue);
+    }
+
+    /// A key the render-time map does not have renders as an empty string: the
+    /// renderer does not fail a join on a missing id. The load-time map is the one
+    /// that decides which keys are valid.
+    #[test]
+    fn a_key_missing_from_the_render_map_renders_as_nothing() {
+        let src = "{\"embed\": {\"description\": \"[{channel:rules}]\"}}";
+        let t = WelcomeTemplate::load(src, &id_map()).expect("template must load");
+        let empty_map = IdMap::default();
+        let out = render_welcome(&t, &member(), &empty_map);
+        assert_eq!(out.embed.description.as_deref(), Some("[]"));
+    }
+
     // ---------------------------------------------------------------------------
     // Rule 4: bots are skipped
     // ---------------------------------------------------------------------------
@@ -1730,20 +1984,16 @@ mod tests {
     /// A bot member is skipped by the policy.
     #[test]
     fn bot_member_is_skipped() {
-        let src = "{\"embed\": {\"title\": \"t\"}}";
-        let t = WelcomeTemplate::load(src, &id_map()).expect("valid template loads");
         let mut m = member();
         m.is_bot = true;
-        let decision = welcome_policy(&t, &m, &id_map());
+        let decision = welcome_policy(&m);
         assert_eq!(decision, SkipReason::Bot);
     }
 
     /// A human member is not skipped.
     #[test]
     fn human_member_is_not_skipped() {
-        let src = "{\"embed\": {\"title\": \"t\"}}";
-        let t = WelcomeTemplate::load(src, &id_map()).expect("valid template loads");
-        assert_eq!(welcome_policy(&t, &member(), &id_map()), SkipReason::None);
+        assert_eq!(welcome_policy(&member()), SkipReason::None);
     }
 
     /// A bot member is skipped even when the template would render fine.
@@ -1754,7 +2004,11 @@ mod tests {
         let mut m = member();
         m.is_bot = true;
         m.username = "@everyone".to_string();
-        let decision = welcome_policy(&t, &m, &id_map());
+        // The template renders fine, so the skip is the policy's decision, not a
+        // side effect of a broken template.
+        let rendered = render_welcome(&t, &m, &id_map());
+        assert!(rendered.embed.title.is_some());
+        let decision = welcome_policy(&m);
         assert_eq!(decision, SkipReason::Bot);
     }
 
@@ -1946,6 +2200,8 @@ mod tests {
             TemplateErrorKind::ContentTooLong,
             TemplateErrorKind::EmptyFieldName,
             TemplateErrorKind::EmptyFieldValue,
+            TemplateErrorKind::MalformedFieldName,
+            TemplateErrorKind::MalformedFieldValue,
         ];
         let mut seen = BTreeMap::new();
         for kind in kinds {
@@ -1953,7 +2209,7 @@ mod tests {
             assert!(!code.is_empty(), "{kind:?} has an empty code");
             assert!(seen.insert(code, kind).is_none(), "duplicate code {code}");
         }
-        assert!(seen.len() >= 19, "unexpected number of codes");
+        assert!(seen.len() >= 21, "unexpected number of codes");
     }
 
     /// The error implements `std::error::Error` so a wiring card can propagate it.
@@ -2238,7 +2494,11 @@ mod tests {
             "footer is {} chars",
             footer.chars().count()
         );
-        let author = out.embed.author_name.as_deref().expect("author must render");
+        let author = out
+            .embed
+            .author_name
+            .as_deref()
+            .expect("author must render");
         assert!(
             author.chars().count() <= 256,
             "author is {} chars",
@@ -2299,5 +2559,107 @@ mod tests {
         let t = WelcomeTemplate::load(template, &id_map()).expect("template must load");
         let out = render_welcome(&t, &member(), &id_map());
         assert!(!out.truncated, "a short welcome was reported as truncated");
+    }
+
+    /// The server name is capped: it is caller-supplied free text, so one placeholder
+    /// must have a bounded expansion.
+    #[test]
+    fn the_server_name_is_capped() {
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let sanitised = sanitize_server_name(&m.server_name);
+        assert!(
+            sanitised.chars().count() <= 100,
+            "the sanitised server name is {} chars",
+            sanitised.chars().count()
+        );
+    }
+
+    /// The server name cannot carry a mass mention either.
+    #[test]
+    fn the_server_name_cannot_ping_everyone() {
+        let sanitised = sanitize_server_name("@everyone");
+        assert!(!sanitised.to_lowercase().contains("@everyone"));
+        assert!(
+            sanitised.contains("everyone"),
+            "the name was lost: {sanitised}"
+        );
+    }
+
+    /// The server name cannot hide text with invisible characters.
+    #[test]
+    fn the_server_name_control_characters_are_stripped() {
+        let sanitised = sanitize_server_name("a\u{200b}b\u{202e}c");
+        assert_eq!(sanitised, "abc");
+    }
+
+    /// The clamp drops the fields that cannot fit rather than leaving an empty field.
+    /// Discord rejects a field without a name or without a value.
+    #[test]
+    fn the_clamp_never_leaves_an_empty_field() {
+        // Twenty-five fields of 1024 characters each: the template text is 25 600
+        // characters, so it is refused at load. A template that LOADS can still
+        // overflow once the placeholders expand, so the clamp has to cope.
+        let fields: Vec<String> = (0..25)
+            .map(|i| {
+                format!(
+                    "{{\"name\": \"n{i}\", \"value\": \"{}\"}}",
+                    "v".repeat(1024)
+                )
+            })
+            .collect();
+        let src = format!("{{\"embed\": {{\"fields\": [{}]}}}}", fields.join(","));
+        let err = WelcomeTemplate::load(&src, &id_map()).expect_err("25 600 chars must be refused");
+        assert_eq!(err.kind(), TemplateErrorKind::EmbedTotalTooLong);
+
+        // A template that loads and then expands past the total: every field must
+        // still have a name and a value afterwards.
+        let src =
+            "{\"embed\": {\"fields\": [{\"name\": \"{username}\", \"value\": \"{username}\"}]}}";
+        let t = WelcomeTemplate::load(src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        for field in &out.embed.fields {
+            assert!(!field.name.is_empty(), "a field lost its name");
+            assert!(!field.value.is_empty(), "a field lost its value");
+        }
+    }
+
+    /// The clamp keeps the headline: the title is shortened last.
+    #[test]
+    fn the_clamp_keeps_the_title_as_long_as_it_can() {
+        // Title 256 + description 4096 + a field value of 1024 + a field name of 1 is
+        // 5377 characters: the template loads. The description then expands past its
+        // own limit, and the embed must still fit the 6000 total, so the description
+        // is what gets cut - not the title.
+        let src = format!(
+            "{{\"embed\": {{\"title\": \"{}\", \"description\": \"{}{{username}}\", \
+             \"fields\": [{{\"name\": \"n\", \"value\": \"{}\"}}]}}}}",
+            "t".repeat(256),
+            "d".repeat(4080),
+            "v".repeat(1024)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let title = out.embed.title.as_deref().expect("title must survive");
+        assert_eq!(title.chars().count(), 256, "the title was cut");
+        assert!(out.truncated, "the cut was not reported");
+    }
+
+    /// The clamp never splits a multi-byte character.
+    #[test]
+    fn the_clamp_cuts_on_a_character_boundary() {
+        let src = format!(
+            "{{\"embed\": {{\"description\": \"{}\"}}}}",
+            "é".repeat(4096)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let out = render_welcome(&t, &member(), &id_map());
+        let description = out.embed.description.as_deref().expect("description");
+        assert!(description.chars().all(|c| c == 'é'));
+        assert!(description.chars().count() <= 4096);
     }
 }
