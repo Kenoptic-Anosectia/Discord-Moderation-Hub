@@ -2985,4 +2985,84 @@ mod tests {
             name.chars().count()
         );
     }
+
+    /// The total clamp cuts exactly the excess when the embed is over the limit. The
+    /// cut is exact: the embed ends at 6000 characters, not below it.
+    #[test]
+    fn the_total_clamp_cuts_exactly_the_excess() {
+        // Twenty fields of 280 literal characters plus a `{server}` placeholder are
+        // 5820 characters of template text, so the template loads. The server name
+        // expands every field value, and the rendered embed is then over 6000.
+        let src = fields_template(20, 280);
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        // The rendered embed ends at exactly 6000 characters: the clamp cut the
+        // excess and no more.
+        assert_eq!(
+            rendered_embed_total(&out.embed),
+            6000,
+            "the clamp did not cut exactly the excess"
+        );
+        assert!(out.truncated, "the cut was not reported");
+    }
+
+    /// The order of the cuts is fixed: the description goes first, then the footer,
+    /// then the fields. A template that is too long in all of them loses the
+    /// description, and the footer keeps all of its characters.
+    #[test]
+    fn the_clamp_cuts_the_description_before_the_footer() {
+        let src = format!(
+            "{{\"embed\": {{\"title\": \"{}{{server}}\", \"description\": \"{}{{server}}\", \
+             \"footer\": {{\"text\": \"{}{{server}}\"}}, \"fields\": [{}]}}}}",
+            "t".repeat(200),
+            "d".repeat(1500),
+            "f".repeat(300),
+            (0..15)
+                .map(|i| format!(
+                    "{{\"name\": \"n{i}\", \"value\": \"{}{{server}}\"}}",
+                    "v".repeat(250)
+                ))
+                .collect::<Vec<String>>()
+                .join(",")
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let description = out
+            .embed
+            .description
+            .as_deref()
+            .expect("description must survive");
+        let footer = out
+            .embed
+            .footer_text
+            .as_deref()
+            .expect("footer must survive");
+        // The description is cut first, so the footer keeps all of its characters
+        // while the description loses what it has to.
+        assert_eq!(footer.chars().count(), 400);
+        assert!(
+            description.chars().count() < 1600,
+            "the description was not cut"
+        );
+        assert_eq!(rendered_embed_total(&out.embed), 6000);
+    }
+
+    /// A template with `count` fields, each with a `value_len` character value plus a
+    /// `{server}` placeholder.
+    fn fields_template(count: usize, value_len: usize) -> String {
+        format!(
+            "{{\"embed\": {{\"fields\": [{}]}}}}",
+            (0..count)
+                .map(|i| format!(
+                    "{{\"name\": \"n{i}\", \"value\": \"{}{{server}}\"}}",
+                    "v".repeat(value_len)
+                ))
+                .collect::<Vec<String>>()
+                .join(",")
+        )
+    }
 }
