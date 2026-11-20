@@ -415,6 +415,12 @@ pub fn decide_permit(
 /// The owner leaving a room that still holds members makes the room claimable. An
 /// empty room is only cleaned up once its grace period has elapsed; the runtime
 /// records `empty_since` when the room first becomes empty and calls again later.
+///
+/// The grace check comes first and applies to whoever leaves last: a room whose owner
+/// has already left must still be cleaned up once it is empty, or it would linger
+/// forever and keep consuming the global cap. Only a member who leaves a room that is
+/// still occupied can be refused for not being the owner, because only then does the
+/// leave have a claimable consequence.
 pub fn decide_leave(
     channel_id: u64,
     user_id: u64,
@@ -429,14 +435,17 @@ pub fn decide_leave(
     if user_id == 0 {
         return Decision::Deny(DenyReason::InvalidUserId);
     }
-    if user_id != room.owner_id {
-        return Decision::Deny(DenyReason::NotRoomOwner);
-    }
     if room.occupants > 0 {
+        // The room still holds members, so it may become claimable. Only the owner
+        // may leave it that way; anybody else leaves no trace.
+        if user_id != room.owner_id {
+            return Decision::Deny(DenyReason::NotRoomOwner);
+        }
         return Decision::Claimable(channel_id);
     }
     // The room is empty. The grace period starts when the room first became empty;
-    // until it has elapsed the room stays.
+    // until it has elapsed the room stays. The check does not depend on who leaves:
+    // the room is empty, so whoever leaves last reaches it.
     let empty_since = room.empty_since.unwrap_or(now);
     if now - empty_since >= config.empty_grace_secs {
         return Decision::Cleanup(channel_id);
@@ -611,6 +620,12 @@ fn strip_links(raw: &str) -> String {
 }
 
 /// True when the segment is a URL, a `www.` host or an invite link.
+///
+/// The rule is a class rule, not a list of examples: a segment whose host part is a
+/// dotted name with an alphabetic top-level domain is a host, whether or not it
+/// carries a path, a query or a port. `example.com`, `example.com/x`, `example.com:8080`
+/// and `www.example.com` are all removed, and so is a bare invite host such as
+/// `discord.gg`.
 fn is_link_like(segment: &str) -> bool {
     let lowered = segment.to_ascii_lowercase();
     if lowered.contains("://") || lowered.starts_with("www.") {
@@ -619,27 +634,41 @@ fn is_link_like(segment: &str) -> bool {
     if contains_invite_host(&lowered) {
         return true;
     }
-    match lowered.find('/') {
-        Some(slash) => {
-            let host = &lowered[..slash];
-            looks_like_host(host)
-        }
-        None => false,
-    }
+    // The host part is what stands in front of the first slash.
+    let host = match lowered.find('/') {
+        Some(slash) => &lowered[..slash],
+        None => lowered.as_str(),
+    };
+    // A host may carry a port and may carry user information before the `@`.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    looks_like_host(host)
 }
 
 /// True when the text carries one of the known invite hosts.
+///
+/// The host is listed with and without its trailing slash, so a bare `discord.gg` is
+/// an invite host too, and a host that was split across spaces is caught once the
+/// segments are joined.
 fn contains_invite_host(lowered: &str) -> bool {
-    const INVITE_HOSTS: [&str; 4] = [
+    const INVITE_HOSTS: [&str; 8] = [
         "discord.gg/",
+        "discord.gg",
         "discord.com/invite/",
+        "discord.com/invite",
         "discordapp.com/invite/",
+        "discordapp.com/invite",
         "discord.new/",
+        "discord.new",
     ];
     INVITE_HOSTS.iter().any(|host| lowered.contains(host))
 }
 
 /// True when the text looks like a host name such as `example.invalid`.
+///
+/// The name must carry at least one dot, must not start or end with one, and its last
+/// label must be at least two alphabetic characters, so `example.com` and `discord.gg`
+/// are hosts while `e.g.` and `version 1.2` are not.
 fn looks_like_host(host: &str) -> bool {
     if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
         return false;
@@ -990,6 +1019,54 @@ mod tests {
         assert!(
             !cleaned.to_lowercase().contains("example.invalid"),
             "a split scheme must not smuggle a host into the name: {cleaned:?}"
+        );
+    }
+
+    /// A host with a port and a path is still a host and is removed.
+    #[test]
+    fn a_host_with_a_port_is_removed() {
+        let cleaned = sanitize_name("example.com:8080/x party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a host with a port must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host with user information in front of it is still a host and is removed.
+    #[test]
+    fn a_host_with_user_information_is_removed() {
+        let cleaned = sanitize_name("someone@example.com party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a host with user information must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A bare invite host split across spaces is removed as well.
+    #[test]
+    fn a_bare_invite_host_split_by_spaces_is_removed() {
+        let cleaned = sanitize_name("discord . gg party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("discord"),
+            "a split invite host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// Text that only looks a little like a host is kept: the cleaning removes
+    /// hosts, not ordinary words that carry a dot.
+    #[test]
+    fn ordinary_text_with_a_dot_is_kept() {
+        assert_eq!(
+            sanitize_name("e.g. party", "Voice Room"),
+            "e.g. party",
+            "a one-letter label is not a top-level domain"
+        );
+        assert_eq!(
+            sanitize_name("version 1.2 party", "Voice Room"),
+            "version 1.2 party"
         );
     }
 
