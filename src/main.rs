@@ -1,3 +1,4 @@
+mod activity;
 mod archive_safety;
 mod config;
 mod deletion_attribution;
