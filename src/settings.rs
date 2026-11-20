@@ -395,4 +395,61 @@ mod tests {
 
     // ---- Mutation test: break parse_id_list to confirm tests catch it ----
     // If we remove the zero-check, id_list_rejects_zero will fail.
+
+    // ---- Parser-specific key-in-display tests (RED: these fail against old code) ----
+
+    #[test]
+    fn parse_id_list_error_display_contains_key() {
+        let err = parse_id_list("PROTECTED_ROLE_IDS", Some("S3CR3T")).unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            display.contains("PROTECTED_ROLE_IDS"),
+            "Display should contain key: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn parse_duration_secs_error_display_contains_key() {
+        let err = parse_duration_secs("FEATURE_X_TIMEOUT_SECS", Some("S3CR3T"), 1, 100).unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            display.contains("FEATURE_X_TIMEOUT_SECS"),
+            "Display should contain key: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn parse_duration_unset_error_contains_key() {
+        let err = parse_duration_secs("TIMEOUT_SECS", None, 1, 100).unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            display.contains("TIMEOUT_SECS"),
+            "Display should contain key: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn parse_duration_out_of_range_error_contains_key() {
+        let err = parse_duration_secs("TIMEOUT_SECS", Some("999"), 1, 100).unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            display.contains("TIMEOUT_SECS"),
+            "Display should contain key: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn parse_id_list_empty_entry_error_contains_key() {
+        let err = parse_id_list("CHANNEL_IDS", Some("100,,200")).unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            display.contains("CHANNEL_IDS"),
+            "Display should contain key: {}",
+            display
+        );
+    }
 }
