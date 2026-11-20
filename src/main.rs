@@ -4,6 +4,7 @@ mod deletion_attribution;
 mod flash;
 mod roles;
 mod safeword;
+mod settings;
 mod storage;
 mod text_helpers;
 mod tickets;
