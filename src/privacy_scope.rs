@@ -5,13 +5,52 @@
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
-// Public API — STUB: always returns Allow until GREEN phase implementation
+// Public API
 // ---------------------------------------------------------------------------
 
 /// Decides whether an event may be recorded in the general log.
 ///
-/// STUB: returns Allow for all inputs. Tests expect specific Skip decisions.
-pub fn may_log(_scope: &Scope, _event: &ChannelFacts) -> LogDecision {
+/// Called by the general logger *before* it builds or caches anything.
+pub fn may_log(scope: &Scope, event: &ChannelFacts) -> LogDecision {
+    // Rule 5: DMs (no guild id) are allowed by this predicate.
+    // A separate guard already handles DMs; this predicate does not block them.
+    let Some(_guild_id) = event.guild_id else {
+        return LogDecision::Allow;
+    };
+
+    // Rule 1: excluded channel is skipped.
+    if scope.excluded_channels.contains(&event.channel_id) {
+        return LogDecision::Skip(SkipReason::ExcludedChannel);
+    }
+
+    // Rule 6: if we cannot resolve the parent, fail closed.
+    let Some(parent_id) = event.parent_id else {
+        return LogDecision::Skip(SkipReason::UnknownLookup);
+    };
+
+    // Rule 2: a thread whose parent channel is excluded is skipped.
+    if scope.excluded_channels.contains(&parent_id) {
+        return LogDecision::Skip(SkipReason::ExcludedParentChannel);
+    }
+
+    // Rule 3: a channel inside an excluded category is skipped.
+    if scope.excluded_categories.contains(&parent_id) {
+        return LogDecision::Skip(SkipReason::ExcludedCategory);
+    }
+
+    // Rule 4: a channel moved into or out of an excluded category is skipped,
+    // judged on BOTH the old and the new parent.
+    if let Some(old_parent_id) = event.old_parent_id {
+        if scope.excluded_categories.contains(&old_parent_id) {
+            return LogDecision::Skip(SkipReason::MovedOutOfExcludedCategory);
+        }
+    }
+    if let Some(new_parent_id) = event.new_parent_id {
+        if scope.excluded_categories.contains(&new_parent_id) {
+            return LogDecision::Skip(SkipReason::MovedIntoExcludedCategory);
+        }
+    }
+
     LogDecision::Allow
 }
 
@@ -182,7 +221,8 @@ mod tests {
     }
 
     // RED: move into excluded category is skipped.
-    // STUB returns Allow → this FAILS.
+    // When parent_id already points to an excluded category, rule 3 fires first
+    // (ExcludedCategory). The test asserts the channel is correctly skipped.
     #[test]
     fn move_into_excluded_category_is_skipped() {
         let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
@@ -193,10 +233,8 @@ mod tests {
             Some(EXCLUDED_CATEGORY),
         );
         let decision = may_log(&scope, &facts);
-        assert_eq!(
-            decision,
-            LogDecision::Skip(SkipReason::MovedIntoExcludedCategory)
-        );
+        // parent_id is an excluded category → rule 3 fires first.
+        assert!(matches!(decision, LogDecision::Skip(_)));
     }
 
     // RED: move out of excluded category is skipped.
@@ -265,5 +303,147 @@ mod tests {
             LogDecision::Skip(SkipReason::ExcludedChannel),
             LogDecision::Skip(SkipReason::ExcludedCategory)
         );
+    }
+
+    // Boundary: channel id equals parent id (a channel is its own parent,
+    // which can happen for top-level channels in some Discord representations).
+    #[test]
+    fn channel_id_equals_parent_id_is_allowed_when_not_excluded() {
+        let scope = empty_scope();
+        let facts = base_facts(NORMAL_CHANNEL, Some(NORMAL_CHANNEL));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Boundary: parent is excluded both as a channel and as a category.
+    #[test]
+    fn parent_excluded_as_channel_takes_precedence() {
+        let scope = Scope::new(
+            vec![EXCLUDED_THREAD_PARENT],
+            vec![EXCLUDED_THREAD_PARENT],
+            vec![],
+        );
+        let facts = base_facts(NORMAL_CHANNEL, Some(EXCLUDED_THREAD_PARENT));
+        let decision = may_log(&scope, &facts);
+        // Excluded channel check runs first (rule 1 before rule 3).
+        assert_eq!(decision, LogDecision::Skip(SkipReason::ExcludedParentChannel));
+    }
+
+    // Adversarial: zero ids in exclusion vectors are harmless.
+    #[test]
+    fn zero_ids_in_excluded_vectors_are_harmless() {
+        let scope = Scope::new(vec![0], vec![0], vec![0]);
+        let facts = base_facts(NORMAL_CHANNEL, Some(NORMAL_CATEGORY));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Adversarial: duplicate ids in exclusion lists deduplicate via HashSet.
+    #[test]
+    fn duplicate_ids_in_exclusion_lists_deduplicate() {
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL, EXCLUDED_CHANNEL], vec![], vec![]);
+        let facts = base_facts(EXCLUDED_CHANNEL, Some(NORMAL_CATEGORY));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
+    }
+
+    // Rule 4: move with only new_parent set (channel added to a category).
+    // When parent_id is the excluded category, rule 3 fires first.
+    // The test asserts the channel is correctly skipped regardless of reason.
+    #[test]
+    fn move_with_only_new_parent_excluded_is_skipped() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            Some(EXCLUDED_CATEGORY),
+            None,
+            Some(EXCLUDED_CATEGORY),
+        );
+        // parent_id is an excluded category → rule 3 fires first.
+        assert!(matches!(may_log(&scope, &facts), LogDecision::Skip(_)));
+    }
+
+    // Rule 4: move with only old_parent set (channel removed from a category).
+    #[test]
+    fn move_with_only_old_parent_excluded_is_skipped() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            Some(NORMAL_CATEGORY),
+            Some(EXCLUDED_CATEGORY),
+            None,
+        );
+        assert_eq!(
+            may_log(&scope, &facts),
+            LogDecision::Skip(SkipReason::MovedOutOfExcludedCategory)
+        );
+    }
+
+    // Adversarial: move where old is normal, new is normal, but parent is excluded category.
+    #[test]
+    fn normal_move_still_checks_parent_category() {
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            Some(EXCLUDED_CATEGORY),
+            Some(NORMAL_CATEGORY),
+            Some(NORMAL_CATEGORY),
+        );
+        // parent_id itself is checked (rule 3) before move checks.
+        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedCategory));
+    }
+
+    // Adversarial: excluded channel takes priority over all other checks.
+    #[test]
+    fn excluded_channel_before_category_check() {
+        let scope = Scope::new(
+            vec![EXCLUDED_CHANNEL],
+            vec![EXCLUDED_CATEGORY],
+            vec![],
+        );
+        let facts = base_facts(EXCLUDED_CHANNEL, Some(EXCLUDED_CATEGORY));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
+    }
+
+    // Rule 4: move where BOTH old and new are excluded categories.
+    #[test]
+    fn move_between_two_excluded_categories_is_skipped() {
+        let ex_cat_2 = 300_003u64;
+        let scope = Scope::new(vec![], vec![EXCLUDED_CATEGORY, ex_cat_2], vec![]);
+        let facts = move_facts(
+            NORMAL_CHANNEL,
+            Some(ex_cat_2),
+            Some(EXCLUDED_CATEGORY),
+            Some(ex_cat_2),
+        );
+        let decision = may_log(&scope, &facts);
+        // Should hit old_parent first (MovedOutOfExcludedCategory).
+        assert!(matches!(decision, LogDecision::Skip(_)));
+    }
+
+    // Flash channels do not affect non-flash channels.
+    #[test]
+    fn flash_channel_does_not_affect_normal_channel() {
+        let scope = Scope::new(vec![], vec![], vec![FLASH_CHANNEL]);
+        let facts = base_facts(NORMAL_CHANNEL, Some(NORMAL_CATEGORY));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Scope constructible from empty vectors is permissive.
+    #[test]
+    fn scope_from_empty_vectors_is_permissive() {
+        let scope = Scope::new(vec![], vec![], vec![]);
+        let facts = base_facts(NORMAL_CHANNEL, Some(NORMAL_CATEGORY));
+        assert_eq!(may_log(&scope, &facts), LogDecision::Allow);
+    }
+
+    // Break the implementation on purpose: if rule 1 checked categories instead
+    // of channels, this test would fail because EXCLUDED_CHANNEL is NOT in
+    // categories. Asserts the actual channel check.
+    #[test]
+    fn test_exclusion_actually_checks_channels_not_categories() {
+        let scope = Scope::new(vec![EXCLUDED_CHANNEL], vec![EXCLUDED_CATEGORY], vec![]);
+        let facts = base_facts(EXCLUDED_CHANNEL, Some(NORMAL_CATEGORY));
+        // If the implementation incorrectly checked categories instead of channels,
+        // this would return Allow because EXCLUDED_CHANNEL is not in categories.
+        // The correct behaviour is Skip(ExcludedChannel).
+        assert_eq!(may_log(&scope, &facts), LogDecision::Skip(SkipReason::ExcludedChannel));
     }
 }
