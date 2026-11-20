@@ -153,8 +153,83 @@ pub struct PlanRequest<'a> {
 }
 
 /// The decision for one managed post.
-pub fn plan(_request: &PlanRequest<'_>) -> Plan {
-    Plan::NoOp
+///
+/// The rules, in the order they are applied:
+/// 1. A key that is not usable is refused. A key that names a file or a path could
+///    make the wiring card read the wrong template.
+/// 2. A template hash that is not a SHA-256 hex digest is refused: it cannot be
+///    compared with the recorded one.
+/// 3. A key with no record is created: there is nothing to edit.
+/// 4. A key recorded for another guild or another channel is refused: the same post
+///    must not appear in two places.
+/// 5. A recorded message that is gone is refused, unless the caller explicitly
+///    allowed the post to be created again. A deleted rules post may be deliberate.
+/// 6. A recorded post whose hash equals the template hash is a no-op: reposting
+///    would spam the channel.
+/// 7. Otherwise the recorded message is edited in place. The plan never names a
+///    message that was not recorded.
+pub fn plan(request: &PlanRequest<'_>) -> Plan {
+    if validate_key(request.key).is_err() {
+        return Plan::Refuse(RefuseReason::InvalidKey);
+    }
+    if !is_content_hash(request.template_hash) {
+        return Plan::Refuse(RefuseReason::InvalidHash);
+    }
+    let Some(recorded) = request.recorded else {
+        return Plan::Create;
+    };
+    if recorded.guild != request.target_guild {
+        return Plan::Refuse(RefuseReason::KeyReusedInAnotherGuild);
+    }
+    if recorded.channel != request.target_channel {
+        return Plan::Refuse(RefuseReason::KeyReusedInAnotherChannel);
+    }
+    if request.message_missing {
+        return if request.allow_recreate {
+            Plan::Recreate
+        } else {
+            Plan::Refuse(RefuseReason::MissingMessage)
+        };
+    }
+    if recorded.content_hash == request.template_hash {
+        return Plan::NoOp;
+    }
+    Plan::Edit {
+        message: recorded.message,
+    }
+}
+
+/// Maximum length of a key, in bytes.
+pub const MAX_KEY_BYTES: usize = 64;
+
+/// Checks that a key is usable.
+///
+/// A key names one managed post and, through the wiring card, one template file. It is
+/// therefore restricted to a plain, short name: ASCII letters, digits, `-`, `_` and
+/// `.`, with no path separator, no `..` and no leading dot. Every other spelling is
+/// refused, so a key can never walk out of the template directory.
+pub fn validate_key(key: &str) -> Result<(), RefuseReason> {
+    if key.is_empty() || key.len() > MAX_KEY_BYTES {
+        return Err(RefuseReason::InvalidKey);
+    }
+    if key == "." || key == ".." || key.starts_with('.') || key.contains("..") {
+        return Err(RefuseReason::InvalidKey);
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RefuseReason::InvalidKey);
+    }
+    Ok(())
+}
+
+/// True when `hash` is a SHA-256 hex digest: 64 lowercase hex characters.
+pub fn is_content_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Applies the migrations of the `embeds` feature to a connection.
@@ -168,9 +243,39 @@ pub fn migrate(conn: &mut Connection) -> Result<u32, StorageError> {
 /// Reads the record of one managed post.
 ///
 /// Returns `Ok(None)` when no row exists for the key.
+///
+/// A stored column that does not hold what it must hold is reported as an error, never
+/// silently defaulted: a corrupt row must not turn into a plan that reposts the post.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<StoredPost>, RepoError> {
-    let _ = (conn, key);
-    Ok(None)
+    validate_key(key).map_err(|_| RepoError::InvalidKey)?;
+    let mut stmt = conn.prepare(
+        "SELECT guild, channel, message, content_hash, updated_by, updated_at
+         FROM managed_posts WHERE key = ?1",
+    )?;
+    let mut rows = stmt.query([key])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let guild = parse_id(row.get::<_, String>(0)?)?;
+    let channel = parse_id(row.get::<_, String>(1)?)?;
+    let message = parse_id(row.get::<_, String>(2)?)?;
+    let content_hash: String = row.get(3)?;
+    if !is_content_hash(&content_hash) {
+        return Err(RepoError::CorruptRow);
+    }
+    let updated_by = parse_optional_id(row.get::<_, String>(4)?)?;
+    let updated_at = row.get::<_, i64>(5)?;
+    Ok(Some(StoredPost {
+        record: PostRecord {
+            key: key.to_string(),
+            guild,
+            channel,
+            message,
+            content_hash,
+            updated_by,
+        },
+        updated_at,
+    }))
 }
 
 /// Writes the record of one managed post, replacing any row with the same key.
@@ -178,7 +283,34 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<StoredPost>, RepoError
 /// `now` is the timestamp of the write in epoch milliseconds; the caller supplies it,
 /// so this module never reads the clock.
 pub fn upsert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoError> {
-    let _ = (conn, record, now);
+    validate_key(&record.key).map_err(|_| RepoError::InvalidKey)?;
+    if !is_content_hash(&record.content_hash) {
+        return Err(RepoError::CorruptRow);
+    }
+    if record.guild == 0 || record.channel == 0 || record.message == 0 {
+        return Err(RepoError::InvalidId);
+    }
+    conn.execute(
+        "INSERT INTO managed_posts
+            (key, guild, channel, message, content_hash, updated_by, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(key) DO UPDATE SET
+            guild = excluded.guild,
+            channel = excluded.channel,
+            message = excluded.message,
+            content_hash = excluded.content_hash,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            record.key,
+            record.guild.to_string(),
+            record.channel.to_string(),
+            record.message.to_string(),
+            record.content_hash,
+            record.updated_by.to_string(),
+            now,
+        ],
+    )?;
     Ok(())
 }
 
@@ -192,22 +324,76 @@ pub fn apply(
     record: &PostRecord,
     now: i64,
 ) -> Result<bool, RepoError> {
-    let _ = (conn, plan, record, now);
-    Ok(false)
+    match plan {
+        Plan::NoOp | Plan::Refuse(_) => Ok(false),
+        Plan::Create | Plan::Edit { .. } | Plan::Recreate => {
+            upsert(conn, record, now)?;
+            Ok(true)
+        }
+    }
 }
 
 /// Lists every managed post, ordered by key.
 pub fn list(conn: &Connection) -> Result<Vec<StoredPost>, RepoError> {
-    let _ = conn;
-    Ok(Vec::new())
+    let mut stmt = conn.prepare(
+        "SELECT key, guild, channel, message, content_hash, updated_by, updated_at
+         FROM managed_posts ORDER BY key ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let guild = parse_id(row.get::<_, String>(1)?)?;
+        let channel = parse_id(row.get::<_, String>(2)?)?;
+        let message = parse_id(row.get::<_, String>(3)?)?;
+        let content_hash: String = row.get(4)?;
+        if !is_content_hash(&content_hash) {
+            return Err(RepoError::CorruptRow);
+        }
+        let updated_by = parse_optional_id(row.get::<_, String>(5)?)?;
+        let updated_at = row.get::<_, i64>(6)?;
+        out.push(StoredPost {
+            record: PostRecord {
+                key,
+                guild,
+                channel,
+                message,
+                content_hash,
+                updated_by,
+            },
+            updated_at,
+        });
+    }
+    Ok(out)
 }
 
 /// Deletes the record of one managed post.
 ///
 /// Returns `Ok(true)` when a row was deleted and `Ok(false)` when there was none.
 pub fn delete(conn: &Connection, key: &str) -> Result<bool, RepoError> {
-    let _ = (conn, key);
-    Ok(false)
+    validate_key(key).map_err(|_| RepoError::InvalidKey)?;
+    let removed = conn.execute("DELETE FROM managed_posts WHERE key = ?1", [key])?;
+    Ok(removed > 0)
+}
+
+/// Parses an id that is stored as text.
+///
+/// A value that is not a number, or that is the id zero for a required id, is a
+/// corrupt row: it is reported, never defaulted to zero.
+fn parse_id(text: String) -> Result<u64, RepoError> {
+    let id = text.parse::<u64>().map_err(|_| RepoError::InvalidId)?;
+    if id == 0 {
+        return Err(RepoError::InvalidId);
+    }
+    Ok(id)
+}
+
+/// Parses an id that may be the id zero.
+///
+/// `updated_by` is the id of the user that caused the last write. The id zero means
+/// "not a user", for example a startup sync, so it is accepted here.
+fn parse_optional_id(text: String) -> Result<u64, RepoError> {
+    text.parse::<u64>().map_err(|_| RepoError::InvalidId)
 }
 
 /// Stable error codes of the repository.
@@ -407,9 +593,22 @@ mod tests {
     /// A key that is not usable is refused before anything else is considered.
     #[test]
     fn an_unusable_key_is_refused() {
-        for key in ["", "  ", "with space", "../escape", "a/b", "a\\b", "..", "."] {
+        for key in [
+            "",
+            "  ",
+            "with space",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+        ] {
             let req = request(key, HASH_A);
-            assert_eq!(plan(&req), Plan::Refuse(RefuseReason::InvalidKey), "{key:?}");
+            assert_eq!(
+                plan(&req),
+                Plan::Refuse(RefuseReason::InvalidKey),
+                "{key:?}"
+            );
         }
     }
 
@@ -549,9 +748,11 @@ mod tests {
         let conn = mem_db();
         upsert(&conn, &record(HASH_A), 1).unwrap();
         let guild: String = conn
-            .query_row("SELECT guild FROM managed_posts WHERE key = ?1", ["general-rules"], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT guild FROM managed_posts WHERE key = ?1",
+                ["general-rules"],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(guild, GUILD.to_string());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
@@ -571,7 +772,42 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(get(&conn, "general-rules").unwrap_err(), RepoError::InvalidId);
+        assert_eq!(
+            get(&conn, "general-rules").unwrap_err(),
+            RepoError::InvalidId
+        );
+    }
+
+    /// A stored id of zero is reported: the id zero is not a real guild, channel or
+    /// message, so it must never be read back as if it were.
+    #[test]
+    fn a_stored_id_of_zero_is_reported() {
+        let conn = mem_db();
+        upsert(&conn, &record(HASH_A), 1).unwrap();
+        for column in ["guild", "channel", "message"] {
+            conn.execute(
+                &format!("UPDATE managed_posts SET {column} = '0' WHERE key = 'general-rules'"),
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                get(&conn, "general-rules").unwrap_err(),
+                RepoError::InvalidId,
+                "column {column}"
+            );
+            upsert(&conn, &record(HASH_A), 1).unwrap();
+        }
+    }
+
+    /// A stored `updated_by` of zero is accepted: it means "not a user".
+    #[test]
+    fn a_stored_updated_by_of_zero_is_accepted() {
+        let conn = mem_db();
+        let mut original = record(HASH_A);
+        original.updated_by = 0;
+        upsert(&conn, &original, 1).unwrap();
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.updated_by, 0);
     }
 
     /// A row whose content hash is not a hash is reported.
@@ -594,16 +830,10 @@ mod tests {
     #[test]
     fn the_repository_refuses_an_unusable_key() {
         let conn = mem_db();
-        assert_eq!(
-            get(&conn, "../escape").unwrap_err(),
-            RepoError::InvalidKey
-        );
+        assert_eq!(get(&conn, "../escape").unwrap_err(), RepoError::InvalidKey);
         let mut bad = record(HASH_A);
         bad.key = "../escape".to_string();
-        assert_eq!(
-            upsert(&conn, &bad, 1).unwrap_err(),
-            RepoError::InvalidKey
-        );
+        assert_eq!(upsert(&conn, &bad, 1).unwrap_err(), RepoError::InvalidKey);
     }
 
     /// A record with the id zero is refused: it is not a real message.

@@ -160,19 +160,93 @@ pub struct EmbedTemplate {
 impl EmbedTemplate {
     /// Returns the combined number of characters that Discord counts towards the
     /// 6000 character total.
+    ///
+    /// The sum is over the trimmed title, description, every field name, every field
+    /// value, the footer text and the author name - the same set Discord counts.
     pub fn total_chars(&self) -> usize {
-        0
+        let mut total = 0usize;
+        total += self.title.as_deref().map_or(0, |text| text.chars().count());
+        total += self
+            .description
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        for field in &self.fields {
+            total += field.name.chars().count();
+            total += field.value.chars().count();
+        }
+        total += self
+            .footer
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        total += self
+            .author_name
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        total
     }
 
     /// Returns the canonical form of this template.
+    ///
+    /// The canonical form is a byte-exact, injective encoding of the rendered content:
+    /// every value is written with its byte length, so no value can be confused with
+    /// the tag that follows it. The JSON key order of the source document cannot change
+    /// it, because the canonical form is built from the PARSED template.
     pub fn canonical(&self) -> String {
-        String::new()
+        let mut out = String::new();
+        out.push_str("embed-template-v1\n");
+        push_tagged(&mut out, "title", self.title.as_deref());
+        push_tagged(&mut out, "description", self.description.as_deref());
+        out.push_str(&format!("fields={}\n", self.fields.len()));
+        for field in &self.fields {
+            push_tagged(&mut out, "name", Some(field.name.as_str()));
+            push_tagged(&mut out, "value", Some(field.value.as_str()));
+            out.push_str(&format!("inline={}\n", u8::from(field.inline)));
+        }
+        push_tagged(&mut out, "footer", self.footer.as_deref());
+        push_tagged(&mut out, "author", self.author_name.as_deref());
+        out.push_str(&format!("color={}\n", self.color.unwrap_or_default()));
+        out
     }
 
     /// Returns the SHA-256 hex digest of the canonical form.
+    ///
+    /// The digest is 64 lowercase hex characters. Two templates with the same rendered
+    /// content always produce the same hash; two templates with different rendered
+    /// content always produce different hashes.
     pub fn content_hash(&self) -> String {
-        String::new()
+        let digest = ring::digest::digest(&ring::digest::SHA256, self.canonical().as_bytes());
+        to_hex(digest.as_ref())
     }
+}
+
+/// Writes one tagged, length-prefixed value into the canonical form.
+///
+/// A value is written as `<byte length>:<bytes>` or as `-` when it is absent. The byte
+/// length makes the encoding injective: a value can never be confused with the tag that
+/// follows it, whatever the value contains.
+fn push_tagged(out: &mut String, tag: &str, value: Option<&str>) {
+    out.push_str(tag);
+    out.push('=');
+    match value {
+        None => out.push('-'),
+        Some(text) => {
+            out.push_str(&text.len().to_string());
+            out.push(':');
+            out.push_str(text);
+        }
+    }
+    out.push('\n');
+}
+
+/// Encodes bytes as lowercase hex.
+fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 /// The on-disk shape of a template file.
@@ -221,14 +295,121 @@ struct RawAuthor {
     name: String,
 }
 
+/// Largest colour value Discord can represent (0xFFFFFF).
+const MAX_COLOR: u32 = 0x00FF_FFFF;
+
+/// Trims a text and normalises a present-but-empty text to "absent".
+fn normalise(text: Option<String>) -> Option<String> {
+    let owned = text?;
+    let trimmed = owned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Loads an embed template from a JSON document.
 ///
 /// The template is validated against the Discord embed limits and returned trimmed and
 /// normalised. Every refusal is a stable code that names the limit that was broken;
 /// no refusal ever contains template text.
 pub fn load(source: &str) -> Result<EmbedTemplate, TemplateError> {
-    let _ = source;
-    Err(TemplateError::new(TemplateErrorKind::InvalidJson))
+    // The document must be a JSON OBJECT. Parsing straight into the struct would let
+    // serde read a JSON ARRAY as a struct with every field defaulted, so the shape is
+    // checked first and a non-object is refused.
+    let value: serde_json::Value = serde_json::from_str(source)
+        .map_err(|_| TemplateError::new(TemplateErrorKind::InvalidJson))?;
+    if !value.is_object() {
+        return Err(TemplateError::new(TemplateErrorKind::InvalidJson));
+    }
+    let raw: RawTemplate = serde_json::from_value(value)
+        .map_err(|_| TemplateError::new(TemplateErrorKind::InvalidJson))?;
+
+    if let Some(color) = raw.color {
+        if color > MAX_COLOR {
+            return Err(TemplateError::new(TemplateErrorKind::InvalidJson));
+        }
+    }
+
+    let title = normalise(raw.title);
+    let description = normalise(raw.description);
+    let footer = normalise(raw.footer.map(|footer| footer.text));
+    let author_name = normalise(raw.author.map(|author| author.name));
+
+    let mut fields = Vec::with_capacity(raw.fields.as_ref().map_or(0, |list| list.len()));
+    if let Some(raw_fields) = raw.fields {
+        for raw_field in raw_fields {
+            fields.push(TemplateField {
+                name: raw_field.name.trim().to_string(),
+                value: raw_field.value.trim().to_string(),
+                inline: raw_field.inline,
+            });
+        }
+    }
+
+    let template = EmbedTemplate {
+        title,
+        description,
+        fields,
+        footer,
+        author_name,
+        color: raw.color,
+    };
+
+    validate(&template)?;
+    Ok(template)
+}
+
+/// Checks a loaded template against the Discord embed limits.
+///
+/// The limits are inclusive, so a value of exactly the limit is accepted. The
+/// individual limits are checked before the combined total, in a fixed order, so a
+/// template that breaks several limits always reports the same one.
+fn validate(template: &EmbedTemplate) -> Result<(), TemplateError> {
+    if let Some(title) = &template.title {
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::TitleTooLong));
+        }
+    }
+    if let Some(description) = &template.description {
+        if description.chars().count() > MAX_DESCRIPTION_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::DescriptionTooLong));
+        }
+    }
+    if template.fields.len() > MAX_FIELDS {
+        return Err(TemplateError::new(TemplateErrorKind::TooManyFields));
+    }
+    for field in &template.fields {
+        if field.name.chars().count() > MAX_FIELD_NAME_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FieldNameTooLong));
+        }
+        if field.value.chars().count() > MAX_FIELD_VALUE_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FieldValueTooLong));
+        }
+    }
+    if let Some(footer) = &template.footer {
+        if footer.chars().count() > MAX_FOOTER_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FooterTooLong));
+        }
+    }
+    if let Some(author) = &template.author_name {
+        if author.chars().count() > MAX_AUTHOR_NAME_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::AuthorNameTooLong));
+        }
+    }
+    if template.total_chars() > MAX_TOTAL_CHARS {
+        return Err(TemplateError::new(TemplateErrorKind::TotalTooLong));
+    }
+    if template.title.is_none()
+        && template.description.is_none()
+        && template.fields.is_empty()
+        && template.footer.is_none()
+        && template.author_name.is_none()
+    {
+        return Err(TemplateError::new(TemplateErrorKind::EmptyTemplate));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -298,14 +479,16 @@ mod tests {
         format!(r#"{{"description":"{text}"}}"#)
     }
 
-    /// Builds a JSON document with `count` fields, each with a name and a value of
-    /// `len` characters.
+    /// Builds a JSON document with `count` fields, each with a name of `name_len`
+    /// characters and a value of `value_len` characters.
+    ///
+    /// The names are identical, so the measured length is exactly `name_len`.
     fn fields_json(count: usize, name_len: usize, value_len: usize) -> String {
         let name = "n".repeat(name_len);
         let value = "v".repeat(value_len);
         let mut fields = Vec::with_capacity(count);
-        for index in 0..count {
-            fields.push(format!(r#"{{"name":"{name}{index}","value":"{value}"}}"#));
+        for _ in 0..count {
+            fields.push(format!(r#"{{"name":"{name}","value":"{value}"}}"#));
         }
         format!(r#"{{"fields":[{}]}}"#, fields.join(","))
     }
@@ -474,9 +657,11 @@ mod tests {
     /// a missing text.
     #[test]
     fn empty_text_is_normalised_to_absent() {
-        let template = expect_ok(r#"{"title":"   ","description":""}"#);
+        let template =
+            expect_ok(r#"{"title":"   ","description":"","fields":[{"name":"A","value":"B"}]}"#);
         assert_eq!(template.title, None);
         assert_eq!(template.description, None);
+        assert_eq!(template.fields.len(), 1);
     }
 
     /// A template with no content at all is refused.
@@ -514,16 +699,24 @@ mod tests {
     fn errors_carry_no_template_text() {
         let secret = "SUPERSECRETTEMPLATEMARKERZZ";
         let source = format!(r#"{{"title":"{secret}"}}"#);
-        let err = load(&source).expect("template loads");
-        assert!(!err.canonical().contains(secret));
+        let loaded = load(&source).expect("template loads");
+        assert_eq!(loaded.title.as_deref(), Some(secret));
 
         let long = "x".repeat(MAX_TITLE_CHARS + 1);
         let source = format!(r#"{{"title":"{long}{secret}"}}"#);
         let err = load(&source).expect_err("title is too long");
         let text = format!("{err} | {err:?}");
-        assert!(!text.contains(secret), "error leaked the template text: {text}");
+        assert!(
+            !text.contains(secret),
+            "error leaked the template text: {text}"
+        );
         assert!(!text.contains(&long), "error leaked the template text");
         assert!(text.len() < 80, "{text}");
+
+        // The same holds for the other limit codes.
+        let err = load(r#"{"fields":[{"name":"a"}]}"#).expect_err("field is malformed");
+        let text = format!("{err} | {err:?}");
+        assert!(!text.contains("name"), "error leaked the shape: {text}");
     }
 
     /// Every reason code is distinct and stable.
