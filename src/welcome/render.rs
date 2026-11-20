@@ -2934,8 +2934,10 @@ mod tests {
     /// keeps whole characters and never leaves half a code point behind.
     #[test]
     fn the_clamp_counts_characters_not_bytes() {
+        // The field name is 246 multi-byte characters plus a placeholder, so the
+        // rendered name is longer than the 256 character limit and has to be cut.
         let src = format!(
-            "{{\"embed\": {{\"fields\": [{{\"name\": \"{}\", \"value\": \"v\"}}]}}}}",
+            "{{\"embed\": {{\"fields\": [{{\"name\": \"{}{{username}}\", \"value\": \"v\"}}]}}}}",
             "é".repeat(246)
         );
         let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
@@ -2943,12 +2945,44 @@ mod tests {
         m.username = "x".repeat(5000);
         let out = render_welcome(&t, &m, &id_map());
         let name = &out.embed.fields[0].name;
-        // Every character is whole and every one of them is the multi-byte letter: a
-        // byte-based cut would have produced a broken code point here.
+        // The cut keeps the whole limit in characters: a byte-based cut would have
+        // kept far fewer characters, because every one of them is two bytes.
+        assert_eq!(
+            name.chars().count(),
+            256,
+            "the cut kept {} characters instead of 256",
+            name.chars().count()
+        );
+        // Every character is whole: the first 246 are the multi-byte letter and the
+        // rest is the username. A byte-based cut would have split a code point and
+        // left a replacement character behind.
         assert!(
-            name.chars().all(|c| c == 'é'),
+            name.chars().take(246).all(|c| c == 'é'),
             "the name was cut mid-character"
         );
-        assert!(name.chars().count() <= 256);
+        assert!(
+            name.chars().skip(246).all(|c| c == 'x'),
+            "the name was cut mid-character"
+        );
+    }
+
+    /// The same cut on a plain ASCII name keeps the whole limit too.
+    #[test]
+    fn the_clamp_keeps_the_whole_limit_in_characters() {
+        let src = format!(
+            "{{\"embed\": {{\"fields\": [{{\"name\": \"{}{{username}}\", \"value\": \"v\"}}]}}}}",
+            "n".repeat(246)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let name = &out.embed.fields[0].name;
+        assert_eq!(
+            name.chars().count(),
+            256,
+            "the cut kept {} characters instead of 256",
+            name.chars().count()
+        );
     }
 }
