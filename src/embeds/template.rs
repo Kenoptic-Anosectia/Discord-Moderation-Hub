@@ -25,6 +25,11 @@
 //! A field whose name or value is empty after trimming is refused as well: Discord
 //! rejects such a field, so a template that carried one could never be posted.
 //!
+//! A control character other than a newline is refused in every text of the
+//! template, and the whole class is refused the same way: a NUL is not
+//! special-cased. A control character is not renderable text, and a NUL truncates
+//! any later C-string handling of the text.
+//!
 //! The hash is over BYTES of the parsed template. Two documents that parse to the
 //! same values hash the same; a document that spells the same text differently in
 //! bytes (a composed and a decomposed accented letter) hashes differently.
@@ -85,6 +90,10 @@ pub enum TemplateErrorKind {
     AuthorNameTooLong,
     /// The combined length exceeded [`MAX_TOTAL_CHARS`].
     TotalTooLong,
+    /// A text carried a control character that is not a newline. The whole class of
+    /// control characters is refused, so a template that carries one can never be
+    /// posted as it stands.
+    ControlCharacter,
 }
 
 impl TemplateErrorKind {
@@ -103,6 +112,7 @@ impl TemplateErrorKind {
             TemplateErrorKind::FooterTooLong => "footer_too_long",
             TemplateErrorKind::AuthorNameTooLong => "author_name_too_long",
             TemplateErrorKind::TotalTooLong => "total_too_long",
+            TemplateErrorKind::ControlCharacter => "control_character",
         }
     }
 }
@@ -394,6 +404,18 @@ pub fn load(source: &str) -> Result<EmbedTemplate, TemplateError> {
     Ok(template)
 }
 
+/// Checks that a text carries no control character other than a newline.
+///
+/// A control character is not renderable text, and a NUL in particular truncates
+/// any later C-string handling of the text. The whole class is refused, not one
+/// example of it: a NUL is not special-cased, every control character is refused
+/// the same way. A newline is allowed, because a rules post is written with line
+/// breaks.
+fn has_control_character(text: &str) -> bool {
+    text.chars()
+        .any(|character| character.is_control() && character != '\n')
+}
+
 /// Checks a loaded template against the Discord embed limits.
 ///
 /// The limits are inclusive, so a value of exactly the limit is accepted. The
@@ -442,6 +464,27 @@ fn validate(template: &EmbedTemplate) -> Result<(), TemplateError> {
     }
     if template.total_chars() > MAX_TOTAL_CHARS {
         return Err(TemplateError::new(TemplateErrorKind::TotalTooLong));
+    }
+    // The control characters are checked last, after the lengths: a template that
+    // is too long is reported as too long, not as carrying a control character.
+    let texts = [
+        template.title.as_deref(),
+        template.description.as_deref(),
+        template.footer.as_deref(),
+        template.author_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        template
+            .fields
+            .iter()
+            .flat_map(|field| [field.name.as_str(), field.value.as_str()]),
+    );
+    for text in texts {
+        if has_control_character(text) {
+            return Err(TemplateError::new(TemplateErrorKind::ControlCharacter));
+        }
     }
     if template.title.is_none()
         && template.description.is_none()
@@ -937,6 +980,7 @@ mod tests {
             TemplateErrorKind::FooterTooLong,
             TemplateErrorKind::AuthorNameTooLong,
             TemplateErrorKind::TotalTooLong,
+            TemplateErrorKind::ControlCharacter,
         ];
         let mut codes: Vec<_> = all.iter().map(|kind| kind.code()).collect();
         codes.sort();
@@ -946,6 +990,71 @@ mod tests {
         assert_eq!(
             TemplateErrorKind::FieldValueEmpty.code(),
             "field_value_empty"
+        );
+        assert_eq!(
+            TemplateErrorKind::ControlCharacter.code(),
+            "control_character"
+        );
+    }
+
+    /// A control character is refused in every text of the template.
+    ///
+    /// The whole class is refused, not one example of it: a NUL is not
+    /// special-cased. Every control character other than a newline is refused the
+    /// same way.
+    #[test]
+    fn a_control_character_is_refused_in_every_text() {
+        for character in [
+            '\u{0}', '\u{1}', '\u{7}', '\u{8}', '\u{b}', '\u{c}', '\u{1b}', '\u{1f}', '\u{7f}',
+        ] {
+            // The JSON ESCAPE of the character, because a literal control
+            // character in a JSON document is not valid JSON at all.
+            let source = format!(r#"{{"title":"a\u{:04x}b"}}"#, character as u32);
+            expect_err(&source, TemplateErrorKind::ControlCharacter);
+        }
+    }
+
+    /// The control character is refused in the description, the footer, the author
+    /// name, the field name and the field value as well.
+    #[test]
+    fn a_control_character_is_refused_in_every_part() {
+        expect_err(
+            "{\"description\":\"a\\u0000b\"}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"footer\":{\"text\":\"a\\u0001b\"}}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"author\":{\"name\":\"a\\u0002b\"}}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"fields\":[{\"name\":\"a\\u0003b\",\"value\":\"v\"}]}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"fields\":[{\"name\":\"n\",\"value\":\"a\\u0004b\"}]}",
+            TemplateErrorKind::ControlCharacter,
+        );
+    }
+
+    /// A newline is not a control character that is refused: a rules post is
+    /// written with line breaks, and the real NSFW rules embed uses them.
+    #[test]
+    fn a_newline_is_allowed() {
+        let template = expect_ok(r#"{"fields":[{"name":"a","value":"one\ntwo"}]}"#);
+        assert_eq!(template.fields[0].value, "one\ntwo");
+    }
+
+    /// A carriage return is a control character and is refused, the same way as
+    /// every other control character.
+    #[test]
+    fn a_carriage_return_is_refused() {
+        expect_err(
+            "{\"title\":\"a\\u000db\"}",
+            TemplateErrorKind::ControlCharacter,
         );
     }
 }

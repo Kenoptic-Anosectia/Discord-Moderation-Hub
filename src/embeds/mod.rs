@@ -2,7 +2,8 @@
 //!
 //! This module is the Discord-free core of the "managed posts" feature: rules and
 //! information embeds that are posted ONCE and then EDITED IN PLACE when the owner
-//! changes a template, never duplicated.
+//! changes a template. They are not duplicated, except for the window between a
+//! successful post and the record of it, which `posts` names.
 //!
 //! * [`template`] loads an embed template from JSON, validates the Discord embed
 //!   limits and computes a stable SHA-256 content hash of the canonical form.

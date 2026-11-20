@@ -1,9 +1,10 @@
 //! Managed embed posts: the plan and the repository.
 //!
 //! A managed post is a message the bot owns: a rules post, an information post. It is
-//! posted ONCE and then EDITED IN PLACE when the owner changes the template, never
-//! duplicated. This module decides what to do and stores which message belongs to
-//! which key.
+//! posted ONCE and then EDITED IN PLACE when the owner changes the template. It is
+//! not duplicated, except for the window between a successful post and the record
+//! of it, which is named below. This module decides what to do and stores which
+//! message belongs to which key.
 //!
 //! The planner is pure: it reads only the plain facts handed to it, it never reads the
 //! clock, never touches the network and never carries text. The repository takes `now`
@@ -23,6 +24,9 @@
 //!   the next sync plans a `Create` again and a second copy of the post is made.
 //!   That window is between the post and the record of it, and it is not closed by
 //!   this module.
+//! * [`apply`] reads the row and then writes it. It is not an atomic
+//!   compare-and-swap, so two writers of the same key can still race between the
+//!   read and the write. The card for this module asks for simple upserts.
 //!
 //! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
 
@@ -120,12 +124,21 @@ pub struct StoredPost {
 }
 
 /// What the runtime should do with one managed post.
+///
+/// The plan names the key it is about. A plan made for `rules-a` must never write
+/// the record of `rules-b`: two keys that name one message would edit each
+/// other's post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Plan {
+pub enum Plan<'a> {
     /// No post exists for this key: post the template and record the new message.
-    Create,
+    Create {
+        /// The key the post belongs to.
+        key: &'a str,
+    },
     /// The post exists and the template changed: edit the recorded message in place.
     Edit {
+        /// The key the post belongs to.
+        key: &'a str,
         /// The id of the message to edit. It is the SAME message that was recorded
         /// before, never a new one.
         message: u64,
@@ -140,6 +153,8 @@ pub enum Plan {
     /// that message and must record a DIFFERENT message, because the message it
     /// replaces is the one that is gone.
     Recreate {
+        /// The key the post belongs to.
+        key: &'a str,
         /// The message that is missing and that this plan replaces.
         replaces: u64,
     },
@@ -186,7 +201,7 @@ pub struct PlanRequest<'a> {
 ///    would spam the channel.
 /// 7. Otherwise the recorded message is edited in place. The plan never names a
 ///    message that was not recorded.
-pub fn plan(request: &PlanRequest<'_>) -> Plan {
+pub fn plan<'a>(request: &'a PlanRequest<'a>) -> Plan<'a> {
     if validate_key(request.key).is_err() {
         return Plan::Refuse(RefuseReason::InvalidKey);
     }
@@ -194,7 +209,7 @@ pub fn plan(request: &PlanRequest<'_>) -> Plan {
         return Plan::Refuse(RefuseReason::InvalidHash);
     }
     let Some(recorded) = request.recorded else {
-        return Plan::Create;
+        return Plan::Create { key: request.key };
     };
     if recorded.guild != request.target_guild {
         return Plan::Refuse(RefuseReason::KeyReusedInAnotherGuild);
@@ -205,6 +220,7 @@ pub fn plan(request: &PlanRequest<'_>) -> Plan {
     if request.message_missing {
         return if request.allow_recreate {
             Plan::Recreate {
+                key: request.key,
                 replaces: recorded.message,
             }
         } else {
@@ -215,6 +231,7 @@ pub fn plan(request: &PlanRequest<'_>) -> Plan {
         return Plan::NoOp;
     }
     Plan::Edit {
+        key: request.key,
         message: recorded.message,
     }
 }
@@ -344,7 +361,7 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<StoredPost>, RepoError
 /// This is the raw write. It does not look at a plan. Use [`apply`] to write a row
 /// that follows a plan.
 pub fn upsert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoError> {
-    check_record(record)?;
+    check_record(conn, record)?;
     conn.execute(
         "INSERT INTO managed_posts
             (key, guild, channel, message, content_hash, updated_by, updated_at)
@@ -376,7 +393,7 @@ pub fn upsert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), Re
 /// [`RepoError::AlreadyExists`]. The primary key of the table does the check, so no
 /// compare-and-swap is needed.
 fn insert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoError> {
-    check_record(record)?;
+    check_record(conn, record)?;
     conn.execute(
         "INSERT INTO managed_posts
             (key, guild, channel, message, content_hash, updated_by, updated_at)
@@ -409,15 +426,26 @@ fn insert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoEr
 /// write, which is the case for `Plan::NoOp` and `Plan::Refuse`.
 ///
 /// The record is checked against the plan before anything is written:
+/// * every plan names the key it is about, so a record that names another key is
+///   refused with `plan_mismatch`: two keys that name one message would edit each
+///   other's post;
 /// * an `Edit` plan names the message that must be edited, so a record that names
 ///   another message is refused with `plan_mismatch`: writing it would orphan the
 ///   real message and forget where it is;
 /// * an `Edit` or `Recreate` plan edits the post that is already recorded, so a
 ///   record that names another guild or another channel is refused with
 ///   `plan_mismatch`: the key would then live in two places;
+/// * a `Recreate` plan names the message it replaces, so a row that no longer
+///   holds that message is refused with `plan_mismatch`: the plan is stale, and
+///   writing it would orphan the message that a later sync just made. A record
+///   that names the missing message itself is refused for the same reason: the
+///   record has to name the NEW post;
 /// * a `Create` plan posts a post that does not exist yet, so a key that already has
 ///   a row is refused with `already_exists`: the recorded post would be forgotten
-///   and the same post would be published twice.
+///   and the same post would be published twice;
+/// * a message that another key already records is refused with
+///   `message_already_recorded`: two keys that name one message would edit each
+///   other's post.
 ///
 /// The check is a read followed by a write, not an atomic compare-and-swap. Two
 /// processes that write the same key at the same moment can still race between the
@@ -425,34 +453,47 @@ fn insert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoEr
 /// compare-and-swap.
 pub fn apply(
     conn: &Connection,
-    plan: &Plan,
+    plan: &Plan<'_>,
     record: &PostRecord,
     now: i64,
 ) -> Result<bool, RepoError> {
     match plan {
         Plan::NoOp | Plan::Refuse(_) => Ok(false),
-        Plan::Create => {
-            check_new_record(conn, record)?;
+        Plan::Create { key } => {
+            check_new_record(conn, key, record)?;
             insert(conn, record, now)?;
             Ok(true)
         }
-        Plan::Edit { message } => {
-            check_recorded_post(conn, record, Some(*message))?;
+        Plan::Edit { key, message } => {
+            check_recorded_post(conn, key, record, EditTarget::Message(*message))?;
             upsert(conn, record, now)?;
             Ok(true)
         }
-        Plan::Recreate { .. } => {
-            check_recorded_post(conn, record, None)?;
+        Plan::Recreate { key, replaces } => {
+            check_recorded_post(conn, key, record, EditTarget::Replaced(*replaces))?;
             upsert(conn, record, now)?;
             Ok(true)
         }
     }
 }
 
+/// Which message a plan expects the row to hold.
+enum EditTarget {
+    /// An `Edit` plan: the row must hold this message, and the record must name
+    /// the same message.
+    Message(u64),
+    /// A `Recreate` plan: the row must hold the message that is missing, and the
+    /// record must name a DIFFERENT message, because that one is the new post.
+    Replaced(u64),
+}
+
 /// Checks that a `Create` plan may write: the key must have no row yet, and the
 /// record itself must be usable.
-fn check_new_record(conn: &Connection, record: &PostRecord) -> Result<(), RepoError> {
-    check_record(record)?;
+fn check_new_record(conn: &Connection, key: &str, record: &PostRecord) -> Result<(), RepoError> {
+    check_record(conn, record)?;
+    if record.key != key {
+        return Err(RepoError::PlanMismatch);
+    }
     if get(conn, &record.key)?.is_some() {
         return Err(RepoError::AlreadyExists);
     }
@@ -461,15 +502,18 @@ fn check_new_record(conn: &Connection, record: &PostRecord) -> Result<(), RepoEr
 
 /// Checks that an `Edit` or `Recreate` plan may write.
 ///
-/// `message` is the message an `Edit` plan names. A `Recreate` plan has no message:
-/// the old one is gone and a new one is posted, so only the guild and the channel
-/// are checked.
+/// `key` is the key the plan is about. `target` is the message the plan expects
+/// the stored row to hold.
 fn check_recorded_post(
     conn: &Connection,
+    key: &str,
     record: &PostRecord,
-    message: Option<u64>,
+    target: EditTarget,
 ) -> Result<(), RepoError> {
-    check_record(record)?;
+    check_record(conn, record)?;
+    if record.key != key {
+        return Err(RepoError::PlanMismatch);
+    }
     let Some(stored) = get(conn, &record.key)? else {
         // There is no recorded post, so there is nothing to edit or to recreate.
         return Err(RepoError::PlanMismatch);
@@ -477,22 +521,64 @@ fn check_recorded_post(
     if stored.record.guild != record.guild || stored.record.channel != record.channel {
         return Err(RepoError::PlanMismatch);
     }
-    if let Some(message) = message {
-        if stored.record.message != message || record.message != message {
-            return Err(RepoError::PlanMismatch);
+    match target {
+        EditTarget::Message(message) => {
+            if stored.record.message != message || record.message != message {
+                return Err(RepoError::PlanMismatch);
+            }
+        }
+        EditTarget::Replaced(replaces) => {
+            // The row must still hold the message the plan replaces. If it holds
+            // another one, the plan is stale: a later sync already made a new
+            // post, and writing this one would orphan it.
+            if stored.record.message != replaces {
+                return Err(RepoError::PlanMismatch);
+            }
+            // The record must name the NEW post, never the message that is gone.
+            if record.message == replaces {
+                return Err(RepoError::PlanMismatch);
+            }
         }
     }
     Ok(())
 }
 
 /// Checks that a record itself is usable before it is written.
-fn check_record(record: &PostRecord) -> Result<(), RepoError> {
+///
+/// A message that another key already records is refused: two keys that name one
+/// message would edit each other's post, and the second key would be posting the
+/// same post twice.
+fn check_record(conn: &Connection, record: &PostRecord) -> Result<(), RepoError> {
     validate_key(&record.key).map_err(|_| RepoError::InvalidKey)?;
     if !is_content_hash(&record.content_hash) {
         return Err(RepoError::CorruptRow);
     }
     if record.guild == 0 || record.channel == 0 || record.message == 0 {
         return Err(RepoError::InvalidId);
+    }
+    check_message_free(conn, record)?;
+    Ok(())
+}
+
+/// Checks that no OTHER key already records this message.
+///
+/// A Discord message belongs to one managed post. Two keys that name one message
+/// would make the wiring card edit that message with two different templates, and
+/// the post would be published twice.
+///
+/// The check is a read followed by the write, not an atomic compare-and-swap: two
+/// processes that write different keys with the same message at the same moment
+/// can still both pass it.
+fn check_message_free(conn: &Connection, record: &PostRecord) -> Result<(), RepoError> {
+    let taken: Option<String> = conn
+        .query_row(
+            "SELECT key FROM managed_posts WHERE message = ?1 AND key <> ?2",
+            rusqlite::params![record.message.to_string(), record.key],
+            |row| row.get(0),
+        )
+        .ok();
+    if taken.is_some() {
+        return Err(RepoError::MessageAlreadyRecorded);
     }
     Ok(())
 }
@@ -709,13 +795,24 @@ mod tests {
         let recorded = record(HASH_A);
         let mut req = request("general-rules", HASH_B);
         req.recorded = Some(&recorded);
-        assert_eq!(plan(&req), Plan::Edit { message: MESSAGE });
+        assert_eq!(
+            plan(&req),
+            Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE
+            }
+        );
     }
 
     /// A key with no record is created.
     #[test]
     fn unknown_key_is_created() {
-        assert_eq!(plan(&request("general-rules", HASH_A)), Plan::Create);
+        assert_eq!(
+            plan(&request("general-rules", HASH_A)),
+            Plan::Create {
+                key: "general-rules"
+            }
+        );
     }
 
     /// A recorded message that is gone is refused unless the caller explicitly allows
@@ -729,7 +826,13 @@ mod tests {
         assert_eq!(plan(&req), Plan::Refuse(RefuseReason::MissingMessage));
 
         req.allow_recreate = true;
-        assert_eq!(plan(&req), Plan::Recreate { replaces: MESSAGE });
+        assert_eq!(
+            plan(&req),
+            Plan::Recreate {
+                key: "general-rules",
+                replaces: MESSAGE
+            }
+        );
     }
 
     /// A missing message is refused even when the template changed: the caller must
@@ -835,7 +938,13 @@ mod tests {
         let recorded = record("");
         let mut req = request("general-rules", HASH_A);
         req.recorded = Some(&recorded);
-        assert_eq!(plan(&req), Plan::Edit { message: MESSAGE });
+        assert_eq!(
+            plan(&req),
+            Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE
+            }
+        );
     }
 
     /// Every refusal code is distinct and stable.
@@ -1059,7 +1168,15 @@ mod tests {
         let conn = mem_db();
         let original = record(HASH_A);
 
-        assert!(apply(&conn, &Plan::Create, &original, 7).unwrap());
+        assert!(apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules"
+            },
+            &original,
+            7
+        )
+        .unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record, original);
         assert_eq!(stored.updated_at, 7);
@@ -1071,7 +1188,15 @@ mod tests {
     fn the_plan_guards_the_second_write() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 7).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            7,
+        )
+        .unwrap();
         assert!(!apply(&conn, &Plan::NoOp, &original, 99).unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.updated_at, 7);
@@ -1088,12 +1213,19 @@ mod tests {
     }
 
     /// Listing returns every row, ordered by key.
+    ///
+    /// Each key gets its own message: a message belongs to one key, so three keys
+    /// that named one message would be a state this module refuses to write.
     #[test]
     fn list_returns_every_row_ordered_by_key() {
         let conn = mem_db();
-        for key in ["nsfw-rules", "general-rules", "welcome"] {
+        for (index, key) in ["nsfw-rules", "general-rules", "welcome"]
+            .iter()
+            .enumerate()
+        {
             let mut row = record(HASH_A);
-            row.key = key.to_string();
+            row.key = (*key).to_string();
+            row.message = MESSAGE + index as u64;
             upsert(&conn, &row, 1).unwrap();
         }
         let keys: Vec<String> = list(&conn)
@@ -1210,12 +1342,29 @@ mod tests {
     fn an_edit_for_another_message_is_refused() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut wrong = original.clone();
         wrong.message = NEW_MESSAGE;
         assert_eq!(
-            apply(&conn, &Plan::Edit { message: MESSAGE }, &wrong, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: MESSAGE
+                },
+                &wrong,
+                2
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         // The row is untouched.
@@ -1230,11 +1379,28 @@ mod tests {
     fn an_edit_for_the_planned_message_is_written() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut edited = original.clone();
         edited.content_hash = HASH_B.to_string();
-        assert!(apply(&conn, &Plan::Edit { message: MESSAGE }, &edited, 2).unwrap());
+        assert!(apply(
+            &conn,
+            &Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE
+            },
+            &edited,
+            2
+        )
+        .unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record.content_hash, HASH_B);
         assert_eq!(stored.updated_at, 2);
@@ -1246,13 +1412,29 @@ mod tests {
     fn a_create_over_an_existing_row_is_refused() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut stale = original.clone();
         stale.message = NEW_MESSAGE;
         stale.channel = OTHER_CHANNEL;
         assert_eq!(
-            apply(&conn, &Plan::Create, &stale, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Create {
+                    key: "general-rules"
+                },
+                &stale,
+                2
+            )
+            .unwrap_err(),
             RepoError::AlreadyExists
         );
         let stored = get(&conn, "general-rules").unwrap().unwrap();
@@ -1265,12 +1447,29 @@ mod tests {
     fn a_recreate_replaces_the_row() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut recreated = original.clone();
         recreated.message = NEW_MESSAGE;
         recreated.content_hash = HASH_B.to_string();
-        assert!(apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &recreated, 2).unwrap());
+        assert!(apply(
+            &conn,
+            &Plan::Recreate {
+                key: "general-rules",
+                replaces: MESSAGE
+            },
+            &recreated,
+            2
+        )
+        .unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record.message, NEW_MESSAGE);
         assert_eq!(stored.updated_at, 2);
@@ -1287,7 +1486,10 @@ mod tests {
         req.message_missing = true;
         req.allow_recreate = true;
         match plan(&req) {
-            Plan::Recreate { replaces } => assert_eq!(replaces, MESSAGE),
+            Plan::Recreate { replaces, key } => {
+                assert_eq!(replaces, MESSAGE);
+                assert_eq!(key, "general-rules");
+            }
             other => panic!("expected a recreate that names the missing message: {other:?}"),
         }
     }
@@ -1302,13 +1504,30 @@ mod tests {
     fn a_stale_recreate_does_not_overwrite_a_fresh_one() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         // Sync 1: the recorded message is missing, so the post is made again.
         let mut first = original.clone();
         first.message = NEW_MESSAGE;
         first.content_hash = HASH_B.to_string();
-        assert!(apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &first, 2).unwrap());
+        assert!(apply(
+            &conn,
+            &Plan::Recreate {
+                key: "general-rules",
+                replaces: MESSAGE
+            },
+            &first,
+            2
+        )
+        .unwrap());
 
         // Sync 2 holds the plan it made BEFORE sync 1 wrote, so it still names the
         // old message. Writing it now would orphan the message sync 1 just made.
@@ -1316,7 +1535,16 @@ mod tests {
         stale.message = NEW_MESSAGE + 1;
         stale.content_hash = HASH_B.to_string();
         assert_eq!(
-            apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &stale, 3).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Recreate {
+                    key: "general-rules",
+                    replaces: MESSAGE
+                },
+                &stale,
+                3
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         // The row still names the message that sync 1 made.
@@ -1332,13 +1560,30 @@ mod tests {
     fn a_recreate_for_the_missing_message_itself_is_refused() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         // The record still names the message that is missing.
         let mut wrong = original.clone();
         wrong.content_hash = HASH_B.to_string();
         assert_eq!(
-            apply(&conn, &Plan::Recreate { replaces: MESSAGE }, &wrong, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Recreate {
+                    key: "general-rules",
+                    replaces: MESSAGE
+                },
+                &wrong,
+                2
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         let stored = get(&conn, "general-rules").unwrap().unwrap();
@@ -1348,20 +1593,88 @@ mod tests {
     /// A plan belongs to ONE key. A plan made for `rules-a` must not write the
     /// record of `rules-b`: two keys that name the same message would post the
     /// same template twice and edit it over each other.
+    ///
+    /// The other key HAS a row of its own, so the refusal cannot come from the
+    /// "there is no row for this key" check: it comes from the key the plan
+    /// names.
     #[test]
     fn a_plan_for_one_key_does_not_write_another_key() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
+        // The other key has a row of its own, with a message of its own.
+        let mut sibling = original.clone();
+        sibling.key = "nsfw-rules".to_string();
+        sibling.message = NEW_MESSAGE;
+        upsert(&conn, &sibling, 1).unwrap();
+
+        // The plan names the message of the OTHER key, so the only thing that can
+        // refuse this write is the key the plan names.
+        let mut other = sibling.clone();
+        other.content_hash = HASH_B.to_string();
+        assert_eq!(
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: NEW_MESSAGE
+                },
+                &other,
+                2
+            )
+            .unwrap_err(),
+            RepoError::PlanMismatch
+        );
+        // The other key keeps the row it had: the refused write changed nothing.
+        let sibling = get(&conn, "nsfw-rules").unwrap().unwrap();
+        assert_eq!(sibling.record.message, NEW_MESSAGE);
+        assert_eq!(sibling.updated_at, 1);
+        let stored = get(&conn, "general-rules").unwrap().unwrap();
+        assert_eq!(stored.record.message, MESSAGE);
+    }
+
+    /// A `Create` plan names its key too: it must not create the row of another
+    /// key, even when that key has no row yet and the message is free.
+    #[test]
+    fn a_create_plan_does_not_create_another_key() {
+        let conn = mem_db();
+        let original = record(HASH_A);
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
+
+        // The other key has no row, and the message is free, so only the key the
+        // plan names can refuse this write.
         let mut other = original.clone();
         other.key = "nsfw-rules".to_string();
         other.message = NEW_MESSAGE;
         assert_eq!(
-            apply(&conn, &Plan::Edit { message: MESSAGE }, &other, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Create {
+                    key: "general-rules"
+                },
+                &other,
+                2
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
-        // No row was written for the other key.
         assert!(get(&conn, "nsfw-rules").unwrap().is_none());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.record.message, MESSAGE);
@@ -1374,13 +1687,29 @@ mod tests {
     fn two_keys_cannot_hold_the_same_message() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         // A second key is created with the SAME message id.
         let mut twin = original.clone();
         twin.key = "nsfw-rules".to_string();
         assert_eq!(
-            apply(&conn, &Plan::Create, &twin, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Create {
+                    key: "general-rules"
+                },
+                &twin,
+                2
+            )
+            .unwrap_err(),
             RepoError::MessageAlreadyRecorded
         );
         assert!(get(&conn, "nsfw-rules").unwrap().is_none());
@@ -1396,12 +1725,29 @@ mod tests {
     fn a_write_that_moves_the_channel_is_refused() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut moved = original.clone();
         moved.channel = OTHER_CHANNEL;
         assert_eq!(
-            apply(&conn, &Plan::Edit { message: MESSAGE }, &moved, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: MESSAGE
+                },
+                &moved,
+                2
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         let stored = get(&conn, "general-rules").unwrap().unwrap();
@@ -1414,12 +1760,29 @@ mod tests {
     fn a_write_that_moves_the_guild_is_refused() {
         let conn = mem_db();
         let original = record(HASH_A);
-        apply(&conn, &Plan::Create, &original, 1).unwrap();
+        apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules",
+            },
+            &original,
+            1,
+        )
+        .unwrap();
 
         let mut moved = original.clone();
         moved.guild = OTHER_GUILD;
         assert_eq!(
-            apply(&conn, &Plan::Edit { message: MESSAGE }, &moved, 2).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: MESSAGE
+                },
+                &moved,
+                2
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         let stored = get(&conn, "general-rules").unwrap().unwrap();
@@ -1432,7 +1795,16 @@ mod tests {
     fn an_edit_without_a_recorded_row_is_refused() {
         let conn = mem_db();
         assert_eq!(
-            apply(&conn, &Plan::Edit { message: MESSAGE }, &record(HASH_A), 1).unwrap_err(),
+            apply(
+                &conn,
+                &Plan::Edit {
+                    key: "general-rules",
+                    message: MESSAGE
+                },
+                &record(HASH_A),
+                1
+            )
+            .unwrap_err(),
             RepoError::PlanMismatch
         );
         assert!(list(&conn).unwrap().is_empty());
@@ -1446,7 +1818,10 @@ mod tests {
         assert_eq!(
             apply(
                 &conn,
-                &Plan::Recreate { replaces: MESSAGE },
+                &Plan::Recreate {
+                    key: "general-rules",
+                    replaces: MESSAGE
+                },
                 &record(HASH_A),
                 1
             )
@@ -1460,7 +1835,15 @@ mod tests {
     #[test]
     fn a_create_for_an_unknown_key_writes_the_row() {
         let conn = mem_db();
-        assert!(apply(&conn, &Plan::Create, &record(HASH_A), 5).unwrap());
+        assert!(apply(
+            &conn,
+            &Plan::Create {
+                key: "general-rules"
+            },
+            &record(HASH_A),
+            5
+        )
+        .unwrap());
         let stored = get(&conn, "general-rules").unwrap().unwrap();
         assert_eq!(stored.updated_at, 5);
     }
@@ -1583,20 +1966,38 @@ mod tests {
         Edited,
     }
 
+    /// The facts of one sync step.
+    ///
+    /// A request struct, so that the helper does not grow past the argument limit
+    /// and so that every input of a step is visible in one place.
+    struct StepRequest<'a> {
+        /// The key that is being synced.
+        key: &'a str,
+        /// The content hash of the template that should be published.
+        hash: &'a str,
+        /// True when the caller allows a missing post to be posted again.
+        allow_recreate: bool,
+        /// True when the Discord call fails, so no message is posted or edited.
+        discord_fails: bool,
+        /// True when the record write is lost, so the table keeps the old row.
+        write_fails: bool,
+        /// The timestamp of the write, in epoch milliseconds.
+        now: i64,
+    }
+
     /// Runs one sync step against the real `plan` and the real `apply`.
     ///
     /// Returns what the step did. The Discord call can fail and the record write
     /// can be lost; both are the faults the module has to survive.
-    fn sync_step(
-        conn: &Connection,
-        discord: &mut Discord,
-        key: &str,
-        hash: &str,
-        allow_recreate: bool,
-        discord_fails: bool,
-        write_fails: bool,
-        now: i64,
-    ) -> Step {
+    fn sync_step(conn: &Connection, discord: &mut Discord, request: &StepRequest<'_>) -> Step {
+        let StepRequest {
+            key,
+            hash,
+            allow_recreate,
+            discord_fails,
+            write_fails,
+            now,
+        } = *request;
         let recorded = get(conn, key).unwrap();
         let missing = recorded
             .as_ref()
@@ -1612,7 +2013,7 @@ mod tests {
         };
         let plan = plan(&request);
         match plan {
-            Plan::Create => {
+            Plan::Create { key } => {
                 if discord_fails {
                     return Step::Quiet;
                 }
@@ -1625,7 +2026,7 @@ mod tests {
                 }
                 Step::Posted
             }
-            Plan::Edit { message } => {
+            Plan::Edit { key, message } => {
                 // An edit never changes which message carries the post.
                 assert!(
                     discord.exists(message),
@@ -1640,7 +2041,7 @@ mod tests {
                 apply(conn, &plan, &edited, now).unwrap();
                 Step::Edited
             }
-            Plan::Recreate { replaces } => {
+            Plan::Recreate { key, replaces } => {
                 // The message the plan replaces is the one that is missing.
                 assert!(
                     !discord.exists(replaces),
@@ -1679,7 +2080,6 @@ mod tests {
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
         let mut edits = 0usize;
         let mut creates = 0usize;
         // The number of record writes that were lost. Every lost write can leave one
@@ -1687,8 +2087,7 @@ mod tests {
         // record of it. This is the limit the module states plainly.
         let mut lost_writes = 0usize;
 
-        for _step in 0..600 {
-            now += 1;
+        for (now, _step) in (1_000i64..).zip(0..600) {
             // The owner changes the template now and then.
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             // A moderator deletes the post now and then.
@@ -1709,12 +2108,14 @@ mod tests {
             let step = sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                hash,
-                rng.below(3) == 0,
-                discord_fails,
-                write_fails,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash,
+                    allow_recreate: rng.below(3) == 0,
+                    discord_fails,
+                    write_fails,
+                    now,
+                },
             );
             match step {
                 Step::Posted => creates += 1,
@@ -1758,12 +2159,10 @@ mod tests {
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0002);
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
         let mut posts = 0usize;
         let mut lost_writes = 0usize;
 
-        for _step in 0..600 {
-            now += 1;
+        for (now, _step) in (1_000i64..).zip(0..600) {
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             if rng.below(20) == 0 {
                 let recorded = get(&conn, "general-rules").unwrap();
@@ -1778,12 +2177,14 @@ mod tests {
             let step = sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                hash,
-                true,
-                false,
-                write_fails,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash,
+                    allow_recreate: true,
+                    discord_fails: false,
+                    write_fails,
+                    now,
+                },
             );
             if step == Step::Posted {
                 posts += 1;
@@ -1812,19 +2213,19 @@ mod tests {
     fn a_sync_that_never_succeeds_keeps_planning() {
         let conn = mem_db();
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
 
-        for step in 0..50 {
-            now += 1;
+        for (now, step) in (1_000i64..).zip(0..50) {
             let action = sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                HASH_A,
-                false,
-                true,
-                false,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash: HASH_A,
+                    allow_recreate: false,
+                    discord_fails: true,
+                    write_fails: false,
+                    now,
+                },
             );
             assert_eq!(action, Step::Quiet, "step {step}");
             // The post was never made, so the module must still plan to make it.
@@ -1838,7 +2239,13 @@ mod tests {
                 message_missing: false,
                 allow_recreate: false,
             };
-            assert_eq!(plan(&request), Plan::Create, "step {step}");
+            assert_eq!(
+                plan(&request),
+                Plan::Create {
+                    key: "general-rules"
+                },
+                "step {step}"
+            );
         }
         assert!(discord.live.is_empty(), "a message was posted");
     }
@@ -1853,19 +2260,19 @@ mod tests {
     fn a_sync_that_loses_every_write_keeps_planning() {
         let conn = mem_db();
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
 
-        for step in 0..20 {
-            now += 1;
+        for (now, step) in (1_000i64..).zip(0..20) {
             sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                HASH_A,
-                false,
-                false,
-                true,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash: HASH_A,
+                    allow_recreate: false,
+                    discord_fails: false,
+                    write_fails: true,
+                    now,
+                },
             );
             assert!(get(&conn, "general-rules").unwrap().is_none());
             let request = PlanRequest {
@@ -1877,7 +2284,13 @@ mod tests {
                 message_missing: false,
                 allow_recreate: false,
             };
-            assert_eq!(plan(&request), Plan::Create, "step {step}");
+            assert_eq!(
+                plan(&request),
+                Plan::Create {
+                    key: "general-rules"
+                },
+                "step {step}"
+            );
         }
     }
 
@@ -1894,12 +2307,10 @@ mod tests {
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0003);
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
 
         // The noisy phase: the template changes, the post is deleted, the Discord
         // call fails and the record write is lost.
-        for _step in 0..300 {
-            now += 1;
+        for (now, _step) in (1_000i64..).zip(0..300) {
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             if rng.below(20) == 0 {
                 if let Some(stored) = get(&conn, "general-rules").unwrap() {
@@ -1909,21 +2320,36 @@ mod tests {
             sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                hash,
-                rng.below(3) == 0,
-                rng.below(10) == 0,
-                rng.below(10) == 0,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash,
+                    allow_recreate: rng.below(3) == 0,
+                    discord_fails: rng.below(10) == 0,
+                    write_fails: rng.below(10) == 0,
+                    now,
+                },
             );
         }
 
         // The quiet phase: the template does not change, nothing is deleted and
         // nothing fails. The module must settle.
-        let hash = HASH_A;
+        //
+        // The template of the quiet phase is the hash that is NOT the recorded
+        // one, so the first quiet step is an EDIT and the module can only settle
+        // by recording that edit. A module that edits without recording would
+        // edit forever and never settle.
+        let recorded_hash = get(&conn, "general-rules")
+            .unwrap()
+            .map(|stored| stored.record.content_hash)
+            .unwrap_or_default();
+        let hash = if recorded_hash == HASH_A {
+            HASH_B
+        } else {
+            HASH_A
+        };
         let mut settled_after = None;
-        for step in 0..10 {
-            now += 1;
+        let mut quiet_edits = 0usize;
+        for (now, step) in (1_000i64..).zip(0..10) {
             let recorded = get(&conn, "general-rules").unwrap();
             let missing = recorded
                 .as_ref()
@@ -1943,16 +2369,21 @@ mod tests {
                 break;
             }
             // The plan is not a no-op yet: the module has work to do, so it acts.
-            sync_step(
+            let action = sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                hash,
-                true,
-                false,
-                false,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash,
+                    allow_recreate: true,
+                    discord_fails: false,
+                    write_fails: false,
+                    now,
+                },
             );
+            if action == Step::Edited {
+                quiet_edits += 1;
+            }
         }
         assert!(
             settled_after.is_some(),
@@ -1963,10 +2394,12 @@ mod tests {
             "the module took {} steps to settle",
             settled_after.unwrap()
         );
+        // The first quiet step was an edit, and it was recorded: that is the only
+        // way the module can reach a no-op here.
+        assert!(quiet_edits > 0, "the quiet phase never edited");
 
         // And it stays there: every further step is a no-op.
         for step in 0..5 {
-            now += 1;
             let recorded = get(&conn, "general-rules").unwrap();
             let missing = recorded
                 .as_ref()
@@ -1995,11 +2428,9 @@ mod tests {
         let conn = mem_db();
         let mut rng = Lcg(0x5EED_1234_ABCD_0004);
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
         let mut lost_writes = 0usize;
 
-        for _step in 0..600 {
-            now += 1;
+        for (now, _step) in (1_000i64..).zip(0..600) {
             let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             if rng.below(20) == 0 {
                 if let Some(stored) = get(&conn, "general-rules").unwrap() {
@@ -2013,12 +2444,14 @@ mod tests {
             sync_step(
                 &conn,
                 &mut discord,
-                "general-rules",
-                hash,
-                true,
-                false,
-                write_fails,
-                now,
+                &StepRequest {
+                    key: "general-rules",
+                    hash,
+                    allow_recreate: true,
+                    discord_fails: false,
+                    write_fails,
+                    now,
+                },
             );
             // The table names ONE message for the key, and that message is the one
             // the module manages. Every OTHER live message is one whose record
@@ -2057,17 +2490,15 @@ mod tests {
     fn two_keys_never_name_the_same_message_in_a_sequence() {
         let conn = mem_db();
         let mut discord = Discord::new();
-        let mut now = 1_000i64;
         // The message id the model hands out to BOTH keys, to imitate a caller
         // that points two keys at one message.
         let shared = MESSAGE;
+        // The message exists on the Discord side, so a key that records it is not
+        // planning a recreation.
+        discord.live.push(shared);
 
-        for _step in 0..200 {
-            now += 1;
-            for (key, hash, shared_message) in [
-                ("general-rules", HASH_A, shared),
-                ("nsfw-rules", HASH_B, shared),
-            ] {
+        for (now, _step) in (1_000i64..).zip(0..200) {
+            for (key, hash) in [("general-rules", HASH_A), ("nsfw-rules", HASH_B)] {
                 let recorded = get(&conn, key).unwrap();
                 let missing = recorded
                     .as_ref()
@@ -2083,10 +2514,10 @@ mod tests {
                 };
                 let decision = plan(&request);
                 match decision {
-                    Plan::Create | Plan::Recreate { .. } => {
+                    Plan::Create { .. } | Plan::Recreate { .. } => {
                         let mut new_record = record(hash);
                         new_record.key = key.to_string();
-                        new_record.message = shared_message;
+                        new_record.message = shared;
                         let result = apply(&conn, &decision, &new_record, now);
                         if key == "general-rules" {
                             assert!(result.is_ok(), "the write was refused: {result:?}");
