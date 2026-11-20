@@ -14,6 +14,16 @@
 //!   template, a channel name or a user.
 //! * The repository stores ids and hashes only. It never stores template text.
 //!
+//! Limits, stated plainly:
+//! * The plan never names a message that was not recorded, and [`apply`] refuses a
+//!   record that contradicts its plan.
+//! * The plan cannot know whether a post that was just made really exists, and it
+//!   cannot know whether the record of a post was written. A post that succeeds on
+//!   Discord and whose record write then fails leaves the table without a row, so
+//!   the next sync plans a `Create` again and a second copy of the post is made.
+//!   That window is between the post and the record of it, and it is not closed by
+//!   this module.
+//!
 //! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
 
 use std::fmt;
@@ -44,8 +54,8 @@ pub const MIGRATIONS: [Migration; 1] = [Migration {
 /// The codes never carry template text, channel names or user ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefuseReason {
-    /// The key is not a usable key: it is empty, too long, or carries a character that
-    /// is not allowed in a key.
+    /// The key is not a usable key: it is empty, too long, or not written in the one
+    /// canonical spelling this module accepts.
     InvalidKey,
     /// The template hash is not a SHA-256 hex digest, so it cannot be compared with
     /// the recorded one.
@@ -204,24 +214,62 @@ pub const MAX_KEY_BYTES: usize = 64;
 
 /// Checks that a key is usable.
 ///
-/// A key names one managed post and, through the wiring card, one template file. It is
-/// therefore restricted to a plain, short name: ASCII letters, digits, `-`, `_` and
-/// `.`, with no path separator, no `..` and no leading dot. Every other spelling is
-/// refused, so a key can never walk out of the template directory.
+/// A key names one managed post and, through the wiring card, one template file. It
+/// is therefore restricted to ONE canonical spelling: a lowercase ASCII name that
+/// starts with a letter or a digit and continues with letters, digits, `-` or `_`.
+///
+/// The spelling is canonical on purpose. The host and the target are Windows, where
+/// the file system is case-insensitive: `General-Rules` and `general-rules` would be
+/// two database rows for one template file, and both would plan a `Create`, so the
+/// same post would be published twice. For the same reason the spelling carries no
+/// dot (a trailing dot is a Windows path spelling, not a name), no path separator
+/// and no leading character that could make a hidden file, and it is not one of the
+/// reserved device names (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`),
+/// which name a device and not a file.
+///
+/// Every other spelling is refused, so a key can never walk out of the template
+/// directory and never names two different files at once.
 pub fn validate_key(key: &str) -> Result<(), RefuseReason> {
     if key.is_empty() || key.len() > MAX_KEY_BYTES {
         return Err(RefuseReason::InvalidKey);
     }
-    if key == "." || key == ".." || key.starts_with('.') || key.contains("..") {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(RefuseReason::InvalidKey);
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return Err(RefuseReason::InvalidKey);
     }
-    if !key
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    if !bytes.all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    }) {
+        return Err(RefuseReason::InvalidKey);
+    }
+    if is_reserved_device_name(key) {
         return Err(RefuseReason::InvalidKey);
     }
     Ok(())
+}
+
+/// True when the key is one of the reserved Windows device names.
+///
+/// The names are already lowercase, because a key with a capital letter is refused
+/// before this is reached.
+fn is_reserved_device_name(key: &str) -> bool {
+    const STATIC_NAMES: [&str; 4] = ["con", "prn", "aux", "nul"];
+    if STATIC_NAMES.contains(&key) {
+        return true;
+    }
+    // `com1`..`com9` and `lpt1`..`lpt9` are the numbered devices. `com0` is not one
+    // on Windows, but it is refused as well: the whole class is refused, so a host
+    // that does reserve it cannot make the module accept it.
+    let Some(rest) = key.strip_prefix("com").or_else(|| key.strip_prefix("lpt")) else {
+        return false;
+    };
+    matches!(
+        rest,
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+    )
 }
 
 /// True when `hash` is a SHA-256 hex digest: 64 lowercase hex characters.
@@ -282,14 +330,11 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<StoredPost>, RepoError
 ///
 /// `now` is the timestamp of the write in epoch milliseconds; the caller supplies it,
 /// so this module never reads the clock.
+///
+/// This is the raw write. It does not look at a plan. Use [`apply`] to write a row
+/// that follows a plan.
 pub fn upsert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoError> {
-    validate_key(&record.key).map_err(|_| RepoError::InvalidKey)?;
-    if !is_content_hash(&record.content_hash) {
-        return Err(RepoError::CorruptRow);
-    }
-    if record.guild == 0 || record.channel == 0 || record.message == 0 {
-        return Err(RepoError::InvalidId);
-    }
+    check_record(record)?;
     conn.execute(
         "INSERT INTO managed_posts
             (key, guild, channel, message, content_hash, updated_by, updated_at)
@@ -314,10 +359,60 @@ pub fn upsert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), Re
     Ok(())
 }
 
-/// Writes the record only when the plan allows a write.
+/// Writes the record of one managed post and refuses to replace an existing row.
+///
+/// This is the write of a `Create` plan: the post does not exist yet, so a key that
+/// already has a row is a stale plan and is refused with
+/// [`RepoError::AlreadyExists`]. The primary key of the table does the check, so no
+/// compare-and-swap is needed.
+fn insert(conn: &Connection, record: &PostRecord, now: i64) -> Result<(), RepoError> {
+    check_record(record)?;
+    conn.execute(
+        "INSERT INTO managed_posts
+            (key, guild, channel, message, content_hash, updated_by, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            record.key,
+            record.guild.to_string(),
+            record.channel.to_string(),
+            record.message.to_string(),
+            record.content_hash,
+            record.updated_by.to_string(),
+            now,
+        ],
+    )
+    .map_err(|err| match err {
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            RepoError::AlreadyExists
+        }
+        other => RepoError::from(other),
+    })?;
+    Ok(())
+}
+
+/// Writes the record only when the plan allows a write AND the record agrees with
+/// the plan.
 ///
 /// Returns `Ok(true)` when a row was written and `Ok(false)` when the plan forbids a
 /// write, which is the case for `Plan::NoOp` and `Plan::Refuse`.
+///
+/// The record is checked against the plan before anything is written:
+/// * an `Edit` plan names the message that must be edited, so a record that names
+///   another message is refused with `plan_mismatch`: writing it would orphan the
+///   real message and forget where it is;
+/// * an `Edit` or `Recreate` plan edits the post that is already recorded, so a
+///   record that names another guild or another channel is refused with
+///   `plan_mismatch`: the key would then live in two places;
+/// * a `Create` plan posts a post that does not exist yet, so a key that already has
+///   a row is refused with `already_exists`: the recorded post would be forgotten
+///   and the same post would be published twice.
+///
+/// The check is a read followed by a write, not an atomic compare-and-swap. Two
+/// processes that write the same key at the same moment can still race between the
+/// read and the write; the card for this module asks for simple upserts, not for a
+/// compare-and-swap.
 pub fn apply(
     conn: &Connection,
     plan: &Plan,
@@ -326,14 +421,77 @@ pub fn apply(
 ) -> Result<bool, RepoError> {
     match plan {
         Plan::NoOp | Plan::Refuse(_) => Ok(false),
-        Plan::Create | Plan::Edit { .. } | Plan::Recreate => {
+        Plan::Create => {
+            check_new_record(conn, record)?;
+            insert(conn, record, now)?;
+            Ok(true)
+        }
+        Plan::Edit { message } => {
+            check_recorded_post(conn, record, Some(*message))?;
+            upsert(conn, record, now)?;
+            Ok(true)
+        }
+        Plan::Recreate => {
+            check_recorded_post(conn, record, None)?;
             upsert(conn, record, now)?;
             Ok(true)
         }
     }
 }
 
+/// Checks that a `Create` plan may write: the key must have no row yet, and the
+/// record itself must be usable.
+fn check_new_record(conn: &Connection, record: &PostRecord) -> Result<(), RepoError> {
+    check_record(record)?;
+    if get(conn, &record.key)?.is_some() {
+        return Err(RepoError::AlreadyExists);
+    }
+    Ok(())
+}
+
+/// Checks that an `Edit` or `Recreate` plan may write.
+///
+/// `message` is the message an `Edit` plan names. A `Recreate` plan has no message:
+/// the old one is gone and a new one is posted, so only the guild and the channel
+/// are checked.
+fn check_recorded_post(
+    conn: &Connection,
+    record: &PostRecord,
+    message: Option<u64>,
+) -> Result<(), RepoError> {
+    check_record(record)?;
+    let Some(stored) = get(conn, &record.key)? else {
+        // There is no recorded post, so there is nothing to edit or to recreate.
+        return Err(RepoError::PlanMismatch);
+    };
+    if stored.record.guild != record.guild || stored.record.channel != record.channel {
+        return Err(RepoError::PlanMismatch);
+    }
+    if let Some(message) = message {
+        if stored.record.message != message || record.message != message {
+            return Err(RepoError::PlanMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a record itself is usable before it is written.
+fn check_record(record: &PostRecord) -> Result<(), RepoError> {
+    validate_key(&record.key).map_err(|_| RepoError::InvalidKey)?;
+    if !is_content_hash(&record.content_hash) {
+        return Err(RepoError::CorruptRow);
+    }
+    if record.guild == 0 || record.channel == 0 || record.message == 0 {
+        return Err(RepoError::InvalidId);
+    }
+    Ok(())
+}
+
 /// Lists every managed post, ordered by key.
+///
+/// A row whose key is not a usable key is reported as [`RepoError::CorruptRow`]: this
+/// module never writes such a row, so it can only be a row that was written by
+/// something else or that was corrupted.
 pub fn list(conn: &Connection) -> Result<Vec<StoredPost>, RepoError> {
     let mut stmt = conn.prepare(
         "SELECT key, guild, channel, message, content_hash, updated_by, updated_at
@@ -343,6 +501,7 @@ pub fn list(conn: &Connection) -> Result<Vec<StoredPost>, RepoError> {
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
+        validate_key(&key).map_err(|_| RepoError::CorruptRow)?;
         let guild = parse_id(row.get::<_, String>(1)?)?;
         let channel = parse_id(row.get::<_, String>(2)?)?;
         let message = parse_id(row.get::<_, String>(3)?)?;
@@ -378,10 +537,12 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool, RepoError> {
 
 /// Parses an id that is stored as text.
 ///
-/// A value that is not a number, or that is the id zero for a required id, is a
-/// corrupt row: it is reported, never defaulted to zero.
+/// A value that is not a number, that is not written the way this module writes it
+/// (a `+` sign or a leading zero is a second spelling of the same number) or that
+/// is the id zero for a required id, is a corrupt row: it is reported, never
+/// defaulted to zero.
 fn parse_id(text: String) -> Result<u64, RepoError> {
-    let id = text.parse::<u64>().map_err(|_| RepoError::InvalidId)?;
+    let id = parse_canonical_id(&text)?;
     if id == 0 {
         return Err(RepoError::InvalidId);
     }
@@ -393,7 +554,20 @@ fn parse_id(text: String) -> Result<u64, RepoError> {
 /// `updated_by` is the id of the user that caused the last write. The id zero means
 /// "not a user", for example a startup sync, so it is accepted here.
 fn parse_optional_id(text: String) -> Result<u64, RepoError> {
-    text.parse::<u64>().map_err(|_| RepoError::InvalidId)
+    parse_canonical_id(&text)
+}
+
+/// Parses an id that is written the way this module writes it.
+///
+/// The text must be the plain decimal spelling of the number: no sign, no leading
+/// zeros and no whitespace. A second spelling of the same number would be a second
+/// way to write the same id, so it is refused rather than silently accepted.
+fn parse_canonical_id(text: &str) -> Result<u64, RepoError> {
+    let id = text.parse::<u64>().map_err(|_| RepoError::InvalidId)?;
+    if id.to_string() != text {
+        return Err(RepoError::InvalidId);
+    }
+    Ok(id)
 }
 
 /// Stable error codes of the repository.
@@ -941,7 +1115,12 @@ mod tests {
     #[test]
     fn a_case_alias_of_a_key_is_refused() {
         assert!(validate_key("general-rules").is_ok());
-        for key in ["General-Rules", "GENERAL-RULES", "General-rules", "gEnErAl-RuLeS"] {
+        for key in [
+            "General-Rules",
+            "GENERAL-RULES",
+            "General-rules",
+            "gEnErAl-RuLeS",
+        ] {
             assert_eq!(
                 validate_key(key).unwrap_err(),
                 RefuseReason::InvalidKey,
@@ -1000,10 +1179,7 @@ mod tests {
         let key = "a".repeat(MAX_KEY_BYTES);
         assert!(validate_key(&key).is_ok());
         let longer = "a".repeat(MAX_KEY_BYTES + 1);
-        assert_eq!(
-            validate_key(&longer).unwrap_err(),
-            RefuseReason::InvalidKey
-        );
+        assert_eq!(validate_key(&longer).unwrap_err(), RefuseReason::InvalidKey);
     }
 
     /// The planner refuses the same spellings the repository does.
@@ -1152,10 +1328,7 @@ mod tests {
         assert_eq!(list(&conn).unwrap_err(), RepoError::CorruptRow);
         // The row cannot be read by its key either: the key is refused before the
         // row is looked up.
-        assert_eq!(
-            get(&conn, "../evil").unwrap_err(),
-            RepoError::InvalidKey
-        );
+        assert_eq!(get(&conn, "../evil").unwrap_err(), RepoError::InvalidKey);
     }
 
     /// A stored id that is not written the way this module writes it is corrupt: a
@@ -1230,11 +1403,7 @@ mod tests {
         for step in 0..600 {
             now += 1;
             // The owner changes the template now and then.
-            let hash = if rng.below(4) == 0 {
-                HASH_B
-            } else {
-                HASH_A
-            };
+            let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             // A moderator deletes the post now and then.
             if rng.below(20) == 0 {
                 live.clear();
@@ -1268,7 +1437,7 @@ mod tests {
                         if write_fails {
                             lost_writes += 1;
                         } else {
-                            apply(&conn, &Plan::Create, &new_record, now).unwrap();
+                            apply(&conn, &plan, &new_record, now).unwrap();
                         }
                     }
                 }
@@ -1366,11 +1535,7 @@ mod tests {
 
         for step in 0..600 {
             now += 1;
-            let hash = if rng.below(4) == 0 {
-                HASH_B
-            } else {
-                HASH_A
-            };
+            let hash = if rng.below(4) == 0 { HASH_B } else { HASH_A };
             if rng.below(20) == 0 {
                 live = false;
             }

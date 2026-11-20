@@ -22,6 +22,13 @@
 //! title + description + every field name + every field value + footer text +
 //! author name.
 //!
+//! A field whose name or value is empty after trimming is refused as well: Discord
+//! rejects such a field, so a template that carried one could never be posted.
+//!
+//! The hash is over BYTES of the parsed template. Two documents that parse to the
+//! same values hash the same; a document that spells the same text differently in
+//! bytes (a composed and a decomposed accented letter) hashes differently.
+//!
 //! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
 
 use std::fmt;
@@ -195,10 +202,13 @@ impl EmbedTemplate {
 
     /// Returns the canonical form of this template.
     ///
-    /// The canonical form is a byte-exact, injective encoding of the rendered content:
-    /// every value is written with its byte length, so no value can be confused with
-    /// the tag that follows it. The JSON key order of the source document cannot change
-    /// it, because the canonical form is built from the PARSED template.
+    /// The canonical form is a byte-exact encoding of the PARSED template: every text
+    /// value is written with its byte length, so no value can be confused with the tag
+    /// that follows it, and "no colour" is written differently from "colour 0". Two
+    /// templates that parse to the same values therefore produce the same canonical
+    /// form, and two templates that parse to different values produce different
+    /// canonical forms. The JSON key order of the source document cannot change it,
+    /// because the canonical form is built from the PARSED template.
     pub fn canonical(&self) -> String {
         let mut out = String::new();
         out.push_str("embed-template-v1\n");
@@ -212,17 +222,27 @@ impl EmbedTemplate {
         }
         push_tagged(&mut out, "footer", self.footer.as_deref());
         push_tagged(&mut out, "author", self.author_name.as_deref());
-        out.push_str(&format!("color={}\n", self.color.unwrap_or_default()));
+        // The colour is written as a tagged value like every other one, so "no colour"
+        // (`-`) and "colour 0" (`0`) are DIFFERENT canonical forms and therefore
+        // different hashes. They are not the same request to Discord, so the module
+        // must not treat them as the same content.
+        match self.color {
+            None => out.push_str("color=-\n"),
+            Some(color) => out.push_str(&format!("color={color}\n")),
+        }
         out
     }
 
     /// Returns the SHA-256 hex digest of the canonical form.
     ///
     /// The digest is 64 lowercase hex characters. The same template always produces
-    /// the same hash, and the hash changes when the rendered content changes. The
-    /// canonical form is injective, so two templates with different content cannot
-    /// share a canonical form; the only way two different templates could share a
-    /// hash is a SHA-256 collision.
+    /// the same hash, and the hash changes when the parsed template changes. Two
+    /// templates that parse to DIFFERENT values produce different canonical forms, so
+    /// the only way two different templates could share a hash is a SHA-256 collision.
+    ///
+    /// The hash is over BYTES, not over rendered text: two spellings of the same text
+    /// that differ in their bytes (for example a composed and a decomposed accented
+    /// letter) hash differently.
     pub fn content_hash(&self) -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, self.canonical().as_bytes());
         to_hex(digest.as_ref())
@@ -324,16 +344,19 @@ fn normalise(text: Option<String>) -> Option<String> {
 /// The template is validated against the Discord embed limits and returned trimmed and
 /// normalised. Every refusal is a stable code that names the limit that was broken;
 /// no refusal ever contains template text.
+///
+/// The document is deserialised straight into the template shape. A document that is
+/// not a JSON object, that carries an unknown key, that carries the same key twice or
+/// that has a wrong type is refused as `invalid_json`: serde reports a repeated key
+/// as a duplicate field, so a template cannot silently lose one of two `title`s.
 pub fn load(source: &str) -> Result<EmbedTemplate, TemplateError> {
-    // The document must be a JSON OBJECT. Parsing straight into the struct would let
-    // serde read a JSON ARRAY as a struct with every field defaulted, so the shape is
-    // checked first and a non-object is refused.
-    let value: serde_json::Value = serde_json::from_str(source)
-        .map_err(|_| TemplateError::new(TemplateErrorKind::InvalidJson))?;
-    if !value.is_object() {
+    // The document must be a JSON OBJECT. The shape is checked first, because the
+    // template shape has only optional fields and serde would read a JSON ARRAY as
+    // a template with every field defaulted.
+    if !source.trim_start().starts_with('{') {
         return Err(TemplateError::new(TemplateErrorKind::InvalidJson));
     }
-    let raw: RawTemplate = serde_json::from_value(value)
+    let raw: RawTemplate = serde_json::from_str(source)
         .map_err(|_| TemplateError::new(TemplateErrorKind::InvalidJson))?;
 
     if let Some(color) = raw.color {
@@ -391,6 +414,15 @@ fn validate(template: &EmbedTemplate) -> Result<(), TemplateError> {
         return Err(TemplateError::new(TemplateErrorKind::TooManyFields));
     }
     for field in &template.fields {
+        // Discord refuses a field whose name or value is empty. A template that
+        // carried one could never be posted, so it is refused at load with its own
+        // code rather than failing later at every sync.
+        if field.name.is_empty() {
+            return Err(TemplateError::new(TemplateErrorKind::FieldNameEmpty));
+        }
+        if field.value.is_empty() {
+            return Err(TemplateError::new(TemplateErrorKind::FieldValueEmpty));
+        }
         if field.name.chars().count() > MAX_FIELD_NAME_CHARS {
             return Err(TemplateError::new(TemplateErrorKind::FieldNameTooLong));
         }
@@ -911,6 +943,9 @@ mod tests {
         codes.dedup();
         assert_eq!(codes.len(), all.len());
         assert_eq!(TemplateErrorKind::FieldNameEmpty.code(), "field_name_empty");
-        assert_eq!(TemplateErrorKind::FieldValueEmpty.code(), "field_value_empty");
+        assert_eq!(
+            TemplateErrorKind::FieldValueEmpty.code(),
+            "field_value_empty"
+        );
     }
 }
