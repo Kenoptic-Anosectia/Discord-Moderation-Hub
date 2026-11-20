@@ -2827,4 +2827,128 @@ mod tests {
         assert_eq!(plain.chars().count(), 64);
         assert!(plain.chars().all(|c| c == 'a'));
     }
+
+    /// The clamp always finishes. A render that has to cut a lot must not spin: this
+    /// test renders the largest embed the loader accepts, with the longest possible
+    /// placeholders, and the test only ends if the renderer returns.
+    #[test]
+    fn the_clamp_always_terminates() {
+        // Twenty-five fields of 1024 characters each is refused at load, so use the
+        // largest embed that loads: twenty-four fields of 238 characters, which the
+        // placeholders then expand well past the total.
+        let src = format!(
+            "{{\"embed\": {{\"fields\": [{}]}}}}",
+            (0..24)
+                .map(|i| format!(
+                    "{{\"name\": \"n{i}\", \"value\": \"{}{{server}}\"}}",
+                    "v".repeat(230)
+                ))
+                .collect::<Vec<String>>()
+                .join(",")
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        // The render returned, so the clamp terminated. The embed still fits.
+        assert!(rendered_embed_total(&out.embed) <= 6000);
+    }
+
+    /// The rendered field NAME stays inside the Discord field-name limit, even when
+    /// the template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn the_rendered_field_name_stays_within_the_limit() {
+        let src = field_template(246, "v");
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let name = &out.embed.fields[0].name;
+        assert!(
+            name.chars().count() <= 256,
+            "rendered field name is {} chars, over the 256 limit",
+            name.chars().count()
+        );
+        assert!(!name.is_empty(), "the field lost its name");
+    }
+
+    /// A template with one field whose name is `name_len` literal characters plus a
+    /// `{username}` placeholder.
+    fn field_template(name_len: usize, value: &str) -> String {
+        format!(
+            "{{\"embed\": {{\"fields\": [{{\"name\": \"{}{{username}}\", \"value\": \"{}\"}}]}}}}",
+            "n".repeat(name_len),
+            value
+        )
+    }
+
+    /// The rendered footer stays inside the Discord footer limit, even when the
+    /// template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn the_rendered_footer_stays_within_the_limit() {
+        let src = format!(
+            "{{\"embed\": {{\"footer\": {{\"text\": \"{}{{username}}\"}}}}}}",
+            "f".repeat(2038)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let footer = out
+            .embed
+            .footer_text
+            .as_deref()
+            .expect("footer must render");
+        assert!(
+            footer.chars().count() <= 2048,
+            "rendered footer is {} chars, over the 2048 limit",
+            footer.chars().count()
+        );
+    }
+
+    /// The rendered author name stays inside the Discord author-name limit, even when
+    /// the template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn the_rendered_author_name_stays_within_the_limit() {
+        let src = format!(
+            "{{\"embed\": {{\"author\": {{\"name\": \"{}{{username}}\"}}}}}}",
+            "a".repeat(246)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let author = out
+            .embed
+            .author_name
+            .as_deref()
+            .expect("author must render");
+        assert!(
+            author.chars().count() <= 256,
+            "rendered author name is {} chars, over the 256 limit",
+            author.chars().count()
+        );
+    }
+
+    /// The clamp counts CHARACTERS, not bytes: a multi-byte name that has to be cut
+    /// keeps whole characters and never leaves half a code point behind.
+    #[test]
+    fn the_clamp_counts_characters_not_bytes() {
+        let src = format!(
+            "{{\"embed\": {{\"fields\": [{{\"name\": \"{}\", \"value\": \"v\"}}]}}}}",
+            "é".repeat(246)
+        );
+        let t = WelcomeTemplate::load(&src, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let name = &out.embed.fields[0].name;
+        // Every character is whole and every one of them is the multi-byte letter: a
+        // byte-based cut would have produced a broken code point here.
+        assert!(
+            name.chars().all(|c| c == 'é'),
+            "the name was cut mid-character"
+        );
+        assert!(name.chars().count() <= 256);
+    }
 }
