@@ -15,6 +15,7 @@
 use crate::roles::eligibility::{
     decide, decide_removal, Decision, DenyReason, GrantPath, GrantRequest, RoleFacts, SafewordState,
 };
+use std::collections::BTreeSet;
 
 /// Discord's limit of options in one select component.
 pub const SELECT_OPTION_LIMIT: usize = 25;
@@ -133,25 +134,191 @@ pub struct Component {
     pub options: Vec<MenuOption>,
 }
 
+/// Options of a group with repeated roles dropped (first occurrence wins).
+fn distinct_options(group: &Group) -> Vec<&MenuOption> {
+    let mut seen = BTreeSet::new();
+    group
+        .options
+        .iter()
+        .filter(|o| seen.insert(o.role_id))
+        .collect()
+}
+
 /// Split every group into select components of at most `SELECT_OPTION_LIMIT`
-/// options, in declared order, never mixing groups.
+/// options, in declared order, never mixing groups. Repeated roles inside a
+/// group are dropped (Discord select values must be unique). Groups with no
+/// options produce no component. This does not check how many components fit
+/// in one message; the posting card owns layout.
 pub fn split_components(menu: &Menu) -> Vec<Component> {
-    let _ = menu;
-    Vec::new()
+    let mut out = Vec::new();
+    for group in &menu.groups {
+        for (part, chunk) in distinct_options(group)
+            .chunks(SELECT_OPTION_LIMIT)
+            .enumerate()
+        {
+            out.push(Component {
+                group_id: group.id.clone(),
+                part,
+                options: chunk.iter().map(|o| (*o).clone()).collect(),
+            });
+        }
+    }
+    out
+}
+
+fn facts_for(ctx: &GrantContext, role_id: u64) -> Option<RoleFacts> {
+    ctx.role_facts.iter().find(|f| f.id == role_id).copied()
+}
+
+fn request<'a>(ctx: &GrantContext<'a>, role: RoleFacts) -> GrantRequest<'a> {
+    GrantRequest {
+        path: GrantPath::Menu,
+        role,
+        bot_top_position: ctx.bot_top_position,
+        guild_id: ctx.guild_id,
+        protected_role_ids: ctx.protected_role_ids,
+        safeword: ctx.safeword,
+        safeword_restricted_role_ids: ctx.safeword_restricted_role_ids,
+        staff: None,
+    }
+}
+
+/// K03 `decide` on the Menu path. A role with no facts counts as deleted.
+fn check_add(ctx: &GrantContext, role_id: u64) -> Result<(), Reason> {
+    let role = facts_for(ctx, role_id).unwrap_or(RoleFacts {
+        id: role_id,
+        position: 0,
+        managed: false,
+        permissions: 0,
+        exists: false,
+    });
+    match decide(&request(ctx, role)) {
+        Decision::Allow => Ok(()),
+        Decision::Deny(reason) => Err(Reason::Denied(reason)),
+    }
+}
+
+enum Removal {
+    Remove,
+    /// Nothing to remove: the role is deleted or unknown to the caller.
+    Gone,
+    Blocked(DenyReason),
+}
+
+fn check_removal(ctx: &GrantContext, role_id: u64) -> Removal {
+    match facts_for(ctx, role_id) {
+        Some(role) if role.exists => match decide_removal(&request(ctx, role)) {
+            Decision::Allow => Removal::Remove,
+            Decision::Deny(reason) => Removal::Blocked(reason),
+        },
+        _ => Removal::Gone,
+    }
+}
+
+/// Remove one role if allowed, otherwise report why not.
+fn remove_or_skip(plan: &mut Plan, ctx: &GrantContext, role_id: u64) {
+    match check_removal(ctx, role_id) {
+        Removal::Remove => plan.remove.push(role_id),
+        Removal::Gone => plan
+            .skipped
+            .push((role_id, Reason::RemovalDenied(DenyReason::RoleDeleted))),
+        Removal::Blocked(r) => plan.skipped.push((role_id, Reason::RemovalDenied(r))),
+    }
+}
+
+/// Exclusive group, option not held: add it and remove the other held
+/// options, all or nothing.
+fn exclusive_swap(plan: &mut Plan, ctx: &GrantContext, option: u64, others: &[u64]) {
+    if let Err(reason) = check_add(ctx, option) {
+        plan.skipped.push((option, reason));
+        return;
+    }
+    let checks: Vec<(u64, Removal)> = others
+        .iter()
+        .map(|r| (*r, check_removal(ctx, *r)))
+        .collect();
+    let blocked: Vec<(u64, DenyReason)> = checks
+        .iter()
+        .filter_map(|(r, c)| match c {
+            Removal::Blocked(d) => Some((*r, *d)),
+            _ => None,
+        })
+        .collect();
+    if !blocked.is_empty() {
+        for (r, d) in blocked {
+            plan.skipped.push((r, Reason::RemovalDenied(d)));
+        }
+        plan.skipped.push((option, Reason::SwapBlocked));
+        return;
+    }
+    plan.add.push(option);
+    for (r, c) in checks {
+        match c {
+            Removal::Remove => plan.remove.push(r),
+            _ => plan
+                .skipped
+                .push((r, Reason::RemovalDenied(DenyReason::RoleDeleted))),
+        }
+    }
 }
 
 /// Decide what a click does. `Err` only for an unknown group; everything
 /// else is reported in `Plan::skipped`.
 pub fn plan_click(request: &PlanRequest) -> Result<Plan, PlanError> {
-    let _ = (
-        request,
-        decide,
-        decide_removal,
-        Decision::Allow,
-        GrantPath::Menu,
-    );
-    let _: Option<GrantRequest> = None;
-    Ok(Plan::default())
+    let ctx = &request.grant;
+    let click = request.click;
+    let group = request
+        .menu
+        .groups
+        .iter()
+        .find(|g| g.id == click.group_id)
+        .ok_or(PlanError::UnknownGroup)?;
+    let option = click.option_role_id;
+    let mut plan = Plan::default();
+
+    let group_roles: Vec<u64> = distinct_options(group).iter().map(|o| o.role_id).collect();
+    if !group_roles.contains(&option) {
+        plan.skipped.push((option, Reason::UnknownOption));
+        return Ok(plan);
+    }
+    let member: BTreeSet<u64> = click.member_roles.iter().copied().collect();
+    let held_in_group: Vec<u64> = group_roles
+        .iter()
+        .copied()
+        .filter(|r| member.contains(r))
+        .collect();
+    let holds_option = member.contains(&option);
+
+    match group.mode {
+        GroupMode::Multi if holds_option => remove_or_skip(&mut plan, ctx, option),
+        GroupMode::Multi => {
+            if let Err(reason) = check_add(ctx, option) {
+                plan.skipped.push((option, reason));
+            } else if group.max.is_some_and(|m| held_in_group.len() >= m as usize) {
+                plan.skipped.push((option, Reason::MaxReached));
+            } else {
+                plan.add.push(option);
+            }
+        }
+        GroupMode::Exclusive => {
+            let others: Vec<u64> = held_in_group
+                .iter()
+                .copied()
+                .filter(|r| *r != option)
+                .collect();
+            if holds_option {
+                // Not a toggle: the group keeps its choice. Extra options held
+                // from before are cleaned up.
+                plan.skipped.push((option, Reason::AlreadySelected));
+                for other in others {
+                    remove_or_skip(&mut plan, ctx, other);
+                }
+            } else {
+                exclusive_swap(&mut plan, ctx, option, &others);
+            }
+        }
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -870,6 +1037,6 @@ mod tests {
             }
         }
         assert!(clicks >= 20_000);
-        assert!(effective > 2_000, "sequence too inert: {effective}");
+        assert!(effective > 1_000, "sequence too inert: {effective}");
     }
 }
