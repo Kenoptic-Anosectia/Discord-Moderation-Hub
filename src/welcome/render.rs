@@ -304,6 +304,9 @@ pub struct RenderedWelcome {
     pub content: Option<String>,
     /// The single embed the template describes.
     pub embed: RenderedEmbed,
+    /// True when a part of the template was cut so that the rendered message stays
+    /// inside the Discord limits.
+    pub truncated: bool,
 }
 
 /// Why a member is skipped.
@@ -878,7 +881,11 @@ pub fn render_welcome(
             .map(|text| render_text(text, &context)),
     };
 
-    RenderedWelcome { content, embed }
+    RenderedWelcome {
+        content,
+        embed,
+        truncated: false,
+    }
 }
 
 /// The values the placeholders resolve to for one member.
@@ -2027,5 +2034,270 @@ mod tests {
         let field: &RenderedField = &embed.fields[0];
         assert_eq!(field.name, "n");
         assert_eq!(field.value, "v");
+    }
+
+    // -----------------------------------------------------------------------
+    // The RENDERED output is bounded, not only the template text
+    // -----------------------------------------------------------------------
+
+    /// The number of characters in the whole rendered embed.
+    fn rendered_embed_total(embed: &RenderedEmbed) -> usize {
+        let mut total = 0usize;
+        if let Some(title) = &embed.title {
+            total += title.chars().count();
+        }
+        if let Some(description) = &embed.description {
+            total += description.chars().count();
+        }
+        for field in &embed.fields {
+            total += field.name.chars().count();
+            total += field.value.chars().count();
+        }
+        if let Some(footer) = &embed.footer_text {
+            total += footer.chars().count();
+        }
+        if let Some(author) = &embed.author_name {
+            total += author.chars().count();
+        }
+        total
+    }
+
+    /// The rendered description stays inside the Discord description limit even when the
+    /// template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn rendered_description_stays_within_the_limit() {
+        // 4086 literal characters plus one `{username}` placeholder: the template text
+        // is 4096 characters, exactly the limit, so the template loads. The rendered
+        // text must still be at most 4096 characters.
+        let template = format!(
+            "{{\"embed\": {{\"description\": \"{}{{username}}\"}}}}",
+            "d".repeat(4086)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let rendered = out.embed.description.expect("description must render");
+        assert!(
+            rendered.chars().count() <= 4096,
+            "rendered description is {} chars, over the 4096 limit",
+            rendered.chars().count()
+        );
+    }
+
+    /// The rendered field value stays inside the Discord field-value limit even when the
+    /// template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn rendered_field_value_stays_within_the_limit() {
+        let template = format!(
+            "{{\"embed\": {{\"fields\": [{{\"name\": \"n\", \"value\": \"{}{{username}}\"}}]}}}}",
+            "v".repeat(1014)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let rendered = &out.embed.fields[0].value;
+        assert!(
+            rendered.chars().count() <= 1024,
+            "rendered field value is {} chars, over the 1024 limit",
+            rendered.chars().count()
+        );
+    }
+
+    /// The rendered message content stays inside the Discord content limit even when the
+    /// template text is exactly at the limit and a placeholder expands it.
+    #[test]
+    fn rendered_content_stays_within_the_limit() {
+        let template = format!(
+            "{{\"content\": \"{}{{username}}\", \"embed\": {{\"title\": \"t\"}}}}",
+            "c".repeat(1990)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let rendered = out.content.expect("content must render");
+        assert!(
+            rendered.chars().count() <= 2000,
+            "rendered content is {} chars, over the 2000 limit",
+            rendered.chars().count()
+        );
+    }
+
+    /// The rendered embed total stays inside the Discord total limit even when the
+    /// template text is exactly at the limit and the placeholders expand it.
+    #[test]
+    fn rendered_embed_total_stays_within_the_limit() {
+        // Title 256 + description 4080 + one field name of 1 + one field value of 1014
+        // plus two placeholders that expand: the template text is 6000 characters,
+        // exactly the total limit, so the template loads.
+        let template = format!(
+            "{{\"embed\": {{\"title\": \"{}\", \"description\": \"{}{{username}}\", \
+             \"fields\": [{{\"name\": \"n\", \"value\": \"{}{{username}}\"}}]}}}}",
+            "t".repeat(256),
+            "d".repeat(4080),
+            "v".repeat(1014)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let total = rendered_embed_total(&out.embed);
+        assert!(
+            total <= 6000,
+            "rendered embed total is {total} chars, over the 6000 limit"
+        );
+    }
+
+    /// A template that repeats a placeholder expands far beyond the limit. The rendered
+    /// result must still be inside the limit, whatever the expansion is.
+    #[test]
+    fn rendered_output_stays_within_the_limits_for_a_repeated_placeholder() {
+        let template = format!(
+            "{{\"embed\": {{\"description\": \"{}\"}}}}",
+            "{username}".repeat(400)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let rendered = out.embed.description.expect("description must render");
+        assert!(
+            rendered.chars().count() <= 4096,
+            "rendered description is {} chars, over the 4096 limit",
+            rendered.chars().count()
+        );
+    }
+
+    /// The server name is caller-supplied free text. It must not be able to push the
+    /// rendered output past the limit, however long it is.
+    #[test]
+    fn rendered_output_stays_within_the_limits_for_a_long_server_name() {
+        let template = "{\"embed\": {\"description\": \"{server}\"}}";
+        let t = WelcomeTemplate::load(template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.server_name = "S".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        let rendered = out.embed.description.expect("description must render");
+        assert!(
+            rendered.chars().count() <= 4096,
+            "rendered description is {} chars, over the 4096 limit",
+            rendered.chars().count()
+        );
+    }
+
+    /// Every rendered slot stays inside its own limit for the worst-case member: the
+    /// longest name, the longest server name and the largest possible ids.
+    #[test]
+    fn every_rendered_slot_stays_within_its_limit_for_the_worst_case_member() {
+        let template = "{\"content\": \"{user_mention} {username} {server} {member_count} \
+                        {member_ordinal} {channel:rules} {role:member}\", \
+                        \"embed\": {\"title\": \"{user_mention} {username}\", \
+                        \"description\": \"{server} {username}\", \
+                        \"fields\": [{\"name\": \"{username}\", \"value\": \"{user_mention}\"}], \
+                        \"footer\": {\"text\": \"{username}\"}, \
+                        \"author\": {\"name\": \"{user_mention}\"}}}";
+        let t = WelcomeTemplate::load(template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.user_id = u64::MAX;
+        m.username = "x".repeat(5000);
+        m.server_name = "S".repeat(5000);
+        m.member_count = u64::MAX;
+        let out = render_welcome(&t, &m, &id_map());
+
+        let content = out.content.expect("content must render");
+        assert!(
+            content.chars().count() <= 2000,
+            "content is {} chars",
+            content.chars().count()
+        );
+        let title = out.embed.title.as_deref().expect("title must render");
+        assert!(
+            title.chars().count() <= 256,
+            "title is {} chars",
+            title.chars().count()
+        );
+        let description = out
+            .embed
+            .description
+            .as_deref()
+            .expect("description must render");
+        assert!(
+            description.chars().count() <= 4096,
+            "description is {} chars",
+            description.chars().count()
+        );
+        let footer = out
+            .embed
+            .footer_text
+            .as_deref()
+            .expect("footer must render");
+        assert!(
+            footer.chars().count() <= 2048,
+            "footer is {} chars",
+            footer.chars().count()
+        );
+        let author = out.embed.author_name.as_deref().expect("author must render");
+        assert!(
+            author.chars().count() <= 256,
+            "author is {} chars",
+            author.chars().count()
+        );
+        for field in &out.embed.fields {
+            assert!(
+                field.name.chars().count() <= 256,
+                "field name is {} chars",
+                field.name.chars().count()
+            );
+            assert!(
+                field.value.chars().count() <= 1024,
+                "field value is {} chars",
+                field.value.chars().count()
+            );
+        }
+        let total = rendered_embed_total(&out.embed);
+        assert!(total <= 6000, "embed total is {total} chars");
+    }
+
+    /// The sanitised username is the whole rendered username: the escaping must not
+    /// push it past the cap.
+    #[test]
+    fn the_sanitised_username_is_at_most_the_cap() {
+        let mut m = member();
+        m.username = "*".repeat(5000);
+        let sanitised = sanitize_username(&m.username);
+        assert!(
+            sanitised.chars().count() <= 64,
+            "the sanitised username is {} chars",
+            sanitised.chars().count()
+        );
+    }
+
+    /// A truncation is visible to the caller: the rendered welcome says that something
+    /// was cut, so the wiring card can log it.
+    #[test]
+    fn a_truncated_render_is_reported_to_the_caller() {
+        let template = format!(
+            "{{\"embed\": {{\"description\": \"{}{{username}}\"}}}}",
+            "d".repeat(4086)
+        );
+        let t = WelcomeTemplate::load(&template, &id_map()).expect("template must load");
+        let mut m = member();
+        m.username = "x".repeat(5000);
+        let out = render_welcome(&t, &m, &id_map());
+        assert!(
+            out.truncated,
+            "the caller cannot see that the description was cut"
+        );
+    }
+
+    /// A render that fits is NOT reported as truncated.
+    #[test]
+    fn a_complete_render_is_not_reported_as_truncated() {
+        let template = "{\"embed\": {\"description\": \"Welcome {username}!\"}}";
+        let t = WelcomeTemplate::load(template, &id_map()).expect("template must load");
+        let out = render_welcome(&t, &member(), &id_map());
+        assert!(!out.truncated, "a short welcome was reported as truncated");
     }
 }
