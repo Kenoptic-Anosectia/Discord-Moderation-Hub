@@ -361,7 +361,7 @@ pub fn decide_join(
         return Decision::Deny(DenyReason::GlobalCapReached);
     }
     if let Some(last) = state.last_create.get(&event.user_id) {
-        if event.at - *last < config.create_cooldown_secs {
+        if event.at.saturating_sub(*last) < config.create_cooldown_secs {
             return Decision::Deny(DenyReason::CreateCooldown);
         }
     }
@@ -442,6 +442,9 @@ pub fn decide_leave(
     if user_id == 0 {
         return Decision::Deny(DenyReason::InvalidUserId);
     }
+    if config.empty_grace_secs < 0 {
+        return Decision::Deny(DenyReason::InvalidConfig);
+    }
     if room.occupants > 0 {
         // The room still holds members, so it may become claimable. Only the owner
         // may leave it that way; anybody else leaves no trace.
@@ -454,7 +457,7 @@ pub fn decide_leave(
     // until it has elapsed the room stays. The check does not depend on who leaves:
     // the room is empty, so whoever leaves last reaches it.
     let empty_since = room.empty_since.unwrap_or(now);
-    if now - empty_since >= config.empty_grace_secs {
+    if now.saturating_sub(empty_since) >= config.empty_grace_secs {
         return Decision::Cleanup(channel_id);
     }
     Decision::Deny(DenyReason::EmptyGraceNotElapsed)
@@ -473,8 +476,21 @@ pub fn decide_sweep(
     config: &VoiceRoomConfig,
     state: &VoiceRoomState,
 ) -> Decision {
-    let _ = (channel_id, now, config, state);
-    Decision::Deny(DenyReason::UntrackedChannel)
+    let room = match state.room(channel_id) {
+        Some(room) => room,
+        None => return Decision::Deny(DenyReason::UntrackedChannel),
+    };
+    if config.empty_grace_secs < 0 {
+        return Decision::Deny(DenyReason::InvalidConfig);
+    }
+    if room.occupants > 0 {
+        return Decision::Deny(DenyReason::RoomNotEmpty);
+    }
+    let empty_since = room.empty_since.unwrap_or(now);
+    if now.saturating_sub(empty_since) >= config.empty_grace_secs {
+        return Decision::Cleanup(channel_id);
+    }
+    Decision::Deny(DenyReason::EmptyGraceNotElapsed)
 }
 
 /// Decides whether a room may be renamed.
@@ -499,11 +515,15 @@ pub fn decide_rename(
     if owner_id != room.owner_id {
         return Decision::Deny(DenyReason::NotRoomOwner);
     }
+    if config.rename_budget.window_secs < 0 {
+        return Decision::Deny(DenyReason::InvalidConfig);
+    }
     let used = state
         .renames
         .iter()
         .filter(|(renamed_channel, at)| {
-            *renamed_channel == channel_id && now - *at < config.rename_budget.window_secs
+            *renamed_channel == channel_id
+                && now.saturating_sub(*at) < config.rename_budget.window_secs
         })
         .count();
     if used >= config.rename_budget.max_renames as usize {
@@ -514,15 +534,21 @@ pub fn decide_rename(
 
 /// Cleans a room name.
 ///
-/// The cleaning removes, in this order: the mention tokens `<@..>`, `<@&..>` and
-/// `<#..>`, the `@everyone` and `@here` words, the control and zero-width
-/// characters, and every link (a URL, a `www.` host, an invite link, and an invite
+/// The cleaning removes, in this order: the control and the invisible characters,
+/// the mention tokens `<@..>`, `<@&..>` and `<#..>`, the `@everyone` and `@here`
+/// words, and every link (a URL, a `www.` host, an invite link, and an invite
 /// host that was spread across spaces). What is left is trimmed, shortened to
 /// [`MAX_NAME_CHARS`] characters and, when it is empty, replaced by `default_name`.
+///
+/// The invisible characters are removed FIRST, because an invisible character
+/// inside a mention would otherwise hide the mention from the mention pass and
+/// the mention would be rebuilt when the invisible character was removed. The
+/// mention pass then runs until the text stops changing, so a nested token
+/// cannot reassemble into a live token.
 pub fn sanitize_name(raw: &str, default_name: &str) -> String {
-    let cleaned = strip_links(&strip_invisible(&strip_mentions(raw)));
+    let cleaned = clean_text(raw);
     let cleaned = if cleaned.trim().is_empty() {
-        strip_links(&strip_invisible(&strip_mentions(default_name)))
+        clean_text(default_name)
     } else {
         cleaned
     };
@@ -532,6 +558,39 @@ pub fn sanitize_name(raw: &str, default_name: &str) -> String {
     }
     truncate_chars(cleaned, MAX_NAME_CHARS)
 }
+
+/// Removes the invisible characters, then the mentions, until the text stops
+/// changing, and finally the links.
+///
+/// The links come last on purpose: a mention token can hide the front of a URL,
+/// so the URL is only whole after the mentions are gone.
+fn clean_text(raw: &str) -> String {
+    let without_invisible = strip_invisible(raw);
+    let without_mentions = strip_mentions_to_fixpoint(&without_invisible);
+    strip_links(&without_mentions)
+}
+
+/// Removes the mention tokens and the `@everyone` and `@here` words, until the
+/// text stops changing.
+///
+/// The loop is what keeps a nested token from reassembling: stripping one token
+/// can expose another one behind it.
+fn strip_mentions_to_fixpoint(raw: &str) -> String {
+    let mut current = strip_mentions(raw);
+    // Every pass removes at least one character, so the text shrinks and the loop
+    // ends; the bound is only a guard against a mistake in the strippers.
+    for _ in 0..MAX_MENTION_PASSES {
+        let next = strip_mentions(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// The most passes the mention stripping may take before it is treated as stuck.
+const MAX_MENTION_PASSES: usize = 16;
 
 /// Removes the mention tokens and the `@everyone` and `@here` words.
 fn strip_mentions(raw: &str) -> String {
@@ -602,23 +661,43 @@ fn mention_word_len(chars: &[char], start: usize) -> Option<usize> {
     None
 }
 
-/// Removes the control and the zero-width characters.
+/// Removes the control and the invisible characters.
 fn strip_invisible(raw: &str) -> String {
     raw.chars()
-        .filter(|c| !c.is_control() && !is_zero_width(*c))
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .collect()
 }
 
 /// True for the characters that are invisible but still occupy a position.
-fn is_zero_width(c: char) -> bool {
-    matches!(
-        c,
+///
+/// The rule is a class rule, not a hand list: the format characters that hide
+/// text (the zero-width characters, the bidirectional controls and the tag
+/// characters), the Hangul filler and the non-ASCII space characters are all
+/// removed. The bidi controls and the tag characters are included because they
+/// can carry text that a reader never sees, and the Hangul filler because it
+/// looks blank but is not a control character.
+///
+/// The plain ASCII space is kept: it separates the words of a name.
+fn is_invisible(c: char) -> bool {
+    if c == ' ' {
+        return false;
+    }
+    if c.is_whitespace() {
+        // Every other space character (the tab and the newline are control
+        // characters and are already gone) is a look-alike of the plain space
+        // and is removed.
+        return true;
+    }
+    matches!(c,
         '\u{00AD}'
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
             | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
@@ -646,27 +725,74 @@ fn strip_links(raw: &str) -> String {
 /// True when the segment is a URL, a `www.` host or an invite link.
 ///
 /// The rule is a class rule, not a list of examples: a segment whose host part is a
-/// dotted name with an alphabetic top-level domain is a host, whether or not it
-/// carries a path, a query or a port. `example.com`, `example.com/x`, `example.com:8080`
-/// and `www.example.com` are all removed, and so is a bare invite host such as
-/// `discord.gg`.
+/// dotted name with a valid top-level domain is a host, whether or not it carries a
+/// path, a query, a fragment or a port. `example.com`, `example.com/x`,
+/// `example.com:8080` and `www.example.com` are all removed, and so is a bare invite
+/// host such as `discord.gg`.
 fn is_link_like(segment: &str) -> bool {
-    let lowered = segment.to_ascii_lowercase();
+    let trimmed = segment.trim_matches(|c: char| !c.is_alphanumeric());
+    let lowered = trimmed.to_ascii_lowercase();
     if lowered.contains("://") || lowered.starts_with("www.") {
         return true;
     }
     if contains_invite_host(&lowered) {
         return true;
     }
-    // The host part is what stands in front of the first slash.
-    let host = match lowered.find('/') {
-        Some(slash) => &lowered[..slash],
-        None => lowered.as_str(),
-    };
+    // The host part is what stands in front of the first slash, question mark or
+    // fragment marker: everything from there on belongs to the link, not to the
+    // host.
+    let host = cut_at_first_of(&lowered, &['/', '?', '#']);
     // A host may carry a port and may carry user information before the `@`.
     let host = host.rsplit('@').next().unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);
     looks_like_host(host)
+}
+
+/// Cuts the text at the first of the given markers.
+fn cut_at_first_of<'a>(text: &'a str, markers: &[char]) -> &'a str {
+    match text.find(markers) {
+        Some(index) => &text[..index],
+        None => text,
+    }
+}
+
+/// True when the text looks like a host name such as `example.invalid`.
+///
+/// The name must carry at least one dot, and its last label must be a valid
+/// top-level domain: at least two alphabetic characters, or a punycode label
+/// (`xn--` followed by letters and digits). So `example.com`, `discord.gg` and
+/// `example.xn--p1ai` are hosts while `e.g.` and `version 1.2` are not.
+///
+/// A trailing dot is allowed: `example.com.` is the fully qualified form of the
+/// same host.
+fn looks_like_host(host: &str) -> bool {
+    // The host may be wrapped in punctuation; the punctuation is not part of it.
+    let host = host.trim_matches(|c: char| !c.is_alphanumeric());
+    if !host.contains('.') || host.starts_with('.') {
+        return false;
+    }
+    // A trailing dot is the fully qualified form and does not change the host.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+    let last_label = host.rsplit('.').next().unwrap_or_default();
+    is_top_level_domain(last_label)
+}
+
+/// True when the label is a valid top-level domain.
+///
+/// The label is either alphabetic (`com`, `gg`, `invalid`) or a punycode label
+/// (`xn--p1ai`), which is what a host with a non-ASCII top-level domain looks
+/// like once it is encoded.
+fn is_top_level_domain(label: &str) -> bool {
+    if label.len() >= 2 && label.chars().all(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    let Some(encoded) = label.strip_prefix("xn--") else {
+        return false;
+    };
+    !encoded.is_empty() && encoded.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// True when the text carries one of the known invite hosts.
@@ -686,19 +812,6 @@ fn contains_invite_host(lowered: &str) -> bool {
         "discord.new",
     ];
     INVITE_HOSTS.iter().any(|host| lowered.contains(host))
-}
-
-/// True when the text looks like a host name such as `example.invalid`.
-///
-/// The name must carry at least one dot, must not start or end with one, and its last
-/// label must be at least two alphabetic characters, so `example.com` and `discord.gg`
-/// are hosts while `e.g.` and `version 1.2` are not.
-fn looks_like_host(host: &str) -> bool {
-    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
-        return false;
-    }
-    let last_label = host.rsplit('.').next().unwrap_or_default();
-    last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// Finds the run of segments that, joined without spaces, starts with an invite host.
@@ -1631,16 +1744,18 @@ mod tests {
         );
     }
 
-    /// An extreme `empty_since` from persistence must not panic and must not wrap
-    /// around into a negative elapsed time, which would keep the room for ever.
+    /// An extreme `empty_since` from persistence must not panic, and a room whose
+    /// `empty_since` is far in the past is past its grace and must be cleaned up:
+    /// the elapsed time saturates instead of wrapping around into a negative
+    /// number, which would keep the room for ever.
     #[test]
     fn an_extreme_empty_since_does_not_panic_and_keeps_the_room() {
         let state = state_with(vec![room(OWNER, 0, Some(i64::MIN))]);
         let decision = decide_leave(ROOM, OWNER, T0, &cfg(), &state);
         assert_eq!(
-            expect_deny(&decision),
-            DenyReason::EmptyGraceNotElapsed,
-            "a room whose empty_since is far in the past must still be cleaned up"
+            decision,
+            Decision::Cleanup(ROOM),
+            "a room whose empty_since is far in the past is past its grace and must be cleaned up"
         );
     }
 
@@ -1861,8 +1976,46 @@ mod tests {
             }
         }
 
-        // The quiet phase: no more joins, no more leaves. The clock advances past
-        // every grace period and the runtime sweeps the rooms that are empty.
+        // The quiet phase: no more joins. First everybody who is still in a room
+        // leaves it, so every room becomes empty and the grace period starts.
+        // Then the clock advances past every grace period and the runtime sweeps
+        // the rooms.
+        for _ in 0..10 {
+            let rooms: Vec<(u64, u64)> = state
+                .rooms
+                .iter()
+                .map(|r| (r.channel_id, r.owner_id))
+                .collect();
+            for (channel_id, owner_id) in rooms {
+                let occupants = state
+                    .room(channel_id)
+                    .map(|r| r.occupants)
+                    .unwrap_or_default();
+                let decision = decide_leave(channel_id, owner_id, now, &config, &state);
+                match decision {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) => {
+                        let after_leave = occupants.saturating_sub(1);
+                        if let Some(room) =
+                            state.rooms.iter_mut().find(|r| r.channel_id == channel_id)
+                        {
+                            room.occupants = after_leave;
+                            if after_leave == 0 {
+                                room.empty_since = Some(now);
+                            }
+                        }
+                    }
+                    Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+            now += 1;
+        }
+
+        // Every room is empty now. The clock advances past every grace period and
+        // the runtime sweeps the rooms that are empty.
         now += config.empty_grace_secs * 2;
         for _ in 0..10 {
             let rooms: Vec<u64> = state.rooms.iter().map(|r| r.channel_id).collect();
