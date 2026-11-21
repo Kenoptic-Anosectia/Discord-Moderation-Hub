@@ -40,6 +40,14 @@ pub const KEY_COUNT_SELF_DEAFENED: &str = "ACTIVITY_COUNT_SELF_DEAFENED";
 /// Seconds in one day. Used to walk UTC day boundaries.
 pub const SECONDS_PER_DAY: i64 = 86_400;
 
+/// The largest number of voice records one closed session may emit.
+///
+/// A session that crosses more UTC days than this is not credited at all and is
+/// flagged, because the split would otherwise emit one record per day and a
+/// corrupt timestamp could ask for an unbounded number of them. The value is far
+/// beyond any real voice presence: it is a year of days.
+pub const MAX_SESSION_RECORDS: usize = 366;
+
 /// The plain facts about one incoming message.
 ///
 /// The content of the message is deliberately absent: the policy counts messages and
@@ -1988,6 +1996,9 @@ mod tests {
         let restart = ledger.note_restart(T + 10, T + 1_000, &cfg());
         assert_eq!(restart.anomalies.len(), 1);
         assert_eq!(restart.anomalies[0].kind, AnomalyKind::RestartGap);
+        // The anomaly marks the START of the uncredited gap, which is the end of
+        // the credited span, not the heartbeat that lies about the future.
+        assert_eq!(restart.anomalies[0].at, T + 10);
     }
 
     #[test]
@@ -2038,5 +2049,118 @@ mod tests {
         assert_eq!(left.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
         assert_eq!(left.anomalies[0].channel_id, Some(AFK));
         assert!(left.sessions.is_empty());
+    }
+
+    // ---- the record cap ----------------------------------------------------
+
+    #[test]
+    fn a_session_that_needs_more_records_than_the_cap_is_not_credited() {
+        // A span longer than the cap would need one record per UTC day. The
+        // session is not credited and the drop is flagged.
+        let start = day_start(T);
+        let end = start + (MAX_SESSION_RECORDS as i64 + 1) * SECONDS_PER_DAY;
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(end, CHANNEL), &cfg());
+        assert!(left.sessions.is_empty());
+        assert_eq!(left.anomalies.len(), 1);
+        assert_eq!(left.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+    }
+
+    #[test]
+    fn a_session_that_stays_within_the_cap_is_credited() {
+        // Exactly at the cap the session is credited normally, so the cap does
+        // not refuse a long but legitimate presence.
+        let start = day_start(T);
+        let end = start + (MAX_SESSION_RECORDS as i64) * SECONDS_PER_DAY;
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(end, CHANNEL), &cfg());
+        assert_eq!(left.sessions.len(), MAX_SESSION_RECORDS);
+        assert!(left.anomalies.is_empty());
+    }
+
+    #[test]
+    fn a_span_across_the_whole_timestamp_range_is_not_credited_and_does_not_allocate() {
+        // Two timestamps at the far ends of the range would need billions of
+        // daily records. The session is dropped and flagged instead, and the
+        // process does not run out of memory.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(i64::MIN, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(i64::MAX, CHANNEL), &cfg());
+        assert!(left.sessions.is_empty());
+        assert_eq!(left.anomalies.len(), 1);
+        assert_eq!(left.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+    }
+
+    #[test]
+    fn a_span_across_the_whole_timestamp_range_is_dropped_at_the_restart_too() {
+        // The restart closes the session the same way a leave does, so the same
+        // bound applies there.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(i64::MIN, CHANNEL), &cfg());
+        let restart = ledger.note_restart(i64::MAX, i64::MIN, &cfg());
+        assert!(restart.sessions.is_empty());
+        assert!(restart
+            .anomalies
+            .iter()
+            .any(|a| a.kind == AnomalyKind::UnaccountedChannel));
+    }
+
+    // ---- the voice path refuses the id zero --------------------------------
+
+    #[test]
+    fn a_voice_event_with_a_zero_guild_is_refused() {
+        let mut event = join(T, CHANNEL);
+        event.guild_id = 0;
+        let mut ledger = Ledger::new();
+        let outcome = ledger.apply_voice(&event, &cfg());
+        assert!(outcome.sessions.is_empty());
+        assert_eq!(outcome.anomalies.len(), 1);
+        assert_eq!(outcome.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+    }
+
+    #[test]
+    fn a_voice_event_with_a_zero_user_is_refused() {
+        let mut event = join(T, CHANNEL);
+        event.user_id = 0;
+        let mut ledger = Ledger::new();
+        let outcome = ledger.apply_voice(&event, &cfg());
+        assert!(outcome.sessions.is_empty());
+        assert_eq!(outcome.anomalies.len(), 1);
+        assert_eq!(outcome.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+    }
+
+    #[test]
+    fn a_voice_event_with_a_zero_channel_is_refused() {
+        let mut ledger = Ledger::new();
+        let outcome = ledger.apply_voice(&join(T, 0), &cfg());
+        assert!(outcome.sessions.is_empty());
+        assert_eq!(outcome.anomalies.len(), 1);
+        assert_eq!(outcome.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+        assert_eq!(outcome.anomalies[0].channel_id, Some(0));
+    }
+
+    #[test]
+    fn a_voice_event_with_a_zero_id_never_credits_a_session() {
+        // The whole event is refused, so the leave that follows has no session
+        // to close and credits nothing either.
+        let mut ledger = Ledger::new();
+        let joined = ledger.apply_voice(&join(T, 0), &cfg());
+        assert!(joined.sessions.is_empty());
+        let left = ledger.apply_voice(&leave(T + 600, 0), &cfg());
+        assert!(left.sessions.is_empty());
+        assert!(left
+            .anomalies
+            .iter()
+            .all(|a| a.kind == AnomalyKind::UnaccountedChannel));
+    }
+
+    #[test]
+    fn a_voice_event_with_a_zero_id_opens_no_session() {
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(T, 0), &cfg());
+        assert_eq!(ledger.open_session_count(), 0);
+        assert!(ledger.is_idle(GUILD, USER));
     }
 }
