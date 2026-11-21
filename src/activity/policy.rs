@@ -735,12 +735,14 @@ impl Ledger {
             let end = segment.end.max(start);
             let mut cursor = start;
             while cursor < end {
-                // The boundary is the start of the next UTC day. It is always strictly
-                // after the cursor, so the loop advances. The guard below makes that a
-                // property of the loop and not only of `next_day_start`.
+                // The boundary is the start of the next UTC day. It is strictly after
+                // the cursor for every cursor the loop can take, because the cursor
+                // is below the end of the session and the end of a session is an
+                // `i64`, so the cursor is at most `i64::MAX - 1`. The guard below
+                // keeps the loop advancing even if that ever stops being true.
                 //
-                // `cursor` is below `end`, and `end` is an `i64`, so `cursor` can never
-                // be `i64::MAX` here and the step of one second cannot overflow.
+                // The cursor is below `end`, and `end` is an `i64`, so the step of one
+                // second cannot overflow here either.
                 let boundary = next_day_start(cursor);
                 let stop = end.min(boundary.max(cursor.saturating_add(1)));
                 if !segment.self_deaf || cfg.count_self_deafened() {
@@ -1809,6 +1811,34 @@ mod tests {
     // These reach the real edges of `i64`, not a comfortable distance away from
     // them. A timestamp is seconds since the epoch, so `i64::MAX` and `i64::MIN`
     // are the extremes a caller could pass. Nothing may panic on them.
+
+    #[test]
+    fn the_next_day_start_is_after_every_cursor_the_day_split_can_take() {
+        // The day split walks the cursor forward one UTC day at a time. The cursor
+        // is always below the end of the session and the end of a session is an
+        // `i64`, so the cursor is at most `i64::MAX - 1`. For every one of those
+        // the next day start must be strictly later, otherwise the split could not
+        // move on.
+        for at in [
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MIN + 86_399,
+            i64::MIN + 86_400,
+            -86_400,
+            -1,
+            0,
+            86_399,
+            86_400,
+            1_709_640_000,
+            i64::MAX - 86_400,
+            i64::MAX - 1,
+        ] {
+            assert!(
+                next_day_start(at) > at,
+                "the next day start must be after {at}"
+            );
+        }
+    }
 
     #[test]
     fn a_join_and_leave_at_the_largest_timestamps_do_not_panic() {
