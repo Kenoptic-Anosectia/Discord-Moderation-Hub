@@ -339,6 +339,24 @@ pub fn next_day_start(at: i64) -> i64 {
     day_start(at).saturating_add(SECONDS_PER_DAY)
 }
 
+/// The number of UTC days the stretch `start..end` touches.
+///
+/// This is the number of records the day split emits for that stretch, computed
+/// with arithmetic instead of a walk. The stretch is half open: the second at
+/// `end` belongs to the next stretch. An empty stretch touches no day.
+fn days_touched(start: i64, end: i64) -> u64 {
+    if end <= start {
+        return 0;
+    }
+    // The last second of the stretch is `end - 1`. The difference of the two day
+    // indexes is the number of day boundaries between them, so the count is that
+    // plus the first day itself.
+    let last = end - 1;
+    let first_day = start.div_euclid(SECONDS_PER_DAY);
+    let last_day = last.div_euclid(SECONDS_PER_DAY);
+    (last_day - first_day).saturating_add(1) as u64
+}
+
 /// Converts a count of days since the Unix epoch into a civil (year, month, day).
 ///
 /// This is Howard Hinnant's `civil_from_days` algorithm, which is exact for the whole
@@ -489,6 +507,23 @@ impl Ledger {
     pub fn apply_voice(&mut self, event: &VoiceEvent, cfg: &ActivityConfig) -> VoiceOutcome {
         let mut outcome = VoiceOutcome::default();
         let key = (event.guild_id, event.user_id);
+
+        // An update that names the id zero is refused before anything else, the
+        // same way the message path refuses it. The id zero is not a real guild,
+        // member or channel, so a presence recorded against it would be a
+        // presence nobody had. The whole event is refused: no session is opened,
+        // no session is closed and the ledger is left exactly as it was.
+        let zero_channel = event.old_channel == Some(0) || event.new_channel == Some(0);
+        if event.guild_id == 0 || event.user_id == 0 || zero_channel {
+            outcome.anomalies.push(Anomaly {
+                kind: AnomalyKind::UnaccountedChannel,
+                guild_id: event.guild_id,
+                user_id: event.user_id,
+                channel_id: event.old_channel.or(event.new_channel),
+                at: event.at,
+            });
+            return outcome;
+        }
 
         // An update that is older than the last one seen for this member is refused
         // before anything else: it must not reopen or re-close a session.
@@ -710,6 +745,11 @@ impl Ledger {
     /// The session is not credited when its channel is excluded or the AFK channel.
     /// The anomaly that says so is raised here, on the outcome that drops the
     /// session, not on the outcome that opened it.
+    ///
+    /// The session is also not credited when the split would need more than
+    /// [`MAX_SESSION_RECORDS`] records. The number of records is known before the
+    /// split starts, so an absurd span is refused instead of asking for an
+    /// unbounded allocation.
     fn close(
         &self,
         session: OpenSession,
@@ -737,6 +777,26 @@ impl Ledger {
         let mut segments = session.segments;
         if let Some(last) = segments.last_mut() {
             last.end = end_at.max(last.start);
+        }
+        // How many records the split would emit. It is one record per UTC day the
+        // session touches, summed over the stretches. The count is known without
+        // walking the days, so a span that would need an unbounded number of
+        // records is refused here and never allocated.
+        let records: u64 = segments
+            .iter()
+            .map(|segment| days_touched(segment.start, segment.end))
+            .fold(0u64, |total, count| total.saturating_add(count));
+        if records > MAX_SESSION_RECORDS as u64 {
+            // The presence is not credited: the span is beyond anything a real
+            // presence can be, so the safe failure is to drop it and say so.
+            outcome.anomalies.push(Anomaly {
+                kind: AnomalyKind::UnaccountedChannel,
+                guild_id,
+                user_id,
+                channel_id: Some(channel_id),
+                at: end_at,
+            });
+            return;
         }
         for segment in &segments {
             let start = segment.start;
@@ -2096,10 +2156,11 @@ mod tests {
     #[test]
     fn a_span_across_the_whole_timestamp_range_is_dropped_at_the_restart_too() {
         // The restart closes the session the same way a leave does, so the same
-        // bound applies there.
+        // bound applies there. The heartbeat is at the top of the range, so the
+        // credited span is the whole range and the cap applies to it.
         let mut ledger = Ledger::new();
         ledger.apply_voice(&join(i64::MIN, CHANNEL), &cfg());
-        let restart = ledger.note_restart(i64::MAX, i64::MIN, &cfg());
+        let restart = ledger.note_restart(i64::MAX, i64::MAX, &cfg());
         assert!(restart.sessions.is_empty());
         assert!(restart
             .anomalies
