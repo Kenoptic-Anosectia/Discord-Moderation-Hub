@@ -313,13 +313,22 @@ pub fn utc_day(at: i64) -> String {
 }
 
 /// The start of the UTC day that contains the timestamp, in seconds since the epoch.
+///
+/// The floor of the day is not representable for a timestamp at the very bottom of
+/// the `i64` range, so it is clamped there instead of overflowing.
 pub fn day_start(at: i64) -> i64 {
-    at.div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY
+    at.div_euclid(SECONDS_PER_DAY)
+        .saturating_mul(SECONDS_PER_DAY)
 }
 
 /// The start of the next UTC day after the one that contains the timestamp.
+///
+/// The start of the next day is not representable for a timestamp in the very last
+/// day of the `i64` range, so it is clamped to the end of the range instead of
+/// overflowing. Nothing in the representable range lies after that day, so the
+/// clamped value splits no session in two.
 pub fn next_day_start(at: i64) -> i64 {
-    day_start(at) + SECONDS_PER_DAY
+    day_start(at).saturating_add(SECONDS_PER_DAY)
 }
 
 /// Converts a count of days since the Unix epoch into a civil (year, month, day).
@@ -651,10 +660,15 @@ impl Ledger {
 
     /// Records a restart of the bot.
     ///
-    /// Every open session is closed at `last_heartbeat_at`, the last moment the bot was
-    /// known to be running. The gap between that moment and `now_at` is not credited and
-    /// is flagged as a [`AnomalyKind::RestartGap`], because crediting the hours the bot
-    /// was offline would inflate the levels.
+    /// Every open session is closed at the last moment the bot was known to be
+    /// running, which is `last_heartbeat_at`, but never later than `now_at`, the
+    /// instant the bot came back. A heartbeat that claims a moment AFTER the
+    /// restart would credit presence that had not happened yet, so the credited
+    /// span stops at `now_at` and the difference is not credited.
+    ///
+    /// The difference between the credited end and the heartbeat is flagged as a
+    /// [`AnomalyKind::RestartGap`], because crediting the hours the bot was
+    /// offline would inflate the levels.
     pub fn note_restart(
         &mut self,
         now_at: i64,
@@ -662,36 +676,32 @@ impl Ledger {
         cfg: &ActivityConfig,
     ) -> VoiceOutcome {
         let mut outcome = VoiceOutcome::default();
+        // The credited span never reaches past the restart instant. When the
+        // heartbeat lies about the future, the earlier of the two wins.
+        let credited_end = last_heartbeat_at.min(now_at);
         let keys: Vec<(u64, u64)> = self.open.keys().copied().collect();
         for (guild_id, user_id) in keys {
             let Some(session) = self.open.remove(&(guild_id, user_id)) else {
                 continue;
             };
-            self.close(
-                session,
-                guild_id,
-                user_id,
-                last_heartbeat_at,
-                cfg,
-                &mut outcome,
-            );
+            self.close(session, guild_id, user_id, credited_end, cfg, &mut outcome);
             outcome.anomalies.push(Anomaly {
                 kind: AnomalyKind::RestartGap,
                 guild_id,
                 user_id,
                 channel_id: None,
-                at: last_heartbeat_at,
+                at: credited_end,
             });
         }
         self.last_seen.clear();
-        let _ = now_at;
         outcome
     }
 
     /// Closes an open session at `end_at` and pushes the credited stretches.
     ///
-    /// The session is not credited when its channel is excluded or the AFK channel: the
-    /// anomaly for that was already raised when the session opened.
+    /// The session is not credited when its channel is excluded or the AFK channel.
+    /// The anomaly that says so is raised here, on the outcome that drops the
+    /// session, not on the outcome that opened it.
     fn close(
         &self,
         session: OpenSession,
@@ -728,8 +738,11 @@ impl Ledger {
                 // The boundary is the start of the next UTC day. It is always strictly
                 // after the cursor, so the loop advances. The guard below makes that a
                 // property of the loop and not only of `next_day_start`.
+                //
+                // `cursor` is below `end`, and `end` is an `i64`, so `cursor` can never
+                // be `i64::MAX` here and the step of one second cannot overflow.
                 let boundary = next_day_start(cursor);
-                let stop = end.min(boundary.max(cursor + 1));
+                let stop = end.min(boundary.max(cursor.saturating_add(1)));
                 if !segment.self_deaf || cfg.count_self_deafened() {
                     outcome.sessions.push(VoiceSession {
                         user_id,
@@ -1824,13 +1837,18 @@ mod tests {
         // The session starts in the last day that fits in `i64` and ends at the very
         // end of the range, so the day split has to work at the edge.
         let mut ledger = Ledger::new();
-        ledger.apply_voice(&join(i64::MAX - 200_000, CHANNEL), &cfg());
-        let left = ledger.apply_voice(&leave(i64::MAX, CHANNEL), &cfg());
+        let start = i64::MAX - 200_000;
+        let end = i64::MAX;
+        ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(end, CHANNEL), &cfg());
         let credited: u64 = left.sessions.iter().map(|s| s.seconds).sum();
         assert_eq!(credited, 200_000);
         for session in &left.sessions {
             assert!(session.start <= session.end);
-            assert!(session.end <= i64::MAX);
+            // The record may not reach past the end of the session it came from.
+            assert!(session.end <= end);
+            assert!(session.start >= start);
+            assert_eq!(session.seconds, (session.end - session.start) as u64);
         }
     }
 
@@ -1867,8 +1885,8 @@ mod tests {
     #[test]
     fn a_seeded_sweep_of_edge_timestamps_never_panics_and_never_overlaps() {
         // A sweep over the whole range: every credited record must stay inside the
-        // range, must not overlap its neighbour and must never have a negative
-        // length.
+        // session it came from, must not overlap its neighbour and must never have
+        // a negative length.
         let config = plain_cfg();
         let mut rng = Lcg(0x5EED_1234_ABCD_0005);
         let mut ledger = Ledger::new();
@@ -1885,14 +1903,16 @@ mod tests {
             let outcome = ledger.apply_voice(&join(at, channel), &config);
             for session in &outcome.sessions {
                 assert!(session.start <= session.end);
-                assert!(session.end <= i64::MAX);
-                assert!(session.start >= i64::MIN);
+                assert_eq!(session.seconds, (session.end - session.start) as u64);
             }
-            let left = ledger.apply_voice(&leave(at + 1, channel), &config);
+            // The leave follows one second after the join. The step is saturating so
+            // the sweep itself cannot overflow at the top of the range.
+            let leave_at = at.saturating_add(1);
+            let left = ledger.apply_voice(&leave(leave_at, channel), &config);
             for session in &left.sessions {
                 assert!(session.start <= session.end);
-                assert!(session.end <= i64::MAX);
-                assert!(session.start >= i64::MIN);
+                assert!(session.start >= at);
+                assert!(session.end <= leave_at);
                 assert_eq!(session.seconds, (session.end - session.start) as u64);
             }
         }
@@ -1931,12 +1951,11 @@ mod tests {
         let mut ledger = Ledger::new();
         ledger.apply_voice(&join(T, CHANNEL), &cfg());
         let restart = ledger.note_restart(T - 100, T - 50, &cfg());
+        assert!(restart.sessions.is_empty());
         let credited: u64 = restart.sessions.iter().map(|s| s.seconds).sum();
         assert_eq!(credited, 0);
-        for session in &restart.sessions {
-            assert!(session.start <= session.end);
-            assert_eq!(session.seconds, 0);
-        }
+        assert_eq!(restart.anomalies.len(), 1);
+        assert_eq!(restart.anomalies[0].kind, AnomalyKind::RestartGap);
     }
 
     #[test]
@@ -1949,10 +1968,7 @@ mod tests {
         let mut ledger = Ledger::new();
         for _ in 0..500 {
             clock += (rng.next() % 300) as i64 + 1;
-            ledger.apply_voice(
-                &join(clock, CHANNEL),
-                &config,
-            );
+            ledger.apply_voice(&join(clock, CHANNEL), &config);
             let heartbeat = clock - 1 + (rng.next() as i64 % 5_000);
             let restart = ledger.note_restart(clock, heartbeat, &config);
             for session in &restart.sessions {
