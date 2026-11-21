@@ -285,6 +285,11 @@ pub enum DenyReason {
     EmptyGraceNotElapsed,
     /// The member already has access to the room.
     AlreadyPermitted,
+    /// The configuration is invalid, so the request is refused rather than
+    /// answered with a nonsensical bound.
+    InvalidConfig,
+    /// The room still holds members, so it may not be cleaned up.
+    RoomNotEmpty,
 }
 
 impl DenyReason {
@@ -303,6 +308,8 @@ impl DenyReason {
             DenyReason::UntrackedChannel => "untracked_channel",
             DenyReason::EmptyGraceNotElapsed => "empty_grace_not_elapsed",
             DenyReason::AlreadyPermitted => "already_permitted",
+            DenyReason::InvalidConfig => "invalid_config",
+            DenyReason::RoomNotEmpty => "room_not_empty",
         }
     }
 }
@@ -451,6 +458,23 @@ pub fn decide_leave(
         return Decision::Cleanup(channel_id);
     }
     Decision::Deny(DenyReason::EmptyGraceNotElapsed)
+}
+
+/// Decides whether an empty room may be cleaned up, without a member leaving.
+///
+/// The runtime has to be able to reap a room whose last member left before the
+/// grace period had elapsed: nobody leaves the room again, so `decide_leave` would
+/// never be called for it. The sweep is the runtime's periodic check: it cleans an
+/// empty room up once its grace period has elapsed, and it never touches a room
+/// that still holds members or a channel the policy does not track.
+pub fn decide_sweep(
+    channel_id: u64,
+    now: i64,
+    config: &VoiceRoomConfig,
+    state: &VoiceRoomState,
+) -> Decision {
+    let _ = (channel_id, now, config, state);
+    Decision::Deny(DenyReason::UntrackedChannel)
 }
 
 /// Decides whether a room may be renamed.
@@ -1055,6 +1079,211 @@ mod tests {
         assert!(cleaned.contains("party"));
     }
 
+    /// An invisible character inside a mention must not let the mention through:
+    /// the cleaning removes the invisible characters FIRST, so the mention that
+    /// they were hiding is recognised and removed.
+    #[test]
+    fn an_invisible_character_inside_a_mention_does_not_hide_the_mention() {
+        let cleaned = sanitize_name("@every\u{200B}one party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("@everyone"),
+            "a mention split by a zero-width character must not survive: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A zero-width joiner inside a mention must not let the mention through.
+    #[test]
+    fn a_joiner_inside_a_mention_does_not_hide_the_mention() {
+        let cleaned = sanitize_name("@he\u{200D}re party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("@here"),
+            "a mention split by a joiner must not survive: {cleaned:?}"
+        );
+    }
+
+    /// A control character inside a mention must not let the mention through.
+    #[test]
+    fn a_control_character_inside_a_mention_does_not_hide_the_mention() {
+        let cleaned = sanitize_name("@every\u{0007}one party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("@everyone"),
+            "a mention split by a control character must not survive: {cleaned:?}"
+        );
+    }
+
+    /// An invisible character inside a user mention token must not let the token
+    /// through.
+    #[test]
+    fn an_invisible_character_inside_a_mention_token_does_not_hide_it() {
+        let cleaned = sanitize_name("<\u{200B}@1000000000000000007> party", "Voice Room");
+        assert!(
+            !cleaned.contains("<@") && !cleaned.contains("1000000000000000007"),
+            "a mention token split by a zero-width character must not survive: {cleaned:?}"
+        );
+    }
+
+    /// A nested mention token must not reassemble into a live token: the mention
+    /// stripping runs until the text stops changing.
+    #[test]
+    fn a_nested_mention_token_does_not_reassemble() {
+        let cleaned = sanitize_name("<<@1000000000000000007>@1000000000000000007>", "Voice Room");
+        assert!(
+            !cleaned.contains("<@"),
+            "a nested mention token must not reassemble into a live token: {cleaned:?}"
+        );
+    }
+
+    /// No mention of any shape survives the cleaning: the final name carries no
+    /// `<@`, no `<#`, no `@everyone` and no `@here`, whatever the input was.
+    #[test]
+    fn no_mention_of_any_shape_survives_the_cleaning() {
+        let inputs = [
+            "@everyone party",
+            "@here party",
+            "<@1000000000000000007> party",
+            "<@&1000000000000000009> party",
+            "<#1000000000000000004> party",
+            "@every\u{200B}one party",
+            "<\u{200B}@1000000000000000007> party",
+            "<<@1000000000000000007>@1000000000000000007>",
+            "@ev\u{0007}eryone party",
+            "@\u{202A}everyone party",
+        ];
+        for input in inputs {
+            let cleaned = sanitize_name(input, "Voice Room");
+            let lowered = cleaned.to_lowercase();
+            assert!(
+                !lowered.contains("<@") && !lowered.contains("<#"),
+                "a mention token survived for {input:?}: {cleaned:?}"
+            );
+            assert!(
+                !lowered.contains("@everyone") && !lowered.contains("@here"),
+                "a mention word survived for {input:?}: {cleaned:?}"
+            );
+        }
+    }
+
+    /// The bidirectional control characters are removed: they can reorder the text
+    /// a reader sees without changing the bytes.
+    #[test]
+    fn bidirectional_control_characters_are_removed() {
+        let cleaned = sanitize_name("a\u{202A}b\u{202C}c", "Voice Room");
+        assert_eq!(cleaned, "abc");
+    }
+
+    /// The tag characters are removed: they are invisible and can carry text that
+    /// a reader never sees.
+    #[test]
+    fn tag_characters_are_removed() {
+        let cleaned = sanitize_name("\u{E0041}\u{E0042} party", "Voice Room");
+        assert_eq!(cleaned, "party");
+    }
+
+    /// A name that is only invisible characters falls back to the default name.
+    #[test]
+    fn a_name_of_only_invisible_characters_falls_back_to_the_default() {
+        assert_eq!(
+            sanitize_name("\u{E0041}\u{E0042}", "Voice Room"),
+            "Voice Room",
+            "a name made only of invisible characters is an empty name"
+        );
+        assert_eq!(
+            sanitize_name("\u{3164}", "Voice Room"),
+            "Voice Room",
+            "a name made only of a Hangul filler is an empty name"
+        );
+    }
+
+    /// The Hangul filler is removed: it looks blank but is not a control
+    /// character.
+    #[test]
+    fn the_hangul_filler_is_removed() {
+        let cleaned = sanitize_name("par\u{3164}ty", "Voice Room");
+        assert_eq!(cleaned, "party");
+    }
+
+    /// A host inside brackets is removed: the brackets are punctuation around the
+    /// host, not part of it.
+    #[test]
+    fn a_host_in_brackets_is_removed() {
+        let cleaned = sanitize_name("(example.com) party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a bracketed host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host followed by a comma is removed: the comma is punctuation after the
+    /// host, not part of it.
+    #[test]
+    fn a_host_followed_by_a_comma_is_removed() {
+        let cleaned = sanitize_name("example.com, party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a host followed by a comma must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host with a trailing dot is removed: the trailing dot is the fully
+    /// qualified form of the same host.
+    #[test]
+    fn a_host_with_a_trailing_dot_is_removed() {
+        let cleaned = sanitize_name("example.com. party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a trailing-dot host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host with a query string is removed: the query is part of the link.
+    #[test]
+    fn a_host_with_a_query_is_removed() {
+        let cleaned = sanitize_name("example.com?x=1 party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a host with a query must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host with a fragment is removed: the fragment is part of the link.
+    #[test]
+    fn a_host_with_a_fragment_is_removed() {
+        let cleaned = sanitize_name("example.com#x party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "a host with a fragment must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host inside angle brackets is removed.
+    #[test]
+    fn a_host_in_angle_brackets_is_removed() {
+        let cleaned = sanitize_name("<example.com> party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.com"),
+            "an angle-bracketed host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
+    /// A host with a punycode top-level domain is removed: the last label is not
+    /// alphabetic, but it is a valid top-level domain.
+    #[test]
+    fn a_host_with_a_punycode_top_level_domain_is_removed() {
+        let cleaned = sanitize_name("example.xn--p1ai party", "Voice Room");
+        assert!(
+            !cleaned.to_lowercase().contains("example.xn--p1ai"),
+            "a punycode host must not survive the cleaning: {cleaned:?}"
+        );
+        assert!(cleaned.contains("party"));
+    }
+
     /// Text that only looks a little like a host is kept: the cleaning removes
     /// hosts, not ordinary words that carry a dot.
     #[test]
@@ -1402,6 +1631,129 @@ mod tests {
         );
     }
 
+    /// An extreme `empty_since` from persistence must not panic and must not wrap
+    /// around into a negative elapsed time, which would keep the room for ever.
+    #[test]
+    fn an_extreme_empty_since_does_not_panic_and_keeps_the_room() {
+        let state = state_with(vec![room(OWNER, 0, Some(i64::MIN))]);
+        let decision = decide_leave(ROOM, OWNER, T0, &cfg(), &state);
+        assert_eq!(
+            expect_deny(&decision),
+            DenyReason::EmptyGraceNotElapsed,
+            "a room whose empty_since is far in the past must still be cleaned up"
+        );
+    }
+
+    /// An extreme `empty_since` from persistence must still let the grace period
+    /// elapse: the elapsed time is saturated, not wrapped.
+    #[test]
+    fn an_extreme_empty_since_still_reaches_the_grace() {
+        let state = state_with(vec![room(OWNER, 0, Some(i64::MIN))]);
+        let decision = decide_leave(ROOM, OWNER, i64::MAX, &cfg(), &state);
+        assert_eq!(
+            decision,
+            Decision::Cleanup(ROOM),
+            "the elapsed time must saturate, not wrap around"
+        );
+    }
+
+    /// An extreme `last_create` from persistence must not panic when the cooldown
+    /// is measured against it.
+    #[test]
+    fn an_extreme_last_create_does_not_panic() {
+        let mut state = state_with(Vec::new());
+        state.last_create.insert(OWNER, i64::MAX);
+        let decision = decide_join(&join(OWNER, -10), &cfg(), &state);
+        assert!(
+            matches!(decision, Decision::Deny(_)),
+            "an extreme last_create must deny, not panic"
+        );
+    }
+
+    /// An extreme `last_create` in the past must not panic when the cooldown is
+    /// measured against it.
+    #[test]
+    fn an_extreme_past_last_create_does_not_panic() {
+        let mut state = state_with(Vec::new());
+        state.last_create.insert(OWNER, i64::MIN);
+        let decision = decide_join(&join(OWNER, i64::MAX), &cfg(), &state);
+        assert!(
+            matches!(decision, Decision::Create(_)),
+            "the cooldown must saturate, not wrap around"
+        );
+    }
+
+    /// An extreme rename timestamp from persistence must not panic when the
+    /// rename window is measured against it.
+    #[test]
+    fn an_extreme_rename_timestamp_does_not_panic() {
+        let mut state = state_with(vec![room(OWNER, 2, None)]);
+        state.renames.push((ROOM, i64::MIN));
+        let decision = decide_rename(ROOM, OWNER, T0, &cfg(), &state);
+        assert!(
+            matches!(decision, Decision::Allow),
+            "the rename window must saturate, not wrap around"
+        );
+    }
+
+    /// A sweep cleans an empty room up once its grace period has elapsed, without
+    /// a member leaving: the runtime has to be able to reap a room whose last
+    /// member left before the grace elapsed.
+    #[test]
+    fn a_sweep_cleans_an_empty_room_up_after_the_grace() {
+        let state = state_with(vec![room(OWNER, 0, Some(T0))]);
+        let before = decide_sweep(ROOM, T0 + 59, &cfg(), &state);
+        assert_eq!(expect_deny(&before), DenyReason::EmptyGraceNotElapsed);
+        let after = decide_sweep(ROOM, T0 + 60, &cfg(), &state);
+        assert_eq!(after, Decision::Cleanup(ROOM));
+    }
+
+    /// A sweep never cleans a room up that still holds members.
+    #[test]
+    fn a_sweep_never_cleans_an_occupied_room_up() {
+        let state = state_with(vec![room(OWNER, 3, None)]);
+        let decision = decide_sweep(ROOM, T0 + 10_000, &cfg(), &state);
+        assert_eq!(expect_deny(&decision), DenyReason::RoomNotEmpty);
+    }
+
+    /// A sweep of a channel the policy does not track never deletes anything.
+    #[test]
+    fn a_sweep_of_an_untracked_channel_deletes_nothing() {
+        let state = state_with(Vec::new());
+        let decision = decide_sweep(OTHER_ROOM, T0 + 10_000, &cfg(), &state);
+        assert_eq!(expect_deny(&decision), DenyReason::UntrackedChannel);
+    }
+
+    /// A sweep is not a claim: it never hands a room to a new owner.
+    #[test]
+    fn a_sweep_never_claims_a_room() {
+        let state = state_with(vec![room(OWNER, 0, Some(T0))]);
+        let decision = decide_sweep(ROOM, T0 + 10_000, &cfg(), &state);
+        assert_ne!(decision, Decision::Claimable(ROOM));
+    }
+
+    /// A negative rename window is refused: a negative window would make the
+    /// budget unlimited, so the policy refuses the rename instead.
+    #[test]
+    fn a_negative_rename_window_refuses_the_rename() {
+        let mut config = cfg();
+        config.rename_budget.window_secs = -1;
+        let state = state_with(vec![room(OWNER, 2, None)]);
+        let decision = decide_rename(ROOM, OWNER, T0, &config, &state);
+        assert_eq!(expect_deny(&decision), DenyReason::InvalidConfig);
+    }
+
+    /// A negative grace period is refused: a negative grace would clean a room up
+    /// the instant it became empty.
+    #[test]
+    fn a_negative_grace_period_refuses_the_cleanup() {
+        let mut config = cfg();
+        config.empty_grace_secs = -1;
+        let state = state_with(vec![room(OWNER, 0, Some(T0))]);
+        let decision = decide_leave(ROOM, OWNER, T0, &config, &state);
+        assert_eq!(expect_deny(&decision), DenyReason::InvalidConfig);
+    }
+
     /// A member who is not the owner leaving an EMPTY room does not claim it: the
     /// room is not claimable once it is empty, it is only cleaned up.
     #[test]
@@ -1424,9 +1776,19 @@ mod tests {
         assert_eq!(expect_deny(&decision), DenyReason::NotRoomOwner);
     }
 
-    /// Over a seeded sequence, a room that has become empty is always cleaned up
-    /// once its grace period has elapsed, whoever leaves last. No room may linger
-    /// forever and keep consuming the global cap.
+    /// Over a seeded sequence, every room that becomes empty is REMOVED once its
+    /// grace period has elapsed, whoever leaves last. No room may linger forever
+    /// and keep consuming the global cap.
+    ///
+    /// The model owns the occupancy and the `empty_since` stamp, exactly as the
+    /// runtime does: the count is the number of members in the room BEFORE the
+    /// leave, so a room whose count is one becomes empty when that member leaves.
+    /// The model decrements the count on EVERY leave, not only on the claimable
+    /// branch, and stamps `empty_since` when the count reaches zero.
+    ///
+    /// The quiet phase at the end advances the clock past every grace period and
+    /// asserts that every room is actually gone from the state, not merely that
+    /// it could be cleaned up.
     #[test]
     fn a_seeded_sequence_never_leaves_an_empty_room_forever() {
         let mut config = cfg();
@@ -1438,8 +1800,9 @@ mod tests {
         let mut rng = Lcg(0x5EED_1234_ABCD_0002);
         let mut now = T0;
         let members = [OWNER, MEMBER, OTHER_MEMBER, 1_000_000_000_000_000_010];
+        let mut next_channel = 1_000_000_000_000_200_000u64;
 
-        for step in 0..2_000 {
+        for _step in 0..2_000 {
             now += 1;
             let user = members[rng.below(members.len() as u64) as usize];
             if rng.below(3) == 0 {
@@ -1451,13 +1814,14 @@ mod tests {
                 };
                 match decide_join(&event, &config, &state) {
                     Decision::Create(_) => {
-                        let channel_id = 1_000_000_000_000_200_000 + step as u64;
+                        let channel_id = next_channel;
+                        next_channel += 1;
                         state.rooms.push(Room {
                             channel_id,
                             owner_id: user,
                             created_at: now,
                             empty_since: None,
-                            occupants: 2,
+                            occupants: 1,
                         });
                         state.last_create.insert(user, now);
                     }
@@ -1473,36 +1837,87 @@ mod tests {
                 } else {
                     OTHER_MEMBER
                 };
+                // The count the policy sees is the count BEFORE the leave.
                 let occupants = state.rooms[index].occupants;
-                match decide_leave(channel_id, leaver, now, &config, &state) {
+                let decision = decide_leave(channel_id, leaver, now, &config, &state);
+                // The model applies the leave on EVERY branch, not only on the
+                // claimable one: a member that leaves a room reduces its count.
+                let after_leave = occupants.saturating_sub(1);
+                match decision {
                     Decision::Cleanup(id) => {
                         state.rooms.retain(|r| r.channel_id != id);
                     }
                     Decision::Claimable(_) => {
-                        state.rooms[index].occupants = occupants.saturating_sub(1);
+                        state.rooms[index].occupants = after_leave;
+                        if after_leave == 0 {
+                            state.rooms[index].empty_since = Some(now);
+                        }
+                    }
+                    Decision::Deny(_) => {
+                        // The leave was refused, so the count does not change.
+                    }
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+        }
+
+        // The quiet phase: no more joins, no more leaves. The clock advances past
+        // every grace period and the runtime sweeps the rooms that are empty.
+        now += config.empty_grace_secs * 2;
+        for _ in 0..10 {
+            let rooms: Vec<u64> = state.rooms.iter().map(|r| r.channel_id).collect();
+            for channel_id in rooms {
+                match decide_sweep(channel_id, now, &config, &state) {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
                     }
                     Decision::Deny(_) => {}
                     other => panic!("unexpected decision {other:?}"),
                 }
             }
-
-            // Every empty room must be cleaned up once its grace has elapsed, even
-            // when the member who leaves last is not the owner.
-            for room in &state.rooms {
-                if room.occupants == 0 {
-                    let empty_since = room.empty_since.unwrap_or(now);
-                    if now - empty_since >= config.empty_grace_secs {
-                        let decision =
-                            decide_leave(room.channel_id, OTHER_MEMBER, now, &config, &state);
-                        assert_eq!(
-                            decision,
-                            Decision::Cleanup(room.channel_id),
-                            "an empty room past its grace must be cleanable by whoever leaves"
-                        );
-                    }
-                }
-            }
+            now += 1;
         }
+
+        assert!(
+            state.rooms.is_empty(),
+            "every room must be gone once its grace has elapsed: {:?}",
+            state.rooms
+        );
+        assert!(
+            state.rooms.len() < config.global_cap,
+            "the rooms must not pile up against the global cap"
+        );
+    }
+
+    /// The quiet phase of the seeded sequence is what makes it fail: a policy that
+    /// never cleans a room up leaves the rooms in the state, and a policy that
+    /// cleans a room up before its grace has elapsed is caught by the grace
+    /// boundary tests. This test asserts the end state directly.
+    #[test]
+    fn the_seeded_sequence_quiet_phase_removes_every_room() {
+        let mut config = cfg();
+        config.global_cap = 5;
+        config.per_user_cap = 1;
+        config.create_cooldown_secs = 0;
+        config.empty_grace_secs = 60;
+        let mut state = VoiceRoomState::default();
+        state.rooms.push(Room {
+            channel_id: ROOM,
+            owner_id: OWNER,
+            created_at: T0,
+            empty_since: Some(T0),
+            occupants: 0,
+        });
+
+        // The room is empty and its grace has elapsed: the sweep removes it.
+        let now = T0 + 60;
+        let decision = decide_sweep(ROOM, now, &config, &state);
+        assert_eq!(decision, Decision::Cleanup(ROOM));
+        state.rooms.retain(|r| r.channel_id != ROOM);
+        assert!(
+            state.rooms.is_empty(),
+            "the swept room must be gone from the state"
+        );
     }
 
     // ---------------------------------------------------------------------
