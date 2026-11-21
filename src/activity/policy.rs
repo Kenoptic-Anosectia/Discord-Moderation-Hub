@@ -1441,6 +1441,22 @@ mod tests {
     }
 
     #[test]
+    fn the_day_key_holds_at_both_edges_of_the_range() {
+        // The day key must have the same shape for every timestamp, including the
+        // two edges of the range the caller could pass.
+        for at in [i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1] {
+            let day = utc_day(at);
+            assert_eq!(day.len(), 10, "the day key must have ten characters");
+            assert!(
+                day.bytes().all(|b| b.is_ascii_digit() || b == b'-'),
+                "the day key must be digits and dashes"
+            );
+        }
+        assert_eq!(utc_day(i64::MAX), "9999-12-31");
+        assert_eq!(utc_day(i64::MIN), "0000-01-01");
+    }
+
+    #[test]
     fn a_timestamp_before_the_epoch_gets_a_valid_day() {
         let day = utc_day(-1);
         assert_eq!(day, "1969-12-31");
