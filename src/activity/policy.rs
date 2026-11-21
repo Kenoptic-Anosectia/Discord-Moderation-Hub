@@ -1790,4 +1790,191 @@ mod tests {
         }
         assert_eq!(credited, 0);
     }
+
+    // ---- the edges of the timestamp range -----------------------------------
+    //
+    // These reach the real edges of `i64`, not a comfortable distance away from
+    // them. A timestamp is seconds since the epoch, so `i64::MAX` and `i64::MIN`
+    // are the extremes a caller could pass. Nothing may panic on them.
+
+    #[test]
+    fn a_join_and_leave_at_the_largest_timestamps_do_not_panic() {
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(i64::MAX - 50, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(i64::MAX, CHANNEL), &cfg());
+        assert_eq!(left.sessions.len(), 1);
+        assert_eq!(left.sessions[0].seconds, 50);
+        assert_eq!(left.sessions[0].start, i64::MAX - 50);
+        assert_eq!(left.sessions[0].end, i64::MAX);
+    }
+
+    #[test]
+    fn a_join_and_leave_at_the_smallest_timestamps_do_not_panic() {
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(i64::MIN + 100, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(i64::MIN + 500, CHANNEL), &cfg());
+        assert_eq!(left.sessions.len(), 1);
+        assert_eq!(left.sessions[0].seconds, 400);
+        assert_eq!(left.sessions[0].start, i64::MIN + 100);
+        assert_eq!(left.sessions[0].end, i64::MIN + 500);
+    }
+
+    #[test]
+    fn a_session_that_straddles_the_last_day_does_not_panic() {
+        // The session starts in the last day that fits in `i64` and ends at the very
+        // end of the range, so the day split has to work at the edge.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(i64::MAX - 200_000, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(i64::MAX, CHANNEL), &cfg());
+        let credited: u64 = left.sessions.iter().map(|s| s.seconds).sum();
+        assert_eq!(credited, 200_000);
+        for session in &left.sessions {
+            assert!(session.start <= session.end);
+            assert!(session.end <= i64::MAX);
+        }
+    }
+
+    #[test]
+    fn the_day_start_does_not_panic_at_the_edges() {
+        // The floor of the day is not representable at the very bottom of the
+        // range, so it is clamped instead of overflowing.
+        assert_eq!(day_start(i64::MIN), i64::MIN);
+        assert_eq!(day_start(i64::MIN + 1), i64::MIN);
+        assert_eq!(day_start(i64::MAX), i64::MAX - (i64::MAX % 86_400));
+        assert_eq!(day_start(i64::MAX - 1), i64::MAX - (i64::MAX % 86_400));
+    }
+
+    #[test]
+    fn the_next_day_start_does_not_panic_at_the_edges() {
+        // The start of the next day is not representable at the very top of the
+        // range, so it is clamped instead of overflowing.
+        assert_eq!(next_day_start(i64::MAX), i64::MAX);
+        assert_eq!(next_day_start(i64::MAX - 1), i64::MAX);
+        assert_eq!(next_day_start(i64::MIN), i64::MIN + 86_400);
+        assert_eq!(next_day_start(i64::MIN + 1), i64::MIN + 86_400);
+    }
+
+    #[test]
+    fn the_day_start_stays_the_start_of_the_day_at_the_edges() {
+        // The day key and the day start must still agree at the edges, which is
+        // what makes the split records land in the day they belong to.
+        for at in [i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1] {
+            let start = day_start(at);
+            assert_eq!(utc_day(start), utc_day(at));
+        }
+    }
+
+    #[test]
+    fn a_seeded_sweep_of_edge_timestamps_never_panics_and_never_overlaps() {
+        // A sweep over the whole range: every credited record must stay inside the
+        // range, must not overlap its neighbour and must never have a negative
+        // length.
+        let config = plain_cfg();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0005);
+        let mut ledger = Ledger::new();
+        for _ in 0..2_000 {
+            let raw = rng.next() as i64;
+            // Fold the random value onto both ends of the range.
+            let at = match raw % 4 {
+                0 => i64::MAX - (rng.next() as i64 % 1_000_000),
+                1 => i64::MIN + (rng.next() as i64 % 1_000_000),
+                2 => raw,
+                _ => raw / 2,
+            };
+            let channel = if raw % 2 == 0 { CHANNEL } else { OTHER_CHANNEL };
+            let outcome = ledger.apply_voice(&join(at, channel), &config);
+            for session in &outcome.sessions {
+                assert!(session.start <= session.end);
+                assert!(session.end <= i64::MAX);
+                assert!(session.start >= i64::MIN);
+            }
+            let left = ledger.apply_voice(&leave(at + 1, channel), &config);
+            for session in &left.sessions {
+                assert!(session.start <= session.end);
+                assert!(session.end <= i64::MAX);
+                assert!(session.start >= i64::MIN);
+                assert_eq!(session.seconds, (session.end - session.start) as u64);
+            }
+        }
+    }
+
+    // ---- a restart that would credit presence that never happened ------------
+
+    #[test]
+    fn a_restart_never_credits_past_the_restart_instant() {
+        // The heartbeat claims a moment AFTER the restart, so the presence it
+        // claims did not happen yet. Only the part before the restart may be
+        // credited.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(T, CHANNEL), &cfg());
+        let restart = ledger.note_restart(T + 10, T + 1_000, &cfg());
+        let credited: u64 = restart.sessions.iter().map(|s| s.seconds).sum();
+        assert_eq!(credited, 10);
+        for session in &restart.sessions {
+            assert!(session.end <= T + 10);
+        }
+    }
+
+    #[test]
+    fn a_restart_with_a_heartbeat_after_the_restart_instant_is_flagged() {
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(T, CHANNEL), &cfg());
+        let restart = ledger.note_restart(T + 10, T + 1_000, &cfg());
+        assert_eq!(restart.anomalies.len(), 1);
+        assert_eq!(restart.anomalies[0].kind, AnomalyKind::RestartGap);
+    }
+
+    #[test]
+    fn a_restart_before_the_session_started_credits_nothing() {
+        // The restart instant is before the session began, so there is no presence
+        // to credit at all.
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(T, CHANNEL), &cfg());
+        let restart = ledger.note_restart(T - 100, T - 50, &cfg());
+        let credited: u64 = restart.sessions.iter().map(|s| s.seconds).sum();
+        assert_eq!(credited, 0);
+        for session in &restart.sessions {
+            assert!(session.start <= session.end);
+            assert_eq!(session.seconds, 0);
+        }
+    }
+
+    #[test]
+    fn a_restart_never_credits_more_than_the_restart_instant() {
+        // The seeded sweep of restarts, with a heartbeat that sometimes lies about
+        // the future. The credited span is always bounded by the restart instant.
+        let config = plain_cfg();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0006);
+        let mut clock = 1_700_000_000i64;
+        let mut ledger = Ledger::new();
+        for _ in 0..500 {
+            clock += (rng.next() % 300) as i64 + 1;
+            ledger.apply_voice(
+                &join(clock, CHANNEL),
+                &config,
+            );
+            let heartbeat = clock - 1 + (rng.next() as i64 % 5_000);
+            let restart = ledger.note_restart(clock, heartbeat, &config);
+            for session in &restart.sessions {
+                assert!(session.end <= clock);
+            }
+        }
+    }
+
+    // ---- when the unaccounted channel anomaly is raised ----------------------
+
+    #[test]
+    fn the_unaccounted_channel_anomaly_is_raised_when_the_session_is_dropped() {
+        // The anomaly appears on the outcome that drops the session, not on the
+        // outcome that opened it.
+        let mut ledger = Ledger::new();
+        let joined = ledger.apply_voice(&join(T, AFK), &cfg());
+        assert!(joined.anomalies.is_empty());
+        assert!(joined.sessions.is_empty());
+        let left = ledger.apply_voice(&leave(T + 600, AFK), &cfg());
+        assert_eq!(left.anomalies.len(), 1);
+        assert_eq!(left.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+        assert_eq!(left.anomalies[0].channel_id, Some(AFK));
+        assert!(left.sessions.is_empty());
+    }
 }
