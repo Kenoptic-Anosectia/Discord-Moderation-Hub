@@ -778,10 +778,13 @@ impl Ledger {
         if let Some(last) = segments.last_mut() {
             last.end = end_at.max(last.start);
         }
-        // How many records the split would emit. It is one record per UTC day the
-        // session touches, summed over the stretches. The count is known without
-        // walking the days, so a span that would need an unbounded number of
-        // records is refused here and never allocated.
+        // An upper bound on how many records the split would emit: one record
+        // per UTC day the session touches, summed over the stretches. A
+        // self-deafened stretch emits no record, so the count can be higher
+        // than the number of records actually pushed; it is a bound, not an
+        // exact count. The count is arithmetic, not a walk, so a span that
+        // would need an unbounded number of records is refused here and never
+        // allocated.
         let records: u64 = segments
             .iter()
             .map(|segment| days_touched(segment.start, segment.end))
