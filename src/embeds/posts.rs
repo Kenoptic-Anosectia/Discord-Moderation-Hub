@@ -1572,11 +1572,11 @@ mod tests {
     /// This is the sequence the reviewer described. The row holds HASH_A. Sync A
     /// plans an edit for HASH_B, sync B plans an edit for HASH_C, and both plans
     /// were made from the row that holds HASH_A. The two writes land in the
-    /// opposite order to the Discord calls: Discord shows HASH_B last, so the
-    /// record must hold HASH_B as well.
+    /// opposite order to the Discord calls: Discord shows HASH_C last, so the
+    /// record must hold HASH_C as well.
     ///
-    /// Without the `from` guard the record would end up holding HASH_C while
-    /// Discord shows HASH_B, and `plan(HASH_B)` would then return `NoOp` for ever:
+    /// Without the `from` guard the record would end up holding HASH_B while
+    /// Discord shows HASH_C, and `plan(HASH_C)` would then return `NoOp` for ever:
     /// a changed rules template would never be published again and nothing would
     /// report it.
     #[test]
@@ -1631,6 +1631,47 @@ mod tests {
         let mut req = request("general-rules", HASH_C);
         req.recorded = Some(&stored.record);
         assert_eq!(plan(&req), Plan::NoOp);
+    }
+
+    /// The consequence the verification doc states for two OVERLAPPING Discord
+    /// calls: the record and Discord can disagree, and then the plan cannot see
+    /// the disagreement.
+    ///
+    /// The doc says: "the record holds HASH_B while Discord shows HASH_A. The
+    /// template is still HASH_B, so every later sync of HASH_B is a `NoOp`: Discord
+    /// keeps showing the older template HASH_A and nothing reports it."
+    ///
+    /// This test pins both halves of that sentence, because an earlier version of
+    /// the sentence claimed the opposite:
+    /// * with the record on HASH_B and the template on HASH_B, the plan is a
+    ///   `NoOp` - and it stays a `NoOp` however often the sync is repeated;
+    /// * with the record on HASH_B and the template on HASH_A, the plan is NOT a
+    ///   `NoOp`: it is an `Edit` of the same message, planned from HASH_B.
+    #[test]
+    fn a_diverged_record_hides_itself_from_the_plan() {
+        let recorded = record(HASH_B);
+
+        // The template is still HASH_B, the same hash the record holds. The plan
+        // is a no-op, so nothing republishes and the divergence is not reported.
+        let mut req = request("general-rules", HASH_B);
+        req.recorded = Some(&recorded);
+        assert_eq!(plan(&req), Plan::NoOp);
+        // Repeating the sync does not change that: it stays a no-op for ever.
+        assert_eq!(plan(&req), Plan::NoOp);
+
+        // The template is HASH_A, which is what Discord shows but what the record
+        // does not hold. This is NOT a no-op: the plan edits the SAME recorded
+        // message, and it names the hash it was planned from.
+        let mut req = request("general-rules", HASH_A);
+        req.recorded = Some(&recorded);
+        assert_eq!(
+            plan(&req),
+            Plan::Edit {
+                key: "general-rules",
+                message: MESSAGE,
+                from: HASH_B,
+            }
+        );
     }
 
     /// A `Create` plan must not replace a row that already exists: the recorded post
