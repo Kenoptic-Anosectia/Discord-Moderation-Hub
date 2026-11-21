@@ -894,6 +894,19 @@ mod tests {
         }
     }
 
+    /// A state update inside the same channel: only the self-deaf flag can have
+    /// changed, and the presence is split into two stretches.
+    fn same_channel(at: i64, channel: u64, self_deaf: bool) -> VoiceEvent {
+        VoiceEvent {
+            guild_id: GUILD,
+            user_id: USER,
+            old_channel: Some(channel),
+            new_channel: Some(channel),
+            self_deaf,
+            at,
+        }
+    }
+
     // ---- message accounting -------------------------------------------------
 
     #[test]
@@ -2135,6 +2148,37 @@ mod tests {
         let end = start + (MAX_SESSION_RECORDS as i64) * SECONDS_PER_DAY;
         let mut ledger = Ledger::new();
         ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        let left = ledger.apply_voice(&leave(end, CHANNEL), &cfg());
+        assert_eq!(left.sessions.len(), MAX_SESSION_RECORDS);
+        assert!(left.anomalies.is_empty());
+    }
+
+    #[test]
+    fn a_session_split_into_stretches_counts_every_stretch_against_the_cap() {
+        // A state update inside the channel splits the presence into two
+        // stretches. The cap has to count BOTH of them: counting only the last
+        // one would let a presence that spans far more than the cap through.
+        let start = day_start(T);
+        let split_at = start + (MAX_SESSION_RECORDS as i64 + 1) * SECONDS_PER_DAY;
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        ledger.apply_voice(&same_channel(split_at, CHANNEL, false), &cfg());
+        let left = ledger.apply_voice(&leave(split_at + 1, CHANNEL), &cfg());
+        assert!(left.sessions.is_empty());
+        assert_eq!(left.anomalies.len(), 1);
+        assert_eq!(left.anomalies[0].kind, AnomalyKind::UnaccountedChannel);
+    }
+
+    #[test]
+    fn an_empty_stretch_does_not_count_against_the_cap() {
+        // A state update at the very instant of the join leaves a stretch of no
+        // length at all. An empty stretch touches no UTC day, so it must not
+        // push a session that is exactly at the cap over it.
+        let start = day_start(T);
+        let end = start + (MAX_SESSION_RECORDS as i64) * SECONDS_PER_DAY;
+        let mut ledger = Ledger::new();
+        ledger.apply_voice(&join(start, CHANNEL), &cfg());
+        ledger.apply_voice(&same_channel(start, CHANNEL, false), &cfg());
         let left = ledger.apply_voice(&leave(end, CHANNEL), &cfg());
         assert_eq!(left.sessions.len(), MAX_SESSION_RECORDS);
         assert!(left.anomalies.is_empty());
