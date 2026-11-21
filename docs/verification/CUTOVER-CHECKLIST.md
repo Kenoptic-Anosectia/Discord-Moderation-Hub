@@ -2,9 +2,9 @@
 
 > Written for `main` once the policy/library modules have landed. Every `.env` key, id and name below is a placeholder.
 
-**Two labels only.** `policy/library only, no runtime (not wired)`: code and tests exist, but nothing posts, deletes, grants or reads a key, and no `shadow`/`live` mode exists. `not built`: no code. **No feature is running yet, so no step below can be done today.** Every SHADOW, HANDOVER and ROLLBACK step says `NOT YET POSSIBLE: needs runtime card <name>` (names from `consolidation-plan/PLAN.md`), then describes the step it WILL be so the owner can prepare.
+**Two labels only.** `policy/library only, no runtime (not wired)`: code and tests exist, but nothing posts, deletes, grants or reads a key, and no `shadow`/`live` mode exists. `not built`: no code that could replace the old bot's feature (an unrelated basic command that already runs does not count; the Carl-bot section says which). **No feature is running yet, so no step below can be done today.** Every SHADOW, HANDOVER and ROLLBACK step says `NOT YET POSSIBLE: needs runtime card <name>` (names from `consolidation-plan/PLAN.md`), then describes the step it WILL be so the owner can prepare.
 
-**Single-writer rule.** The OLD bot's feature is disabled first, then this bot's is enabled. A mode key that nothing reads does nothing, so setting one now would leave the old bot as the only writer and prove nothing. **Mode keys** (`*_MODE=off|shadow|live`) are all `to be added by the wiring card; not read by any module today`, except `VOICE_ROOMS_MODE`, which the VR1 policy defines (still read by nothing). Other keys named below are defined (or documented) by a policy module for the wiring card to read; none is read today. Every *Pre-checks* item is an owner action.
+**Single-writer rule.** The OLD bot's feature is disabled first, then this bot's is enabled. A mode key that nothing reads does nothing, so setting one now would leave the old bot as the only writer and prove nothing. **Mode keys** (`*_MODE=off|shadow|live`) are `to be added by the wiring card; not read by any module today`, except two that a module defines in code, `VOICE_ROOMS_MODE` (VR1 policy) and `ACTIVITY_MODE` (AC1 policy), and one documented by SW1 for SW3, `SAFEWORD_MODE` (default `off`; any value other than off|shadow|live fails closed to `off`). Even those three are read by no runtime today. Other keys named below are defined (or documented) by a policy module for the wiring card to read; none is read today. Every *Pre-checks* item is an owner action.
 
 Library-only foundations with no feature of their own: K02 jobs, K04 grant executor, K05 privacy scope, K06 settings, SW2 safeword repository, AC1 activity accounting.
 
@@ -21,8 +21,8 @@ Library-only foundations with no feature of their own: K02 jobs, K04 grant execu
 6. **Evidence:** YAGPDB settings screenshots now; later 3 shadow log lines with identical notice text; date.
 
 ### Safeword (epic S01 — policy/library only, no runtime (not wired): state machine and repository)
-1. **What:** Will, on a `Safeword_Red` reaction, save restricted roles, remove them and add the safeword role; restore on reaction removal. Mode key `SAFEWORD_MODE=off|shadow|live`: to be added by the wiring card; not read by any module today.
-2. **Pre-checks (owner):** YAGPDB safeword custom command active. Have ready (named in the SW1 doc for SW3/wiring): `SAFEWORD_CHANNEL_ID`, `SAFEWORD_MESSAGE_ID`, `SAFEWORD_EMOJI_ID`, `SAFEWORD_ROLE_ID`, `SAFEWORD_RESTRICTED_ROLE_IDS`.
+1. **What:** Will, on a `Safeword_Red` reaction, save restricted roles, remove them and add the safeword role; restore on reaction removal. Mode key `SAFEWORD_MODE=off|shadow|live`: documented by SW1 for SW3 (default `off`; an unknown value fails closed to `off`); read by nothing today.
+2. **Pre-checks (owner):** YAGPDB safeword custom command active. Have ready (also named in the SW1 doc for SW3/wiring): `SAFEWORD_CHANNEL_ID`, `SAFEWORD_MESSAGE_ID`, `SAFEWORD_EMOJI_ID`, `SAFEWORD_ROLE_ID`, `SAFEWORD_RESTRICTED_ROLE_IDS`.
 3. **Shadow:** NOT YET POSSIBLE: needs runtime card SW3 (with RG2, W2). Will be: set `SAFEWORD_MODE=shadow`; SKYNET logs snapshot, removals and adds; compare saved role set and DM text with YAGPDB.
 4. **Handover:** NOT YET POSSIBLE: needs runtime card SW3. Will be: (a) disable the safeword command in YAGPDB, (b) then set `SAFEWORD_MODE=live`. Do it when no member is on safeword.
 5. **Rollback:** NOT YET POSSIBLE: needs runtime card SW3. Will be: set `SAFEWORD_MODE=off`, re-enable YAGPDB; members on safeword lose SKYNET state.
@@ -46,9 +46,9 @@ Library-only foundations with no feature of their own: K02 jobs, K04 grant execu
 
 ---
 
-## Carl-bot (epic R01 — not built: migration)
+## Carl-bot (epic R01 — not built: no replacement code; migration)
 1. **What:** Reaction-role bindings. Only the basic `/reactionrole` command exists today; it has no groups, exclusivity, shadow, mode key or safeword guard, so it does not replace Carl-bot. Mode key `REACTIONROLE_MODE=off|shadow|live`: to be added by the wiring card; not read by any module today.
-2. **Pre-checks (owner):** Carl-bot reaction-role menus active; screenshot every binding (no Carl export known).
+2. **Pre-checks (owner):** Carl-bot reaction-role menus active; screenshot every binding (no Carl export known). **Never bind `/reactionrole` on a message that a Carl-bot or Pronoun Picker menu manages**: it is the one SKYNET writer that runs today, and both bots would then grant roles from the same reaction (two writers).
 3. **Shadow:** NOT YET POSSIBLE: needs runtime cards RR2, RM2, RM3. Will be: `REACTIONROLE_MODE=shadow`; SKYNET logs reactions and the roles it would grant; compare with Carl-bot's grants.
 4. **Handover:** NOT YET POSSIBLE: needs runtime card RR2 (with W2). Will be: (a) disable reaction roles in the Carl-bot dashboard, (b) set `REACTIONROLE_MODE=live`.
 5. **Rollback:** NOT YET POSSIBLE: needs runtime card RR2. Will be: `REACTIONROLE_MODE=off`, re-enable Carl-bot; rebuild bindings from the screenshots.
@@ -79,9 +79,9 @@ Library-only foundations with no feature of their own: K02 jobs, K04 grant execu
 6. **Evidence:** Chai settings screenshot now; later shadow log; date.
 
 ## Lurkr (epic E02 — not built)
-1. **What:** XP/levels from messages and voice. Mode key `XP_MODE=off|shadow|live`: to be added by the wiring card; not read by any module today. Activity accounting (AC1, library only) will feed it.
+1. **What:** XP/levels from messages and voice. Mode key `XP_MODE=off|shadow|live`: to be added by the wiring card; not read by any module today. Activity accounting (AC1, library only) will feed it; `ACTIVITY_MODE` is the AC1-defined key the AC2 runtime will read.
 2. **Pre-checks (owner):** Lurkr active; record XP rules and reward roles. Keys planned, not defined: `XP_MESSAGE_COOLDOWN_MS`, `XP_VOICE_MULTIPLIER`.
-3. **Shadow:** NOT YET POSSIBLE: needs runtime cards LV1, LV2, AC2 (with W5). Will be: `XP_MODE=shadow` accumulates XP silently; compare with Lurkr.
+3. **Shadow:** NOT YET POSSIBLE: needs runtime cards LV2, AC2 (with W5); LV1 is a pure XP-policy prerequisite, not a runtime card. Will be: `XP_MODE=shadow` accumulates XP silently; compare with Lurkr.
 4. **Handover:** NOT YET POSSIBLE: needs runtime card LV2. Will be: (a) disable Lurkr XP and rewards, (b) set `XP_MODE=live`.
 5. **Rollback:** NOT YET POSSIBLE: needs runtime card LV2. Will be: `XP_MODE=off`, re-enable Lurkr.
 6. **Evidence:** Lurkr config screenshot now; later shadow-vs-Lurkr comparison; date.
@@ -89,7 +89,7 @@ Library-only foundations with no feature of their own: K02 jobs, K04 grant execu
 ## Statbot (epic E03 — not built)
 1. **What:** Message and voice-time statistics with graphs. Mode key `STATS_MODE=off|shadow|live`: to be added by the wiring card; not read by any module today.
 2. **Pre-checks (owner):** Statbot active; record its stats channel. Key planned, not defined: `STATS_SERVER_CHANNEL_ID`.
-3. **Shadow:** NOT YET POSSIBLE: needs runtime cards ST1, ST2, AC2 (with W5). Will be: `STATS_MODE=shadow`; compare counts with Statbot.
+3. **Shadow:** NOT YET POSSIBLE: needs runtime cards ST2, AC2 (with W5); ST1 is a pure stats-query prerequisite, not a runtime card. Will be: `STATS_MODE=shadow`; compare counts with Statbot.
 4. **Handover:** NOT YET POSSIBLE: needs runtime card ST2. Will be: (a) disable Statbot, (b) set `STATS_MODE=live`.
 5. **Rollback:** NOT YET POSSIBLE: needs runtime card ST2. Will be: `STATS_MODE=off`, re-enable Statbot.
 6. **Evidence:** Statbot screenshot now; later count comparison; date.
@@ -117,6 +117,6 @@ Library-only foundations with no feature of their own: K02 jobs, K04 grant execu
 | Pronoun Picker | Pronoun menu | policy/library only, no runtime (not wired) | RM2, RM3 |
 | Bump Buddy | Bump reminder | policy/library only, no runtime (not wired) | BU2 |
 | Chai | Voice rooms | policy/library only, no runtime (not wired) | VR2, VR3 |
-| Lurkr | XP/levels | not built | LV1, LV2 |
-| Statbot | Stats/graphs | not built | ST1, ST2 |
+| Lurkr | XP/levels | not built | LV2, AC2 (LV1 pure prerequisite) |
+| Statbot | Stats/graphs | not built | ST2, AC2 (ST1 pure prerequisite) |
 | Wick | Moderation | not built | MO1, MO2, AM1, AM2 |
