@@ -1101,6 +1101,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_send_failure_codes_are_stable_and_carry_no_text() {
+        let error = |status| SendError {
+            status,
+            api_code: None,
+        };
+        assert_eq!(error(403).code(), CODE_SEND_FORBIDDEN);
+        assert_eq!(error(429).code(), CODE_SEND_RATE_LIMITED);
+        // Every other status is one stable code, not a guess.
+        for status in [0u16, 400, 404, 500, 502] {
+            assert_eq!(error(status).code(), CODE_SEND_FAILED, "{status}");
+        }
+        // The code carries no message text, no name and no id.
+        for status in [0u16, 403, 429, 500] {
+            let code = error(status).code();
+            assert!(!code.contains(' '), "{code}");
+            assert!(!code.contains('@'), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_alert_carries_the_code_only_and_never_the_message_text() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::failing(500),
+        );
+        let outcome = rt.handle_join(&facts(false)).await;
+        assert_eq!(
+            outcome.message,
+            Some(MessageOutcome::Failed(CODE_SEND_FAILED))
+        );
+        assert_eq!(rt.alerter.alerts.len(), 1);
+        let (channel_id, code) = &rt.alerter.alerts[0];
+        assert_eq!(*channel_id, 799_001);
+        assert_eq!(code, CODE_SEND_FAILED);
+        assert!(!code.contains("synthetic-user"), "{code}");
+        assert!(!code.contains("700003"), "{code}");
+    }
+
     #[tokio::test]
     async fn a_grant_failure_is_reported_and_does_not_block_the_message() {
         let mut rt = runtime(
