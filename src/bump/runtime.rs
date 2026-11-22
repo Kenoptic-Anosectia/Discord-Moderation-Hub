@@ -2224,6 +2224,11 @@ mod tests {
             requests_before,
             "a denied reset scheduled a job"
         );
+        // The reply never names the home guild.
+        let CommandOutcome::WrongGuild { reply } = outcome else {
+            panic!("expected WrongGuild, got {outcome:?}");
+        };
+        assert!(!reply.contains(&GUILD.to_string()), "{reply}");
     }
 
     #[test]
