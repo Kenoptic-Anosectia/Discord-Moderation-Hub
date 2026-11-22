@@ -84,8 +84,71 @@ impl std::error::Error for ConfigError {}
 
 /// Parses the settings from a lookup closure.
 pub fn parse(lookup: impl Fn(&str) -> Option<String>) -> Result<EmbedConfig, ConfigError> {
-    let _ = lookup;
-    Ok(EmbedConfig::off())
+    let mut bad: Vec<&'static str> = Vec::new();
+    let mode = match parse_mode(MODE_KEY, lookup(MODE_KEY).as_deref()) {
+        Ok(mode) => mode,
+        Err(_) => {
+            bad.push(MODE_KEY);
+            Mode::Off
+        }
+    };
+    let template_dir = match parse_template_dir(lookup(TEMPLATE_DIR_KEY).as_deref()) {
+        Ok(dir) => dir,
+        Err(()) => {
+            bad.push(TEMPLATE_DIR_KEY);
+            None
+        }
+    };
+    let publishers = match parse_publishers(lookup(PUBLISHERS_KEY).as_deref()) {
+        Ok(publishers) => publishers,
+        Err(()) => {
+            bad.push(PUBLISHERS_KEY);
+            Publishers::OwnerOnly
+        }
+    };
+    // A mode that is on needs somewhere to read templates from.
+    if bad.is_empty() && mode != Mode::Off && template_dir.is_none() {
+        bad.push(TEMPLATE_DIR_KEY);
+    }
+    if bad.is_empty() {
+        Ok(EmbedConfig {
+            mode,
+            template_dir,
+            publishers,
+        })
+    } else {
+        Err(ConfigError { keys: bad })
+    }
+}
+
+/// The template directory: blank is "not set"; a control character or an over-long value
+/// is refused. No file system access happens here.
+fn parse_template_dir(raw: Option<&str>) -> Result<Option<PathBuf>, ()> {
+    let Some(raw) = raw else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_TEMPLATE_DIR_BYTES || trimmed.chars().any(char::is_control) {
+        return Err(());
+    }
+    Ok(Some(PathBuf::from(trimmed)))
+}
+
+/// `owner` (default) or `staff`, ASCII case-insensitive. Anything else is refused, so a
+/// typo never widens who may publish.
+fn parse_publishers(raw: Option<&str>) -> Result<Publishers, ()> {
+    let Some(raw) = raw else {
+        return Ok(Publishers::OwnerOnly);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("owner") {
+        Ok(Publishers::OwnerOnly)
+    } else if trimmed.eq_ignore_ascii_case("staff") {
+        Ok(Publishers::Staff)
+    } else {
+        Err(())
+    }
 }
 
 /// Parses the settings; a bad value gives the OFF configuration and the error.

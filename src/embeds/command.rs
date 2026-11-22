@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use poise::serenity_prelude as s;
 
 use super::config::{EmbedConfig, Publishers};
-use super::posts::{PostRecord, RepoError, StoredPost};
-use super::template::EmbedTemplate;
+use super::posts::{self, Plan, PlanRequest, PostRecord, RepoError, StoredPost};
+use super::template::{self, EmbedTemplate};
 use crate::features::Feature;
 use crate::jobs::runner::{Registry, RunnerError};
 use crate::settings::Mode;
@@ -178,7 +178,24 @@ pub struct Counts {
 impl Report {
     /// Counts the codes of the items.
     pub fn counts(&self) -> Counts {
-        Counts::default()
+        let mut counts = Counts::default();
+        for item in &self.items {
+            match item.outcome.code {
+                Code::Posted => counts.posted += 1,
+                Code::Edited => counts.edited += 1,
+                Code::Recreated => counts.recreated += 1,
+                Code::WouldPost => counts.would_post += 1,
+                Code::WouldEdit => counts.would_edit += 1,
+                Code::WouldRecreate => counts.would_recreate += 1,
+                Code::Unchanged => counts.unchanged += 1,
+                code => match code.class() {
+                    Class::Refusal => counts.refused += 1,
+                    Class::Failure => counts.failed += 1,
+                    Class::Success => {}
+                },
+            }
+        }
+        counts
     }
 }
 
@@ -211,26 +228,104 @@ impl Reply {
     }
 }
 
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome.detail {
+        Some(detail) => format!("{} ({detail})", outcome.code.as_str()),
+        None => outcome.code.as_str().to_string(),
+    }
+}
+
+/// Adds lines to `text` while the total stays within the reply limit, leaving room for a
+/// closing "+N more" line.
+fn push_lines_within_limit(text: &mut String, lines: &[String]) {
+    // Room kept for "\n+99999 more".
+    const RESERVE: usize = 16;
+    let mut used = text.chars().count();
+    for (index, line) in lines.iter().enumerate() {
+        let cost = 1 + line.chars().count();
+        if used + cost + RESERVE > MAX_REPLY_CHARS {
+            text.push_str(&format!("\n+{} more", lines.len() - index));
+            return;
+        }
+        text.push('\n');
+        text.push_str(line);
+        used += cost;
+    }
+}
+
 /// Builds the reply for a `post` or `sync` report.
 pub fn report_reply(report: &Report) -> Reply {
-    let _ = report;
-    Reply {
-        text: String::new(),
+    let mut text = String::new();
+    if report.shadow {
+        text.push_str("[shadow] nothing was sent, edited, deleted or written.\n");
     }
+    match report.items.as_slice() {
+        [only] => {
+            text.push_str("embed ");
+            text.push_str(&outcome_text(&only.outcome));
+            if let Some(key) = &only.key {
+                text.push_str(&format!(" key={key}"));
+            }
+        }
+        items => {
+            let c = report.counts();
+            text.push_str(&format!(
+                "embed sync: {} keys: posted={} edited={} recreated={} would_post={} would_edit={} would_recreate={} unchanged={} refused={} failed={}",
+                items.len(),
+                c.posted,
+                c.edited,
+                c.recreated,
+                c.would_post,
+                c.would_edit,
+                c.would_recreate,
+                c.unchanged,
+                c.refused,
+                c.failed
+            ));
+            let lines: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}: {}",
+                        item.key.as_deref().unwrap_or("-"),
+                        outcome_text(&item.outcome)
+                    )
+                })
+                .collect();
+            push_lines_within_limit(&mut text, &lines);
+        }
+    }
+    Reply { text }
 }
 
 /// Builds the reply for a `list` report.
 pub fn list_reply(list: &ListReport) -> Reply {
-    let _ = list;
-    Reply {
-        text: String::new(),
+    if list.outcome.code != Code::Listed {
+        return Reply {
+            text: format!("embed {}", outcome_text(&list.outcome)),
+        };
     }
+    let mut text = format!("embed list: {} posts", list.posts.len());
+    let lines: Vec<String> = list
+        .posts
+        .iter()
+        .map(|post| {
+            format!(
+                "`{}` <#{}> message {} hash {}",
+                post.record.key,
+                post.record.channel,
+                post.record.message,
+                &post.record.content_hash[..12]
+            )
+        })
+        .collect();
+    push_lines_within_limit(&mut text, &lines);
+    Reply { text }
 }
 
 /// The text of a staff alert: a stable code only.
 pub fn alert_text(code: &'static str) -> String {
-    let _ = code;
-    String::new()
+    format!("embeds: {code}")
 }
 
 // ---------------------------------------------------------------------------
@@ -249,10 +344,17 @@ pub struct Invoker {
 }
 
 /// Checks that the caller may publish: the guild owner always, staff only when the
-/// configuration widened it.
+/// configuration widened it. A caller or owner id of zero is never trusted.
 pub fn authorize(publishers: Publishers, who: &Invoker) -> Result<(), Code> {
-    let _ = (publishers, who);
-    Ok(())
+    if who.user == 0 {
+        return Err(Code::Denied);
+    }
+    let is_owner = who.user == who.guild_owner;
+    if is_owner || (publishers == Publishers::Staff && who.is_staff) {
+        Ok(())
+    } else {
+        Err(Code::Denied)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,9 +458,40 @@ impl DirTemplateSource {
 #[s::async_trait]
 impl TemplateSource for DirTemplateSource {
     async fn read(&self, key: &str) -> Result<String, SourceError> {
-        let _ = (&self.dir, key);
-        Err(SourceError::Unreadable)
+        // Defence in depth: the command already refused every key that is not plain,
+        // and this refuses it again before a path is built.
+        if posts::validate_key(key).is_err() {
+            return Err(SourceError::Unreadable);
+        }
+        let path = self.dir.join(format!("{key}.json"));
+        tokio::task::spawn_blocking(move || read_limited(&path))
+            .await
+            .unwrap_or(Err(SourceError::Unreadable))
     }
+}
+
+/// Reads one regular file, at most [`MAX_TEMPLATE_BYTES`], as UTF-8.
+fn read_limited(path: &std::path::Path) -> Result<String, SourceError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SourceError::NotFound
+        } else {
+            SourceError::Unreadable
+        }
+    })?;
+    let meta = file.metadata().map_err(|_| SourceError::Unreadable)?;
+    if !meta.is_file() {
+        return Err(SourceError::Unreadable);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TEMPLATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SourceError::Unreadable)?;
+    if bytes.len() as u64 > MAX_TEMPLATE_BYTES {
+        return Err(SourceError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| SourceError::Unreadable)
 }
 
 /// What a store write must do. Owned, so it can cross to the database thread.
@@ -394,6 +527,14 @@ pub struct TokioStore {
     conn: tokio_rusqlite::Connection,
 }
 
+/// A database call that could not run is a store failure; an error from the call is kept.
+fn store_error(error: tokio_rusqlite::Error<RepoError>) -> RepoError {
+    match error {
+        tokio_rusqlite::Error::Error(inner) => inner,
+        _ => RepoError::Sqlite,
+    }
+}
+
 impl TokioStore {
     /// A store over a connection.
     pub fn new(conn: tokio_rusqlite::Connection) -> Self {
@@ -402,23 +543,48 @@ impl TokioStore {
 
     /// Creates the `managed_posts` table if it is not there.
     pub async fn migrate(&self) -> Result<(), RepoError> {
-        let _ = &self.conn;
-        Err(RepoError::Sqlite)
+        self.conn
+            .call(|c| posts::migrate(c).map(|_| ()).map_err(|_| RepoError::Sqlite))
+            .await
+            .map_err(store_error)
     }
 }
 
 #[s::async_trait]
 impl PostStore for TokioStore {
     async fn get(&self, key: &str) -> Result<Option<StoredPost>, RepoError> {
-        let _ = (&self.conn, key);
-        Err(RepoError::Sqlite)
+        let key = key.to_string();
+        self.conn
+            .call(move |c| posts::get(c, &key))
+            .await
+            .map_err(store_error)
     }
     async fn list(&self) -> Result<Vec<StoredPost>, RepoError> {
-        Err(RepoError::Sqlite)
+        self.conn
+            .call(|c| posts::list(c))
+            .await
+            .map_err(store_error)
     }
     async fn write(&self, req: WriteRequest) -> Result<bool, RepoError> {
-        let _ = req;
-        Err(RepoError::Sqlite)
+        self.conn
+            .call(move |c| {
+                let key = req.key.as_str();
+                let plan = match &req.kind {
+                    WriteKind::Create => Plan::Create { key },
+                    WriteKind::Edit { message, from } => Plan::Edit {
+                        key,
+                        message: *message,
+                        from: from.as_str(),
+                    },
+                    WriteKind::Recreate { replaces } => Plan::Recreate {
+                        key,
+                        replaces: *replaces,
+                    },
+                };
+                posts::apply(c, &plan, &req.record, req.now)
+            })
+            .await
+            .map_err(store_error)
     }
 }
 
@@ -451,19 +617,27 @@ impl KeyLocks {
         KeyLocks::default()
     }
 
+    fn set(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        // A poisoned set is still a valid set of keys.
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Takes a key, or `None` when it is already held.
     pub fn try_acquire(&self, key: &str) -> Option<KeyGuard<'_>> {
-        let _ = &self.held;
-        Some(KeyGuard {
-            locks: self,
-            key: key.to_string(),
-        })
+        if self.set().insert(key.to_string()) {
+            Some(KeyGuard {
+                locks: self,
+                key: key.to_string(),
+            })
+        } else {
+            None
+        }
     }
 }
 
 impl Drop for KeyGuard<'_> {
     fn drop(&mut self) {
-        let _ = (&self.locks, &self.key);
+        self.locks.set().remove(&self.key);
     }
 }
 
@@ -511,36 +685,300 @@ pub struct ListRequest {
     pub invoker: Invoker,
 }
 
+/// One unit of work: one key.
+struct Job<'a> {
+    invoker: Invoker,
+    key: &'a str,
+    guild: u64,
+    /// The channel to publish into; `None` means "the recorded channel" (sync).
+    channel: Option<u64>,
+    allow_recreate: bool,
+    now: i64,
+    shadow: bool,
+}
+
+/// Mode and caller checks shared by every command.
+fn gate(env: &Env<'_>, who: &Invoker) -> Result<(), Outcome> {
+    if !env.config.enabled() {
+        return Err(Outcome::new(Code::Disabled));
+    }
+    authorize(env.config.publishers, who).map_err(Outcome::new)
+}
+
+fn refused_report(env: &Env<'_>, outcome: Outcome) -> Report {
+    Report {
+        shadow: env.config.mode == Mode::Shadow,
+        items: vec![ItemReport { key: None, outcome }],
+    }
+}
+
+/// Reports each failure code once. A shadow run sends nothing, an alert included.
+async fn alert_failures(env: &Env<'_>, shadow: bool, outcomes: impl Iterator<Item = Outcome>) {
+    if shadow {
+        return;
+    }
+    let mut sent: Vec<Code> = Vec::new();
+    for outcome in outcomes {
+        if outcome.code.class() == Class::Failure && !sent.contains(&outcome.code) {
+            sent.push(outcome.code);
+            env.alerts.alert(outcome.code.as_str()).await;
+        }
+    }
+}
+
 /// Publishes a template into a channel and records it.
 pub async fn post(env: &Env<'_>, req: &PostRequest<'_>) -> Report {
-    let _ = (env, req);
-    Report {
-        shadow: false,
-        items: vec![ItemReport {
-            key: None,
-            outcome: Outcome::new(Code::Disabled),
-        }],
+    if let Err(outcome) = gate(env, &req.invoker) {
+        return refused_report(env, outcome);
     }
+    let shadow = env.config.mode == Mode::Shadow;
+    let job = Job {
+        invoker: req.invoker,
+        key: req.key,
+        guild: req.guild,
+        channel: Some(req.channel),
+        allow_recreate: req.allow_recreate,
+        now: req.now,
+        shadow,
+    };
+    let report = Report {
+        shadow,
+        items: vec![run_one(env, &job).await],
+    };
+    alert_failures(env, shadow, report.items.iter().map(|i| i.outcome)).await;
+    report
 }
 
 /// Re-renders recorded posts by editing their messages.
 pub async fn sync(env: &Env<'_>, req: &SyncRequest<'_>) -> Report {
-    let _ = (env, req);
-    Report {
-        shadow: false,
-        items: vec![ItemReport {
-            key: None,
-            outcome: Outcome::new(Code::Disabled),
-        }],
+    if let Err(outcome) = gate(env, &req.invoker) {
+        return refused_report(env, outcome);
     }
+    let shadow = env.config.mode == Mode::Shadow;
+    let keys: Vec<String> = match req.key {
+        Some(key) => vec![key.to_string()],
+        None => match env.store.list().await {
+            Ok(rows) => rows.into_iter().map(|row| row.record.key).collect(),
+            Err(error) => {
+                let report = refused_report(env, Outcome::with(Code::StoreFailed, error.code()));
+                alert_failures(env, shadow, report.items.iter().map(|i| i.outcome)).await;
+                return report;
+            }
+        },
+    };
+    let mut items = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let job = Job {
+            invoker: req.invoker,
+            key,
+            guild: req.guild,
+            channel: None,
+            allow_recreate: req.allow_recreate,
+            now: req.now,
+            shadow,
+        };
+        items.push(run_one(env, &job).await);
+    }
+    let report = Report { shadow, items };
+    alert_failures(env, shadow, report.items.iter().map(|i| i.outcome)).await;
+    report
 }
 
 /// Lists the recorded posts.
 pub async fn list(env: &Env<'_>, req: &ListRequest) -> ListReport {
-    let _ = (env, req);
-    ListReport {
-        outcome: Outcome::new(Code::Disabled),
-        posts: Vec::new(),
+    if let Err(outcome) = gate(env, &req.invoker) {
+        return ListReport {
+            outcome,
+            posts: Vec::new(),
+        };
+    }
+    match env.store.list().await {
+        Ok(posts) => ListReport {
+            outcome: Outcome::new(Code::Listed),
+            posts,
+        },
+        Err(error) => {
+            let outcome = Outcome::with(Code::StoreFailed, error.code());
+            let shadow = env.config.mode == Mode::Shadow;
+            alert_failures(env, shadow, std::iter::once(outcome)).await;
+            ListReport {
+                outcome,
+                posts: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Handles one key. The key is echoed in the report only when it is a plain valid key.
+async fn run_one(env: &Env<'_>, job: &Job<'_>) -> ItemReport {
+    if posts::validate_key(job.key).is_err() {
+        return ItemReport {
+            key: None,
+            outcome: Outcome::new(Code::InvalidKey),
+        };
+    }
+    let outcome = if job.guild == 0 || job.channel == Some(0) {
+        Outcome::new(Code::InvalidTarget)
+    } else {
+        match env.locks.try_acquire(job.key) {
+            // The guard is held until the key is done, whatever the outcome.
+            Some(_guard) => handle(env, job).await,
+            None => Outcome::new(Code::Busy),
+        }
+    };
+    ItemReport {
+        key: Some(job.key.to_string()),
+        outcome,
+    }
+}
+
+fn discord_outcome(error: DiscordError) -> Outcome {
+    match error {
+        DiscordError::Forbidden => Outcome::new(Code::DiscordForbidden),
+        DiscordError::NotFound | DiscordError::Failed => Outcome::new(Code::DiscordFailed),
+    }
+}
+
+/// The decision and the action for one key, under its lock.
+async fn handle(env: &Env<'_>, job: &Job<'_>) -> Outcome {
+    let key = job.key;
+    let record = match env.store.get(key).await {
+        Ok(stored) => stored.map(|row| row.record),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    let channel = match (job.channel, &record) {
+        (Some(channel), _) => channel,
+        (None, Some(record)) => record.channel,
+        (None, None) => return Outcome::new(Code::NotRecorded),
+    };
+    let text = match env.templates.read(key).await {
+        Ok(text) => text,
+        Err(SourceError::NotFound) => return Outcome::new(Code::TemplateNotFound),
+        Err(SourceError::Unreadable | SourceError::TooLarge) => {
+            return Outcome::new(Code::TemplateUnreadable)
+        }
+    };
+    let template = match template::load(&text) {
+        Ok(template) => template,
+        Err(error) => return Outcome::with(Code::TemplateInvalid, error.code()),
+    };
+    drop(text);
+    let hash = template.content_hash();
+
+    // Only a post recorded for this guild and channel is looked up: the plan refuses any
+    // other one before it reads the lookup.
+    let mut message_missing = false;
+    if let Some(recorded) = &record {
+        if recorded.guild == job.guild && recorded.channel == channel {
+            match env
+                .discord
+                .message_state(recorded.channel, recorded.message)
+                .await
+            {
+                Ok(MessageState::Present) => {}
+                Ok(MessageState::Missing) | Err(DiscordError::NotFound) => message_missing = true,
+                Err(error) => return discord_outcome(error),
+            }
+        }
+    }
+
+    let request = PlanRequest {
+        key,
+        template_hash: &hash,
+        recorded: record.as_ref(),
+        target_guild: job.guild,
+        target_channel: channel,
+        message_missing,
+        allow_recreate: job.allow_recreate,
+    };
+    let plan = posts::plan(&request);
+    let out = OutgoingEmbed {
+        channel,
+        template: &template,
+        mentions: AllowedMentions::none(),
+    };
+    let new_record = |message: u64| PostRecord {
+        key: key.to_string(),
+        guild: job.guild,
+        channel,
+        message,
+        content_hash: hash.clone(),
+        updated_by: job.invoker.user,
+    };
+    match plan {
+        Plan::Refuse(reason) => Outcome::with(Code::Refused, reason.code()),
+        Plan::NoOp => Outcome::new(Code::Unchanged),
+        Plan::Create { .. } if job.shadow => Outcome::new(Code::WouldPost),
+        Plan::Edit { .. } if job.shadow => Outcome::new(Code::WouldEdit),
+        Plan::Recreate { .. } if job.shadow => Outcome::new(Code::WouldRecreate),
+        Plan::Create { .. } => {
+            publish(
+                env,
+                &out,
+                key,
+                job.now,
+                WriteKind::Create,
+                new_record,
+                Code::Posted,
+            )
+            .await
+        }
+        Plan::Recreate { replaces, .. } => {
+            let kind = WriteKind::Recreate { replaces };
+            publish(env, &out, key, job.now, kind, new_record, Code::Recreated).await
+        }
+        Plan::Edit { message, from, .. } => {
+            match env.discord.edit(message, &out).await {
+                Ok(()) => {}
+                // The lookup said it was there and the edit says it is gone: nothing is
+                // written, and the next sync decides again.
+                Err(DiscordError::NotFound) => return Outcome::new(Code::MessageMissing),
+                Err(error) => return discord_outcome(error),
+            }
+            let write = WriteRequest {
+                key: key.to_string(),
+                kind: WriteKind::Edit {
+                    message,
+                    from: from.to_string(),
+                },
+                record: new_record(message),
+                now: job.now,
+            };
+            match env.store.write(write).await {
+                Ok(_) => Outcome::new(Code::Edited),
+                Err(error) => Outcome::with(Code::EditedNotRecorded, error.code()),
+            }
+        }
+    }
+}
+
+/// Sends a new message, records it, and takes the message back down when the record could
+/// not be written: a post that is not recorded would be posted again by the next run.
+async fn publish(
+    env: &Env<'_>,
+    out: &OutgoingEmbed<'_>,
+    key: &str,
+    now: i64,
+    kind: WriteKind,
+    new_record: impl Fn(u64) -> PostRecord,
+    done: Code,
+) -> Outcome {
+    let message = match env.discord.send(out).await {
+        Ok(message) => message,
+        Err(error) => return discord_outcome(error),
+    };
+    let write = WriteRequest {
+        key: key.to_string(),
+        kind,
+        record: new_record(message),
+        now,
+    };
+    match env.store.write(write).await {
+        Ok(_) => Outcome::new(done),
+        Err(error) => match env.discord.delete(out.channel, message).await {
+            Ok(()) | Err(DiscordError::NotFound) => Outcome::with(Code::StoreFailed, error.code()),
+            Err(_) => Outcome::with(Code::PostedNotRecorded, error.code()),
+        },
     }
 }
 
@@ -550,14 +988,139 @@ pub async fn list(env: &Env<'_>, req: &ListRequest) -> ListReport {
 
 /// Maps an HTTP status to a Discord error class.
 pub fn classify_status(status: u16) -> DiscordError {
-    let _ = status;
-    DiscordError::Failed
+    match status {
+        404 => DiscordError::NotFound,
+        401 | 403 => DiscordError::Forbidden,
+        _ => DiscordError::Failed,
+    }
 }
 
 /// Renders a template as a serenity embed.
 pub fn render(template: &EmbedTemplate) -> s::CreateEmbed {
-    let _ = template;
-    s::CreateEmbed::new()
+    let mut embed = s::CreateEmbed::new();
+    if let Some(title) = &template.title {
+        embed = embed.title(title.clone());
+    }
+    if let Some(description) = &template.description {
+        embed = embed.description(description.clone());
+    }
+    for field in &template.fields {
+        embed = embed.field(field.name.clone(), field.value.clone(), field.inline);
+    }
+    if let Some(footer) = &template.footer {
+        embed = embed.footer(s::CreateEmbedFooter::new(footer.clone()));
+    }
+    if let Some(author) = &template.author_name {
+        embed = embed.author(s::CreateEmbedAuthor::new(author.clone()));
+    }
+    if let Some(color) = template.color {
+        embed = embed.colour(s::Colour::new(color));
+    }
+    embed
+}
+
+/// Builds serenity's allowed-mentions object from ours.
+fn serenity_mentions(mentions: &AllowedMentions) -> s::CreateAllowedMentions {
+    let mut out = s::CreateAllowedMentions::new();
+    if !mentions.users.is_empty() {
+        out = out.users(mentions.users.iter().map(|id| s::UserId::new(*id)));
+    }
+    if !mentions.roles.is_empty() {
+        out = out.roles(mentions.roles.iter().map(|id| s::RoleId::new(*id)));
+    }
+    if mentions.everyone {
+        out = out.everyone(true);
+    }
+    if mentions.replied_user {
+        out = out.replied_user(true);
+    }
+    out
+}
+
+fn classify_error(error: &s::Error) -> DiscordError {
+    match error {
+        s::Error::Http(s::http::HttpError::UnsuccessfulRequest(response)) => {
+            classify_status(response.status_code.as_u16())
+        }
+        _ => DiscordError::Failed,
+    }
+}
+
+/// The real Discord calls. It is built by the wiring card; it has no offline test beyond
+/// `render`, `classify_status` and the allowed-mentions object.
+pub struct SerenityDiscord {
+    /// The HTTP client of the running bot.
+    pub http: std::sync::Arc<s::Http>,
+}
+
+#[s::async_trait]
+impl EmbedDiscord for SerenityDiscord {
+    async fn message_state(
+        &self,
+        channel: u64,
+        message: u64,
+    ) -> Result<MessageState, DiscordError> {
+        match s::ChannelId::new(channel)
+            .message(&*self.http, s::MessageId::new(message))
+            .await
+        {
+            Ok(_) => Ok(MessageState::Present),
+            Err(error) => match classify_error(&error) {
+                DiscordError::NotFound => Ok(MessageState::Missing),
+                other => Err(other),
+            },
+        }
+    }
+
+    async fn send(&self, out: &OutgoingEmbed<'_>) -> Result<u64, DiscordError> {
+        let builder = s::CreateMessage::new()
+            .embed(render(out.template))
+            .allowed_mentions(serenity_mentions(&out.mentions));
+        s::ChannelId::new(out.channel)
+            .send_message(&*self.http, builder)
+            .await
+            .map(|message| message.id.get())
+            .map_err(|error| classify_error(&error))
+    }
+
+    async fn edit(&self, message: u64, out: &OutgoingEmbed<'_>) -> Result<(), DiscordError> {
+        let builder = s::EditMessage::new()
+            .embed(render(out.template))
+            .allowed_mentions(serenity_mentions(&out.mentions));
+        s::ChannelId::new(out.channel)
+            .edit_message(&*self.http, s::MessageId::new(message), builder)
+            .await
+            .map(|_| ())
+            .map_err(|error| classify_error(&error))
+    }
+
+    async fn delete(&self, channel: u64, message: u64) -> Result<(), DiscordError> {
+        s::ChannelId::new(channel)
+            .delete_message(&*self.http, s::MessageId::new(message))
+            .await
+            .map_err(|error| classify_error(&error))
+    }
+}
+
+/// Posts alert codes to the staff alert channel, with no mention allowed.
+pub struct SerenityAlerts {
+    /// The HTTP client of the running bot.
+    pub http: std::sync::Arc<s::Http>,
+    /// The staff alert channel.
+    pub channel: u64,
+}
+
+#[s::async_trait]
+impl AlertSink for SerenityAlerts {
+    async fn alert(&self, code: &'static str) {
+        let builder = s::CreateMessage::new()
+            .content(alert_text(code))
+            .allowed_mentions(serenity_mentions(&AllowedMentions::none()));
+        // An alert that cannot be sent has no further channel to be reported to.
+        let _ = s::ChannelId::new(self.channel)
+            .send_message(&*self.http, builder)
+            .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,8 +1135,9 @@ pub struct EmbedFeature {
 impl EmbedFeature {
     /// The hook for a parsed configuration.
     pub fn new(config: &EmbedConfig) -> Self {
-        let _ = config;
-        EmbedFeature { enabled: false }
+        EmbedFeature {
+            enabled: config.enabled(),
+        }
     }
 }
 
@@ -584,8 +1148,10 @@ impl<X, D> Feature<X, D> for EmbedFeature {
     fn enabled(&self) -> bool {
         self.enabled
     }
+    // The records live in the shared core database. No job kind is registered:
+    // post, sync and list answer a staff command and nothing is restart-sensitive.
     fn needs_core_db(&self) -> bool {
-        false
+        true
     }
     fn register_jobs(&self, _registry: &mut Registry) -> Result<(), RunnerError> {
         Ok(())
@@ -595,8 +1161,6 @@ impl<X, D> Feature<X, D> for EmbedFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeds::posts;
-    use crate::embeds::template;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -663,9 +1227,10 @@ mod tests {
 
     impl FakeDiscord {
         fn new() -> Self {
-            let mut state = DiscordState::default();
-            state.next = 9_000;
-            FakeDiscord(Mutex::new(state))
+            FakeDiscord(Mutex::new(DiscordState {
+                next: 9_000,
+                ..DiscordState::default()
+            }))
         }
         fn with<R>(&self, f: impl FnOnce(&mut DiscordState) -> R) -> R {
             f(&mut self.0.lock().unwrap())
@@ -895,10 +1460,10 @@ mod tests {
                 .unwrap();
         }
         async fn break_inserts(&self) {
-            self.sql("CREATE TRIGGER no_insert BEFORE INSERT ON managed_posts BEGIN SELECT RAISE(ABORT, 'x'); END;").await;
+            self.sql("PRAGMA query_only = ON;").await;
         }
         async fn heal_inserts(&self) {
-            self.sql("DROP TRIGGER IF EXISTS no_insert;").await;
+            self.sql("PRAGMA query_only = OFF;").await;
         }
         async fn break_updates(&self) {
             self.sql("CREATE TRIGGER no_update BEFORE UPDATE ON managed_posts BEGIN SELECT RAISE(ABORT, 'x'); END;").await;
@@ -2407,6 +2972,18 @@ mod tests {
         let none = AllowedMentions::none();
         assert!(none.users.is_empty() && none.roles.is_empty());
         assert!(!none.everyone && !none.replied_user);
+        // The object sent to Discord names no user, no role and no `@everyone`.
+        let json = serde_json::to_value(serenity_mentions(&none)).unwrap();
+        let parse = json.get("parse").cloned().unwrap_or(serde_json::json!([]));
+        assert_eq!(parse, serde_json::json!([]), "{json}");
+        for key in ["users", "roles"] {
+            let list = json.get(key).cloned().unwrap_or(serde_json::json!([]));
+            assert_eq!(list, serde_json::json!([]), "{key}: {json}");
+        }
+        assert!(
+            json.get("replied_user").is_none_or(|v| v == false),
+            "{json}"
+        );
     }
 
     // ---- registry hook ----
