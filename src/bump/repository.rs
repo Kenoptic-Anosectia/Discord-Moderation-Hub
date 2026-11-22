@@ -215,6 +215,20 @@ impl Repository {
         Ok(())
     }
 
+    /// Mark the cycle as reminded, but only if the stored row is still that cycle.
+    ///
+    /// RED STUB: the write is not conditional on the cycle number. That is the
+    /// defect the round-2 tests reproduce: a stale handler can mark a newer
+    /// cycle as reminded.
+    pub fn mark_reminded(&mut self, guild: u64, cycle: i64) -> Result<bool, RepoError> {
+        let _ = cycle;
+        let n = self.conn.execute(
+            "UPDATE bump_state SET reminded = 1 WHERE guild = ?1",
+            params![guild.to_string()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// The connection, for a caller that must reach the shared database (the job
     /// queue lives in the same file).
     pub fn connection(&self) -> &Connection {
