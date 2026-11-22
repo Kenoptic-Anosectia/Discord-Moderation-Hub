@@ -847,7 +847,8 @@ async fn run_one(env: &Env<'_>, job: &Job<'_>) -> ItemReport {
             outcome: Outcome::new(Code::InvalidKey),
         };
     }
-    let outcome = if job.guild == 0 || job.channel == Some(0) {
+    // The guild was checked by `gate` (zero is refused there); only the channel is left.
+    let outcome = if job.channel == Some(0) {
         Outcome::new(Code::InvalidTarget)
     } else {
         match env.locks.try_acquire(job.key) {
