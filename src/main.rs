@@ -7,6 +7,7 @@ mod embeds;
 mod flash;
 mod jobs;
 mod privacy_scope;
+mod preflight;
 mod role_menus;
 mod roles;
 mod safeword;
