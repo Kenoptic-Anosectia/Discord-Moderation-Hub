@@ -717,30 +717,41 @@ fn is_invisible(c: char) -> bool {
 
 /// The closed class of the code points that render nothing, as ranges.
 ///
-/// The class is the union of three Unicode sets, and every code point of it
-/// is covered:
+/// The class is the union of three Unicode sets:
 ///
 /// * the **format characters**, the code points whose general category is
 ///   `Cf`: they have no visible effect wherever they appear;
 /// * the **default ignorable** code points, the code points Unicode defines
-///   as having no visible effect: the format characters above plus the
-///   variation selectors, the Mongolian free variation selectors, the
-///   Khmer inherent vowels, the Hangul fillers and the tag characters;
+///   as having no visible effect. This set is NOT the same as the format
+///   characters: `DerivedCoreProperties.txt` builds it as
+///   `Other_Default_Ignorable_Code_Point + Cf + Variation_Selector`
+///   `minus White_Space minus FFF9..FFFB`, so it also holds the variation
+///   selectors, the Mongolian free variation selectors, the Khmer inherent
+///   vowels, the Hangul fillers, the reserved code points U+FFF0..U+FFF8 and
+///   the tag characters - and it does NOT hold the interlinear annotation
+///   characters U+FFF9..U+FFFB nor the Egyptian format controls
+///   U+13430..U+1343F, which are `Cf` but not default ignorable;
 /// * the **blank fillers**, the code points that occupy a position and draw
 ///   nothing but belong to neither set above.
 ///
-/// The table is the whole class, not a list of the examples that were
-/// thought of: a hand list left out the Mongolian free variation selectors,
-/// the shorthand format controls, the reserved part of the tag block and
-/// every format character that Unicode does not make default ignorable, and
-/// those came back in a name as blank-looking text.
+/// The union is the class, so a code point is in it if it is in ANY of the
+/// three sets. The table below is the whole class for the Unicode version
+/// named here, not a list of the examples that were thought of: a hand list
+/// left out the Mongolian free variation selectors, the shorthand format
+/// controls, the reserved part of the tag block, every format character
+/// Unicode does not make default ignorable, and the reserved default
+/// ignorables U+FFF0..U+FFF8, and those came back in a name as
+/// blank-looking text.
 ///
-/// The ranges were taken from the Unicode character database of the same
-/// Unicode version the Rust standard library ships, so they describe the
-/// characters this crate actually sees. The test
+/// The ranges were generated from the Unicode character database files
+/// `DerivedCoreProperties.txt` (the `Default_Ignorable_Code_Point` property)
+/// and `UnicodeData.txt` (the `Cf` general category), both of **Unicode
+/// 17.0.0** - the Unicode version this crate's Rust standard library ships
+/// (`char::UNICODE_VERSION`). The test
 /// `every_character_that_renders_nothing_is_removed` walks every code point
-/// of every range, and `a_character_just_outside_the_class_survives` checks
-/// the edge, so the class is pinned in both directions.
+/// of every range, `the_class_holds_every_code_point_of_the_default_ignorable_set`
+/// pins the total, and `a_character_just_outside_the_class_survives` checks
+/// the edge, so the class is pinned in all three directions.
 const INVISIBLE_RANGES: &[(u32, u32)] = &[
     // The soft hyphen.
     (0x00AD, 0x00AD),
@@ -780,8 +791,10 @@ const INVISIBLE_RANGES: &[(u32, u32)] = &[
     (0xFEFF, 0xFEFF),
     // The halfwidth Hangul filler.
     (0xFFA0, 0xFFA0),
-    // The interlinear annotation characters.
-    (0xFFF9, 0xFFFB),
+    // The reserved code points U+FFF0..U+FFF8 and the interlinear annotation
+    // characters U+FFF9..U+FFFB. The reserved ones are default ignorable but
+    // are NOT format characters, so they have to be named here.
+    (0xFFF0, 0xFFFB),
     // The Kaithi number signs.
     (0x110BD, 0x110BD),
     (0x110CD, 0x110CD),
@@ -2868,7 +2881,7 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 4198,
+            checked, 4207,
             "the closed class must hold every code point of every range"
         );
     }
@@ -2959,9 +2972,7 @@ mod tests {
     /// it falls back to the default name instead of coming back blank.
     #[test]
     fn a_name_of_only_the_reserved_default_ignorables_falls_back_to_the_default() {
-        let only_reserved: String = (0xFFF0u32..=0xFFF8)
-            .filter_map(char::from_u32)
-            .collect();
+        let only_reserved: String = (0xFFF0u32..=0xFFF8).filter_map(char::from_u32).collect();
         assert_eq!(only_reserved.chars().count(), 9);
         assert_eq!(
             sanitize_name(&only_reserved, "Voice Room"),
