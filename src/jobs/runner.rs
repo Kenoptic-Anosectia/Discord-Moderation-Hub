@@ -224,7 +224,8 @@ pub struct RunnerConfig {
     pub concurrency: usize,
     /// Longest sleep with nothing due: [`MIN_POLL`]..=[`MAX_POLL`].
     pub max_poll: Duration,
-    /// How long shutdown waits for in-flight handlers before abandoning them.
+    /// How long shutdown waits for in-flight handlers before abandoning them:
+    /// [`MIN_SHUTDOWN_GRACE`]..=[`MAX_SHUTDOWN_GRACE`].
     pub shutdown_grace: Duration,
     /// Longest one handler may run before it is aborted and treated as a
     /// cancel: [`MIN_HANDLER_TIMEOUT`]..=[`MAX_HANDLER_TIMEOUT`].
@@ -1162,6 +1163,28 @@ mod tests {
         );
         assert_eq!(
             timeout(Duration::MAX),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        // The documented numbers themselves (JOB-RUNNER.md), not just the
+        // constants: a drifting constant must fail here.
+        assert_eq!(
+            grace(Duration::from_millis(999)),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(grace(Duration::from_millis(1000)), Ok(()));
+        assert_eq!(grace(Duration::from_millis(300_000)), Ok(()));
+        assert_eq!(
+            grace(Duration::from_millis(300_001)),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(
+            timeout(Duration::from_millis(999)),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        assert_eq!(timeout(Duration::from_millis(1000)), Ok(()));
+        assert_eq!(timeout(Duration::from_millis(3_600_000)), Ok(()));
+        assert_eq!(
+            timeout(Duration::from_millis(3_600_001)),
             Err(RunnerError::InvalidHandlerTimeout)
         );
         // The shipped defaults sit inside both ranges, and the ranges are sane.
