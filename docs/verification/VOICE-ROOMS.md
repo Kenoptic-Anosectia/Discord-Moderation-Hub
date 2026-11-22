@@ -22,10 +22,9 @@ chars, no `@`, no stray space, a subsequence of the input or the default, idempo
 dropping `trim_end` after the cut is equivalent (the next pass's link step trims that space).
 **Config** (read by W1; bad or negative caps/cooldown/grace = default): `VOICE_ROOMS_MODE` (off),
 `VOICE_ROOM_HUB_CHANNEL_ID`, `VOICE_ROOM_CATEGORY_ID` (unset = no rooms), `VOICE_ROOM_PER_USER_CAP`
-(1), `VOICE_ROOM_GLOBAL_CAP` (25), `VOICE_ROOM_CREATE_COOLDOWN_SECS` (30),
-`VOICE_ROOM_EMPTY_GRACE_SECS` (60), `VOICE_ROOM_DEFAULT_NAME`, `VOICE_ROOM_RENAME_BUDGET` (2),
-`VOICE_ROOM_RENAME_WINDOW_SECS` (600). **Not done**: no runtime, commands, registration, persistence
-or config change; the runtime owns the state and `empty_since`; W1 removes `#![allow(dead_code)]`.
-DEFERRED (owner-approved): emoji and symbols are dropped. Non-alphabetic marks are dropped too
-(`e`+U+0301, Indic virama, Thai tone mark); a letter some font draws blank survives; `notes.txt` is
-removed as a host while a bare IP and `example . com` stay. Discord's rename limit is unverified.
+(1), `VOICE_ROOM_GLOBAL_CAP` (25), `VOICE_ROOM_CREATE_COOLDOWN_SECS` (30), `VOICE_ROOM_EMPTY_GRACE_SECS`
+(60), `VOICE_ROOM_DEFAULT_NAME`, `VOICE_ROOM_RENAME_BUDGET` (2), `VOICE_ROOM_RENAME_WINDOW_SECS` (600).
+**Not done**: runtime, commands, registration, persistence, config change (the runtime owns state and
+`empty_since`; W1 removes the `dead_code` allow). DEFERRED (owner-approved): emoji and symbols are
+dropped. Also dropped: non-alphabetic marks (`e`+U+0301, Indic virama, Thai tone mark). Font-blank
+letters survive; `notes.txt` goes as a host, a bare IP stays. Discord's rename limit is unverified.
