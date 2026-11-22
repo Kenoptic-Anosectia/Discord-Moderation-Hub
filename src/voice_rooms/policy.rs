@@ -2789,6 +2789,48 @@ mod tests {
         assert_eq!(sanitize_name("@@everyone", "Voice Room"), "Voice Room");
     }
 
+    /// The documented limits of the cleaner, pinned so the doc cannot drift:
+    /// non-alphabetic combining marks (a Devanagari virama, a Thai tone mark)
+    /// are dropped, a dotted word is taken for a host, and a bare IP and a
+    /// spaced dot survive.
+    #[test]
+    fn the_documented_limits_hold() {
+        // Hindi "namaste" loses its virama U+094D.
+        assert_eq!(
+            sanitize_name(
+                "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}",
+                "Voice Room"
+            ),
+            "\u{0928}\u{092E}\u{0938}\u{0924}\u{0947}"
+        );
+        // Thai "mai" loses its tone mark U+0E48.
+        assert_eq!(
+            sanitize_name("\u{0E44}\u{0E21}\u{0E48}", "Voice Room"),
+            "\u{0E44}\u{0E21}"
+        );
+        assert_eq!(sanitize_name("notes.txt party", "Voice Room"), "party");
+        assert_eq!(
+            sanitize_name("192.0.2.7 party", "Voice Room"),
+            "192.0.2.7 party"
+        );
+        assert_eq!(
+            sanitize_name("example . com party", "Voice Room"),
+            "example . com party"
+        );
+    }
+
+    /// The cap counts the text after the spaces are collapsed: a double
+    /// space left by a removed character does not use up a character of the
+    /// 100.
+    #[test]
+    fn the_cap_counts_the_collapsed_text() {
+        let raw = format!("a * {}", "b".repeat(120));
+        assert_eq!(
+            sanitize_name(&raw, "Voice Room"),
+            format!("a {}", "b".repeat(98))
+        );
+    }
+
     /// Returns true when `small` can be obtained from `big` by deleting
     /// characters only.
     fn is_subsequence(small: &str, big: &str) -> bool {
