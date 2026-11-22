@@ -776,7 +776,11 @@ const INVISIBLE_RANGES: &[(u32, u32)] = &[
     // The Mongolian free variation selectors and the vowel separator.
     (0x180B, 0x180F),
     // The zero-width characters.
-    (0x200B, 0x200F),
+    // RED COMMIT: this range is deliberately shifted down by one code point
+    // (0x200A..0x200E instead of 0x200B..0x200F) so the new class tests in
+    // this commit FAIL and show that they catch a range that was moved. The
+    // next commit puts the range back.
+    (0x200A, 0x200E),
     // The bidirectional embedding, override and isolate controls.
     (0x202A, 0x202E),
     // The word joiner, the invisible operators and the isolates.
@@ -2996,5 +3000,138 @@ mod tests {
             counted, 4207,
             "the closed class must hold every code point of every range"
         );
+    }
+
+    /// The class, written out as raw literals: the expected first and last
+    /// code point of each of the 26 ranges, with the code point just below
+    /// and the code point just above each range.
+    ///
+    /// This table is a SECOND copy of the class, transcribed by hand from the
+    /// Unicode 17.0.0 character database, and it does NOT come from
+    /// `INVISIBLE_RANGES`. That is the whole point of it: the other tests
+    /// build their inputs from the production constant, so they only check
+    /// that the implementation agrees with itself. A range that was moved by
+    /// one code point but kept its size passes all of them, because the walk
+    /// only ever visits the code points the table names and the count is
+    /// unchanged.
+    ///
+    /// The neighbours are `None` where the neighbour is removed by another
+    /// rule rather than by the class (the whitespace rule removes U+200A,
+    /// U+2029, U+202F and U+205F), so only the neighbours that must survive
+    /// are asserted.
+    const EXPECTED_CLASS: &[(u32, u32, Option<u32>, Option<u32>)] = &[
+        (0x00AD, 0x00AD, Some(0x00AC), Some(0x00AE)),
+        (0x034F, 0x034F, Some(0x034E), Some(0x0350)),
+        (0x0600, 0x0605, Some(0x05FF), Some(0x0606)),
+        (0x061C, 0x061C, Some(0x061B), Some(0x061D)),
+        (0x06DD, 0x06DD, Some(0x06DC), Some(0x06DE)),
+        (0x070F, 0x070F, Some(0x070E), Some(0x0710)),
+        (0x0890, 0x0891, Some(0x088F), Some(0x0892)),
+        (0x08E2, 0x08E2, Some(0x08E1), Some(0x08E3)),
+        (0x115F, 0x1160, Some(0x115E), Some(0x1161)),
+        (0x17B4, 0x17B5, Some(0x17B3), Some(0x17B6)),
+        (0x180B, 0x180F, Some(0x180A), Some(0x1810)),
+        (0x200B, 0x200F, None, Some(0x2010)),
+        (0x202A, 0x202E, None, None),
+        (0x2060, 0x206F, None, Some(0x2070)),
+        (0x2800, 0x2800, Some(0x27FF), Some(0x2801)),
+        (0x3164, 0x3164, Some(0x3163), Some(0x3165)),
+        (0xFE00, 0xFE0F, Some(0xFDFF), Some(0xFE10)),
+        (0xFEFF, 0xFEFF, Some(0xFEFE), Some(0xFF00)),
+        (0xFFA0, 0xFFA0, Some(0xFF9F), Some(0xFFA1)),
+        (0xFFF0, 0xFFFB, Some(0xFFEF), Some(0xFFFC)),
+        (0x110BD, 0x110BD, Some(0x110BC), Some(0x110BE)),
+        (0x110CD, 0x110CD, Some(0x110CC), Some(0x110CE)),
+        (0x13430, 0x1343F, Some(0x1342F), Some(0x13440)),
+        (0x1BCA0, 0x1BCA3, Some(0x1BC9F), Some(0x1BCA4)),
+        (0x1D173, 0x1D17A, Some(0x1D172), Some(0x1D17B)),
+        (0xE0000, 0xE0FFF, Some(0xDFFF), Some(0xE1000)),
+    ];
+
+    /// The production table must BE the class, checked against a second,
+    /// independently written copy of it.
+    ///
+    /// The check is on the observable behaviour, not on a field: for every
+    /// range of the expected class, the first and the last code point are
+    /// removed from a name, and the code point just outside each end is
+    /// kept. A range that was moved by one code point but kept its size
+    /// either lets a code point of the class survive or removes a code point
+    /// that draws something, and either way this test fails.
+    #[test]
+    fn the_class_is_the_one_the_unicode_character_database_names() {
+        assert_eq!(
+            EXPECTED_CLASS.len(),
+            26,
+            "the class must hold the 26 ranges of Unicode 17.0.0"
+        );
+        let mut removed = 0usize;
+        for &(first, last, below, above) in EXPECTED_CLASS {
+            for cp in [first, last] {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                removed += 1;
+                assert_eq!(
+                    sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                    "party",
+                    "U+{cp:04X} renders nothing and must be removed"
+                );
+            }
+            for cp in [below, above].into_iter().flatten() {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                assert_eq!(
+                    sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                    format!("par{c}ty"),
+                    "U+{cp:04X} draws something and must survive"
+                );
+            }
+        }
+        assert_eq!(
+            removed, 52,
+            "every range has a first and a last code point to check"
+        );
+    }
+
+    /// The production table must hold exactly the ranges of the expected
+    /// class: no range is missing, none is extra, and every range starts and
+    /// ends where the expected one does.
+    ///
+    /// This is the direct check on the table, so a range that was shifted or
+    /// dropped is caught here even when the count stays the same.
+    #[test]
+    fn the_production_table_is_the_expected_class() {
+        let mut expected: Vec<(u32, u32)> =
+            EXPECTED_CLASS.iter().map(|&(f, l, _, _)| (f, l)).collect();
+        expected.sort_unstable();
+        let mut actual: Vec<(u32, u32)> = INVISIBLE_CLASS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "the production table must be exactly the 26 ranges of the class"
+        );
+    }
+
+    /// The code point just outside each range of the expected class must
+    /// survive on its own, not only inside a word.
+    ///
+    /// The word test above could pass for a code point that the class
+    /// removes only when it is between two letters, so this test pins the
+    /// code point alone as well.
+    #[test]
+    fn a_code_point_just_outside_the_expected_class_survives_on_its_own() {
+        for &(_, _, below, above) in EXPECTED_CLASS {
+            for cp in [below, above].into_iter().flatten() {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                assert_eq!(
+                    sanitize_name(&format!("a{c}b"), "Voice Room"),
+                    format!("a{c}b"),
+                    "U+{cp:04X} draws something and must survive"
+                );
+            }
+        }
     }
 }
