@@ -3022,10 +3022,17 @@ mod tests {
     /// The neighbours are `None` where the neighbour is removed by another
     /// rule rather than by the class (the whitespace rule removes U+200A,
     /// U+2029, U+202F and U+205F), so only the neighbours that must survive
-    /// are asserted. The neighbour below the tag range is U+DFFF and not
-    /// U+DFFFF, because U+D800..U+DFFF are the surrogates, which are not
-    /// characters at all, so U+DFFF is the nearest code point below U+E0000
-    /// that a name can hold.
+    /// are asserted.
+    ///
+    /// Every neighbour that IS given must be a real character, because a
+    /// neighbour that is not one cannot be asserted on at all: the tests
+    /// that walk them used to skip it, and then the end of the range it
+    /// belongs to was never checked from that side. The neighbour below the
+    /// tag range (U+E0000..U+E0FFF) is therefore U+DFFFF, the nearest
+    /// character below U+E0000 - it is in plane 13 and is NOT a surrogate.
+    /// The surrogate block is U+D800..U+DFFF, which is a different block
+    /// entirely, and U+DFFF is its LAST surrogate, so it is not a character
+    /// and cannot be used here.
     const EXPECTED_CLASS: &[(u32, u32, Option<u32>, Option<u32>)] = &[
         (0x00AD, 0x00AD, Some(0x00AC), Some(0x00AE)),
         (0x034F, 0x034F, Some(0x034E), Some(0x0350)),
@@ -3052,7 +3059,7 @@ mod tests {
         (0x13430, 0x1343F, Some(0x1342F), Some(0x13440)),
         (0x1BCA0, 0x1BCA3, Some(0x1BC9F), Some(0x1BCA4)),
         (0x1D173, 0x1D17A, Some(0x1D172), Some(0x1D17B)),
-        (0xE0000, 0xE0FFF, Some(0xDFFF), Some(0xE1000)),
+        (0xE0000, 0xE0FFF, Some(0xDFFFF), Some(0xE1000)),
     ];
 
     /// The production table must BE the class, checked against a second,
@@ -3074,9 +3081,9 @@ mod tests {
         let mut removed = 0usize;
         for &(first, last, below, above) in EXPECTED_CLASS {
             for cp in [first, last] {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
+                let c = char::from_u32(cp).unwrap_or_else(|| {
+                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
+                });
                 removed += 1;
                 assert_eq!(
                     sanitize_name(&format!("par{c}ty"), "Voice Room"),
@@ -3085,9 +3092,9 @@ mod tests {
                 );
             }
             for cp in [below, above].into_iter().flatten() {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
+                let c = char::from_u32(cp).unwrap_or_else(|| {
+                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
+                });
                 assert_eq!(
                     sanitize_name(&format!("par{c}ty"), "Voice Room"),
                     format!("par{c}ty"),
