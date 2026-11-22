@@ -7,8 +7,9 @@
 //!
 //! Fail-closed rules (each has a test):
 //!
-//! * `SAFEWORD_MODE` is parsed by `settings::parse_mode`. Any value other than
-//!   `off`, `shadow` or `live` is `off` (K06 already does that).
+//! * `SAFEWORD_MODE` is parsed by `settings::parse_mode`. That helper never
+//!   fails: an unset or unknown mode is `off` (K06 already does that), so a
+//!   bad mode never produces a `ConfigError` — it is simply off.
 //! * Every id key must be present and must be exactly one plain decimal id.
 //!   A missing or unusable id switches the feature off and the error names the
 //!   **key**, never the value.
@@ -56,8 +57,6 @@ pub const FLAG_OFF: &str = "off";
 /// Every variant is a stable code and carries no value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigErrorKind {
-    /// The mode key could not be read.
-    ModeUnreadable,
     /// A required id key was not set.
     MissingId,
     /// A required id key held something that is not one plain decimal id.
@@ -72,7 +71,6 @@ impl ConfigErrorKind {
     /// The stable machine code. It never contains a name, an id or a value.
     pub fn code(self) -> &'static str {
         match self {
-            ConfigErrorKind::ModeUnreadable => "mode_unreadable",
             ConfigErrorKind::MissingId => "missing_id",
             ConfigErrorKind::InvalidId => "invalid_id",
             ConfigErrorKind::InvalidIdList => "invalid_id_list",
@@ -150,8 +148,11 @@ impl SafewordConfig {
     /// A refused configuration is an error: the caller switches the feature
     /// off and reports the key. The feature is never half-configured.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        // K06's `parse_mode` never fails: an unset or unknown mode is `off`.
+        // The mode therefore never produces a `ConfigError`; a bad mode is
+        // simply off, which is the fail-closed reading.
         let mode = parse_mode(KEY_MODE, lookup(KEY_MODE).as_deref())
-            .map_err(|_| ConfigError::new(ConfigErrorKind::ModeUnreadable, KEY_MODE))?;
+            .map_err(|_| ConfigError::new(ConfigErrorKind::InvalidFlag, KEY_MODE))?;
 
         let role_id = parse_single_id(KEY_ROLE_ID, &lookup)?;
         let channel_id = parse_single_id(KEY_CHANNEL_ID, &lookup)?;

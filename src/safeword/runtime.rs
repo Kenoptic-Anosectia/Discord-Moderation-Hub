@@ -592,7 +592,7 @@ fn run_actions(
     }
 
     // Persist the state the machine ended in.
-    let persisted = match &state {
+    let persisted: Result<u64, &'static str> = match &state {
         State::Inactive => ops.store.clear(guild_id, member_id, version, now),
         other => ops.store.store(guild_id, member_id, other, version, now),
     };
@@ -677,10 +677,29 @@ fn perform(
             }
         }
         Action::RemoveRoles(roles) => remove_roles(guild_id, member_id, roles, ops, shadow),
-        Action::AddSafewordRole => add_role(guild_id, member_id, config.role_id, ops, shadow),
+        Action::AddSafewordRole => {
+            // The member is not on safeword yet: the safeword role itself is
+            // not a restricted role, so the K03 safeword rule does not apply.
+            add_role(
+                guild_id,
+                member_id,
+                config.role_id,
+                false,
+                &config.restricted_role_ids,
+                ops,
+                shadow,
+            )
+        }
         Action::SendDm(kind) => send_dm(config, member_id, *kind, ops),
         Action::RemoveSafewordRole => remove_role(guild_id, member_id, config.role_id, ops, shadow),
-        Action::RestoreRoles(roles) => restore_roles(guild_id, member_id, roles, ops, shadow),
+        Action::RestoreRoles(roles) => restore_roles(
+            guild_id,
+            member_id,
+            roles,
+            &config.restricted_role_ids,
+            ops,
+            shadow,
+        ),
         Action::ClearSnapshot => match ops.store.clear(guild_id, member_id, *version, now) {
             Ok(new_version) => {
                 *version = new_version;
@@ -765,13 +784,25 @@ fn restore_roles(
     guild_id: u64,
     member_id: u64,
     roles: &[RoleId],
+    restricted_roles: &[RoleId],
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> StepOutcome {
     let mut failures = 0usize;
     let mut written = 0usize;
     for role_id in roles {
-        match add_role(guild_id, member_id, *role_id, ops, shadow) {
+        // The member is still on safeword while the release runs, so the K03
+        // safeword rule is live: only the `SafewordRestore` path may give a
+        // restricted role back.
+        match add_role(
+            guild_id,
+            member_id,
+            *role_id,
+            true,
+            restricted_roles,
+            ops,
+            shadow,
+        ) {
             StepOutcome::Done => written += 1,
             StepOutcome::Failed { .. } => failures += 1,
         }
@@ -794,14 +825,21 @@ fn restore_roles(
 }
 
 /// Add one role, after the K03 grant decision.
+///
+/// `safeword_active` says whether the member is on safeword right now. It is
+/// `true` for a restore: the member is still recorded as on safeword while
+/// the release runs, so the K03 safeword rule is live and only the
+/// `SafewordRestore` path may give a restricted role back.
 fn add_role(
     guild_id: u64,
     member_id: u64,
     role_id: RoleId,
+    safeword_active: bool,
+    restricted_roles: &[RoleId],
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> StepOutcome {
-    match grant_decision(guild_id, role_id, ops) {
+    match grant_decision(guild_id, role_id, safeword_active, restricted_roles, ops) {
         GrantDecision::Allow => match ops.members.add_role(member_id, role_id) {
             Ok(()) => {
                 shadow.role_adds = shadow.role_adds.saturating_add(1);
@@ -865,8 +903,16 @@ fn alert_code(code: FailureCode) -> &'static str {
 /// The K03 grant decision for a role the safeword writes.
 ///
 /// The path is `SafewordRestore`: it is the path that exists for the safeword
-/// restores, so a restricted role can be given back.
-fn grant_decision(guild_id: u64, role_id: RoleId, ops: &mut Ops) -> GrantDecision {
+/// restores, so a restricted role can be given back while the member is on
+/// safeword. The restricted set and the safeword state are the real ones, so
+/// the K03 safeword rule is live: another path would be denied.
+fn grant_decision(
+    guild_id: u64,
+    role_id: RoleId,
+    safeword_active: bool,
+    restricted_roles: &[RoleId],
+    ops: &mut Ops,
+) -> GrantDecision {
     let bot_top = match ops.facts.bot_top_position() {
         Some(position) => position,
         None => return GrantDecision::Denied(CODE_BOT_TOP_UNKNOWN),
@@ -877,8 +923,12 @@ fn grant_decision(guild_id: u64, role_id: RoleId, ops: &mut Ops) -> GrantDecisio
         bot_top_position: bot_top,
         guild_id,
         protected_role_ids: &[],
-        safeword: SafewordState::Inactive,
-        safeword_restricted_role_ids: &[],
+        safeword: if safeword_active {
+            SafewordState::Active
+        } else {
+            SafewordState::Inactive
+        },
+        safeword_restricted_role_ids: restricted_roles,
         staff: None,
     };
     match decide_from_facts(facts, role_id, &inputs) {
@@ -1184,7 +1234,10 @@ fn collect_reaction_users(
     ops: &mut Ops,
     report: &mut ReconcileReport,
 ) -> Option<Vec<u64>> {
-    let mut users: Vec<u64> = Vec::new();
+    // The list holds at most one page's worth of users per page read, so its
+    // length is bounded by `max_pages * REACTION_PAGE_SIZE`.
+    let capacity = (max_pages as usize).saturating_mul(REACTION_PAGE_SIZE as usize);
+    let mut users: Vec<u64> = Vec::with_capacity(capacity.min(1024));
     let mut after: Option<u64> = None;
     let mut pages = 0u32;
     loop {
@@ -1208,11 +1261,23 @@ fn collect_reaction_users(
                 return None;
             }
         };
+        // A page that holds more users than the page size is not a page: the
+        // whole class is refused rather than one bad page being trimmed.
+        if page.len() > REACTION_PAGE_SIZE as usize {
+            report.push(CODE_REACTION_USERS_FAILED);
+            return None;
+        }
         let count = page.len();
         let last = page.last().copied();
         users.extend(page);
         if count < REACTION_PAGE_SIZE as usize {
             break;
+        }
+        // A full page that does not advance the cursor would loop forever on
+        // the same page, so it is refused.
+        if after == last {
+            report.push(CODE_REACTION_USERS_FAILED);
+            return None;
         }
         after = last;
     }
@@ -1774,7 +1839,7 @@ mod tests {
             self
         }
 
-        fn with_facts(mut self, facts: FakeFacts) -> Self {
+        fn with_facts<F: RoleFactsSource + 'static>(mut self, facts: F) -> Self {
             self.ops.facts = Box::new(facts);
             self
         }
@@ -2582,6 +2647,74 @@ mod tests {
     #[allow(dead_code)]
     fn member_set(ids: &[u64]) -> BTreeSet<u64> {
         ids.iter().copied().collect()
+    }
+
+    // ------------------------------------------------------------------
+    // The K03 eligibility decision
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_restore_goes_through_the_k03_safeword_restore_path() {
+        // The member is on safeword and holds the restricted role. Only the
+        // `SafewordRestore` path may give a restricted role back while the
+        // safeword is active, so the restore succeeds.
+        let cfg = config();
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        // The member now holds only the safeword role, as Discord would say.
+        harness
+            .members_log
+            .borrow_mut()
+            .roles
+            .insert(MEMBER, vec![SAFEWORD_ROLE]);
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::Done);
+        assert!(
+            harness.added().contains(&(MEMBER, RESTRICTED_A)),
+            "the restricted role was given back, added {:?}",
+            harness.added()
+        );
+        assert!(
+            harness.alerts().is_empty(),
+            "no alert: the restore path allows it, alerts {:?}",
+            harness.alerts()
+        );
+    }
+
+    #[test]
+    fn a_role_the_bot_cannot_reach_is_never_written() {
+        // The bot's top role is at position 50 and the role sits at 50: K03
+        // denies it, so no write happens and the denial is alerted.
+        struct HighRoleFacts;
+        impl RoleFactsSource for HighRoleFacts {
+            fn role_facts(&mut self, role_id: RoleId) -> roles_facts::FactsOutcome {
+                roles_facts::FactsOutcome::Found(RoleFacts {
+                    id: role_id,
+                    position: 50,
+                    managed: false,
+                    permissions: 0,
+                    exists: true,
+                })
+            }
+
+            fn bot_top_position(&mut self) -> Option<u16> {
+                Some(50)
+            }
+        }
+        let cfg = config();
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_facts(HighRoleFacts);
+        let mut shadow = ShadowRecord::default();
+        let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert!(!outcome.is_success(), "a denied write is never a success");
+        assert!(harness.removed().is_empty());
+        assert!(
+            harness.alerts().contains(&"at_or_above_bot"),
+            "the K03 deny code is alerted, got {:?}",
+            harness.alerts()
+        );
     }
 
     // ------------------------------------------------------------------
