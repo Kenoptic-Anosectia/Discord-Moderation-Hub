@@ -1780,6 +1780,49 @@ mod tests {
     // ---- the stale mark must not touch a newer cycle ------------------------------------
 
     #[tokio::test]
+    async fn a_job_of_an_older_cycle_is_stale_even_with_the_same_due_time() {
+        // A reset at the same moment as the confirmation opens the next cycle
+        // with the SAME due time, so only the cycle number tells the two jobs
+        // apart. The job of the older cycle must not act.
+        let mut h = Harness::new("live");
+        {
+            let mut rt = h.runtime();
+            rt.observe(&success(100), NOW).unwrap();
+        }
+        {
+            let mut rt = h.runtime();
+            rt.reset(StaffCheck::Staff, Some(GUILD), NOW).unwrap();
+        }
+        let state = h.repo.load(GUILD).unwrap().unwrap();
+        assert_eq!(state.cycle, 2);
+        assert_eq!(state.next_due_at, Some(NOW + INTERVAL as i64));
+        // The job of cycle 1 carries the same due time as the stored row.
+        let old = job_for(1, NOW + INTERVAL as i64);
+        assert_eq!(
+            parse_reminder_payload(&old.payload_json).unwrap().due_at,
+            state.next_due_at.unwrap(),
+            "the old job must carry the same due time for this test to bite"
+        );
+        {
+            let mut rt = h.runtime();
+            assert!(
+                !rt.run_reminder(NOW + INTERVAL as i64, &old).await.unwrap(),
+                "a job of an older cycle acted"
+            );
+        }
+        assert!(
+            h.channel.sent().is_empty(),
+            "an old cycle posted a reminder"
+        );
+        let state = h.repo.load(GUILD).unwrap().unwrap();
+        assert_eq!(state.cycle, 2);
+        assert!(
+            !state.reminded,
+            "an old cycle marked the newer cycle as reminded"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stale_reminder_cannot_mark_a_newer_cycle() {
         let mut h = Harness::new("live");
         {
