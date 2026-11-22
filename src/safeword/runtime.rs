@@ -28,16 +28,20 @@
 //! * **Shadow mode performs nothing.** No role write, no DM and no alert: it
 //!   only produces a structured would-do record of counts and codes.
 //! * **A failed lookup never costs the member their protection.** A lookup
-//!   that fails is a refusal, never a guess, so the member keeps the safeword
-//!   role they already hold.
+//!   that fails is a refusal, never a guess: the runtime writes nothing at
+//!   all, so the member keeps exactly the roles and the safeword role it
+//!   already holds.
 //!
-//! Everything here is Discord-free and clock-free: the ids and the `now` come
-//! in through the request structs. The Discord calls sit behind small traits so
-//! a test injects fakes.
+//! The decision core is Discord-free and clock-free: the ids and the `now`
+//! come in through the request structs, and the Discord calls sit behind
+//! small traits so a test injects fakes. Two places touch serenity on
+//! purpose and are marked as such: [`reaction_event`] reads a serenity event
+//! into plain values, and [`SafewordFeature`] is the registry hook.
 
 use crate::roles::eligibility::{
     decide_removal, Decision, GrantPath, GrantRequest, RoleFacts, SafewordState,
 };
+use crate::roles::grant::Sleeper;
 use crate::roles::runtime::{
     self as roles_facts, decide_from_facts, DecisionInputs, RuntimeDecision,
 };
@@ -160,9 +164,9 @@ pub const CODE_BOT_TOP_UNKNOWN: &str = "bot_top_position_unknown";
 
 /// The most actions one event may run.
 ///
-/// The state machine emits a bounded number of actions per event. This cap is
-/// a guard against a loop that never ends; it is not a promise about how many
-/// actions an event runs.
+/// This is a guard against a loop that never ends: the runtime stops after
+/// this many actions, alerts `state_failed` and reports the run as failed.
+/// It is not a statement about how many actions an event normally runs.
 pub const MAX_ACTIONS_PER_EVENT: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -385,6 +389,11 @@ pub struct Ops {
     pub store: Box<dyn StateStore>,
     /// The reaction user list.
     pub reactions: Box<dyn ReactionUsers>,
+    /// The sleeper the K04 grant executor uses between rate-limit retries.
+    pub sleeper: Box<dyn Sleeper>,
+    /// The guild-wide protected roles (the wiring card passes
+    /// `PROTECTED_ROLE_IDS`). They are never given back by a restore.
+    pub protected_role_ids: Vec<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1416,8 +1425,8 @@ mod tests {
     };
     use crate::safeword::state::ACTIVE_DM_TEXT;
     use crate::safeword::state::RELEASED_DM_TEXT;
-    use std::cell::RefCell;
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::cell::{Cell, RefCell};
+    use std::collections::{BTreeMap, VecDeque};
     use std::rc::Rc;
 
     const GUILD: u64 = 600_001;
@@ -1451,6 +1460,10 @@ mod tests {
         lookup_fails: bool,
         /// Role ids whose write fails, and with what.
         fail_writes: BTreeMap<u64, WriteCode>,
+        /// Role ids whose next ADDs fail a number of times, then succeed.
+        transient: BTreeMap<u64, (WriteCode, u32)>,
+        /// A script consumed one entry per write: `Some` fails the write.
+        chaos: VecDeque<Option<WriteCode>>,
     }
 
     impl FakeMembers {
@@ -1459,7 +1472,40 @@ mod tests {
                 log: Rc::new(RefCell::new(MemberLog::default())),
                 lookup_fails: false,
                 fail_writes: BTreeMap::new(),
+                transient: BTreeMap::new(),
+                chaos: VecDeque::new(),
             }
+        }
+
+        /// The next `times` writes of `role_id` fail with `code`, then succeed.
+        fn failing_write_times(mut self, role_id: u64, code: WriteCode, times: u32) -> Self {
+            self.transient.insert(role_id, (code, times));
+            self
+        }
+
+        /// Each write consumes one scripted entry; `Some(code)` fails it.
+        fn with_chaos(mut self, script: Vec<Option<WriteCode>>) -> Self {
+            self.chaos = script.into();
+            self
+        }
+
+        /// The failure the next write of `role_id` meets, if any.
+        fn next_failure(&mut self, role_id: u64, is_add: bool) -> Option<WriteCode> {
+            if let Some(code) = self.fail_writes.get(&role_id) {
+                return Some(*code);
+            }
+            let transient = if is_add {
+                self.transient.get_mut(&role_id)
+            } else {
+                None
+            };
+            if let Some((code, left)) = transient {
+                if *left > 0 {
+                    *left -= 1;
+                    return Some(*code);
+                }
+            }
+            self.chaos.pop_front().flatten()
         }
 
         fn with_roles(self, member_id: u64, roles: &[u64]) -> Self {
@@ -1498,8 +1544,8 @@ mod tests {
 
         fn add_role(&mut self, member_id: u64, role_id: RoleId) -> Result<(), WriteCode> {
             self.log.borrow_mut().added.push((member_id, role_id));
-            match self.fail_writes.get(&role_id) {
-                Some(code) => Err(*code),
+            match self.next_failure(role_id, true) {
+                Some(code) => Err(code),
                 None => {
                     let mut log = self.log.borrow_mut();
                     log.roles.entry(member_id).or_default().push(role_id);
@@ -1510,8 +1556,8 @@ mod tests {
 
         fn remove_role(&mut self, member_id: u64, role_id: RoleId) -> Result<(), WriteCode> {
             self.log.borrow_mut().removed.push((member_id, role_id));
-            match self.fail_writes.get(&role_id) {
-                Some(code) => Err(*code),
+            match self.next_failure(role_id, false) {
+                Some(code) => Err(code),
                 None => {
                     let mut log = self.log.borrow_mut();
                     if let Some(roles) = log.roles.get_mut(&member_id) {
@@ -1577,10 +1623,16 @@ mod tests {
     struct FakeDms {
         sent: Rc<RefCell<Vec<(u64, String)>>>,
         failure: Option<DmCode>,
+        /// How many of the next sends fail before the rest succeed.
+        fail_next: u32,
     }
 
     impl DmSender for FakeDms {
         fn send_dm(&mut self, user_id: u64, text: &str) -> Result<(), DmCode> {
+            if self.fail_next > 0 {
+                self.fail_next -= 1;
+                return Err(DmCode::Other);
+            }
             match self.failure {
                 Some(code) => Err(code),
                 None => {
@@ -1786,6 +1838,17 @@ mod tests {
         }
     }
 
+    /// The sleeper fake: it records the sleeps and never waits.
+    struct FakeSleeper {
+        slept: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Sleeper for FakeSleeper {
+        fn sleep_ms(&mut self, ms: u64) {
+            self.slept.borrow_mut().push(ms);
+        }
+    }
+
     /// The whole fake set, with the log handles the test keeps.
     struct Harness {
         ops: Ops,
@@ -1796,6 +1859,7 @@ mod tests {
         store_writes: Rc<RefCell<Vec<(u64, State)>>>,
         store_clears: Rc<RefCell<Vec<u64>>>,
         reaction_calls: ReactionCalls,
+        slept: Rc<RefCell<Vec<u64>>>,
     }
 
     impl Harness {
@@ -1809,18 +1873,24 @@ mod tests {
             let store_clears = Rc::clone(&store.clears);
             let reactions = FakeReactionUsers::new(Vec::new());
             let reaction_calls = Rc::clone(&reactions.calls);
+            let slept = Rc::new(RefCell::new(Vec::new()));
             let ops = Ops {
                 members: Box::new(members),
                 facts: Box::new(FakeFacts::new()),
                 dms: Box::new(FakeDms {
                     sent: Rc::clone(&dms_sent),
                     failure: None,
+                    fail_next: 0,
                 }),
                 alerter: Box::new(FakeAlerter {
                     alerts: Rc::clone(&alerts),
                 }),
                 store: Box::new(store),
                 reactions: Box::new(reactions),
+                sleeper: Box::new(FakeSleeper {
+                    slept: Rc::clone(&slept),
+                }),
+                protected_role_ids: Vec::new(),
             };
             Self {
                 ops,
@@ -1831,7 +1901,17 @@ mod tests {
                 store_writes,
                 store_clears,
                 reaction_calls,
+                slept,
             }
+        }
+
+        fn with_protected(mut self, roles: &[u64]) -> Self {
+            self.ops.protected_role_ids = roles.to_vec();
+            self
+        }
+
+        fn sleeps(&self) -> Vec<u64> {
+            self.slept.borrow().clone()
         }
 
         fn with_store(mut self, store: FakeStore) -> Self {
@@ -1848,6 +1928,7 @@ mod tests {
             self.ops.dms = Box::new(FakeDms {
                 sent: Rc::clone(&self.dms_sent),
                 failure: Some(code),
+                fail_next: 0,
             });
             self
         }
@@ -2482,83 +2563,335 @@ mod tests {
     // Liveness
     // ------------------------------------------------------------------
 
-    #[test]
-    fn a_seeded_random_sequence_always_ends_in_a_final_state() {
-        // A model runtime that acknowledges, fails and retries. The model
-        // stands in for Discord: a role write may fail, and the machine must
-        // still reach a final state (Active or Inactive) and never leave work
-        // unacknowledged.
-        let cfg = config();
-        let mut seed: u64 = 0x5DEE_CE66_D1B5_1A3F;
-        let mut next = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            seed >> 33
-        };
+    /// Facts where one role can be moved above the bot between two events.
+    struct ToggleFacts {
+        high_role: RoleId,
+        high: Rc<Cell<bool>>,
+    }
 
-        for round in 0..64u64 {
-            let mut harness =
-                Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
-            // The writer fails on one role in some rounds.
-            let failing_role = if next() % 3 == 0 {
-                Some(RESTRICTED_B)
+    impl RoleFactsSource for ToggleFacts {
+        fn role_facts(&mut self, role_id: RoleId) -> roles_facts::FactsOutcome {
+            let position = if role_id == self.high_role && self.high.get() {
+                60
             } else {
-                None
+                1
             };
-            if let Some(role) = failing_role {
-                harness.ops.members = Box::new(
-                    FakeMembers::new()
-                        .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
-                        .failing_write(role, WriteCode::RateLimited),
+            roles_facts::FactsOutcome::Found(RoleFacts {
+                id: role_id,
+                position,
+                managed: false,
+                permissions: 0,
+                exists: true,
+            })
+        }
+
+        fn bot_top_position(&mut self) -> Option<u16> {
+            Some(50)
+        }
+    }
+
+    /// Activate, then release, with the member holding both restricted roles.
+    /// Returns the outcome of the release.
+    fn activate_then_release(cfg: &SafewordConfig, harness: &mut Harness) -> Outcome {
+        let mut shadow = ShadowRecord::default();
+        let first = handle_reaction(cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(first, Outcome::Done, "the activation completes first");
+        handle_reaction(cfg, &event(false), NOW, &mut harness.ops, &mut shadow)
+    }
+
+    fn writes_of(harness: &Harness, role: u64) -> usize {
+        harness
+            .added()
+            .iter()
+            .filter(|(_, added)| *added == role)
+            .count()
+    }
+
+    #[test]
+    fn a_rate_limited_restore_is_retried_by_the_k04_executor() {
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                .failing_write_times(RESTRICTED_A, WriteCode::RateLimited, 2),
+        );
+        let outcome = activate_then_release(&cfg, &mut harness);
+        assert_eq!(outcome, Outcome::Done, "the third write succeeds");
+        assert_eq!(
+            writes_of(&harness, RESTRICTED_A),
+            3,
+            "two retries, then done"
+        );
+        assert_eq!(
+            harness.sleeps(),
+            vec![1_000, 2_000],
+            "the executor's linear backoff went through the injected sleeper"
+        );
+        assert!(harness.alerts().is_empty(), "{:?}", harness.alerts());
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Inactive)));
+    }
+
+    #[test]
+    fn a_restore_that_stays_rate_limited_stops_at_the_executor_limit_and_is_retried_later() {
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                .failing_write_times(RESTRICTED_A, WriteCode::RateLimited, 4),
+        );
+        let mut shadow = ShadowRecord::default();
+        let outcome = activate_then_release(&cfg, &mut harness);
+        assert_eq!(outcome, Outcome::Partial, "one role came back, one did not");
+        assert!(!outcome.is_success());
+        assert_eq!(
+            writes_of(&harness, RESTRICTED_A),
+            4,
+            "one try and three retries"
+        );
+        assert_eq!(harness.sleeps(), vec![1_000, 2_000, 3_000]);
+        assert!(harness.alerts().contains(&CODE_PARTIAL_ROLE_FAILURE));
+        match harness.state_of(MEMBER) {
+            Some(State::Releasing(snapshot)) => {
+                assert!(
+                    snapshot.saved_roles.contains(&RESTRICTED_A),
+                    "the snapshot is kept"
                 );
             }
-            let mut shadow = ShadowRecord::default();
+            other => panic!("the release must stay open, got {other:?}"),
+        }
+        // The next trigger finishes the release and writes only what is missing.
+        let again = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(again, Outcome::Done);
+        assert_eq!(writes_of(&harness, RESTRICTED_A), 5);
+        assert_eq!(
+            writes_of(&harness, RESTRICTED_B),
+            1,
+            "the role that came back is not written twice"
+        );
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Inactive)));
+    }
 
-            // A random sequence of adds and removes.
-            let steps = 1 + (next() % 6) as usize;
-            for _ in 0..steps {
-                let added = next() % 2 == 0;
+    #[test]
+    fn a_role_the_member_already_holds_is_not_written_again_on_restore() {
+        let cfg = config();
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        // A staff member gave one role back by hand while the safeword ran.
+        harness
+            .members_log
+            .borrow_mut()
+            .roles
+            .insert(MEMBER, vec![SAFEWORD_ROLE, RESTRICTED_A]);
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(writes_of(&harness, RESTRICTED_A), 0);
+        assert_eq!(writes_of(&harness, RESTRICTED_B), 1);
+    }
+
+    #[test]
+    fn a_protected_role_is_never_given_back_by_a_restore() {
+        let cfg = config();
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_protected(&[RESTRICTED_A]);
+        let _ = activate_then_release(&cfg, &mut harness);
+        assert_eq!(
+            writes_of(&harness, RESTRICTED_A),
+            0,
+            "a protected role is never restored by the bot"
+        );
+        assert_eq!(writes_of(&harness, RESTRICTED_B), 1);
+    }
+
+    #[test]
+    fn a_restore_for_a_role_that_rose_above_the_bot_is_denied_and_alerted() {
+        let cfg = config();
+        let high = Rc::new(Cell::new(false));
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_facts(ToggleFacts {
+                    high_role: RESTRICTED_A,
+                    high: Rc::clone(&high),
+                });
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        high.set(true);
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::Partial);
+        assert_eq!(
+            writes_of(&harness, RESTRICTED_A),
+            0,
+            "K03 denied it: never written"
+        );
+        assert_eq!(writes_of(&harness, RESTRICTED_B), 1);
+        assert!(harness.alerts().contains(&"at_or_above_bot"));
+        assert!(matches!(
+            harness.state_of(MEMBER),
+            Some(State::Releasing(_))
+        ));
+    }
+
+    #[test]
+    fn a_partial_activation_failure_keeps_the_member_protected() {
+        // One restricted role cannot be removed. The member must still hold
+        // the safeword role and the snapshot, so nothing is lost.
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                .failing_write(RESTRICTED_B, WriteCode::Forbidden),
+        );
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert!(harness.roles_of(MEMBER).contains(&SAFEWORD_ROLE));
+        let state = harness.state_of(MEMBER).expect("the state was stored");
+        let snapshot = state.snapshot().expect("the snapshot is stored");
+        assert!(snapshot.saved_roles.contains(&RESTRICTED_A));
+        assert!(snapshot.saved_roles.contains(&RESTRICTED_B));
+    }
+
+    #[test]
+    fn one_reconcile_pass_finishes_an_activation_a_crash_left_half_done() {
+        // The crash happened after the snapshot was saved and before any role
+        // was removed. One pass must carry the work to the end, not one step.
+        use crate::safeword::state::Snapshot;
+        let cfg = config();
+        let snapshot = Snapshot {
+            saved_roles: vec![RESTRICTED_A, RESTRICTED_B],
+            original_roles: vec![RESTRICTED_A, RESTRICTED_B],
+            snapshot_saved: true,
+            ..Snapshot::default()
+        };
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_store(FakeStore::new().with_state(MEMBER, State::Activating(snapshot)))
+                .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(report.failed, 0, "{}", report.summary_line());
+        assert_eq!(harness.roles_of(MEMBER), vec![SAFEWORD_ROLE]);
+        assert!(
+            matches!(harness.state_of(MEMBER), Some(State::Active(_))),
+            "got {:?}",
+            harness.state_of(MEMBER)
+        );
+        assert_eq!(harness.dms().len(), 1, "the activation DM went out once");
+    }
+
+    #[test]
+    fn a_failed_reconcile_action_is_alerted_and_kept_for_the_next_pass() {
+        let cfg = config();
+        use crate::safeword::state::Snapshot;
+        let snapshot = Snapshot {
+            saved_roles: vec![RESTRICTED_A],
+            original_roles: vec![RESTRICTED_A],
+            snapshot_saved: true,
+            ..Snapshot::default()
+        };
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A])
+                .failing_write(RESTRICTED_A, WriteCode::Forbidden),
+        )
+        .with_store(FakeStore::new().with_state(MEMBER, State::Activating(snapshot)))
+        .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(report.failed, 1, "{}", report.summary_line());
+        assert!(harness.alerts().contains(&CODE_ROLE_WRITE_FAILED));
+        assert!(
+            !matches!(harness.state_of(MEMBER), Some(State::Inactive) | None),
+            "the unfinished work is still on record"
+        );
+    }
+
+    /// A seeded linear congruential generator: no new dependency.
+    fn lcg(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        }
+    }
+
+    #[test]
+    fn a_seeded_random_run_converges_and_never_fails_silently() {
+        // The model runtime: Discord is the fake member (roles are the truth),
+        // role writes and DMs fail at random for a while, events arrive in a
+        // random order, and the reconcile retries. However it goes, the member
+        // must end in the state the last reaction asks for, with every
+        // original role held when released, and no failed run may be silent.
+        let cfg = config();
+        let mut next = lcg(0x5DEE_CE66_D1B5_1A3F);
+        let codes = [
+            WriteCode::Forbidden,
+            WriteCode::RateLimited,
+            WriteCode::Other,
+            WriteCode::UnknownRole,
+        ];
+        for round in 0..300u32 {
+            let chaos: Vec<Option<WriteCode>> = (0..16)
+                .map(|_| {
+                    if next() % 100 < 35 {
+                        Some(codes[(next() % 4) as usize])
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut harness = Harness::new(
+                FakeMembers::new()
+                    .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                    .with_chaos(chaos),
+            );
+            harness.ops.dms = Box::new(FakeDms {
+                sent: Rc::clone(&harness.dms_sent),
+                failure: None,
+                fail_next: (next() % 3) as u32,
+            });
+            let mut shadow = ShadowRecord::default();
+            let mut present = false;
+            for _ in 0..(1 + next() % 6) {
+                present = next() % 2 == 0;
+                let before = harness.alerts().len();
                 let outcome =
-                    handle_reaction(&cfg, &event(added), NOW, &mut harness.ops, &mut shadow);
-                assert!(
-                    matches!(
-                        outcome,
-                        Outcome::Done | Outcome::NoWork | Outcome::Partial | Outcome::Failed
-                    ),
-                    "the runtime always answers with an outcome"
-                );
-                // The state that is stored is always a state the machine knows.
-                if let Some(state) = harness.state_of(MEMBER) {
+                    handle_reaction(&cfg, &event(present), NOW, &mut harness.ops, &mut shadow);
+                if !outcome.is_success() {
                     assert!(
-                        matches!(
-                            state,
-                            State::Inactive
-                                | State::Activating(_)
-                                | State::Active(_)
-                                | State::Releasing(_)
-                        ),
-                        "round {round}: the stored state is one the machine knows: {state:?}"
+                        harness.alerts().len() > before,
+                        "round {round}: a failed run raised no alert"
                     );
                 }
             }
-
-            // After the last event, one more event of each kind must leave the
-            // member in a state the machine can describe: the work is never
-            // silently left unacknowledged.
-            let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
-            assert!(matches!(
-                outcome,
-                Outcome::Done | Outcome::NoWork | Outcome::Partial | Outcome::Failed
-            ));
-            if let Some(state) = harness.state_of(MEMBER) {
-                let snapshot = state.snapshot();
-                if let Some(snapshot) = snapshot {
-                    // Every step the machine still owes is a step it recorded
-                    // as failed, so the next trigger re-emits it: the work is
-                    // not forgotten.
-                    let _ = snapshot.failed_steps.len();
+            // The failures are over (the script is finite): the reconcile
+            // must now finish whatever is unacknowledged.
+            let users = if present { vec![vec![MEMBER]] } else { vec![] };
+            for _ in 0..8 {
+                harness.ops.reactions = Box::new(FakeReactionUsers::new(users.clone()));
+                reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+            }
+            let roles = harness.roles_of(MEMBER);
+            let state = harness.state_of(MEMBER);
+            if present {
+                match state {
+                    Some(State::Active(snapshot)) => {
+                        assert!(snapshot.failed_steps.is_empty(), "round {round}");
+                    }
+                    other => panic!("round {round}: expected Active, got {other:?}"),
                 }
+                assert!(roles.contains(&SAFEWORD_ROLE), "round {round}: {roles:?}");
+                assert!(!roles.contains(&RESTRICTED_A), "round {round}: {roles:?}");
+                assert!(!roles.contains(&RESTRICTED_B), "round {round}: {roles:?}");
+            } else {
+                assert!(
+                    matches!(state, None | Some(State::Inactive)),
+                    "round {round}: expected Inactive, got {state:?}"
+                );
+                assert!(!roles.contains(&SAFEWORD_ROLE), "round {round}: {roles:?}");
+                assert!(roles.contains(&RESTRICTED_A), "round {round}: {roles:?}");
+                assert!(roles.contains(&RESTRICTED_B), "round {round}: {roles:?}");
             }
         }
     }
@@ -2625,28 +2958,6 @@ mod tests {
             assert_eq!(code.code(), text);
         }
         assert_eq!(LookupCode::Unavailable.code(), "lookup_unavailable");
-    }
-
-    // ------------------------------------------------------------------
-    // A helper the fake uses
-    // ------------------------------------------------------------------
-
-    /// A queue of scripted role-write failures, used by the liveness test.
-    #[allow(dead_code)]
-    fn scripted(roles: &[(u64, VecDeque<WriteCode>)]) -> BTreeMap<u64, WriteCode> {
-        let mut map = BTreeMap::new();
-        for (role, codes) in roles {
-            if let Some(code) = codes.front() {
-                map.insert(*role, *code);
-            }
-        }
-        map
-    }
-
-    /// A set of member ids, used by the reconcile test.
-    #[allow(dead_code)]
-    fn member_set(ids: &[u64]) -> BTreeSet<u64> {
-        ids.iter().copied().collect()
     }
 
     // ------------------------------------------------------------------
