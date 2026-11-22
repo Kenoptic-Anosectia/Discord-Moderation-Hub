@@ -454,6 +454,14 @@ impl Outcome {
 /// holds a name, an id or message text.
 enum StepOutcome {
     Done,
+    /// The step failed but is acknowledged to the machine anyway, so the
+    /// machine moves on. Only the direct message uses it: a member must never
+    /// be held in `Activating` or `Releasing` by a DM they cannot receive.
+    /// The run still counts as a failure and raises the alert.
+    Acknowledged {
+        /// The stable code the staff alert carries.
+        alert: &'static str,
+    },
     Failed {
         /// The code the state machine records.
         machine: FailureCode,
@@ -496,15 +504,24 @@ pub fn handle_reaction(
     }
     if config.mode == crate::settings::Mode::Shadow {
         // Shadow performs nothing: no read of the live state, no write.
+        // Count only what the decision would really do. An activation strips
+        // the restricted roles, adds the safeword role and sends a DM; a
+        // release removes the safeword role, gives the restricted roles back
+        // and sends a DM.
+        let restricted = config.restricted_role_ids.len() as u32;
         match decision {
-            ReactionDecision::Activate(_) => shadow.activates = shadow.activates.saturating_add(1),
-            ReactionDecision::Release(_) => shadow.releases = shadow.releases.saturating_add(1),
+            ReactionDecision::Activate(_) => {
+                shadow.activates = shadow.activates.saturating_add(1);
+                shadow.role_removals = shadow.role_removals.saturating_add(restricted);
+                shadow.role_adds = shadow.role_adds.saturating_add(1);
+            }
+            ReactionDecision::Release(_) => {
+                shadow.releases = shadow.releases.saturating_add(1);
+                shadow.role_removals = shadow.role_removals.saturating_add(1);
+                shadow.role_adds = shadow.role_adds.saturating_add(restricted);
+            }
             ReactionDecision::Ignore(_) => {}
         }
-        shadow.role_removals = shadow
-            .role_removals
-            .saturating_add(config.restricted_role_ids.len() as u32);
-        shadow.role_adds = shadow.role_adds.saturating_add(1);
         shadow.dms = shadow.dms.saturating_add(u32::from(config.dm));
         return Outcome::NoWork;
     }
@@ -630,6 +647,18 @@ fn run_actions(
             StepOutcome::Done => {
                 performed += 1;
                 // The machine acknowledges the step, which may emit more.
+                let (following, more) = step(&state, Event::ActionDone(action.id()), &context);
+                state = following;
+                pending.extend(more);
+            }
+            StepOutcome::Acknowledged { alert } => {
+                // The failure is reported (alert, non-success outcome) but the
+                // machine is told the step is done, so it can reach Active or
+                // Inactive.
+                failures += 1;
+                performed += 1;
+                ops.alerter.alert(alert);
+                push_code(shadow, alert);
                 let (following, more) = step(&state, Event::ActionDone(action.id()), &context);
                 state = following;
                 pending.extend(more);
@@ -779,7 +808,7 @@ fn remove_roles(
     for role_id in roles {
         match remove_role(guild_id, member_id, *role_id, ops, shadow) {
             StepOutcome::Done => written += 1,
-            StepOutcome::Failed { .. } => failures += 1,
+            StepOutcome::Failed { .. } | StepOutcome::Acknowledged { .. } => failures += 1,
         }
     }
     if failures == 0 {
@@ -986,6 +1015,11 @@ fn add_roles(
 }
 
 /// Send one of the two fixed direct messages.
+///
+/// A failed DM is **acknowledged**, not retried through the machine: the
+/// member may have closed DMs for good, and a step that can never succeed
+/// would keep the machine in `Activating`/`Releasing` and trap the member.
+/// The failure is alerted (`dm_failed`) and the run is not a success.
 fn send_dm(config: &SafewordConfig, member_id: u64, kind: DmKind, ops: &mut Ops) -> StepOutcome {
     if !config.dm {
         // The DM is switched off: the step is done, nothing was sent.
@@ -993,14 +1027,9 @@ fn send_dm(config: &SafewordConfig, member_id: u64, kind: DmKind, ops: &mut Ops)
     }
     match ops.dms.send_dm(member_id, kind.text()) {
         Ok(()) => StepOutcome::Done,
-        Err(code) => {
-            // A DM failure never changes the member's roles or the snapshot:
-            // only the machine learns about it.
-            let machine = dm_failure_code(code);
-            let alert = alert_code(machine);
-            ops.alerter.alert(alert);
-            StepOutcome::Failed { machine, alert }
-        }
+        Err(_) => StepOutcome::Acknowledged {
+            alert: CODE_DM_FAILED,
+        },
     }
 }
 
@@ -1099,15 +1128,6 @@ fn write_failure_code(code: WriteCode) -> FailureCode {
         WriteCode::UnknownMember => FailureCode::MissingPermissions,
         WriteCode::RateLimited => FailureCode::RateLimited,
         WriteCode::Other => FailureCode::TransientHttp,
-    }
-}
-
-/// The stable failure code of a direct message.
-fn dm_failure_code(code: DmCode) -> FailureCode {
-    match code {
-        DmCode::Closed => FailureCode::DmClosed,
-        DmCode::RateLimited => FailureCode::RateLimited,
-        DmCode::Other => FailureCode::TransientHttp,
     }
 }
 
@@ -1414,7 +1434,15 @@ fn collect_reaction_users(
         }
         let count = page.len();
         let last = page.last().map(|user| user.id);
-        users.extend(page.iter().map(|user| user.id));
+        // A bot is never activated. It still counts for the cursor, so a bot
+        // at the end of a full page cannot stop the next page being read.
+        for user in &page {
+            if user.is_bot {
+                report.bots_skipped = report.bots_skipped.saturating_add(1);
+            } else {
+                users.push(user.id);
+            }
+        }
         if count < REACTION_PAGE_SIZE as usize {
             break;
         }
