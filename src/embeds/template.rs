@@ -1,0 +1,1060 @@
+//! Embed template loading, Discord limit validation and the content hash.
+//!
+//! A template is a JSON document describing one Discord embed. It is loaded from a
+//! `&str` (the file reading belongs to the wiring card), validated against the Discord
+//! embed limits and then reduced to a canonical form whose SHA-256 hash identifies the
+//! CONTENT of the embed.
+//!
+//! The hash is what makes "edit in place, never duplicate" possible: the same template
+//! loaded twice produces the same hash, whatever order the JSON keys were written in,
+//! and any change to the rendered content produces a different hash.
+//!
+//! Privacy notes:
+//! * Every error is a stable code. No error, no `Display` output and no `Debug` output
+//!   ever contains template text, a field name or a value.
+//! * The template text is only ever used as INPUT to the validator and the hash. It is
+//!   not copied into any error, and the module holds no global state that could leak it.
+//!
+//! Limits (Discord documents them as inclusive; leading and trailing whitespace is
+//! trimmed before the length is measured, exactly as Discord trims it):
+//! title 256, description 4096, 25 fields, field name 256, field value 1024,
+//! footer text 2048, author name 256, and a combined total of 6000 characters over
+//! title + description + every field name + every field value + footer text +
+//! author name.
+//!
+//! A field whose name or value is empty after trimming is refused as well: Discord
+//! rejects such a field, so a template that carried one could never be posted.
+//!
+//! A control character other than a newline is refused in every text of the
+//! template, and the whole class is refused the same way: a NUL is not
+//! special-cased. A control character is not renderable text, and a NUL truncates
+//! any later C-string handling of the text.
+//!
+//! The hash is over BYTES of the parsed template. Two documents that parse to the
+//! same values hash the same; a document that spells the same text differently in
+//! bytes (a composed and a decomposed accented letter) hashes differently.
+//!
+//! Wiring card W1 removes the module-level `allow(dead_code)` in `super::mod`.
+
+use std::fmt;
+
+use serde::Deserialize;
+
+/// Maximum number of characters in the embed title.
+pub const MAX_TITLE_CHARS: usize = 256;
+/// Maximum number of characters in the embed description.
+pub const MAX_DESCRIPTION_CHARS: usize = 4096;
+/// Maximum number of fields in one embed.
+pub const MAX_FIELDS: usize = 25;
+/// Maximum number of characters in one field name.
+pub const MAX_FIELD_NAME_CHARS: usize = 256;
+/// Maximum number of characters in one field value.
+pub const MAX_FIELD_VALUE_CHARS: usize = 1024;
+/// Maximum number of characters in the footer text.
+pub const MAX_FOOTER_CHARS: usize = 2048;
+/// Maximum number of characters in the author name.
+pub const MAX_AUTHOR_NAME_CHARS: usize = 256;
+/// Maximum combined number of characters over title, description, field names, field
+/// values, footer text and author name.
+pub const MAX_TOTAL_CHARS: usize = 6000;
+
+/// Stable reason codes for a template that was refused.
+///
+/// The codes never carry template text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateErrorKind {
+    /// The document was not a well-formed template: invalid JSON, a wrong shape, an
+    /// unknown key, a wrong type or a colour outside the representable range.
+    InvalidJson,
+    /// The template carried no renderable content at all.
+    EmptyTemplate,
+    /// The title was longer than [`MAX_TITLE_CHARS`].
+    TitleTooLong,
+    /// The description was longer than [`MAX_DESCRIPTION_CHARS`].
+    DescriptionTooLong,
+    /// The template carried more than [`MAX_FIELDS`] fields.
+    TooManyFields,
+    /// A field name was empty or only whitespace. Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    FieldNameEmpty,
+    /// A field value was empty or only whitespace. Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    FieldValueEmpty,
+    /// A field name was longer than [`MAX_FIELD_NAME_CHARS`].
+    FieldNameTooLong,
+    /// A field value was longer than [`MAX_FIELD_VALUE_CHARS`].
+    FieldValueTooLong,
+    /// The footer text was longer than [`MAX_FOOTER_CHARS`].
+    FooterTooLong,
+    /// The author name was longer than [`MAX_AUTHOR_NAME_CHARS`].
+    AuthorNameTooLong,
+    /// The combined length exceeded [`MAX_TOTAL_CHARS`].
+    TotalTooLong,
+    /// A text carried a control character that is not a newline. The whole class of
+    /// control characters is refused, so a template that carries one can never be
+    /// posted as it stands.
+    ControlCharacter,
+}
+
+impl TemplateErrorKind {
+    /// Returns the stable code of this reason.
+    pub fn code(self) -> &'static str {
+        match self {
+            TemplateErrorKind::InvalidJson => "invalid_json",
+            TemplateErrorKind::EmptyTemplate => "empty_template",
+            TemplateErrorKind::TitleTooLong => "title_too_long",
+            TemplateErrorKind::DescriptionTooLong => "description_too_long",
+            TemplateErrorKind::TooManyFields => "too_many_fields",
+            TemplateErrorKind::FieldNameEmpty => "field_name_empty",
+            TemplateErrorKind::FieldValueEmpty => "field_value_empty",
+            TemplateErrorKind::FieldNameTooLong => "field_name_too_long",
+            TemplateErrorKind::FieldValueTooLong => "field_value_too_long",
+            TemplateErrorKind::FooterTooLong => "footer_too_long",
+            TemplateErrorKind::AuthorNameTooLong => "author_name_too_long",
+            TemplateErrorKind::TotalTooLong => "total_too_long",
+            TemplateErrorKind::ControlCharacter => "control_character",
+        }
+    }
+}
+
+/// A refused template.
+///
+/// The error names the reason only. It never carries template text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateError {
+    kind: TemplateErrorKind,
+}
+
+impl TemplateError {
+    /// Builds an error for the given reason.
+    pub fn new(kind: TemplateErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Returns the stable reason code of this refusal.
+    pub fn kind(&self) -> TemplateErrorKind {
+        self.kind
+    }
+
+    /// Returns the stable code of this refusal.
+    pub fn code(&self) -> &'static str {
+        self.kind.code()
+    }
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.kind.code())
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
+/// One field of an embed template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateField {
+    /// The field name, already trimmed.
+    pub name: String,
+    /// The field value, already trimmed.
+    pub value: String,
+    /// Whether the field is rendered inline.
+    pub inline: bool,
+}
+
+/// A validated embed template.
+///
+/// The text fields are already trimmed and normalised: a present-but-empty optional
+/// text is normalised to "absent", so an empty title and a missing title render the
+/// same embed and hash the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedTemplate {
+    /// The embed title, if any.
+    pub title: Option<String>,
+    /// The embed description, if any.
+    pub description: Option<String>,
+    /// The embed fields, in the order they will be rendered.
+    pub fields: Vec<TemplateField>,
+    /// The footer text, if any.
+    pub footer: Option<String>,
+    /// The author name, if any.
+    pub author_name: Option<String>,
+    /// The embed colour, if any.
+    pub color: Option<u32>,
+}
+
+impl EmbedTemplate {
+    /// Returns the combined number of characters that Discord counts towards the
+    /// 6000 character total.
+    ///
+    /// The sum is over the trimmed title, description, every field name, every field
+    /// value, the footer text and the author name - the same set Discord counts.
+    pub fn total_chars(&self) -> usize {
+        let mut total = 0usize;
+        total += self.title.as_deref().map_or(0, |text| text.chars().count());
+        total += self
+            .description
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        for field in &self.fields {
+            total += field.name.chars().count();
+            total += field.value.chars().count();
+        }
+        total += self
+            .footer
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        total += self
+            .author_name
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        total
+    }
+
+    /// Returns the canonical form of this template.
+    ///
+    /// The canonical form is a byte-exact encoding of the PARSED template: every text
+    /// value is written with its byte length, so no value can be confused with the tag
+    /// that follows it, and "no colour" is written differently from "colour 0". Two
+    /// templates that parse to the same values therefore produce the same canonical
+    /// form, and two templates that parse to different values produce different
+    /// canonical forms. The JSON key order of the source document cannot change it,
+    /// because the canonical form is built from the PARSED template.
+    pub fn canonical(&self) -> String {
+        let mut out = String::new();
+        out.push_str("embed-template-v1\n");
+        push_tagged(&mut out, "title", self.title.as_deref());
+        push_tagged(&mut out, "description", self.description.as_deref());
+        out.push_str(&format!("fields={}\n", self.fields.len()));
+        for field in &self.fields {
+            push_tagged(&mut out, "name", Some(field.name.as_str()));
+            push_tagged(&mut out, "value", Some(field.value.as_str()));
+            out.push_str(&format!("inline={}\n", u8::from(field.inline)));
+        }
+        push_tagged(&mut out, "footer", self.footer.as_deref());
+        push_tagged(&mut out, "author", self.author_name.as_deref());
+        // The colour is written as a tagged value like every other one, so "no colour"
+        // (`-`) and "colour 0" (`0`) are DIFFERENT canonical forms and therefore
+        // different hashes. They are not the same request to Discord, so the module
+        // must not treat them as the same content.
+        match self.color {
+            None => out.push_str("color=-\n"),
+            Some(color) => out.push_str(&format!("color={color}\n")),
+        }
+        out
+    }
+
+    /// Returns the SHA-256 hex digest of the canonical form.
+    ///
+    /// The digest is 64 lowercase hex characters. The same template always produces
+    /// the same hash, and the hash changes when the parsed template changes. Two
+    /// templates that parse to DIFFERENT values produce different canonical forms, so
+    /// the only way two different templates could share a hash is a SHA-256 collision.
+    ///
+    /// The hash is over BYTES, not over rendered text: two spellings of the same text
+    /// that differ in their bytes (for example a composed and a decomposed accented
+    /// letter) hash differently.
+    pub fn content_hash(&self) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, self.canonical().as_bytes());
+        to_hex(digest.as_ref())
+    }
+}
+
+/// Writes one tagged, length-prefixed value into the canonical form.
+///
+/// A value is written as `<byte length>:<bytes>` or as `-` when it is absent. The byte
+/// length makes the encoding injective: a value can never be confused with the tag that
+/// follows it, whatever the value contains.
+fn push_tagged(out: &mut String, tag: &str, value: Option<&str>) {
+    out.push_str(tag);
+    out.push('=');
+    match value {
+        None => out.push('-'),
+        Some(text) => {
+            out.push_str(&text.len().to_string());
+            out.push(':');
+            out.push_str(text);
+        }
+    }
+    out.push('\n');
+}
+
+/// Encodes bytes as lowercase hex.
+fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// The on-disk shape of a template file.
+///
+/// Every key is closed: an unknown key is a refusal, so a typo such as `"titel"`
+/// cannot silently drop content. `Option` fields are optional; everything else is
+/// required.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTemplate {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    fields: Option<Vec<RawField>>,
+    #[serde(default)]
+    footer: Option<RawFooter>,
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    #[serde(default)]
+    color: Option<u32>,
+}
+
+/// The on-disk shape of one field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawField {
+    name: String,
+    value: String,
+    #[serde(default)]
+    inline: bool,
+}
+
+/// The on-disk shape of the footer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFooter {
+    text: String,
+}
+
+/// The on-disk shape of the author.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuthor {
+    name: String,
+}
+
+/// Largest colour value Discord can represent (0xFFFFFF).
+const MAX_COLOR: u32 = 0x00FF_FFFF;
+
+/// Trims a text and normalises a present-but-empty text to "absent".
+fn normalise(text: Option<String>) -> Option<String> {
+    let owned = text?;
+    let trimmed = owned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Loads an embed template from a JSON document.
+///
+/// The template is validated against the Discord embed limits and returned trimmed and
+/// normalised. Every refusal is a stable code that names the limit that was broken;
+/// no refusal ever contains template text.
+///
+/// The document is deserialised straight into the template shape. A document that is
+/// not a JSON object, that carries an unknown key, that carries the same key twice or
+/// that has a wrong type is refused as `invalid_json`: serde reports a repeated key
+/// as a duplicate field, so a template cannot silently lose one of two `title`s.
+pub fn load(source: &str) -> Result<EmbedTemplate, TemplateError> {
+    // The document must be a JSON OBJECT. The shape is checked first, because the
+    // template shape has only optional fields and serde would read a JSON ARRAY as
+    // a template with every field defaulted.
+    if !source.trim_start().starts_with('{') {
+        return Err(TemplateError::new(TemplateErrorKind::InvalidJson));
+    }
+    let raw: RawTemplate = serde_json::from_str(source)
+        .map_err(|_| TemplateError::new(TemplateErrorKind::InvalidJson))?;
+
+    if let Some(color) = raw.color {
+        if color > MAX_COLOR {
+            return Err(TemplateError::new(TemplateErrorKind::InvalidJson));
+        }
+    }
+
+    let title = normalise(raw.title);
+    let description = normalise(raw.description);
+    let footer = normalise(raw.footer.map(|footer| footer.text));
+    let author_name = normalise(raw.author.map(|author| author.name));
+
+    let mut fields = Vec::with_capacity(raw.fields.as_ref().map_or(0, |list| list.len()));
+    if let Some(raw_fields) = raw.fields {
+        for raw_field in raw_fields {
+            fields.push(TemplateField {
+                name: raw_field.name.trim().to_string(),
+                value: raw_field.value.trim().to_string(),
+                inline: raw_field.inline,
+            });
+        }
+    }
+
+    let template = EmbedTemplate {
+        title,
+        description,
+        fields,
+        footer,
+        author_name,
+        color: raw.color,
+    };
+
+    validate(&template)?;
+    Ok(template)
+}
+
+/// Checks that a text carries no control character other than a newline.
+///
+/// A control character is not renderable text, and a NUL in particular truncates
+/// any later C-string handling of the text. The whole class is refused, not one
+/// example of it: a NUL is not special-cased, every control character is refused
+/// the same way. A newline is allowed, because a rules post is written with line
+/// breaks.
+fn has_control_character(text: &str) -> bool {
+    text.chars()
+        .any(|character| character.is_control() && character != '\n')
+}
+
+/// Checks a loaded template against the Discord embed limits.
+///
+/// The limits are inclusive, so a value of exactly the limit is accepted. The
+/// individual limits are checked before the combined total, in a fixed order, so a
+/// template that breaks several limits always reports the same one.
+fn validate(template: &EmbedTemplate) -> Result<(), TemplateError> {
+    if let Some(title) = &template.title {
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::TitleTooLong));
+        }
+    }
+    if let Some(description) = &template.description {
+        if description.chars().count() > MAX_DESCRIPTION_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::DescriptionTooLong));
+        }
+    }
+    if template.fields.len() > MAX_FIELDS {
+        return Err(TemplateError::new(TemplateErrorKind::TooManyFields));
+    }
+    for field in &template.fields {
+        // Discord refuses a field whose name or value is empty. A template that
+        // carried one could never be posted, so it is refused at load with its own
+        // code rather than failing later at every sync.
+        if field.name.is_empty() {
+            return Err(TemplateError::new(TemplateErrorKind::FieldNameEmpty));
+        }
+        if field.value.is_empty() {
+            return Err(TemplateError::new(TemplateErrorKind::FieldValueEmpty));
+        }
+        if field.name.chars().count() > MAX_FIELD_NAME_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FieldNameTooLong));
+        }
+        if field.value.chars().count() > MAX_FIELD_VALUE_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FieldValueTooLong));
+        }
+    }
+    if let Some(footer) = &template.footer {
+        if footer.chars().count() > MAX_FOOTER_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::FooterTooLong));
+        }
+    }
+    if let Some(author) = &template.author_name {
+        if author.chars().count() > MAX_AUTHOR_NAME_CHARS {
+            return Err(TemplateError::new(TemplateErrorKind::AuthorNameTooLong));
+        }
+    }
+    if template.total_chars() > MAX_TOTAL_CHARS {
+        return Err(TemplateError::new(TemplateErrorKind::TotalTooLong));
+    }
+    // The control characters are checked last, after the lengths: a template that
+    // is too long is reported as too long, not as carrying a control character.
+    let texts = [
+        template.title.as_deref(),
+        template.description.as_deref(),
+        template.footer.as_deref(),
+        template.author_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        template
+            .fields
+            .iter()
+            .flat_map(|field| [field.name.as_str(), field.value.as_str()]),
+    );
+    for text in texts {
+        if has_control_character(text) {
+            return Err(TemplateError::new(TemplateErrorKind::ControlCharacter));
+        }
+    }
+    if template.title.is_none()
+        && template.description.is_none()
+        && template.fields.is_empty()
+        && template.footer.is_none()
+        && template.author_name.is_none()
+    {
+        return Err(TemplateError::new(TemplateErrorKind::EmptyTemplate));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The General Rules embed of the old YAGPDB bot, rebuilt from `YAG:199-248` of
+    /// `YAGPDB Custom Commands.md`. The role and channel references are replaced by
+    /// clearly synthetic ids: the real ones are server specific and this repo is public.
+    const GENERAL_RULES: &str = r#"{
+        "title": "Server Rules (General)",
+        "description": "Be kind and respectful. Follow Discord's Terms of Service. Admins and moderators have final say; listen to them. No spam: no emotes, repeated characters, stickers, GIFs, etc. This is an 18+ server with NSFW content. Age verification may be required; refusal = kick, knowingly underage = permanent ban. Check pins in new channels for channel-specific rules. Respect pronouns, gender, orientation, race, citizenship, etc. No discrimination. Use a custom profile: at minimum a non-default PFP. Staff may ask you to change it; refusal = kick. Rules are guided by common sense: just behave.",
+        "color": 5793266,
+        "fields": [
+            {
+                "name": "📌 Key Points",
+                "value": "• Follow Discord TOS\n• Mods/admins have final say\n• No spam of any kind\n• 18+ only; age checks enforced\n• Check channel pins for extra rules\n• Respect identities; no discrimination\n• Non-default PFP required\n• Common sense applies",
+                "inline": false
+            }
+        ],
+        "footer": { "text": "SKYNET // NETWORK CORE" }
+    }"#;
+
+    /// The NSFW & Kink Rules embed of the old YAGPDB bot, rebuilt from `YAG:199-248`.
+    /// The safeword emoji ids and the staff role id are synthetic.
+    const NSFW_RULES: &str = r#"{
+        "title": "NSFW & Kink Rules",
+        "color": 15525061,
+        "fields": [
+            {
+                "name": "⚠️ General NSFW Rules",
+                "value": "All general server rules also apply in NSFW channels.\n\nRead people's roles before interacting: everyone has different kinks, limits, likes, and dislikes. Be respectful.\n\nServer safewords (emotes):\n<:Safeword_Green:1000000000000000001> = \"I like this; consent given.\"\n<:Safeword_Yellow:1000000000000000002> = \"I'm uncomfortable. Stop & ask to continue.\"\n<:Safeword_Red:1000000000000000003> = \"VERY uncomfortable. Stop immediately and go to aftercare.\"\n\nIf someone fails to respond appropriately to safewords, mention <@&1000000000000000004> immediately.",
+                "inline": false
+            },
+            {
+                "name": "🎭 Role Selection (Pick ONE)",
+                "value": "Choose exactly one: Dom, Switch, Sub, Bottom Barrel Sub.\n\nDom: Dominant in BDSM activities. Can change nicknames for roleplay (don't abuse this). Expected to behave dominantly when in-theme.\n\nSwitch: Can be dominant or submissive. Has same perms as Doms. Clearly communicate whether you're in a dominant or submissive mood with each partner.\n\nSub: Submissive in BDSM activities. Some perms removed (e.g., free nickname changes). Expected to act submissively toward Doms and dominant Switches when in-theme.\n\nBottom Barrel Sub / Slave: Like Sub, but with even fewer perms and no expectation of respect from anyone. Expect near-constant teasing, kink-pushing, and rough treatment from Doms, Switches, and even other Subs. Only take this if you want that. Switch back to normal Sub if you need a break.",
+                "inline": false
+            },
+            {
+                "name": "❤️ Consent & Safety",
+                "value": "Respect people's sexuality and stated limits. If someone says \"no\" or \"stop,\" you stop immediately. Violations = mod action.\n\nIf a trans person is okay with misgendering as a kink, or someone is okay with race play, keep it semi-reasonable. For extreme play, move it to DMs-especially if using hard slurs that will offend most readers.\n\nNo images of minors in any channel. This includes \"aged up\" characters that still look like minors. Violation = immediate ban, no negotiation.",
+                "inline": false
+            },
+            {
+                "name": "🩹 Aftercare & Unlisted Kinks",
+                "value": "ALWAYS offer aftercare (Doms and Subs). This is critical for mental/physical safety. If mods are notified of a failure to provide aftercare: exactly ONE warning, then aggressive escalation (including possible immediate ban depending on severity/history).\n\nAsk before engaging in any kink not listed on someone's bio, roles, or intro-even in on-theme channels. Failure to request consent = moderation, one warning then aggressive escalation.\n\nIf someone asks not to be called titles off-theme, respect that. Off-theme channels are meant to be off-theme; only use titles if everyone consents.\n\nIf you see someone with a <:Safeword_Red:1000000000000000003> next to their name, be kind-they're on safeword and likely not in their best state. If needed, mention <@&1000000000000000004>.",
+                "inline": false
+            },
+            {
+                "name": "🍋🍵 Protocol & Bratting",
+                "value": "Bratting is generally not allowed. Subs may only brat toward Doms and Switches with the Brat Tamer role. If a sub breaks this, contact <@&1000000000000000004>.\n\nChannel prefixes:\n🍋 = High protocol / on-theme: dynamics enforced (subs submissive to doms; bratting only allowed to Doms/Brat Tamer Switches).\n🍵 = Low protocol / off-theme: mods do NOT enforce dynamics. If you have an ownership dynamic and want to punish a sub for off-theme behavior, do it in DMs or an on-theme channel, not in the 🍵 channel.\n🍋 + 🍵 = Half-theme: mix of high/low. Mods enforce less aggressively, but subs should still be respectful to doms. If a scene starts in a half-theme channel, subs MUST follow dynamics rules during that scene.",
+                "inline": false
+            }
+        ]
+    }"#;
+
+    /// Builds a JSON document with one title of `len` characters.
+    fn title_json(len: usize) -> String {
+        let text = "t".repeat(len);
+        format!(r#"{{"title":"{text}"}}"#)
+    }
+
+    /// Builds a JSON document with one description of `len` characters.
+    fn description_json(len: usize) -> String {
+        let text = "d".repeat(len);
+        format!(r#"{{"description":"{text}"}}"#)
+    }
+
+    /// Builds a JSON document with `count` fields, each with a name of `name_len`
+    /// characters and a value of `value_len` characters.
+    ///
+    /// The names are identical, so the measured length is exactly `name_len`.
+    fn fields_json(count: usize, name_len: usize, value_len: usize) -> String {
+        let name = "n".repeat(name_len);
+        let value = "v".repeat(value_len);
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            fields.push(format!(r#"{{"name":"{name}","value":"{value}"}}"#));
+        }
+        format!(r#"{{"fields":[{}]}}"#, fields.join(","))
+    }
+
+    /// Expects the template to load and returns it.
+    fn expect_ok(source: &str) -> EmbedTemplate {
+        load(source).expect("template must load")
+    }
+
+    /// Expects the template to be refused for the given reason.
+    fn expect_err(source: &str, kind: TemplateErrorKind) {
+        let err = load(source).expect_err("template must be refused");
+        assert_eq!(err.kind(), kind, "wrong reason for {source}");
+    }
+
+    /// The General Rules embed of the old bot loads within the Discord limits.
+    #[test]
+    fn general_rules_embed_loads_within_limits() {
+        let template = expect_ok(GENERAL_RULES);
+        assert_eq!(template.title.as_deref(), Some("Server Rules (General)"));
+        assert_eq!(template.fields.len(), 1);
+        assert_eq!(template.fields[0].name, "📌 Key Points");
+        assert!(!template.fields[0].inline);
+        assert_eq!(template.footer.as_deref(), Some("SKYNET // NETWORK CORE"));
+        assert_eq!(template.color, Some(5793266));
+        assert!(template.total_chars() < MAX_TOTAL_CHARS);
+    }
+
+    /// The NSFW & Kink Rules embed of the old bot loads within the Discord limits:
+    /// five fields, each value under 1024 characters, and the whole embed under 6000.
+    #[test]
+    fn nsfw_rules_embed_loads_within_limits() {
+        let template = expect_ok(NSFW_RULES);
+        assert_eq!(template.title.as_deref(), Some("NSFW & Kink Rules"));
+        assert_eq!(template.fields.len(), 5);
+        for field in &template.fields {
+            assert!(
+                field.value.chars().count() <= MAX_FIELD_VALUE_CHARS,
+                "field {:?} is too long",
+                field.name
+            );
+            assert!(field.name.chars().count() <= MAX_FIELD_NAME_CHARS);
+            assert!(!field.inline);
+        }
+        assert!(template.total_chars() <= MAX_TOTAL_CHARS);
+        // The real embed is about 3.5k characters; the module must not silently
+        // truncate or drop a field to make it fit.
+        assert!(template.total_chars() > 3000, "content was lost");
+    }
+
+    /// The title limit is inclusive: 256 characters load, 257 do not.
+    #[test]
+    fn title_limit_boundary() {
+        expect_ok(&title_json(MAX_TITLE_CHARS));
+        expect_err(
+            &title_json(MAX_TITLE_CHARS + 1),
+            TemplateErrorKind::TitleTooLong,
+        );
+    }
+
+    /// The description limit is inclusive: 4096 characters load, 4097 do not.
+    #[test]
+    fn description_limit_boundary() {
+        expect_ok(&description_json(MAX_DESCRIPTION_CHARS));
+        expect_err(
+            &description_json(MAX_DESCRIPTION_CHARS + 1),
+            TemplateErrorKind::DescriptionTooLong,
+        );
+    }
+
+    /// The field count limit is inclusive: 25 fields load, 26 do not.
+    #[test]
+    fn field_count_limit_boundary() {
+        expect_ok(&fields_json(MAX_FIELDS, 1, 1));
+        expect_err(
+            &fields_json(MAX_FIELDS + 1, 1, 1),
+            TemplateErrorKind::TooManyFields,
+        );
+    }
+
+    /// The field name limit is inclusive: 256 characters load, 257 do not.
+    #[test]
+    fn field_name_limit_boundary() {
+        expect_ok(&fields_json(1, MAX_FIELD_NAME_CHARS, 1));
+        expect_err(
+            &fields_json(1, MAX_FIELD_NAME_CHARS + 1, 1),
+            TemplateErrorKind::FieldNameTooLong,
+        );
+    }
+
+    /// The field value limit is inclusive: 1024 characters load, 1025 do not.
+    #[test]
+    fn field_value_limit_boundary() {
+        expect_ok(&fields_json(1, 1, MAX_FIELD_VALUE_CHARS));
+        expect_err(
+            &fields_json(1, 1, MAX_FIELD_VALUE_CHARS + 1),
+            TemplateErrorKind::FieldValueTooLong,
+        );
+    }
+
+    /// The footer limit is inclusive: 2048 characters load, 2049 do not.
+    #[test]
+    fn footer_limit_boundary() {
+        let ok = "f".repeat(MAX_FOOTER_CHARS);
+        let bad = "f".repeat(MAX_FOOTER_CHARS + 1);
+        expect_ok(&format!(r#"{{"footer":{{"text":"{ok}"}}}}"#));
+        expect_err(
+            &format!(r#"{{"footer":{{"text":"{bad}"}}}}"#),
+            TemplateErrorKind::FooterTooLong,
+        );
+    }
+
+    /// The author name limit is inclusive: 256 characters load, 257 do not.
+    #[test]
+    fn author_name_limit_boundary() {
+        let ok = "a".repeat(MAX_AUTHOR_NAME_CHARS);
+        let bad = "a".repeat(MAX_AUTHOR_NAME_CHARS + 1);
+        expect_ok(&format!(r#"{{"author":{{"name":"{ok}"}}}}"#));
+        expect_err(
+            &format!(r#"{{"author":{{"name":"{bad}"}}}}"#),
+            TemplateErrorKind::AuthorNameTooLong,
+        );
+    }
+
+    /// The combined total is inclusive: 6000 characters load, 6001 do not.
+    #[test]
+    fn total_limit_boundary() {
+        let title = "t".repeat(MAX_TITLE_CHARS);
+        let description = "d".repeat(MAX_DESCRIPTION_CHARS);
+        let footer = "f".repeat(MAX_TOTAL_CHARS - MAX_TITLE_CHARS - MAX_DESCRIPTION_CHARS);
+        let source = format!(
+            r#"{{"title":"{title}","description":"{description}","footer":{{"text":"{footer}"}}}}"#
+        );
+        assert_eq!(expect_ok(&source).total_chars(), MAX_TOTAL_CHARS);
+
+        let over = format!(
+            r#"{{"title":"{title}","description":"{description}","footer":{{"text":"{footer}x"}}}}"#
+        );
+        expect_err(&over, TemplateErrorKind::TotalTooLong);
+    }
+
+    /// The total also counts the author name and the field names and values.
+    #[test]
+    fn total_counts_every_part() {
+        let source = r#"{
+            "title": "aaa",
+            "description": "bb",
+            "fields": [{"name":"ccc","value":"dddd"}],
+            "footer": {"text":"ee"},
+            "author": {"name":"ff"}
+        }"#;
+        assert_eq!(expect_ok(source).total_chars(), 3 + 2 + 3 + 4 + 2 + 2);
+    }
+
+    /// Leading and trailing whitespace is trimmed before the length is measured, so a
+    /// title of the limit length plus padding still loads.
+    #[test]
+    fn surrounding_whitespace_is_trimmed_before_measuring() {
+        let title = "t".repeat(MAX_TITLE_CHARS);
+        let source = format!(r#"{{"title":"   {title}   "}}"#);
+        let template = expect_ok(&source);
+        assert_eq!(template.title.as_deref(), Some(title.as_str()));
+    }
+
+    /// A present but empty text is normalised to absent, so it renders and hashes like
+    /// a missing text.
+    #[test]
+    fn empty_text_is_normalised_to_absent() {
+        let template =
+            expect_ok(r#"{"title":"   ","description":"","fields":[{"name":"A","value":"B"}]}"#);
+        assert_eq!(template.title, None);
+        assert_eq!(template.description, None);
+        assert_eq!(template.fields.len(), 1);
+    }
+
+    /// A template with no content at all is refused.
+    #[test]
+    fn empty_template_is_refused() {
+        expect_err("{}", TemplateErrorKind::EmptyTemplate);
+        expect_err(
+            r#"{"title":"","fields":[]}"#,
+            TemplateErrorKind::EmptyTemplate,
+        );
+    }
+
+    /// Invalid JSON, a wrong shape and an unknown key are all refused as
+    /// `invalid_json`.
+    #[test]
+    fn malformed_documents_are_refused() {
+        for source in [
+            "",
+            "not json",
+            "{",
+            "[]",
+            r#"{"title": 5}"#,
+            r#"{"titel":"typo"}"#,
+            r#"{"fields":[{"name":"a"}]}"#,
+            r#"{"footer":{"text":"a","icon_url":"x"}}"#,
+            r##"{"color":"#ffffff"}"##,
+            r#"{"color":16777216}"#,
+        ] {
+            expect_err(source, TemplateErrorKind::InvalidJson);
+        }
+    }
+
+    /// The refusal names the limit that was broken and never carries template text.
+    #[test]
+    fn errors_carry_no_template_text() {
+        let secret = "SUPERSECRETTEMPLATEMARKERZZ";
+        let source = format!(r#"{{"title":"{secret}"}}"#);
+        let loaded = load(&source).expect("template loads");
+        assert_eq!(loaded.title.as_deref(), Some(secret));
+
+        let long = "x".repeat(MAX_TITLE_CHARS + 1);
+        let source = format!(r#"{{"title":"{long}{secret}"}}"#);
+        let err = load(&source).expect_err("title is too long");
+        let text = format!("{err} | {err:?}");
+        assert!(
+            !text.contains(secret),
+            "error leaked the template text: {text}"
+        );
+        assert!(!text.contains(&long), "error leaked the template text");
+        assert!(text.len() < 80, "{text}");
+
+        // The same holds for the other limit codes.
+        let err = load(r#"{"fields":[{"name":"a"}]}"#).expect_err("field is malformed");
+        let text = format!("{err} | {err:?}");
+        assert!(!text.contains("name"), "error leaked the shape: {text}");
+    }
+
+    /// Every reason code is distinct and stable.
+    #[test]
+    fn error_codes_are_distinct_and_stable() {
+        let all = [
+            TemplateErrorKind::InvalidJson,
+            TemplateErrorKind::EmptyTemplate,
+            TemplateErrorKind::TitleTooLong,
+            TemplateErrorKind::DescriptionTooLong,
+            TemplateErrorKind::TooManyFields,
+            TemplateErrorKind::FieldNameTooLong,
+            TemplateErrorKind::FieldValueTooLong,
+            TemplateErrorKind::FooterTooLong,
+            TemplateErrorKind::AuthorNameTooLong,
+            TemplateErrorKind::TotalTooLong,
+        ];
+        let mut codes: Vec<_> = all.iter().map(|kind| kind.code()).collect();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), all.len());
+        assert_eq!(TemplateErrorKind::TitleTooLong.code(), "title_too_long");
+    }
+
+    /// The content hash is 64 lowercase hex characters and is stable across calls.
+    #[test]
+    fn content_hash_is_64_hex_characters() {
+        let hash = expect_ok(GENERAL_RULES).content_hash();
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!hash.chars().any(|c| c.is_ascii_uppercase()));
+        assert_eq!(hash, expect_ok(GENERAL_RULES).content_hash());
+    }
+
+    /// The hash does not depend on the order the JSON keys were written in.
+    #[test]
+    fn hash_is_stable_across_json_key_order() {
+        let a = r#"{"title":"Rules","description":"Be kind","fields":[{"name":"A","value":"1","inline":true}]}"#;
+        let b = r#"{"fields":[{"inline":true,"value":"1","name":"A"}],"description":"Be kind","title":"Rules"}"#;
+        assert_eq!(expect_ok(a).content_hash(), expect_ok(b).content_hash());
+        assert_eq!(expect_ok(a).canonical(), expect_ok(b).canonical());
+    }
+
+    /// The hash changes when the rendered content changes.
+    #[test]
+    fn hash_changes_with_content() {
+        let base = expect_ok(GENERAL_RULES).content_hash();
+        let changed_title =
+            GENERAL_RULES.replace("Server Rules (General)", "Server Rules (General v2)");
+        assert_ne!(base, expect_ok(&changed_title).content_hash());
+
+        let changed_field =
+            GENERAL_RULES.replace("Common sense applies", "Common sense applies (mostly)");
+        assert_ne!(base, expect_ok(&changed_field).content_hash());
+
+        let changed_color = GENERAL_RULES.replace("5793266", "5793267");
+        assert_ne!(base, expect_ok(&changed_color).content_hash());
+    }
+
+    /// The hash changes when the ORDER of the fields changes, because the order is part
+    /// of the rendered embed.
+    #[test]
+    fn hash_changes_with_field_order() {
+        let a = r#"{"fields":[{"name":"A","value":"1"},{"name":"B","value":"2"}]}"#;
+        let b = r#"{"fields":[{"name":"B","value":"2"},{"name":"A","value":"1"}]}"#;
+        assert_ne!(expect_ok(a).content_hash(), expect_ok(b).content_hash());
+    }
+
+    /// A value that looks like a canonical-form tag cannot be confused with one.
+    #[test]
+    fn canonical_form_is_unambiguous() {
+        let a = r#"{"title":"x","description":"y"}"#;
+        let b = r#"{"title":"x\ndescription=y"}"#;
+        assert_ne!(expect_ok(a).canonical(), expect_ok(b).canonical());
+        assert_ne!(expect_ok(a).content_hash(), expect_ok(b).content_hash());
+    }
+
+    /// A field with an empty name is refused: Discord rejects such a field, so a
+    /// template that carried one could never be posted.
+    #[test]
+    fn an_empty_field_name_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"","value":"b"}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A field name that is only whitespace is refused as well.
+    #[test]
+    fn a_whitespace_only_field_name_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"   ","value":"b"}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A field with an empty value is refused.
+    #[test]
+    fn an_empty_field_value_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"a","value":""}]}"#,
+            TemplateErrorKind::FieldValueEmpty,
+        );
+    }
+
+    /// A field value that is only whitespace is refused as well.
+    #[test]
+    fn a_whitespace_only_field_value_is_refused() {
+        expect_err(
+            r#"{"fields":[{"name":"a","value":"  "}]}"#,
+            TemplateErrorKind::FieldValueEmpty,
+        );
+    }
+
+    /// Both parts of a field can be empty; the name is reported first.
+    #[test]
+    fn a_field_with_both_parts_empty_reports_the_name() {
+        expect_err(
+            r#"{"fields":[{"name":"","value":""}]}"#,
+            TemplateErrorKind::FieldNameEmpty,
+        );
+    }
+
+    /// A colour of zero and NO colour are two different requests, so they must not
+    /// share a hash: otherwise a template that adds a colour would be skipped.
+    #[test]
+    fn colour_zero_and_no_colour_hash_differently() {
+        let none = expect_ok(r#"{"title":"t"}"#);
+        let zero = expect_ok(r#"{"title":"t","color":0}"#);
+        assert_ne!(none.content_hash(), zero.content_hash());
+        assert_ne!(none.canonical(), zero.canonical());
+        assert_eq!(none.color, None);
+        assert_eq!(zero.color, Some(0));
+    }
+
+    /// Two different colours hash differently, and a colour hashes differently from
+    /// the absence of one.
+    #[test]
+    fn colours_hash_differently() {
+        let zero = expect_ok(r#"{"title":"t","color":0}"#).content_hash();
+        let one = expect_ok(r#"{"title":"t","color":1}"#).content_hash();
+        let none = expect_ok(r#"{"title":"t"}"#).content_hash();
+        assert_ne!(zero, one);
+        assert_ne!(zero, none);
+        assert_ne!(one, none);
+    }
+
+    /// The same key twice in one document is refused: the last value must not
+    /// silently replace the first one.
+    #[test]
+    fn a_duplicate_json_key_is_refused() {
+        expect_err(
+            r#"{"title":"first","title":"second"}"#,
+            TemplateErrorKind::InvalidJson,
+        );
+        expect_err(
+            r#"{"fields":[{"name":"a","value":"1","value":"2"}]}"#,
+            TemplateErrorKind::InvalidJson,
+        );
+    }
+
+    /// The ten codes of the previous round and the two new ones are all distinct and
+    /// stable.
+    #[test]
+    fn error_codes_are_distinct_and_stable_after_the_new_codes() {
+        let all = [
+            TemplateErrorKind::InvalidJson,
+            TemplateErrorKind::EmptyTemplate,
+            TemplateErrorKind::TitleTooLong,
+            TemplateErrorKind::DescriptionTooLong,
+            TemplateErrorKind::TooManyFields,
+            TemplateErrorKind::FieldNameEmpty,
+            TemplateErrorKind::FieldValueEmpty,
+            TemplateErrorKind::FieldNameTooLong,
+            TemplateErrorKind::FieldValueTooLong,
+            TemplateErrorKind::FooterTooLong,
+            TemplateErrorKind::AuthorNameTooLong,
+            TemplateErrorKind::TotalTooLong,
+            TemplateErrorKind::ControlCharacter,
+        ];
+        let mut codes: Vec<_> = all.iter().map(|kind| kind.code()).collect();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), all.len());
+        assert_eq!(TemplateErrorKind::FieldNameEmpty.code(), "field_name_empty");
+        assert_eq!(
+            TemplateErrorKind::FieldValueEmpty.code(),
+            "field_value_empty"
+        );
+        assert_eq!(
+            TemplateErrorKind::ControlCharacter.code(),
+            "control_character"
+        );
+    }
+
+    /// A control character is refused in every text of the template.
+    ///
+    /// The whole class is refused, not one example of it: a NUL is not
+    /// special-cased. Every control character other than a newline is refused the
+    /// same way.
+    #[test]
+    fn a_control_character_is_refused_in_every_text() {
+        for character in [
+            '\u{0}', '\u{1}', '\u{7}', '\u{8}', '\u{b}', '\u{c}', '\u{1b}', '\u{1f}', '\u{7f}',
+        ] {
+            // The JSON ESCAPE of the character, because a literal control
+            // character in a JSON document is not valid JSON at all.
+            let source = format!(r#"{{"title":"a\u{:04x}b"}}"#, character as u32);
+            expect_err(&source, TemplateErrorKind::ControlCharacter);
+        }
+    }
+
+    /// The control character is refused in the description, the footer, the author
+    /// name, the field name and the field value as well.
+    #[test]
+    fn a_control_character_is_refused_in_every_part() {
+        expect_err(
+            "{\"description\":\"a\\u0000b\"}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"footer\":{\"text\":\"a\\u0001b\"}}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"author\":{\"name\":\"a\\u0002b\"}}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"fields\":[{\"name\":\"a\\u0003b\",\"value\":\"v\"}]}",
+            TemplateErrorKind::ControlCharacter,
+        );
+        expect_err(
+            "{\"fields\":[{\"name\":\"n\",\"value\":\"a\\u0004b\"}]}",
+            TemplateErrorKind::ControlCharacter,
+        );
+    }
+
+    /// A newline is not a control character that is refused: a rules post is
+    /// written with line breaks, and the real NSFW rules embed uses them.
+    #[test]
+    fn a_newline_is_allowed() {
+        let template = expect_ok(r#"{"fields":[{"name":"a","value":"one\ntwo"}]}"#);
+        assert_eq!(template.fields[0].value, "one\ntwo");
+    }
+
+    /// A carriage return is a control character and is refused, the same way as
+    /// every other control character.
+    #[test]
+    fn a_carriage_return_is_refused() {
+        expect_err(
+            "{\"title\":\"a\\u000db\"}",
+            TemplateErrorKind::ControlCharacter,
+        );
+    }
+}
