@@ -14,6 +14,7 @@ mod storage;
 mod text_helpers;
 mod tickets;
 mod welcome;
+mod voice_rooms;
 
 use config::Config;
 use deletion_attribution::{
