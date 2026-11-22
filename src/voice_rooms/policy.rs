@@ -2647,6 +2647,336 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Rule 2, the allowlist: a character is kept only if it is a letter or a
+    // digit (`char::is_alphanumeric`) other than the four Hangul fillers, the
+    // plain ASCII space, or one of the ASCII punctuation marks
+    // `- _ . , ' ! ? & + ( ) # :`. These tests use raw literals only; none of
+    // them reads a production table.
+    // ---------------------------------------------------------------------
+
+    /// The allowlist as the tests see it, written independently of the
+    /// production code so the two cannot agree by construction.
+    fn allowed_in_a_name(c: char) -> bool {
+        let hangul_filler = matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}');
+        c == ' ' || (c.is_alphanumeric() && !hangul_filler) || "-_.,'!?&+()#:".contains(c)
+    }
+
+    /// Hostile spellings that hide or reorder text are removed, each one
+    /// written as a raw literal.
+    #[test]
+    fn hostile_invisible_spellings_are_removed() {
+        let hostile = [
+            ("zero-width space", '\u{200B}'),
+            ("zero-width non-joiner", '\u{200C}'),
+            ("zero-width joiner", '\u{200D}'),
+            ("right-to-left mark", '\u{200F}'),
+            ("left-to-right embedding", '\u{202A}'),
+            ("right-to-left override", '\u{202E}'),
+            ("first strong isolate", '\u{2068}'),
+            ("word joiner", '\u{2060}'),
+            ("byte order mark", '\u{FEFF}'),
+            ("language tag", '\u{E0001}'),
+            ("tag letter A", '\u{E0041}'),
+            ("cancel tag", '\u{E007F}'),
+            ("reserved tag block", '\u{E0080}'),
+            ("variation selector 16", '\u{FE0F}'),
+            ("variation selector 17", '\u{E0100}'),
+            ("Mongolian free variation selector", '\u{180B}'),
+            ("combining grapheme joiner", '\u{034F}'),
+            ("reserved U+FFF0", '\u{FFF0}'),
+            ("reserved U+FFF8", '\u{FFF8}'),
+            ("interlinear annotation anchor", '\u{FFF9}'),
+            ("object replacement", '\u{FFFC}'),
+            ("unassigned U+DFFFE", '\u{DFFFE}'),
+            ("unassigned U+DFFFF", '\u{DFFFF}'),
+            ("unassigned U+E0FFF", '\u{E0FFF}'),
+            ("unassigned U+E1000", '\u{E1000}'),
+            ("Hangul filler", '\u{3164}'),
+            ("Hangul choseong filler", '\u{115F}'),
+            ("Hangul jungseong filler", '\u{1160}'),
+            ("halfwidth Hangul filler", '\u{FFA0}'),
+            ("soft hyphen", '\u{00AD}'),
+            ("Braille blank", '\u{2800}'),
+            ("musical null notehead", '\u{1D159}'),
+            ("Khmer inherent vowel", '\u{17B4}'),
+            ("Arabic letter mark", '\u{061C}'),
+            ("Arabic number sign", '\u{0600}'),
+            ("private use", '\u{E000}'),
+            ("supplementary private use", '\u{F0000}'),
+            ("bell", '\u{0007}'),
+            ("delete", '\u{007F}'),
+            ("next line", '\u{0085}'),
+            ("tab", '\t'),
+            ("newline", '\n'),
+        ];
+        for (what, c) in hostile {
+            assert_eq!(
+                sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                "party",
+                "the {what} (U+{:04X}) must be removed",
+                c as u32
+            );
+        }
+    }
+
+    /// The Unicode spaces other than the plain ASCII space are removed; the
+    /// plain space is kept between words.
+    #[test]
+    fn unicode_spaces_other_than_the_ascii_space_are_removed() {
+        let spaces = [
+            '\u{00A0}', '\u{1680}', '\u{2000}', '\u{2007}', '\u{200A}', '\u{2028}', '\u{2029}',
+            '\u{202F}', '\u{205F}', '\u{3000}',
+        ];
+        for c in spaces {
+            assert_eq!(
+                sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                "party",
+                "U+{:04X} must be removed",
+                c as u32
+            );
+        }
+        assert_eq!(sanitize_name("late night", "Voice Room"), "late night");
+    }
+
+    /// A name made only of characters outside the allowlist falls back to the
+    /// default name.
+    #[test]
+    fn a_name_of_only_disallowed_characters_falls_back_to_the_default() {
+        let only_hostile = "\u{200B}\u{200D}\u{202E}\u{E0041}\u{FE0F}\u{FFF0}\u{3164}\u{00AD}\
+                            \u{00A0}\u{3000}\u{2800}\u{1D159}\u{DFFFF}\u{E1000}\u{0007}";
+        assert_eq!(sanitize_name(only_hostile, "Voice Room"), "Voice Room");
+        let five_null_noteheads = "\u{1D159}\u{1D159}\u{1D159}\u{1D159}\u{1D159}";
+        assert_eq!(
+            sanitize_name(five_null_noteheads, "Voice Room"),
+            "Voice Room"
+        );
+    }
+
+    /// The allowed ASCII punctuation survives exactly.
+    #[test]
+    fn the_allowed_punctuation_survives() {
+        let name = "Rock & Roll (live) #1: Q&A - it's on! ok? a+b_c, d.";
+        assert_eq!(sanitize_name(name, "Voice Room"), name);
+    }
+
+    /// ASCII punctuation outside the allowlist is removed, `@` included.
+    #[test]
+    fn disallowed_ascii_punctuation_is_removed() {
+        for c in [
+            '@', '<', '>', '/', '\\', '`', '*', '~', '|', '"', '$', '%', '^', '=', '[', ']', '{',
+            '}', ';',
+        ] {
+            assert_eq!(
+                sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                "party",
+                "{c:?} must be removed"
+            );
+        }
+    }
+
+    /// A letter with a precomposed accent survives; a separate combining
+    /// accent after a Latin letter is not alphanumeric and is removed (a
+    /// documented limit), and so is a stack of them.
+    #[test]
+    fn combining_marks_on_latin_text() {
+        assert_eq!(sanitize_name("Caf\u{00E9}", "Voice Room"), "Caf\u{00E9}");
+        assert_eq!(sanitize_name("Cafe\u{0301}", "Voice Room"), "Cafe");
+        assert_eq!(
+            sanitize_name("p\u{0336}\u{0337}\u{0338}arty", "Voice Room"),
+            "party"
+        );
+    }
+
+    /// The alphabetic combining marks of non-Latin scripts survive, so a word
+    /// in those scripts is not mangled.
+    #[test]
+    fn alphabetic_combining_marks_on_non_latin_words_survive() {
+        // Hindi "kitab" with two vowel signs, Arabic "marhaban" with its
+        // vowel marks, Hebrew "shalom" with its points.
+        let words = [
+            "\u{0915}\u{093F}\u{0924}\u{093E}\u{092C}",
+            "\u{0645}\u{064E}\u{0631}\u{0652}\u{062D}\u{064E}\u{0628}\u{064B}\u{0627}",
+            "\u{05E9}\u{05B8}\u{05C1}\u{05DC}\u{05D5}\u{05B9}\u{05DD}",
+        ];
+        for word in words {
+            assert_eq!(sanitize_name(word, "Voice Room"), word);
+        }
+    }
+
+    /// Emoji and decorative symbols are not letters or digits, so they are
+    /// removed in this version (a documented limit).
+    #[test]
+    fn emoji_and_symbols_are_removed() {
+        assert_eq!(
+            sanitize_name("\u{1F3AE} party \u{2728}", "Voice Room"),
+            "party"
+        );
+        assert_eq!(
+            sanitize_name("\u{2605}\u{2665}", "Voice Room"),
+            "Voice Room"
+        );
+    }
+
+    /// Runs of spaces collapse to one, including the runs left behind when a
+    /// removed character stood between two spaces.
+    #[test]
+    fn runs_of_spaces_collapse() {
+        assert_eq!(
+            sanitize_name("  late    night  ", "Voice Room"),
+            "late night"
+        );
+        assert_eq!(sanitize_name("late * night", "Voice Room"), "late night");
+        assert_eq!(
+            sanitize_name("late \u{200B} night", "Voice Room"),
+            "late night"
+        );
+    }
+
+    /// The cap counts characters on multi-byte text, and applies to what is
+    /// left after the cleaning.
+    #[test]
+    fn the_cap_counts_characters_on_multi_byte_text() {
+        let cleaned = sanitize_name(&"\u{65E5}\u{672C}".repeat(80), "Voice Room");
+        assert_eq!(cleaned.chars().count(), 100);
+        assert_eq!(cleaned, "\u{65E5}\u{672C}".repeat(50));
+        let padded = format!("{}{}", "\u{200B}".repeat(50), "a".repeat(120));
+        assert_eq!(sanitize_name(&padded, "Voice Room"), "a".repeat(100));
+    }
+
+    /// Removing a disallowed character cannot assemble a host that survives:
+    /// the cleaning runs until the text stops changing.
+    #[test]
+    fn a_host_assembled_by_a_removal_is_removed() {
+        assert_eq!(sanitize_name("example.c*om party", "Voice Room"), "party");
+    }
+
+    /// Cutting a name at the cap cannot leave a host behind: the cleaning
+    /// runs again on the shortened text.
+    #[test]
+    fn a_host_exposed_by_the_cap_is_removed() {
+        let raw = format!("{} example.cox1", "a".repeat(88));
+        let cleaned = sanitize_name(&raw, "Voice Room");
+        assert_eq!(cleaned, "a".repeat(88));
+        assert_eq!(sanitize_name(&cleaned, "Voice Room"), cleaned);
+    }
+
+    /// An `@` never survives, so no name can ping.
+    #[test]
+    fn an_at_sign_never_survives() {
+        assert_eq!(sanitize_name("a@b", "Voice Room"), "ab");
+        assert_eq!(sanitize_name("@@everyone", "Voice Room"), "Voice Room");
+    }
+
+    /// Returns true when `small` can be obtained from `big` by deleting
+    /// characters only.
+    fn is_subsequence(small: &str, big: &str) -> bool {
+        let mut rest = big.chars();
+        small.chars().all(|wanted| rest.any(|c| c == wanted))
+    }
+
+    /// A seeded pseudo-random fuzz of the cleaner (a small LCG, no
+    /// dependency). For every input the output: holds only allowed
+    /// characters, has at most 100 characters, carries no `@`, has no leading,
+    /// trailing or doubled space, is not empty, is either the default name or
+    /// made by deleting characters from the input, and does not change when
+    /// it is cleaned a second time.
+    #[test]
+    fn a_seeded_fuzz_keeps_the_cleaner_invariants() {
+        const POOL: [char; 30] = [
+            '\u{200B}',
+            '\u{200D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{FE0F}',
+            '\u{FFF0}',
+            '\u{FFF9}',
+            '\u{3164}',
+            '\u{115F}',
+            '\u{FFA0}',
+            '\u{00AD}',
+            '\u{00A0}',
+            '\u{3000}',
+            '\u{2028}',
+            '\u{0301}',
+            '\u{094D}',
+            '\u{1F3AE}',
+            '\u{DFFFF}',
+            '\u{E1000}',
+            '\u{0007}',
+            '\n',
+            '\t',
+            '\u{00E9}',
+            '\u{65E5}',
+            '\u{0915}',
+            '\u{093F}',
+            '.',
+            ' ',
+        ];
+        const PIECES: [&str; 14] = [
+            "@everyone",
+            "@here",
+            "<@",
+            "<#",
+            "<@&",
+            ">",
+            "900000009",
+            "discord.gg/",
+            "https://",
+            "example.com",
+            "www.",
+            "party",
+            "  ",
+            "x.yz",
+        ];
+        let mut seed: u64 = 0x5EED_F00D_0A11_0157;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        for round in 0..1500 {
+            let mut raw = String::new();
+            let pieces = next() % 60;
+            for _ in 0..pieces {
+                match next() % 4 {
+                    0 => {
+                        if let Some(c) = char::from_u32((next() % 0x11_0000) as u32) {
+                            raw.push(c);
+                        }
+                    }
+                    1 => raw.push(POOL[(next() % POOL.len() as u64) as usize]),
+                    2 => raw.push(char::from(0x20 + (next() % 0x5F) as u8)),
+                    _ => raw.push_str(PIECES[(next() % PIECES.len() as u64) as usize]),
+                }
+            }
+            let out = sanitize_name(&raw, "Voice Room");
+            assert!(!out.is_empty(), "round {round}: empty output for {raw:?}");
+            assert!(out.chars().count() <= 100, "round {round}: {out:?}");
+            assert!(!out.contains('@'), "round {round}: {out:?}");
+            assert!(
+                out.chars().all(allowed_in_a_name),
+                "round {round}: a disallowed character in {out:?} from {raw:?}"
+            );
+            assert!(
+                !out.starts_with(' ') && !out.ends_with(' ') && !out.contains("  "),
+                "round {round}: stray space in {out:?}"
+            );
+            assert!(
+                out == "Voice Room" || is_subsequence(&out, &raw),
+                "round {round}: {out:?} is not made by deleting from {raw:?}"
+            );
+            assert_eq!(
+                sanitize_name(&out, "Voice Room"),
+                out,
+                "round {round}: a second cleaning changed the output of {raw:?}"
+            );
+        }
+    }
+
     /// The seeded sequence of the caps must apply EVERY leave, not only the
     /// ones the policy allows: a leave is a fact the runtime observes, not a
     /// request it can refuse.
