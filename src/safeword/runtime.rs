@@ -2639,6 +2639,43 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_dm_found_by_the_reconcile_is_in_the_report_codes_and_summary_line() {
+        use crate::safeword::state::Snapshot;
+        // Same crash as above: only the DM is left to send and DMs are
+        // closed. The staff alert fires, and the REPORT must name the code
+        // too, because the start-up log line is built from it.
+        let cfg = config();
+        let snapshot = Snapshot {
+            saved_roles: vec![RESTRICTED_A],
+            original_roles: vec![RESTRICTED_A],
+            snapshot_saved: true,
+            roles_removed: true,
+            safeword_added: true,
+            ..Snapshot::default()
+        };
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[SAFEWORD_ROLE]))
+            .with_store(FakeStore::new().with_state(MEMBER, State::Activating(snapshot)))
+            .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]))
+            .with_dm_failure(DmCode::Closed);
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(
+            report.codes,
+            vec![CODE_DM_FAILED],
+            "the report names the failed DM and nothing else: {}",
+            report.summary_line()
+        );
+        assert_eq!(report.failed, 1, "{}", report.summary_line());
+        let line = report.summary_line();
+        assert!(line.contains("failed=1"), "{line}");
+        assert!(line.ends_with("codes=dm_failed"), "{line}");
+        assert_eq!(
+            harness.alerts(),
+            vec![CODE_DM_FAILED],
+            "one alert, as before"
+        );
+    }
+
+    #[test]
     fn an_unknown_bot_top_position_denies_the_role_write_and_alerts() {
         let cfg = config();
         let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
@@ -2886,6 +2923,45 @@ mod tests {
         assert_eq!(calls[1].0, Some(BOT_USER), "the bot is the cursor");
         assert_eq!(report.activated, 100, "99 members and MEMBER, not the bot");
         assert_eq!(report.bots_skipped, 1);
+    }
+
+    #[test]
+    fn a_bot_in_the_middle_of_a_full_page_does_not_move_the_cursor_or_lose_the_last_member() {
+        // A full page of 100 users: a bot in the MIDDLE, a human LAST. The
+        // next page must start after the last user (the human), and every
+        // human on both pages must be activated.
+        let cfg = config();
+        let mut first: Vec<u64> = (0..REACTION_PAGE_SIZE as u64)
+            .map(|i| 900_000 + i)
+            .collect();
+        let last_human = *first.last().expect("a full page has a last user");
+        first[50] = BOT_USER;
+        assert_eq!(first.len(), REACTION_PAGE_SIZE as usize);
+        let mut harness = Harness::new(FakeMembers::new()).with_reactions(
+            FakeReactionUsers::new(vec![first, vec![MEMBER]]).with_bots(&[BOT_USER]),
+        );
+        let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
+        let calls = harness.reaction_calls.borrow().clone();
+        assert_eq!(calls.len(), 2, "the second page was read: {calls:?}");
+        assert_eq!(calls[0].0, None, "the first call has no cursor");
+        assert_eq!(
+            calls[1].0,
+            Some(last_human),
+            "the cursor is the last user of the page, not the bot in the middle"
+        );
+        assert_eq!(
+            report.activated,
+            100,
+            "99 humans on page one plus MEMBER on page two: {}",
+            report.summary_line()
+        );
+        assert_eq!(report.bots_skipped, 1, "{}", report.summary_line());
+        assert!(
+            matches!(harness.state_of(last_human), Some(State::Active(_))),
+            "the last human of the full page is activated"
+        );
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Active(_))));
+        assert!(harness.state_of(BOT_USER).is_none());
     }
 
     #[test]
