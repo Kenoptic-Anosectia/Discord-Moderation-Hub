@@ -654,9 +654,10 @@ fn run_actions(
             StepOutcome::Acknowledged { alert } => {
                 // The failure is reported (alert, non-success outcome) but the
                 // machine is told the step is done, so it can reach Active or
-                // Inactive.
+                // Inactive. The step did not succeed, so it is not counted as
+                // performed: a run with nothing but a failed DM (reachable only
+                // through the reconcile) is `Failed`.
                 failures += 1;
-                performed += 1;
                 ops.alerter.alert(alert);
                 push_code(shadow, alert);
                 let (following, more) = step(&state, Event::ActionDone(action.id()), &context);
