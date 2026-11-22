@@ -1,9 +1,7 @@
 //! Role runtime adapter: Discord role facts and a real role writer.
 //!
-//! RED-EVIDENCE STUB COMMIT. The behaviour is deliberately wrong here so the tests
-//! fail; the real implementation follows in the next commit.
-//!
-//! What the module is:
+//! This module is the thin, Discord-facing layer between the pure role services
+//! (`eligibility` = K03, `grant` = K04) and serenity. It does three things:
 //!
 //! 1. **Facts.** It turns Discord role data into [`eligibility::RoleFacts`] and works out
 //!    the bot's top role position. The guild's roles come from a [`RoleSource`]; the real
@@ -13,12 +11,25 @@
 //!    `add_member_role`, and maps serenity's typed errors to [`grant::WriteError`].
 //! 3. **Helpers.** [`already_held`], the decision wrapper that keeps a failed lookup
 //!    visible, and a [`grant::Sleeper`] for tokio-backed callers.
+//!
+//! Fail-closed rules the code enforces:
+//!
+//! * A role id that is not in the guild's role list is `exists: false` (deleted).
+//! * A lookup that *fails* is [`FactsOutcome::Unavailable`], never a guess. The decision
+//!   wrapper turns it into a deny, so a transient API error can never grant a role.
+//! * A role may only be written when the policy allowed it and the facts were found.
+//!
+//! The `grant` traits are synchronous, so the writer drives serenity's async call from a
+//! blocking context. Calling `Handle::block_on` from inside a runtime worker panics
+//! ("Cannot start a runtime from within a runtime"); [`SerenityRoleWriter`] never does
+//! that and reports a stable error instead. See [`drive_blocking`].
 
 use super::eligibility::{Decision, GrantPath, RoleFacts, SafewordState, StaffContext};
 use super::grant::{RoleWriter, Sleeper, WriteError, MAX_SLEEP_MS};
 
 use poise::serenity_prelude as s;
 use s::all::{GuildId, RoleId, UserId};
+use s::http::HttpError;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -30,6 +41,9 @@ pub const MANAGE_ROLES_PERMISSION: u64 = 1 << 28;
 // ---------------------------------------------------------------------------
 
 /// One role's Discord-side data, reduced to what the policy needs.
+///
+/// This is the runtime shape of a role; it is turned into [`RoleFacts`] by
+/// [`role_facts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoleEntry {
     /// The role id.
@@ -75,9 +89,16 @@ pub enum SourceError {
 }
 
 /// Where role facts come from.
+///
+/// The two real sources are the serenity cache (a miss there is normal) and an HTTP
+/// fetch of the guild's roles. [`CachedRoleSource`] composes them: cache first, HTTP on
+/// a miss.
 #[s::async_trait]
 pub trait RoleSource: Send + Sync {
     /// The guild's roles.
+    ///
+    /// `Err(SourceError::Miss)` means "not in this source"; `Err(SourceError::Unavailable)`
+    /// means the source failed.
     async fn roles(&self, guild_id: u64) -> Result<Vec<RoleEntry>, SourceError>;
 
     /// The role ids the given member holds.
@@ -85,6 +106,9 @@ pub trait RoleSource: Send + Sync {
 }
 
 /// The guild's role list from the serenity cache.
+///
+/// A guild that is not cached is a [`SourceError::Miss`]: that is the normal path to the
+/// HTTP source, not a failure.
 pub struct SerenityCacheSource {
     /// The serenity cache.
     pub cache: Arc<s::Cache>,
@@ -92,12 +116,24 @@ pub struct SerenityCacheSource {
 
 #[s::async_trait]
 impl RoleSource for SerenityCacheSource {
-    async fn roles(&self, _guild_id: u64) -> Result<Vec<RoleEntry>, SourceError> {
-        Err(SourceError::Miss)
+    async fn roles(&self, guild_id: u64) -> Result<Vec<RoleEntry>, SourceError> {
+        let Some(guild) = self.cache.guild(GuildId::new(guild_id)) else {
+            return Err(SourceError::Miss);
+        };
+        let mut entries: Vec<RoleEntry> =
+            guild.roles.values().map(RoleEntry::from_serenity).collect();
+        entries.sort_by_key(|r| r.id);
+        Ok(entries)
     }
 
-    async fn member_roles(&self, _guild_id: u64, _member_id: u64) -> Result<Vec<u64>, SourceError> {
-        Err(SourceError::Miss)
+    async fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, SourceError> {
+        let Some(guild) = self.cache.guild(GuildId::new(guild_id)) else {
+            return Err(SourceError::Miss);
+        };
+        let Some(member) = guild.members.get(&UserId::new(member_id)) else {
+            return Err(SourceError::Miss);
+        };
+        Ok(member.roles.iter().map(|id| id.get()).collect())
     }
 }
 
@@ -109,16 +145,31 @@ pub struct SerenityHttpSource {
 
 #[s::async_trait]
 impl RoleSource for SerenityHttpSource {
-    async fn roles(&self, _guild_id: u64) -> Result<Vec<RoleEntry>, SourceError> {
-        Err(SourceError::Unavailable)
+    async fn roles(&self, guild_id: u64) -> Result<Vec<RoleEntry>, SourceError> {
+        let roles = self
+            .http
+            .get_guild_roles(GuildId::new(guild_id))
+            .await
+            .map_err(|_| SourceError::Unavailable)?;
+        let mut entries: Vec<RoleEntry> = roles.iter().map(RoleEntry::from_serenity).collect();
+        entries.sort_by_key(|r| r.id);
+        Ok(entries)
     }
 
-    async fn member_roles(&self, _guild_id: u64, _member_id: u64) -> Result<Vec<u64>, SourceError> {
-        Err(SourceError::Unavailable)
+    async fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, SourceError> {
+        let member = self
+            .http
+            .get_member(GuildId::new(guild_id), UserId::new(member_id))
+            .await
+            .map_err(|_| SourceError::Unavailable)?;
+        Ok(member.roles.iter().map(|id| id.get()).collect())
     }
 }
 
 /// Cache first, HTTP on a miss.
+///
+/// The cache is asked first. When it does not hold the answer the HTTP source is asked.
+/// When the HTTP source fails the whole lookup fails: the result is never a guess.
 pub struct CachedRoleSource<C, H> {
     /// The source asked first.
     pub cache: C,
@@ -140,37 +191,81 @@ where
     H: RoleSource,
 {
     async fn roles(&self, guild_id: u64) -> Result<Vec<RoleEntry>, SourceError> {
-        let _ = guild_id;
-        Err(SourceError::Unavailable)
+        match self.cache.roles(guild_id).await {
+            Ok(roles) => Ok(roles),
+            // The cache had no answer: ask the HTTP source. It is the last resort, so a
+            // miss there is an unavailable lookup, not an empty role list.
+            Err(_) => self
+                .http
+                .roles(guild_id)
+                .await
+                .map_err(|_| SourceError::Unavailable),
+        }
     }
 
     async fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, SourceError> {
-        let _ = (guild_id, member_id);
-        Err(SourceError::Unavailable)
+        match self.cache.member_roles(guild_id, member_id).await {
+            Ok(roles) => Ok(roles),
+            Err(_) => self
+                .http
+                .member_roles(guild_id, member_id)
+                .await
+                .map_err(|_| SourceError::Unavailable),
+        }
     }
 }
 
 /// Build the policy facts for one role from the guild's role list.
+///
+/// A role id that is not in the list is [`FactsOutcome::Missing`] (deleted). The caller
+/// decides what a missing role means; the policy denies it.
 pub fn role_facts(roles: &[RoleEntry], role_id: u64) -> FactsOutcome {
-    let _ = (roles, role_id);
-    FactsOutcome::Unavailable
+    match roles.iter().find(|r| r.id == role_id) {
+        Some(role) => FactsOutcome::Found(RoleFacts {
+            id: role.id,
+            position: role.position,
+            managed: role.managed,
+            permissions: role.permissions,
+            exists: true,
+        }),
+        None => FactsOutcome::Missing,
+    }
 }
 
-/// The bot's top role position.
+/// The bot's top role position: the highest position among the roles the bot holds.
+///
+/// 0 when the bot holds no role that is in the role list. The policy denies every role
+/// whose position is at or above the bot's, so a bot with no known role can grant
+/// nothing.
 pub fn bot_top_position(roles: &[RoleEntry], bot_role_ids: &[u64]) -> u16 {
-    let _ = (roles, bot_role_ids);
-    0
+    bot_role_ids
+        .iter()
+        .filter_map(|id| roles.iter().find(|r| r.id == *id))
+        .map(|r| r.position)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Look up one role's facts and the bot's top position, from one source.
+///
+/// The role lookup and the bot's own roles are separate calls, so either can fail. Any
+/// failure is [`FactsOutcome::Unavailable`]: the caller denies.
 pub async fn lookup_facts<S: RoleSource + ?Sized>(
     source: &S,
     guild_id: u64,
     role_id: u64,
     bot_user_id: u64,
 ) -> (FactsOutcome, u16) {
-    let _ = (source, guild_id, role_id, bot_user_id);
-    (FactsOutcome::Unavailable, 0)
+    let roles = match source.roles(guild_id).await {
+        Ok(roles) => roles,
+        Err(_) => return (FactsOutcome::Unavailable, 0),
+    };
+    let facts = role_facts(&roles, role_id);
+    let bot_roles = match source.member_roles(guild_id, bot_user_id).await {
+        Ok(ids) => ids,
+        Err(_) => return (FactsOutcome::Unavailable, 0),
+    };
+    (facts, bot_top_position(&roles, &bot_roles))
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +292,9 @@ pub struct DecisionInputs<'a> {
 }
 
 /// The policy decision for one role, with a failed lookup kept visible.
+///
+/// The policy's own [`Decision`] is wrapped rather than extended, so the policy enums are
+/// untouched. An unavailable lookup is a deny that the caller can still see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDecision {
     /// The policy decided on the facts that were found.
@@ -207,11 +305,16 @@ pub enum RuntimeDecision {
 
 impl RuntimeDecision {
     /// Whether the role may be written.
+    ///
+    /// Only a policy `Allow` on facts that were found may be written.
     pub fn allows_write(self) -> bool {
         matches!(self, RuntimeDecision::Decided(Decision::Allow))
     }
 
     /// The stable code for a denied role, or `None` when the role may be written.
+    ///
+    /// A policy denial reports the policy's own reason code. An unavailable lookup
+    /// reports `facts_unavailable`.
     pub fn deny_code(self) -> Option<&'static str> {
         match self {
             RuntimeDecision::Decided(Decision::Allow) => None,
@@ -225,16 +328,43 @@ impl RuntimeDecision {
 pub const CODE_FACTS_UNAVAILABLE: &str = "facts_unavailable";
 
 /// Decide one role from the facts and the policy inputs.
+///
+/// A role that is not in the guild's role list is decided by the policy itself, which
+/// denies it as deleted. A lookup that failed is [`RuntimeDecision::Unavailable`], which
+/// is a deny.
 pub fn decide_from_facts(
     facts: FactsOutcome,
     role_id: u64,
     inputs: &DecisionInputs<'_>,
 ) -> RuntimeDecision {
-    let _ = (facts, role_id, inputs);
-    RuntimeDecision::Unavailable
+    let role = match facts {
+        FactsOutcome::Found(facts) => facts,
+        FactsOutcome::Missing => RoleFacts {
+            id: role_id,
+            position: 0,
+            managed: false,
+            permissions: 0,
+            exists: false,
+        },
+        FactsOutcome::Unavailable => return RuntimeDecision::Unavailable,
+    };
+    let request = super::eligibility::GrantRequest {
+        path: inputs.path,
+        role,
+        bot_top_position: inputs.bot_top_position,
+        guild_id: inputs.guild_id,
+        protected_role_ids: inputs.protected_role_ids,
+        safeword: inputs.safeword,
+        safeword_restricted_role_ids: inputs.safeword_restricted_role_ids,
+        staff: inputs.staff,
+    };
+    RuntimeDecision::Decided(super::eligibility::decide(&request))
 }
 
 /// Look up one role's facts and decide it.
+///
+/// The bot's top position is worked out from the same source, so a lookup that failed
+/// denies the role.
 pub async fn decide_role<S: RoleSource + ?Sized>(
     source: &S,
     guild_id: u64,
@@ -242,8 +372,10 @@ pub async fn decide_role<S: RoleSource + ?Sized>(
     bot_user_id: u64,
     inputs: &DecisionInputs<'_>,
 ) -> RuntimeDecision {
-    let _ = (source, guild_id, role_id, bot_user_id, inputs);
-    RuntimeDecision::Unavailable
+    let (facts, bot_top) = lookup_facts(source, guild_id, role_id, bot_user_id).await;
+    let mut inputs = *inputs;
+    inputs.bot_top_position = bot_top;
+    decide_from_facts(facts, role_id, &inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,9 +389,13 @@ pub const STATUS_NOT_HTTP: u16 = 0;
 pub const STATUS_WRONG_CONTEXT: u16 = 1;
 
 /// The failure facts a writer reports.
+///
+/// `retry_after_ms` is the rate-limit hint the transport supplied. It is `None` for
+/// serenity's typed errors, which carry no rate-limit hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteFailure {
-    /// The HTTP status code, or [`STATUS_NOT_HTTP`].
+    /// The HTTP status code, or [`STATUS_NOT_HTTP`] when the failure was not an HTTP
+    /// response.
     pub status: u16,
     /// Discord's JSON error code, when the response carried one.
     pub api_code: Option<u32>,
@@ -288,37 +424,75 @@ impl WriteFailure {
 }
 
 /// Map a serenity error to the grant module's error shape.
+///
+/// A typed HTTP failure keeps its status code and Discord's JSON error code. The
+/// rate-limit hint is `None`: serenity's typed error carries no `retry-after`, and
+/// serenity's own ratelimiter already waits for a 429 and retries the request before the
+/// error surfaces. The grant module then applies its own backoff.
+///
+/// A failure that is not an HTTP response gets the stable status [`STATUS_NOT_HTTP`].
 pub fn map_serenity_error(error: &s::Error) -> WriteError {
-    let _ = error;
-    WriteFailure::not_http().to_write_error()
+    WriteFailure::from_serenity(error).to_write_error()
 }
 
 impl WriteFailure {
     /// Extract the failure facts from a serenity error.
     pub fn from_serenity(error: &s::Error) -> Self {
-        let _ = error;
-        WriteFailure::not_http()
+        let s::Error::Http(HttpError::UnsuccessfulRequest(response)) = error else {
+            return WriteFailure::not_http();
+        };
+        WriteFailure {
+            status: response.status_code.as_u16(),
+            // Discord's error codes are non-negative; serenity uses -1 for a body it
+            // could not decode, which is not an api code.
+            api_code: u32::try_from(response.error.code).ok(),
+            retry_after_ms: None,
+        }
     }
 }
 
 /// Drive an async operation from a synchronous caller.
-pub fn drive_blocking<F, T>(
-    handle: &tokio::runtime::Handle,
-    operation: F,
-) -> Result<T, WriteError>
+///
+/// `grant::RoleWriter` is synchronous but Discord's API is not, so the call has to be
+/// driven to completion here. `Handle::block_on` panics when it is called from inside a
+/// runtime worker ("Cannot start a runtime from within a runtime"), so this never calls
+/// it in that situation:
+///
+/// * no runtime context on this thread: `Handle::block_on` is safe;
+/// * a multi-thread runtime: `block_in_place` lets the worker block safely;
+/// * a current-thread runtime: the caller is inside the runtime and neither
+///   `block_on` nor `block_in_place` is safe, so this reports
+///   [`STATUS_WRONG_CONTEXT`] instead of panicking.
+///
+/// The operation blocks the calling thread. Call it from a blocking context such as
+/// `tokio::task::spawn_blocking`.
+pub fn drive_blocking<F, T>(handle: &tokio::runtime::Handle, operation: F) -> Result<T, WriteError>
 where
     F: Future<Output = T>,
 {
-    let _ = handle;
-    let _ = operation;
-    Err(WriteError {
-        status: STATUS_WRONG_CONTEXT,
-        api_code: None,
-        retry_after_ms: None,
-    })
+    match tokio::runtime::Handle::try_current() {
+        // No runtime context on this thread: blocking here is fine.
+        Err(_) => Ok(handle.block_on(operation)),
+        Ok(current) => {
+            if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                // A current-thread runtime is being driven right here, so blocking would
+                // panic. Report a stable error instead.
+                Err(WriteError {
+                    status: STATUS_WRONG_CONTEXT,
+                    api_code: None,
+                    retry_after_ms: None,
+                })
+            } else {
+                Ok(tokio::task::block_in_place(|| handle.block_on(operation)))
+            }
+        }
+    }
 }
 
 /// The real role writer: one Discord role write, over serenity's `add_member_role`.
+///
+/// The writer holds the guild it writes to and the tokio handle it drives the call
+/// with. See [`drive_blocking`] for how it may be called.
 pub struct SerenityRoleWriter {
     /// The guild the role belongs to.
     pub guild_id: u64,
@@ -330,11 +504,7 @@ pub struct SerenityRoleWriter {
 
 impl SerenityRoleWriter {
     /// Build a writer for one guild.
-    pub fn new(
-        guild_id: u64,
-        http: Arc<s::http::Http>,
-        handle: tokio::runtime::Handle,
-    ) -> Self {
+    pub fn new(guild_id: u64, http: Arc<s::http::Http>, handle: tokio::runtime::Handle) -> Self {
         SerenityRoleWriter {
             guild_id,
             http,
@@ -344,8 +514,19 @@ impl SerenityRoleWriter {
 }
 
 impl RoleWriter for SerenityRoleWriter {
-    fn add_role(&mut self, _member_id: u64, _role_id: u64) -> Result<(), WriteError> {
-        Err(WriteFailure::not_http().to_write_error())
+    fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        let http = Arc::clone(&self.http);
+        let guild_id = self.guild_id;
+        let outcome = drive_blocking(&self.handle, async move {
+            http.add_member_role(
+                GuildId::new(guild_id),
+                UserId::new(member_id),
+                RoleId::new(role_id),
+                None,
+            )
+            .await
+        })?;
+        outcome.map_err(|error| map_serenity_error(&error))
     }
 }
 
@@ -353,26 +534,49 @@ impl RoleWriter for SerenityRoleWriter {
 // Sleeper
 // ---------------------------------------------------------------------------
 
-/// Clamp a sleep request to the grant module's bound.
-pub fn clamp_sleep_ms(ms: u64) -> u64 {
-    ms.min(MAX_SLEEP_MS)
+/// The duration a sleeper waits for a sleep request.
+///
+/// The request is clamped to the bound, whatever the writer asked for. This is the only
+/// place the clamp is applied, so the sleeper and its callers agree.
+pub fn effective_sleep(ms: u64, max_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.min(max_ms))
 }
 
 /// A [`Sleeper`] for tokio-backed callers.
+///
+/// The sleep is clamped to the sleeper's bound, which is the grant module's
+/// [`MAX_SLEEP_MS`] unless another bound is given.
 pub struct TokioSleeper {
     /// The tokio handle used to drive the sleep.
     pub handle: tokio::runtime::Handle,
+    /// The longest sleep this sleeper will wait for.
+    pub max_ms: u64,
 }
 
 impl TokioSleeper {
-    /// Build a sleeper that drives its sleeps with the given handle.
+    /// Build a sleeper that drives its sleeps with the given handle and the grant
+    /// module's bound.
     pub fn new(handle: tokio::runtime::Handle) -> Self {
-        TokioSleeper { handle }
+        TokioSleeper {
+            handle,
+            max_ms: MAX_SLEEP_MS,
+        }
+    }
+
+    /// Build a sleeper with a different bound.
+    pub fn with_bound(handle: tokio::runtime::Handle, max_ms: u64) -> Self {
+        TokioSleeper { handle, max_ms }
     }
 }
 
 impl Sleeper for TokioSleeper {
-    fn sleep_ms(&mut self, _ms: u64) {}
+    fn sleep_ms(&mut self, ms: u64) {
+        let wait = effective_sleep(ms, self.max_ms);
+        let handle = self.handle.clone();
+        // The sleep is driven the same way the writer drives its call: never by blocking
+        // a runtime worker directly.
+        let _ = drive_blocking(&handle, async move { tokio::time::sleep(wait).await });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,26 +585,50 @@ impl Sleeper for TokioSleeper {
 
 /// Whether the member already holds the role.
 pub fn already_held(member_roles: &[u64], role_id: u64) -> bool {
-    let _ = (member_roles, role_id);
-    false
+    member_roles.contains(&role_id)
 }
 
 /// Build the grant executor's items from the runtime decisions.
+///
+/// A role whose facts could not be looked up is denied and is not put into the request,
+/// so the executor can never write it. Its reason stays visible in the
+/// [`RuntimeDecision`].
 pub fn grant_items(
     decisions: &[(u64, RuntimeDecision)],
     member_roles: &[u64],
 ) -> Vec<super::grant::GrantItem> {
-    let _ = (decisions, member_roles);
-    Vec::new()
+    decisions
+        .iter()
+        .filter_map(|(role_id, decision)| {
+            let decision = match decision {
+                RuntimeDecision::Decided(decision) => *decision,
+                // Denied, and deliberately left out: the executor only writes an `Allow`.
+                RuntimeDecision::Unavailable => return None,
+            };
+            Some(super::grant::GrantItem {
+                role_id: *role_id,
+                decision,
+                already_held: already_held(member_roles, *role_id),
+            })
+        })
+        .collect()
 }
 
 /// The permissions the bot needs in the guild for the role writer to work.
+///
+/// The bot needs "Manage Roles" and its own top role must be above the roles it
+/// grants. The gateway needs the guild member list for the member lookup.
 pub const REQUIRED_PERMISSIONS: u64 = MANAGE_ROLES_PERMISSION;
 
 /// The gateway intents the role source needs.
+///
+/// The guild's role list arrives with the guild create event, which needs the guilds
+/// intent. The bot member's role ids come from the guild's member list, which needs the
+/// member intent (a privileged intent).
 pub fn required_intents() -> s::GatewayIntents {
     s::GatewayIntents::GUILDS | s::GatewayIntents::GUILD_MEMBERS
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,7 +875,10 @@ mod tests {
         let cache = Arc::new(s::Cache::default());
         let source = SerenityCacheSource { cache };
         assert_eq!(source.roles(GUILD).await, Err(SourceError::Miss));
-        assert_eq!(source.member_roles(GUILD, BOT).await, Err(SourceError::Miss));
+        assert_eq!(
+            source.member_roles(GUILD, BOT).await,
+            Err(SourceError::Miss)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -676,14 +907,13 @@ mod tests {
 
     #[test]
     fn bot_top_position_is_the_highest_role_the_bot_holds() {
-        let roles = vec![
-            entry(ROLE_LOW, 3),
-            entry(ROLE_MID, 5),
-            entry(ROLE_HIGH, 9),
-        ];
+        let roles = vec![entry(ROLE_LOW, 3), entry(ROLE_MID, 5), entry(ROLE_HIGH, 9)];
         assert_eq!(bot_top_position(&roles, &[ROLE_LOW]), 3);
         assert_eq!(bot_top_position(&roles, &[ROLE_LOW, ROLE_MID]), 5);
-        assert_eq!(bot_top_position(&roles, &[ROLE_LOW, ROLE_MID, ROLE_HIGH]), 9);
+        assert_eq!(
+            bot_top_position(&roles, &[ROLE_LOW, ROLE_MID, ROLE_HIGH]),
+            9
+        );
         // Order does not matter.
         assert_eq!(bot_top_position(&roles, &[ROLE_HIGH, ROLE_LOW]), 9);
     }
@@ -808,7 +1038,10 @@ mod tests {
 
         // The executor is given no item for the role, so it cannot write it.
         let items = grant_items(&[(ROLE_LOW, decision)], &[]);
-        assert!(items.is_empty(), "an unavailable role must not reach the writer");
+        assert!(
+            items.is_empty(),
+            "an unavailable role must not reach the writer"
+        );
 
         let mut writer = RecordingWriter::default();
         let mut sleeper = NoopSleeper;
@@ -1173,24 +1406,97 @@ mod tests {
         assert_eq!(outcome.expect("a blocking context may drive the call"), 19);
     }
 
+    #[test]
+    fn the_writer_reports_a_stable_error_in_a_context_it_cannot_block_in() {
+        // The real writer, called from a current-thread runtime worker: the misuse must
+        // be a stable error, not a panic and not a Discord call.
+        let outcome = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = runtime.handle().clone();
+            let http = Arc::new(s::http::Http::new("synthetic-token-not-used"));
+            let mut writer = SerenityRoleWriter::new(GUILD, http, handle.clone());
+            runtime.block_on(async move { writer.add_role(MEMBER, ROLE_LOW) })
+        })
+        .join()
+        .unwrap();
+        let error = outcome.expect_err("a current-thread runtime must not block");
+        assert_eq!(error.status, STATUS_WRONG_CONTEXT);
+        assert_eq!(error.api_code, None);
+        assert_eq!(error.retry_after_ms, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_writer_from_a_blocking_context_is_not_refused_by_the_context_guard() {
+        // The context guard is the writer's own rule, so it is checked without any
+        // Discord call: a blocking context must not be refused.
+        let handle = tokio::runtime::Handle::current();
+        let outcome = tokio::task::spawn_blocking(move || drive_blocking(&handle, async { 23u8 }))
+            .await
+            .unwrap();
+        assert_eq!(outcome.expect("a blocking context may drive the call"), 23);
+    }
+
     // -----------------------------------------------------------------------
     // Sleeper
     // -----------------------------------------------------------------------
 
     #[test]
-    fn the_sleep_is_clamped_to_the_grant_modules_bound() {
-        assert_eq!(clamp_sleep_ms(0), 0);
-        assert_eq!(clamp_sleep_ms(1_000), 1_000);
-        assert_eq!(clamp_sleep_ms(MAX_SLEEP_MS), MAX_SLEEP_MS);
-        assert_eq!(clamp_sleep_ms(MAX_SLEEP_MS + 1), MAX_SLEEP_MS);
-        assert_eq!(clamp_sleep_ms(u64::MAX), MAX_SLEEP_MS);
+    fn the_sleep_is_clamped_to_the_bound() {
+        assert_eq!(effective_sleep(0, 100), std::time::Duration::from_millis(0));
+        assert_eq!(
+            effective_sleep(1_000, 100),
+            std::time::Duration::from_millis(100),
+            "a request above the bound is clamped to the bound"
+        );
+        assert_eq!(
+            effective_sleep(100, 100),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            effective_sleep(u64::MAX, 100),
+            std::time::Duration::from_millis(100),
+            "a hostile request is clamped to the bound"
+        );
+        assert_eq!(
+            effective_sleep(u64::MAX, MAX_SLEEP_MS),
+            std::time::Duration::from_millis(MAX_SLEEP_MS),
+            "the grant module's bound is the default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tokio_sleeper_waits_at_most_its_bound() {
+        let handle = tokio::runtime::Handle::current();
+        // A small bound keeps the test quick while still showing the clamp.
+        let mut sleeper = TokioSleeper::with_bound(handle, 40);
+        let started = std::time::Instant::now();
+        sleeper.sleep_ms(5_000);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "the sleeper must wait for the bound, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the sleeper must not wait for the requested time, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tokio_sleeper_default_bound_is_the_grant_modules_bound() {
+        let handle = tokio::runtime::Handle::current();
+        let sleeper = TokioSleeper::new(handle);
+        assert_eq!(sleeper.max_ms, MAX_SLEEP_MS);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_tokio_sleeper_sleeps_for_the_clamped_value() {
         let handle = tokio::runtime::Handle::current();
         let mut sleeper = TokioSleeper::new(handle);
-        // The sleeper drives the clamped value, so a 30 ms request waits about 30 ms.
+        // A request under the bound waits for the request.
         let started = std::time::Instant::now();
         sleeper.sleep_ms(30);
         let elapsed = started.elapsed();
@@ -1408,7 +1714,8 @@ mod tests {
                 Err(error) => {
                     assert!(expected.is_none(), "case {case}: {error:?}");
                     assert_eq!(
-                        error, SourceError::Unavailable,
+                        error,
+                        SourceError::Unavailable,
                         "case {case}: the last source's failure is an unavailable lookup"
                     );
                 }
