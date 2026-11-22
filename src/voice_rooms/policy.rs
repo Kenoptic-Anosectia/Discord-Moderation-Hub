@@ -185,7 +185,9 @@ pub struct Room {
     pub created_at: i64,
     /// When the room last became empty, in epoch seconds; absent while it is occupied.
     pub empty_since: Option<i64>,
-    /// How many members are currently in the room.
+    /// How many members are in the room, counted BEFORE the leave that is
+    /// being decided. The member who is leaving is still counted, so a room
+    /// whose count is one becomes empty when that member leaves.
     pub occupants: usize,
 }
 
@@ -419,15 +421,21 @@ pub fn decide_permit(
 
 /// Decides what a leaving member leaves behind.
 ///
-/// The owner leaving a room that still holds members makes the room claimable. An
-/// empty room is only cleaned up once its grace period has elapsed; the runtime
-/// records `empty_since` when the room first becomes empty and calls again later.
+/// The owner leaving a room that still holds members makes the room claimable.
+/// An empty room is only cleaned up once its grace period has elapsed; the
+/// runtime records `empty_since` when the room first becomes empty and calls
+/// again later.
 ///
-/// The grace check comes first and applies to whoever leaves last: a room whose owner
-/// has already left must still be cleaned up once it is empty, or it would linger
-/// forever and keep consuming the global cap. Only a member who leaves a room that is
-/// still occupied can be refused for not being the owner, because only then does the
-/// leave have a claimable consequence.
+/// [`Room::occupants`] is the count BEFORE the leave: the member who is
+/// leaving is still counted. A room whose count is one therefore becomes
+/// empty when that member leaves, and only a room whose count is two or more
+/// still holds members afterwards.
+///
+/// The grace check comes first and applies to whoever leaves last: a room
+/// whose owner has already left must still be cleaned up once it is empty, or
+/// it would linger forever and keep consuming the global cap. Only a member
+/// who leaves a room that still holds members can be refused for not being
+/// the owner, because only then does the leave have a claimable consequence.
 pub fn decide_leave(
     channel_id: u64,
     user_id: u64,
@@ -445,17 +453,19 @@ pub fn decide_leave(
     if config.empty_grace_secs < 0 {
         return Decision::Deny(DenyReason::InvalidConfig);
     }
-    if room.occupants > 0 {
-        // The room still holds members, so it may become claimable. Only the owner
-        // may leave it that way; anybody else leaves no trace.
+    if room.occupants >= 2 {
+        // The room still holds members after this leave, so it may become
+        // claimable. Only the owner may leave it that way; anybody else
+        // leaves no trace.
         if user_id != room.owner_id {
             return Decision::Deny(DenyReason::NotRoomOwner);
         }
         return Decision::Claimable(channel_id);
     }
-    // The room is empty. The grace period starts when the room first became empty;
-    // until it has elapsed the room stays. The check does not depend on who leaves:
-    // the room is empty, so whoever leaves last reaches it.
+    // The room is empty after this leave. The grace period starts when the
+    // room first became empty; until it has elapsed the room stays. The check
+    // does not depend on who leaves: the room is empty, so whoever leaves
+    // last reaches it.
     let empty_since = room.empty_since.unwrap_or(now);
     if now.saturating_sub(empty_since) >= config.empty_grace_secs {
         return Decision::Cleanup(channel_id);
@@ -470,6 +480,10 @@ pub fn decide_leave(
 /// never be called for it. The sweep is the runtime's periodic check: it cleans an
 /// empty room up once its grace period has elapsed, and it never touches a room
 /// that still holds members or a channel the policy does not track.
+///
+/// A sweep has no member leaving, so [`Room::occupants`] is the current
+/// occupancy here: a room whose count is greater than zero still holds
+/// members and is never cleaned up by a sweep.
 pub fn decide_sweep(
     channel_id: u64,
     now: i64,
@@ -544,7 +558,7 @@ pub fn decide_rename(
 /// inside a mention would otherwise hide the mention from the mention pass and
 /// the mention would be rebuilt when the invisible character was removed. The
 /// mention pass then runs until the text stops changing, so a nested token
-/// cannot reassemble into a live token.
+/// cannot reassemble into a live token at any nesting depth.
 pub fn sanitize_name(raw: &str, default_name: &str) -> String {
     let cleaned = clean_text(raw);
     let cleaned = if cleaned.trim().is_empty() {
@@ -575,11 +589,20 @@ fn clean_text(raw: &str) -> String {
 ///
 /// The loop is what keeps a nested token from reassembling: stripping one token
 /// can expose another one behind it.
+///
+/// The loop has no fixed pass count. Every pass that changes the text removes
+/// at least one character, so the text strictly shrinks and the loop always
+/// ends; the number of passes a text can need is bounded by the number of
+/// characters it has, and that bound is the one used here. A fixed pass count
+/// would be a bound the caller controls: a mention nested deeper than the
+/// count would come back as a live token.
 fn strip_mentions_to_fixpoint(raw: &str) -> String {
     let mut current = strip_mentions(raw);
-    // Every pass removes at least one character, so the text shrinks and the loop
-    // ends; the bound is only a guard against a mistake in the strippers.
-    for _ in 0..MAX_MENTION_PASSES {
+    // Every pass that changes the text removes at least one character, so at
+    // most `len` passes can change it; one more pass proves that it has
+    // stopped changing.
+    let bound = current.chars().count() + 1;
+    for _ in 0..bound {
         let next = strip_mentions(&current);
         if next == current {
             break;
@@ -588,9 +611,6 @@ fn strip_mentions_to_fixpoint(raw: &str) -> String {
     }
     current
 }
-
-/// The most passes the mention stripping may take before it is treated as stuck.
-const MAX_MENTION_PASSES: usize = 16;
 
 /// Removes the mention tokens and the `@everyone` and `@here` words.
 fn strip_mentions(raw: &str) -> String {
@@ -670,34 +690,82 @@ fn strip_invisible(raw: &str) -> String {
 
 /// True for the characters that are invisible but still occupy a position.
 ///
-/// The rule is a class rule, not a hand list: the format characters that hide
-/// text (the zero-width characters, the bidirectional controls and the tag
-/// characters), the Hangul filler and the non-ASCII space characters are all
-/// removed. The bidi controls and the tag characters are included because they
-/// can carry text that a reader never sees, and the Hangul filler because it
-/// looks blank but is not a control character.
+/// The rule is a class rule over the ranges that render nothing, not a hand
+/// list of examples:
 ///
-/// The plain ASCII space is kept: it separates the words of a name.
+/// * the control characters, which `char::is_control` already covers;
+/// * the whitespace characters other than the plain ASCII space, which
+///   `char::is_whitespace` already covers (the tab and the newline are
+///   control characters and are already gone);
+/// * the **default ignorable** code points, the characters Unicode defines
+///   as having no visible effect wherever they appear: the format
+///   characters (`Cf`), the variation selectors, the interlinear
+///   annotation characters, the Hangul fillers, the Khmer inherent vowels
+///   and the tag characters;
+/// * the **blank** code points, the characters that occupy a position but
+///   draw nothing: the Braille pattern blank, the Hangul fillers and the
+///   halfwidth Hangul filler.
+///
+/// The ranges below are the ones that render nothing. The plain ASCII space
+/// is kept: it separates the words of a name.
 fn is_invisible(c: char) -> bool {
     if c == ' ' {
         return false;
     }
     if c.is_whitespace() {
-        // Every other space character (the tab and the newline are control
-        // characters and are already gone) is a look-alike of the plain space
-        // and is removed.
+        // Every other space character is a look-alike of the plain space and
+        // is removed.
         return true;
     }
+    is_default_ignorable(c) || is_blank(c)
+}
+
+/// True for the default ignorable code points.
+///
+/// These are the characters Unicode defines as having no visible effect
+/// wherever they appear: the format characters (which include the
+/// zero-width characters, the bidirectional controls and the isolate
+/// controls), the variation selectors, the interlinear annotation
+/// characters, the Khmer inherent vowels and the tag characters.
+fn is_default_ignorable(c: char) -> bool {
     matches!(c,
+        // The soft hyphen and the zero-width characters.
         '\u{00AD}'
-            | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
+            // The bidirectional embedding, override and isolate controls.
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FEFF}'
+            // The word joiner and the invisible operators.
+            | '\u{2060}'..='\u{2064}'
+            // The Mongolian vowel separator and the Arabic letter mark.
+            | '\u{180E}'
+            | '\u{061C}'
+            // The combining marks that join nothing: the combining grapheme
+            // joiner and the Khmer inherent vowels.
+            | '\u{034F}'
+            | '\u{17B4}'..='\u{17B5}'
+            // The variation selectors, the musical format controls and the
+            // interlinear annotation characters.
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            // The tag characters.
             | '\u{E0000}'..='\u{E007F}'
+            // The byte order mark.
+            | '\u{FEFF}'
+    )
+}
+
+/// True for the characters that occupy a position but draw nothing.
+///
+/// These are the fillers a text can be padded with: the Hangul choseong and
+/// jungseong fillers, the Hangul filler, the halfwidth Hangul filler and
+/// the Braille pattern blank.
+fn is_blank(c: char) -> bool {
+    matches!(
+        c,
+        '\u{115F}'..='\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
     )
 }
 
@@ -1667,6 +1735,26 @@ mod tests {
         assert_eq!(decision, Decision::Claimable(ROOM));
     }
 
+    /// The boundary of the occupancy contract: a room whose count is two
+    /// still holds the other member after the owner leaves, so it becomes
+    /// claimable. A room whose count is one does not, and that is the
+    /// difference the count makes.
+    #[test]
+    fn the_occupancy_boundary_is_two_members() {
+        let two = state_with(vec![room(OWNER, 2, None)]);
+        assert_eq!(
+            decide_leave(ROOM, OWNER, T0 + 10, &cfg(), &two),
+            Decision::Claimable(ROOM),
+            "a room with two members still holds one after the owner leaves"
+        );
+        let one = state_with(vec![room(OWNER, 1, None)]);
+        assert_ne!(
+            decide_leave(ROOM, OWNER, T0 + 10, &cfg(), &one),
+            Decision::Claimable(ROOM),
+            "a room with one member is empty once that member leaves"
+        );
+    }
+
     /// The owner leaving a room that is already empty starts the grace period.
     #[test]
     fn owner_leaving_an_empty_room_does_not_clean_it_up_immediately() {
@@ -1956,23 +2044,21 @@ mod tests {
                     OTHER_MEMBER
                 };
                 // The count the policy sees is the count BEFORE the leave.
-                let occupants = state.rooms[index].occupants;
+                let before = state.rooms[index].occupants;
                 let decision = decide_leave(channel_id, leaver, now, &config, &state);
-                // The model applies the leave on EVERY branch, not only on the
-                // claimable one: a member that leaves a room reduces its count.
-                let after_leave = occupants.saturating_sub(1);
                 match decision {
                     Decision::Cleanup(id) => {
                         state.rooms.retain(|r| r.channel_id != id);
                     }
-                    Decision::Claimable(_) => {
-                        state.rooms[index].occupants = after_leave;
-                        if after_leave == 0 {
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        // The model applies the leave on EVERY branch, not only
+                        // on the claimable one: a member that leaves a room
+                        // reduces its count, whatever the policy said about it.
+                        let after = before.saturating_sub(1);
+                        state.rooms[index].occupants = after;
+                        if after == 0 {
                             state.rooms[index].empty_since = Some(now);
                         }
-                    }
-                    Decision::Deny(_) => {
-                        // The leave was refused, so the count does not change.
                     }
                     other => panic!("unexpected decision {other:?}"),
                 }
@@ -1981,8 +2067,8 @@ mod tests {
 
         // The quiet phase: no more joins. First everybody who is still in a room
         // leaves it, so every room becomes empty and the grace period starts.
-        // Then the clock advances past every grace period and the runtime sweeps
-        // the rooms.
+        // Then the clock advances past every grace period and the runtime
+        // reaps the rooms.
         for _ in 0..10 {
             let rooms: Vec<(u64, u64)> = state
                 .rooms
@@ -1990,7 +2076,7 @@ mod tests {
                 .map(|r| (r.channel_id, r.owner_id))
                 .collect();
             for (channel_id, owner_id) in rooms {
-                let occupants = state
+                let before = state
                     .room(channel_id)
                     .map(|r| r.occupants)
                     .unwrap_or_default();
@@ -1999,35 +2085,41 @@ mod tests {
                     Decision::Cleanup(id) => {
                         state.rooms.retain(|r| r.channel_id != id);
                     }
-                    Decision::Claimable(_) => {
-                        let after_leave = occupants.saturating_sub(1);
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        // The leave is applied on EVERY branch: a member that
+                        // leaves a room reduces its count, whatever the policy
+                        // said about it.
+                        let after = before.saturating_sub(1);
                         if let Some(room) =
                             state.rooms.iter_mut().find(|r| r.channel_id == channel_id)
                         {
-                            room.occupants = after_leave;
-                            if after_leave == 0 {
+                            room.occupants = after;
+                            if after == 0 {
                                 room.empty_since = Some(now);
                             }
                         }
                     }
-                    Decision::Deny(_) => {}
                     other => panic!("unexpected decision {other:?}"),
                 }
             }
             now += 1;
         }
 
-        // Every room is empty now. The clock advances past every grace period and
-        // the runtime sweeps the rooms that are empty.
+        // Every room is empty now. The clock advances past every grace period
+        // and the runtime reaps the rooms that are empty. The reaping goes
+        // through `decide_leave` with a member who is NOT the owner, so the
+        // test covers the whole leave path: a policy that refuses a leave
+        // before it reaches the grace check, or that never cleans a room up
+        // on the leave path, leaves the rooms behind and fails this test.
         now += config.empty_grace_secs * 2;
         for _ in 0..10 {
             let rooms: Vec<u64> = state.rooms.iter().map(|r| r.channel_id).collect();
             for channel_id in rooms {
-                match decide_sweep(channel_id, now, &config, &state) {
+                match decide_leave(channel_id, VISITOR, now, &config, &state) {
                     Decision::Cleanup(id) => {
                         state.rooms.retain(|r| r.channel_id != id);
                     }
-                    Decision::Deny(_) => {}
+                    Decision::Claimable(_) | Decision::Deny(_) => {}
                     other => panic!("unexpected decision {other:?}"),
                 }
             }
@@ -2257,10 +2349,16 @@ mod tests {
                     Decision::Cleanup(id) => {
                         state.rooms.retain(|r| r.channel_id != id);
                     }
-                    Decision::Claimable(_) => {
-                        state.rooms[index].occupants = now_occupants.saturating_sub(1);
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        // The leave is applied on EVERY branch: a member that
+                        // leaves a room reduces its count, whatever the policy
+                        // said about it.
+                        let after = now_occupants.saturating_sub(1);
+                        state.rooms[index].occupants = after;
+                        if after == 0 {
+                            state.rooms[index].empty_since = Some(now);
+                        }
                     }
-                    Decision::Deny(_) => {}
                     other => panic!("unexpected decision {other:?}"),
                 }
             }
@@ -2428,8 +2526,15 @@ mod tests {
         // U+FFA0 HALFWIDTH HANGUL FILLER, U+115F HANGUL CHOSEONG FILLER and
         // U+2800 BRAILLE PATTERN BLANK.
         let invisible = [
-            '\u{061C}', '\u{034F}', '\u{FE00}', '\u{FFF9}', '\u{1D173}', '\u{17B4}', '\u{FFA0}',
-            '\u{115F}', '\u{2800}',
+            '\u{061C}',
+            '\u{034F}',
+            '\u{FE00}',
+            '\u{FFF9}',
+            '\u{1D173}',
+            '\u{17B4}',
+            '\u{FFA0}',
+            '\u{115F}',
+            '\u{2800}',
         ];
         for c in invisible {
             let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
@@ -2445,8 +2550,15 @@ mod tests {
     #[test]
     fn a_name_of_only_blank_characters_falls_back_to_the_default() {
         let invisible = [
-            '\u{061C}', '\u{034F}', '\u{FE00}', '\u{FFF9}', '\u{1D173}', '\u{17B4}', '\u{FFA0}',
-            '\u{115F}', '\u{2800}',
+            '\u{061C}',
+            '\u{034F}',
+            '\u{FE00}',
+            '\u{FFF9}',
+            '\u{1D173}',
+            '\u{17B4}',
+            '\u{FFA0}',
+            '\u{115F}',
+            '\u{2800}',
         ];
         for c in invisible {
             assert_eq!(
@@ -2462,8 +2574,14 @@ mod tests {
     #[test]
     fn the_bidi_and_tag_characters_are_removed() {
         assert_eq!(sanitize_name("a\u{202A}b\u{202C}c", "Voice Room"), "abc");
-        assert_eq!(sanitize_name("\u{E0041}\u{E0042} party", "Voice Room"), "party");
-        assert_eq!(sanitize_name("\u{E0001}\u{E0020} party", "Voice Room"), "party");
+        assert_eq!(
+            sanitize_name("\u{E0041}\u{E0042} party", "Voice Room"),
+            "party"
+        );
+        assert_eq!(
+            sanitize_name("\u{E0001}\u{E0020} party", "Voice Room"),
+            "party"
+        );
     }
 
     /// A name that holds only whitespace and blank characters falls back to
@@ -2471,7 +2589,10 @@ mod tests {
     #[test]
     fn a_name_of_only_whitespace_and_blanks_falls_back_to_the_default() {
         assert_eq!(sanitize_name("   ", "Voice Room"), "Voice Room");
-        assert_eq!(sanitize_name("\u{2800}\u{200B} ", "Voice Room"), "Voice Room");
+        assert_eq!(
+            sanitize_name("\u{2800}\u{200B} ", "Voice Room"),
+            "Voice Room"
+        );
     }
 
     /// The seeded sequence of the caps must apply EVERY leave, not only the
@@ -2516,11 +2637,7 @@ mod tests {
                 let index = rng.below(state.rooms.len() as u64) as usize;
                 let channel_id = state.rooms[index].channel_id;
                 let owner_id = state.rooms[index].owner_id;
-                let leaver = if rng.below(2) == 0 {
-                    owner_id
-                } else {
-                    VISITOR
-                };
+                let leaver = if rng.below(2) == 0 { owner_id } else { VISITOR };
                 let before = state.rooms[index].occupants;
                 let decision = decide_leave(channel_id, leaver, now, &config, &state);
                 match decision {
@@ -2598,11 +2715,7 @@ mod tests {
                 let index = rng.below(state.rooms.len() as u64) as usize;
                 let channel_id = state.rooms[index].channel_id;
                 let owner_id = state.rooms[index].owner_id;
-                let leaver = if rng.below(2) == 0 {
-                    owner_id
-                } else {
-                    VISITOR
-                };
+                let leaver = if rng.below(2) == 0 { owner_id } else { VISITOR };
                 let before = state.rooms[index].occupants;
                 let decision = decide_leave(channel_id, leaver, now, &config, &state);
                 match decision {
