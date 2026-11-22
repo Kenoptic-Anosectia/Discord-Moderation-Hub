@@ -860,6 +860,9 @@ mod tests {
     const OTHER_MEMBER: u64 = 1_000_000_000_000_000_008;
     const ROLE: u64 = 1_000_000_000_000_000_009;
     const T0: i64 = 1_700_000_000;
+    /// A member that never owns a room, so a leave from this member is always
+    /// a leave from somebody who is not the owner.
+    const VISITOR: u64 = 1_000_000_000_000_000_011;
 
     fn cfg() -> VoiceRoomConfig {
         VoiceRoomConfig {
@@ -2276,5 +2279,408 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Round 4: the mention fixpoint has no bound, the occupancy contract is
+    // one thing, the invisible set is named, and the seeded models apply
+    // every leave.
+    // ---------------------------------------------------------------------
+
+    /// Builds a user mention nested `depth` levels deep.
+    ///
+    /// Depth 1 is `<@900000009>`; depth 2 is `<<@900000009>@900000009>`; and
+    /// so on. Each level wraps the previous one in another `<` and `>`.
+    fn nested_mention(depth: usize) -> String {
+        let mut text = String::from("<@900000009>");
+        for _ in 1..depth {
+            text = format!("<{}@900000009>", text);
+        }
+        text
+    }
+
+    /// A mention nested three levels deep must not reassemble into a live
+    /// token: the stripping runs until the text stops changing, so the depth
+    /// of the nesting does not matter.
+    #[test]
+    fn a_mention_nested_three_deep_does_not_reassemble() {
+        let cleaned = sanitize_name(&format!("{} party", nested_mention(3)), "Voice Room");
+        assert!(
+            !cleaned.contains("<@") && !cleaned.contains("<#"),
+            "a mention nested three levels deep must not survive: {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("party"),
+            "the harmless text must survive the cleaning: {cleaned:?}"
+        );
+    }
+
+    /// A mention nested eighteen levels deep must not reassemble either. This
+    /// is the depth that defeated the bounded fixpoint of round 3.
+    #[test]
+    fn a_mention_nested_eighteen_deep_does_not_reassemble() {
+        let cleaned = sanitize_name(&format!("{} party", nested_mention(18)), "Voice Room");
+        assert!(
+            !cleaned.contains("<@") && !cleaned.contains("<#"),
+            "a mention nested eighteen levels deep must not survive: {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("party"),
+            "the harmless text must survive the cleaning: {cleaned:?}"
+        );
+    }
+
+    /// A mention nested very deeply must not survive: the depth of the
+    /// nesting is not bounded by anything the caller controls.
+    #[test]
+    fn a_mention_nested_very_deeply_does_not_reassemble() {
+        let cleaned = sanitize_name(&format!("{} party", nested_mention(64)), "Voice Room");
+        assert!(
+            !cleaned.contains("<@") && !cleaned.contains("<#"),
+            "a mention nested sixty-four levels deep must not survive: {cleaned:?}"
+        );
+    }
+
+    /// No mention of any shape survives, at any nesting depth. The test runs
+    /// over a range of depths so that a bound on the number of passes shows up
+    /// as a failure rather than as a surprise in production.
+    #[test]
+    fn no_mention_survives_at_any_nesting_depth() {
+        for depth in 1..=40 {
+            let cleaned = sanitize_name(&format!("{} party", nested_mention(depth)), "Voice Room");
+            let lowered = cleaned.to_lowercase();
+            assert!(
+                !lowered.contains("<@") && !lowered.contains("<#"),
+                "a mention nested {depth} levels deep survived: {cleaned:?}"
+            );
+            assert!(
+                !lowered.contains("@everyone") && !lowered.contains("@here"),
+                "a mention word nested {depth} levels deep survived: {cleaned:?}"
+            );
+        }
+    }
+
+    /// The owner leaving a room that holds only them empties the room: the
+    /// room is not claimable, it starts its grace period. The count is the
+    /// count BEFORE the leave, so a room with one member is empty once that
+    /// member leaves.
+    #[test]
+    fn the_owner_leaving_the_last_member_empties_the_room() {
+        let state = state_with(vec![room(OWNER, 1, None)]);
+        let decision = decide_leave(ROOM, OWNER, T0 + 10, &cfg(), &state);
+        assert_ne!(
+            decision,
+            Decision::Claimable(ROOM),
+            "a room that is empty after the leave must not become claimable"
+        );
+        assert_eq!(
+            expect_deny(&decision),
+            DenyReason::EmptyGraceNotElapsed,
+            "a room that just became empty starts its grace period"
+        );
+    }
+
+    /// The owner leaving a room that holds one other member as well empties
+    /// nothing: the room still holds a member, so it becomes claimable.
+    #[test]
+    fn the_owner_leaving_a_room_with_another_member_makes_it_claimable() {
+        let state = state_with(vec![room(OWNER, 2, None)]);
+        let decision = decide_leave(ROOM, OWNER, T0 + 10, &cfg(), &state);
+        assert_eq!(decision, Decision::Claimable(ROOM));
+    }
+
+    /// The last member leaving a room whose owner already left reaches the
+    /// grace check, whoever leaves last. The count is the count BEFORE the
+    /// leave, so a room with one member left is empty once that member
+    /// leaves.
+    #[test]
+    fn the_last_member_of_a_room_with_one_member_reaches_the_grace_check() {
+        // The owner is gone: the room holds one member and `empty_since` is
+        // set from before.
+        let state = state_with(vec![room(OWNER, 1, Some(T0))]);
+        let before = decide_leave(ROOM, VISITOR, T0 + 59, &cfg(), &state);
+        assert_eq!(
+            expect_deny(&before),
+            DenyReason::EmptyGraceNotElapsed,
+            "an empty room must survive until the grace period has elapsed"
+        );
+        let after = decide_leave(ROOM, VISITOR, T0 + 60, &cfg(), &state);
+        assert_eq!(after, Decision::Cleanup(ROOM));
+    }
+
+    /// A member who is not the owner leaving a room that still holds members
+    /// changes nothing: the room is not theirs to claim.
+    #[test]
+    fn a_non_owner_leaving_a_room_with_members_is_refused() {
+        let state = state_with(vec![room(OWNER, 2, None)]);
+        let decision = decide_leave(ROOM, VISITOR, T0 + 10, &cfg(), &state);
+        assert_eq!(expect_deny(&decision), DenyReason::NotRoomOwner);
+    }
+
+    /// The invisible set is the whole Unicode "default ignorable" class plus
+    /// the blank fillers, not a hand list: every one of the characters below
+    /// renders nothing and must be removed.
+    #[test]
+    fn the_default_ignorable_characters_are_removed() {
+        // U+061C ARABIC LETTER MARK, U+034F COMBINING GRAPHEME JOINER,
+        // U+FE00 VARIATION SELECTOR-1, U+FFF9 INTERLINEAR ANNOTATION ANCHOR,
+        // U+1D173 MUSICAL SYMBOL BEGIN BEAM, U+17B4 KHMER VOWEL INHERENT AQ,
+        // U+FFA0 HALFWIDTH HANGUL FILLER, U+115F HANGUL CHOSEONG FILLER and
+        // U+2800 BRAILLE PATTERN BLANK.
+        let invisible = [
+            '\u{061C}', '\u{034F}', '\u{FE00}', '\u{FFF9}', '\u{1D173}', '\u{17B4}', '\u{FFA0}',
+            '\u{115F}', '\u{2800}',
+        ];
+        for c in invisible {
+            let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
+            assert_eq!(
+                cleaned, "party",
+                "the character {c:?} renders nothing and must be removed"
+            );
+        }
+    }
+
+    /// A name made only of characters that render nothing is an empty name:
+    /// it falls back to the default name instead of coming back blank.
+    #[test]
+    fn a_name_of_only_blank_characters_falls_back_to_the_default() {
+        let invisible = [
+            '\u{061C}', '\u{034F}', '\u{FE00}', '\u{FFF9}', '\u{1D173}', '\u{17B4}', '\u{FFA0}',
+            '\u{115F}', '\u{2800}',
+        ];
+        for c in invisible {
+            assert_eq!(
+                sanitize_name(&c.to_string(), "Voice Room"),
+                "Voice Room",
+                "a name made only of {c:?} is an empty name"
+            );
+        }
+    }
+
+    /// The bidi controls and the tag characters are removed as well: they are
+    /// part of the same default-ignorable class.
+    #[test]
+    fn the_bidi_and_tag_characters_are_removed() {
+        assert_eq!(sanitize_name("a\u{202A}b\u{202C}c", "Voice Room"), "abc");
+        assert_eq!(sanitize_name("\u{E0041}\u{E0042} party", "Voice Room"), "party");
+        assert_eq!(sanitize_name("\u{E0001}\u{E0020} party", "Voice Room"), "party");
+    }
+
+    /// A name that holds only whitespace and blank characters falls back to
+    /// the default name: the room always has a name a reader can see.
+    #[test]
+    fn a_name_of_only_whitespace_and_blanks_falls_back_to_the_default() {
+        assert_eq!(sanitize_name("   ", "Voice Room"), "Voice Room");
+        assert_eq!(sanitize_name("\u{2800}\u{200B} ", "Voice Room"), "Voice Room");
+    }
+
+    /// The seeded sequence of the caps must apply EVERY leave, not only the
+    /// ones the policy allows: a leave is a fact the runtime observes, not a
+    /// request it can refuse.
+    #[test]
+    fn the_caps_sequence_applies_every_leave() {
+        let mut config = cfg();
+        config.global_cap = 5;
+        config.per_user_cap = 1;
+        config.create_cooldown_secs = 0;
+        let mut state = VoiceRoomState::default();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0004);
+        let mut now = T0;
+        let members = [OWNER, MEMBER, OTHER_MEMBER, VISITOR];
+
+        for step in 0..500 {
+            now += 1;
+            let user = members[rng.below(members.len() as u64) as usize];
+            if rng.below(3) == 0 {
+                let event = JoinEvent {
+                    guild_id: GUILD,
+                    user_id: user,
+                    channel_id: HUB,
+                    at: now,
+                };
+                match decide_join(&event, &config, &state) {
+                    Decision::Create(_) => {
+                        state.rooms.push(Room {
+                            channel_id: 1_000_000_000_000_500_000 + step as u64,
+                            owner_id: user,
+                            created_at: now,
+                            empty_since: None,
+                            occupants: 1,
+                        });
+                        state.last_create.insert(user, now);
+                    }
+                    Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            } else if !state.rooms.is_empty() {
+                let index = rng.below(state.rooms.len() as u64) as usize;
+                let channel_id = state.rooms[index].channel_id;
+                let owner_id = state.rooms[index].owner_id;
+                let leaver = if rng.below(2) == 0 {
+                    owner_id
+                } else {
+                    VISITOR
+                };
+                let before = state.rooms[index].occupants;
+                let decision = decide_leave(channel_id, leaver, now, &config, &state);
+                match decision {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        // The leave is applied on EVERY branch: the member left
+                        // the room, whatever the policy said about it.
+                        let after = before.saturating_sub(1);
+                        state.rooms[index].occupants = after;
+                        if after == 0 {
+                            state.rooms[index].empty_since = Some(now);
+                        }
+                    }
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+
+            // The occupancy of a room never rises above the number of members
+            // that ever entered it, and the count never goes negative.
+            for room in &state.rooms {
+                assert!(
+                    room.occupants <= 1,
+                    "a room may hold at most the member that created it: {}",
+                    room.occupants
+                );
+            }
+        }
+    }
+
+    /// The liveness test must be able to fail: the quiet phase drains the
+    /// rooms through `decide_leave`, so a policy whose leave path is broken
+    /// leaves the rooms behind and this test catches it.
+    #[test]
+    fn the_quiet_phase_drains_the_rooms_through_the_leave_path() {
+        let mut config = cfg();
+        config.global_cap = 5;
+        config.per_user_cap = 1;
+        config.create_cooldown_secs = 0;
+        config.empty_grace_secs = 60;
+        let mut state = VoiceRoomState::default();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0002);
+        let mut now = T0;
+        let members = [OWNER, MEMBER, OTHER_MEMBER, VISITOR];
+        let mut next_channel = 1_000_000_000_000_600_000u64;
+
+        for _step in 0..2_000 {
+            now += 1;
+            let user = members[rng.below(members.len() as u64) as usize];
+            if rng.below(3) == 0 {
+                let event = JoinEvent {
+                    guild_id: GUILD,
+                    user_id: user,
+                    channel_id: HUB,
+                    at: now,
+                };
+                match decide_join(&event, &config, &state) {
+                    Decision::Create(_) => {
+                        let channel_id = next_channel;
+                        next_channel += 1;
+                        state.rooms.push(Room {
+                            channel_id,
+                            owner_id: user,
+                            created_at: now,
+                            empty_since: None,
+                            occupants: 1,
+                        });
+                        state.last_create.insert(user, now);
+                    }
+                    Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            } else if !state.rooms.is_empty() {
+                let index = rng.below(state.rooms.len() as u64) as usize;
+                let channel_id = state.rooms[index].channel_id;
+                let owner_id = state.rooms[index].owner_id;
+                let leaver = if rng.below(2) == 0 {
+                    owner_id
+                } else {
+                    VISITOR
+                };
+                let before = state.rooms[index].occupants;
+                let decision = decide_leave(channel_id, leaver, now, &config, &state);
+                match decision {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        let after = before.saturating_sub(1);
+                        state.rooms[index].occupants = after;
+                        if after == 0 {
+                            state.rooms[index].empty_since = Some(now);
+                        }
+                    }
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+        }
+
+        // The quiet phase: everybody leaves, then the clock advances past
+        // every grace period and the runtime reaps the rooms through the
+        // leave path. The reaping goes through `decide_leave`, so a policy
+        // whose leave path never cleans a room up leaves the rooms behind.
+        for _ in 0..10 {
+            let rooms: Vec<(u64, u64)> = state
+                .rooms
+                .iter()
+                .map(|r| (r.channel_id, r.owner_id))
+                .collect();
+            for (channel_id, owner_id) in rooms {
+                let before = state
+                    .room(channel_id)
+                    .map(|r| r.occupants)
+                    .unwrap_or_default();
+                let decision = decide_leave(channel_id, owner_id, now, &config, &state);
+                match decision {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) | Decision::Deny(_) => {
+                        let after = before.saturating_sub(1);
+                        if let Some(room) =
+                            state.rooms.iter_mut().find(|r| r.channel_id == channel_id)
+                        {
+                            room.occupants = after;
+                            if after == 0 {
+                                room.empty_since = Some(now);
+                            }
+                        }
+                    }
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+            now += 1;
+        }
+
+        now += config.empty_grace_secs * 2;
+        for _ in 0..10 {
+            let rooms: Vec<u64> = state.rooms.iter().map(|r| r.channel_id).collect();
+            for channel_id in rooms {
+                let owner_id = state
+                    .room(channel_id)
+                    .map(|r| r.owner_id)
+                    .unwrap_or_default();
+                match decide_leave(channel_id, owner_id, now, &config, &state) {
+                    Decision::Cleanup(id) => {
+                        state.rooms.retain(|r| r.channel_id != id);
+                    }
+                    Decision::Claimable(_) | Decision::Deny(_) => {}
+                    other => panic!("unexpected decision {other:?}"),
+                }
+            }
+            now += 1;
+        }
+
+        assert!(
+            state.rooms.is_empty(),
+            "every room must be gone once its grace has elapsed: {:?}",
+            state.rooms
+        );
     }
 }
