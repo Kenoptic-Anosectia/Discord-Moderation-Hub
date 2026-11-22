@@ -275,7 +275,8 @@ impl Settings {
 pub enum LogExclusion {
     /// Nothing is excluded: the logger is exactly as before.
     Off,
-    /// Messages of these channels and categories are never cached or logged.
+    /// Message create, edit, delete and bulk delete in these channels and
+    /// categories (and under them) are not cached or logged.
     Scope(Scope),
     /// An exclusion list was unusable: guild message events are not cached or
     /// logged until it is fixed (the list cannot be dropped, see K05).
@@ -439,7 +440,8 @@ pub async fn message_gate(
 /// An optional feature.
 ///
 /// A later card implements this for its feature and adds it to
-/// [`production_features`]. All methods have a safe default.
+/// [`production_features`]. All methods except `name` and `enabled` default to
+/// doing nothing.
 pub trait Feature<X, D>: Send + Sync {
     /// Stable name used in start-up lines.
     fn name(&self) -> &'static str;
@@ -660,8 +662,9 @@ impl<X: Sync + 'static, D: Sync + 'static> Features<X, D> {
     /// the guild filter lets it through. Returns how many features saw it.
     ///
     /// Features are awaited one after the other, so a slow feature delays the
-    /// logger; a feature must not block. Dispatch never touches the message
-    /// cache. With no active feature this returns before looking at the event.
+    /// logger; a feature must not block. Dispatch itself never touches the message
+    /// cache (a feature receives `data` and must not use it for that). With no
+    /// active feature this returns before looking at the event.
     pub async fn dispatch(&self, ctx: &X, event: &serenity::FullEvent, data: &D) -> usize {
         if self.active.is_empty() {
             return 0;

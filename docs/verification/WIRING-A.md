@@ -1,0 +1,24 @@
+# WIRING-A (W1) - core settings, feature registry, event routing, log exclusions
+
+`src/features.rs` (new) owns which optional features are on and what they share; `config.rs` parses six new keys with the K06 helpers; `main.rs` sends every event through `route_event`. No real feature is registered (`production_features()` is empty): with every key unset no `core.sqlite` is created, no runner starts and `dispatch` returns at once.
+
+## Rules enforced (each has a test)
+1. Core DB: `storage::open` runs only when an enabled feature `needs_core_db()` (pure `plan`). An unusable path, a path equal to the ticket or reaction-role file, or an open failure turns off the features that need it; the startup line carries a stable code, never the path.
+2. Job runner: started once through an injected `JobStarter` only when an enabled db feature registered a job kind; the restart report is printed as counts. A feature whose registration fails is dropped and the registry rebuilt; a failed start turns off the db features. `Features::stop` triggers shutdown and waits at most the runner grace (10 s) + 5 s.
+3. Dispatch runs first in `route_event`, before the ticket guard, in registration order. `dispatch` itself never reads or writes the message cache (a feature does receive `&Data`; PLAN 5.5 forbids using it). With `GUILD_ID` set only events provably of that guild, or gateway events with no guild, reach features; a DM, an unclassified event kind or an unusable `GUILD_ID` reach none. The filter does not touch the logger.
+4. Log exclusions: inside the ticket guard's sink, `message_gate` skips message create, edit, delete and bulk delete in an excluded channel, a thread of one, or a channel under an excluded category (K05 `may_log`; parent and grandparent looked up). Nothing configured: no lookup. Configured: an unresolvable channel or parent is skipped. The ticket guard is unchanged and outside, so both must allow. DMs stay with the DM guard; reaction and voice events are not gated.
+
+## Tests and RED evidence
+47 new unit tests (config 10, features 29, main 8); 1167 unit + 52 integration pass (the card's 994 unit count was out of date: base had 1120 by my count). Real code under test: `route_event` with the real ticket guard (lockdown, no settings = skip) and real `insert_cache`; the real `TokioJobStarter` (crashed job reconciled, new job runs after wake, stop returns). RED `ed87e6d`: 36 failed (35 new, plus the existing source-text test `runtime_event_handler_calls_the_guard_before_any_cache_insertion`, red only because the stub lacked the `guarded` call). GREEN `a20abfa`. 21 mutations, all caught: guild equality, NoGuild/Closed/Unknown arms, invalid GUILD_ID ignored, predicate ignored, no parent lookup, unknown read as none, zero parent trusted, category check dropped, bulk delete ungated, dispatch removed or after the logger, skip still logs, blocked list allows, plan opens for disabled, runner always started, lookup before the Off check, `:memory:` accepted, ticket db not reserved, list taken as one id (survived until the `5,5` case was added).
+
+## Config keys (blank = unset; a bad value names only the KEY at startup)
+- `CORE_DB_PATH`: default `core.sqlite`. Bad (control char, `file:`, `:memory:`, over 1024 bytes, non-Unicode): core DB and its features off.
+- `GUILD_ID`: default unset = all guilds. Bad (not exactly one id): value None and dispatch closed (fail closed, not "all guilds").
+- `STAFF_ALERT_CHANNEL_ID`: default unset. Bad: off. Not used yet.
+- `LOG_EXCLUDED_CHANNEL_IDS`, `LOG_EXCLUDED_CATEGORY_IDS`: default empty. Bad entry: list empty AND guild message caching plus edit/delete logging pause until fixed (K05: the bad list is not dropped).
+- `PROTECTED_ROLE_IDS`: default empty. Bad: list empty and the key is in `Config.invalid_core_keys`; the role cards must treat that as deny. Not used yet.
+Deviations for the reviewer: the card says a bad value "switches the setting off"; for `GUILD_ID` and the exclusion lists I fail closed (K05). PLAN 5.4 wants one `features` field; I followed the card (six fields plus `invalid_core_keys`).
+
+## Allows and NOT done
+Removed `#![allow(dead_code)]` from `storage` and `privacy_scope`. Kept in `settings` (`parse_mode`, `parse_duration_secs`, `Mode`: the per-feature cards) and `jobs` (`queue::schedule`, `get`, `NewJob`, `JobState`: the first scheduling feature, FL2/BU2); their comments still say W1 removes them. No new allow.
+NOT done: no feature, command or alert post; no flash ids in the exclusion scope (W2); abandoned jobs are only counted, not alerted; not run against Discord. Limits: features run one after another (a slow one delays logging) and a panic is not caught; messages cached before an exclusion changed are not purged; `event_guild` knows only the listed event kinds.
