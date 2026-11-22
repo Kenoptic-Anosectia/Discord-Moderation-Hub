@@ -407,11 +407,12 @@ pub struct Runtime<'a> {
 
 /// The dedupe key of the reminder job for one cycle and due time.
 ///
-/// RED STUB: the due time is not part of the key yet. That is the defect the
-/// round-2 tests reproduce: a re-arm that moves the due time then finds the old
-/// key already taken and schedules no job of its own.
-pub fn dedupe_key(guild: u64, cycle: i64, _due_at: i64) -> String {
-    format!("bump:{guild}:{cycle}")
+/// The due time is part of the key, so a re-arm that moves the due time of a
+/// cycle schedules a NEW job instead of colliding with the old one. The old job
+/// stays harmless: it carries a due time that no longer matches the cycle, so it
+/// is stale and does nothing.
+pub fn dedupe_key(guild: u64, cycle: i64, due_at: i64) -> String {
+    format!("bump:{guild}:{cycle}:{due_at}")
 }
 
 /// The payload of the reminder job for one cycle and due time. It holds the guild
@@ -518,11 +519,13 @@ impl Runtime<'_> {
 
     /// The channel restriction: only the configured bump channel counts.
     ///
-    /// RED STUB: the restriction is not made yet. That is the defect the round-2
-    /// tests reproduce.
+    /// It fails closed: a runtime without a configured channel trusts no message
+    /// at all, because it cannot tell the bump channel from any other one.
     fn channel_allowed(&self, facts: &MessageFacts) -> bool {
-        let _ = facts;
-        true
+        match self.settings.channel_id {
+            Some(id) => facts.channel_id == id,
+            None => false,
+        }
     }
 
     /// Observe one message: detect a bump, persist the cycle and schedule the
@@ -546,10 +549,14 @@ impl Runtime<'_> {
         let policy_state = current.to_policy();
         let (decision, next_state) = policy::observe(facts, &self.config, &policy_state, now);
         let Decision::Confirmed(confirmation) = decision else {
-            // RED STUB: a redelivered confirmation does not re-run the schedule.
-            // That is the defect the round-2 tests reproduce: a cycle whose
-            // schedule was refused keeps no job, and the same message cannot
-            // repair it.
+            // A redelivered confirmation re-runs the idempotent schedule for the
+            // current cycle: a queue that refused the schedule left the cycle with
+            // no job, and the dedupe key makes a second schedule harmless.
+            if let Decision::Ignored(IgnoreReason::AlreadySeen) = decision {
+                if let Some(repaired) = self.repair_schedule(&current)? {
+                    return Ok(repaired);
+                }
+            }
             return Ok(Observation::Ignored(IgnoreCode::from_policy(
                 ignore_reason(&decision),
             )));
@@ -695,21 +702,28 @@ impl Runtime<'_> {
         if !self.is_enabled() || self.is_shadow() {
             return Ok(false);
         }
-        let _ = parse_reminder_payload(&job.payload_json)?;
-        let mut state = self.load_state()?;
+        let payload = parse_reminder_payload(&job.payload_json)?;
+        let state = self.load_state()?;
         if state.cycle <= 0 {
             return Ok(false);
         }
-        // RED STUB: the due time the job carries is not looked at. That is the
-        // defect the round-2 tests reproduce: a job whose due time no longer
-        // matches the cycle's stored due time consumes the reminder instead of
-        // doing nothing.
-        if !self.reminder_due(&state, now) {
+        // The governing rule: the job acts only for the cycle and the due time it
+        // carries. Anything else is stale and does nothing at all.
+        if state.cycle != payload.cycle || state.next_due_at != Some(payload.due_at) {
             return Ok(false);
         }
-        // Mark first: at most once, even across a restart.
-        state.reminded = true;
-        self.repo.save(&state)?;
+        if state.reminded {
+            return Ok(false);
+        }
+        if now < payload.due_at {
+            return Ok(false);
+        }
+        // Mark first: at most once, even across a restart. The mark is conditional
+        // on the cycle, so a handler that read an older cycle cannot mark the
+        // newer one.
+        if !self.repo.mark_reminded(state.guild, state.cycle)? {
+            return Ok(false);
+        }
         let reminder = build_reminder(self.settings, state.cycle);
         self.channel.send(&reminder).await?;
         Ok(true)
@@ -722,11 +736,11 @@ impl Runtime<'_> {
     /// on and no home guild is configured the check FAILS CLOSED: the command is
     /// denied and nothing changes.
     pub fn allows_command_from(&self, guild_id: Option<u64>) -> bool {
-        // RED STUB: the home-guild check is not made yet. That is the defect the
-        // round-2 tests reproduce: the commands are registered globally, so a
-        // command from another guild would act on the home guild's cycle.
-        let _ = guild_id;
-        true
+        match self.settings.guild_id {
+            Some(home) => guild_id == Some(home),
+            // No home guild configured: deny, whatever the caller says.
+            None => false,
+        }
     }
 
     /// `/bump status`: report the stored cycle.
@@ -795,12 +809,14 @@ impl Runtime<'_> {
         // A reset clears the "reminded" mark of the old cycle: the new cycle owes its
         // own reminder.
         next.reminded = false;
-        // RED STUB: in shadow mode the reply says a cycle is running although
-        // nothing was changed. That is the defect the round-2 tests reproduce.
-        if !self.is_shadow() {
-            self.repo.save(&next)?;
-            self.schedule_for(next.guild, cycle, next_due)?;
+        if self.is_shadow() {
+            // Shadow changes nothing, so the reply says so.
+            return Ok(CommandOutcome::Done {
+                reply: reset_reply_shadow(next.cycle, next_due),
+            });
         }
+        self.repo.save(&next)?;
+        self.schedule_for(next.guild, cycle, next_due)?;
         Ok(CommandOutcome::Done {
             reply: reset_reply_done(&next),
         })

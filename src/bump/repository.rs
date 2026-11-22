@@ -217,14 +217,13 @@ impl Repository {
 
     /// Mark the cycle as reminded, but only if the stored row is still that cycle.
     ///
-    /// RED STUB: the write is not conditional on the cycle number. That is the
-    /// defect the round-2 tests reproduce: a stale handler can mark a newer
-    /// cycle as reminded.
+    /// The write is conditional on the cycle number, so a handler that read an
+    /// older cycle cannot mark a newer one: it finds `false` and must not post.
+    /// Returns `true` when the row was changed.
     pub fn mark_reminded(&mut self, guild: u64, cycle: i64) -> Result<bool, RepoError> {
-        let _ = cycle;
         let n = self.conn.execute(
-            "UPDATE bump_state SET reminded = 1 WHERE guild = ?1",
-            params![guild.to_string()],
+            "UPDATE bump_state SET reminded = 1 WHERE guild = ?1 AND cycle = ?2",
+            params![guild.to_string(), cycle],
         )?;
         Ok(n == 1)
     }
@@ -397,6 +396,38 @@ mod tests {
         repo.save(&s).unwrap();
         let loaded = repo.load(GUILD).unwrap().unwrap();
         assert_eq!(loaded.to_policy(), s.to_policy());
+    }
+
+    #[test]
+    fn the_mark_of_the_reminder_is_conditional_on_the_cycle() {
+        let mut repo = mem();
+        repo.save(&state()).unwrap();
+        // The stored cycle is 3: the mark lands.
+        assert!(repo.mark_reminded(GUILD, 3).unwrap());
+        assert!(repo.load(GUILD).unwrap().unwrap().reminded);
+        // A stale handler that read an older cycle must not mark a newer one.
+        let mut newer = state();
+        newer.cycle = 4;
+        newer.reminded = false;
+        repo.save(&newer).unwrap();
+        assert!(
+            !repo.mark_reminded(GUILD, 3).unwrap(),
+            "a stale cycle marked the row"
+        );
+        let stored = repo.load(GUILD).unwrap().unwrap();
+        assert_eq!(stored.cycle, 4);
+        assert!(!stored.reminded, "the newer cycle was marked as reminded");
+        // The right cycle marks it.
+        assert!(repo.mark_reminded(GUILD, 4).unwrap());
+        assert!(repo.load(GUILD).unwrap().unwrap().reminded);
+    }
+
+    #[test]
+    fn a_mark_for_another_guild_changes_nothing() {
+        let mut repo = mem();
+        repo.save(&state()).unwrap();
+        assert!(!repo.mark_reminded(OTHER_GUILD, 3).unwrap());
+        assert!(!repo.load(GUILD).unwrap().unwrap().reminded);
     }
 
     #[test]
