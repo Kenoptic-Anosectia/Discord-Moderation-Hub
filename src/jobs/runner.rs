@@ -248,6 +248,12 @@ impl RunnerConfig {
         if !(MIN_POLL..=MAX_POLL).contains(&self.max_poll) {
             return Err(RunnerError::InvalidPoll);
         }
+        if !(MIN_SHUTDOWN_GRACE..=MAX_SHUTDOWN_GRACE).contains(&self.shutdown_grace) {
+            return Err(RunnerError::InvalidShutdownGrace);
+        }
+        if !(MIN_HANDLER_TIMEOUT..=MAX_HANDLER_TIMEOUT).contains(&self.handler_timeout) {
+            return Err(RunnerError::InvalidHandlerTimeout);
+        }
         self.retry
             .validate()
             .map_err(|_| RunnerError::InvalidRetryPolicy)
@@ -412,11 +418,19 @@ enum AckError {
     Refused,
 }
 
-type JoinResult = Result<(tokio::task::Id, HandlerResult), tokio::task::JoinError>;
+type JoinResult = Result<(tokio::task::Id, TaskEnd), tokio::task::JoinError>;
+
+/// How a handler task ended (apart from a panic, which `JoinSet` reports).
+enum TaskEnd {
+    /// The handler returned.
+    Returned(HandlerResult),
+    /// The handler ran past `handler_timeout` and its future was dropped.
+    TimedOut,
+}
 
 /// Mutable state of one `run`.
 struct Live {
-    set: JoinSet<HandlerResult>,
+    set: JoinSet<TaskEnd>,
     /// task id -> (job id, restart policy of its kind)
     tasks: HashMap<tokio::task::Id, (i64, RestartPolicy)>,
     acks: Vec<Ack>,
@@ -427,16 +441,23 @@ impl Live {
     /// Turn a finished handler task into an acknowledgement to write.
     fn finish(&mut self, res: JoinResult) {
         let ack = match res {
-            Ok((tid, result)) => {
-                let Some((id, _)) = self.tasks.remove(&tid) else {
+            Ok((tid, end)) => {
+                let Some((id, policy)) = self.tasks.remove(&tid) else {
                     return;
                 };
-                match result {
-                    Ok(()) => Ack::Complete { id },
-                    Err(e) => Ack::Fail {
+                match end {
+                    TaskEnd::Returned(Ok(())) => Ack::Complete { id },
+                    TaskEnd::Returned(Err(e)) => Ack::Fail {
                         id,
                         code: e.code(),
                         terminal: false,
+                    },
+                    // Treated as a cancel: the effect may have happened
+                    // before the handler hung, so at-most-once is terminal.
+                    TaskEnd::TimedOut => Ack::Fail {
+                        id,
+                        code: CODE_TIMED_OUT,
+                        terminal: policy == RestartPolicy::AtMostOnce,
                     },
                 }
             }
@@ -531,7 +552,7 @@ impl<C: Clock> Runner<C> {
                 Ok(AckDone::Completed) => live.sum.completed += 1,
                 Ok(AckDone::Retried) => live.sum.retried += 1,
                 Ok(AckDone::Failed) => live.sum.failed += 1,
-                Err(AckError::Refused) => {}
+                Err(AckError::Refused) => live.sum.refused_acks += 1,
                 Err(AckError::Transient) => {
                     live.sum.db_errors += 1;
                     live.acks.push(ack);
@@ -561,9 +582,21 @@ impl<C: Clock> Runner<C> {
             return;
         };
         let handler = entry.handler.clone();
+        let clock = self.clock.clone();
+        let timeout = self.cfg.handler_timeout;
         // The handler is called inside the task, so even a handler function
-        // that panics before returning its future cannot reach the loop.
-        let handle = live.set.spawn(async move { (*handler)(job).await });
+        // that panics before returning its future cannot reach the loop. The
+        // injected clock bounds the run: when its timer fires first, the
+        // handler future is dropped (at its next `.await`; code that never
+        // awaits cannot be stopped) and the task reports `TimedOut`.
+        let handle = live.set.spawn(async move {
+            let run = (*handler)(job);
+            tokio::select! {
+                biased;
+                r = run => TaskEnd::Returned(r),
+                () = clock.sleep(timeout) => TaskEnd::TimedOut,
+            }
+        });
         live.tasks.insert(handle.id(), (id, entry.policy));
     }
 
