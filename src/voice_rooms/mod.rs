@@ -8,7 +8,8 @@
 //!
 //! The public surface is [`policy`] itself; the wiring card (W1) calls
 //! `voice_rooms::policy::decide_join`, `voice_rooms::policy::decide_permit`,
-//! `voice_rooms::policy::decide_leave` and `voice_rooms::policy::decide_rename`.
+//! `voice_rooms::policy::decide_leave`, `voice_rooms::policy::decide_sweep` and
+//! `voice_rooms::policy::decide_rename`.
 //!
 //! Unwired building block: no production caller exists yet. Wiring card W1 removes this
 //! allow once the runtime calls into the policy.
