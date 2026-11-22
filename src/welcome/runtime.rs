@@ -893,13 +893,19 @@ mod tests {
 
     impl FakeWriter {
         fn failing(role_id: u64, status: u16) -> Self {
+            Self::failing_with(role_id, status, None)
+        }
+
+        /// A writer that fails one role with a status and an optional Discord
+        /// api code, so every executor failure code can be produced.
+        fn failing_with(role_id: u64, status: u16, api_code: Option<u32>) -> Self {
             FakeWriter {
                 calls: Vec::new(),
                 fail: Some((
                     role_id,
                     crate::roles::grant::WriteError {
                         status,
-                        api_code: None,
+                        api_code,
                         retry_after_ms: None,
                     },
                 )),
@@ -1298,6 +1304,261 @@ mod tests {
         );
         assert_eq!(outcome.message, Some(MessageOutcome::Sent));
         assert!(outcome.alerts.contains(&"forbidden"));
+        // The code reached the staff alert channel, not only the outcome.
+        assert_eq!(
+            rt.alerter.alerts,
+            vec![(799_001, "forbidden".to_string())],
+            "the grant failure reached the staff alert channel"
+        );
+    }
+
+    // ---- the alert rules ----------------------------------------------------
+
+    /// The codes the alerter observed, without the channel id.
+    fn alerted(rt: &WelcomeRuntime<FakeSource, FakeWriter, FakeSleeper, FakeSender, FakeAlerter>) -> Vec<String> {
+        rt.alerter.alerts.iter().map(|(_, code)| code.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_grant_reaches_the_staff_alert_channel() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(alerted(&rt), vec!["forbidden".to_string()]);
+        // Every alert went to the staff alert channel.
+        assert!(rt
+            .alerter
+            .alerts
+            .iter()
+            .all(|(channel_id, _)| *channel_id == 799_001));
+    }
+
+    #[tokio::test]
+    async fn every_failed_grant_code_reaches_the_staff_alert_channel() {
+        // One code per executor failure: forbidden, unknown role, unknown
+        // member, rate limited and the catch-all.
+        for (status, api_code, expected) in [
+            (403u16, None::<u32>, "forbidden"),
+            (404, Some(10011), "unknown_role"),
+            (404, Some(10007), "unknown_member"),
+            (429, None, "rate_limited"),
+            (500, None, "other"),
+        ] {
+            let mut rt = runtime(
+                Mode::Live,
+                &[ROLE_LOW],
+                FakeSource::with_roles(guild_roles()),
+                FakeWriter::failing_with(ROLE_LOW, status, api_code),
+                FakeSender::ok(),
+            );
+            rt.handle_join(&facts(false)).await;
+            assert_eq!(alerted(&rt), vec![expected.to_string()], "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_privileged_role_reaches_the_staff_alert_channel() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_PRIVILEGED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(
+            alerted(&rt),
+            vec!["privileged_permission".to_string()],
+            "a policy denial is a configuration problem staff must see"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_protected_role_reaches_the_staff_alert_channel() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_PROTECTED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.grant_policy.protected_role_ids = vec![ROLE_PROTECTED];
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(alerted(&rt), vec!["protected_role".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_role_reaches_the_staff_alert_channel_as_facts_unavailable() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::unavailable(),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(
+            alerted(&rt),
+            vec![CODE_FACTS_UNAVAILABLE.to_string()],
+            "a role the lookup could not resolve is reported with facts_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_failure_reaches_the_staff_alert_channel() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::failing(403),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(alerted(&rt), vec![CODE_SEND_FORBIDDEN.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_join_where_the_grant_and_the_message_both_fail_alerts_both_codes() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::failing(500),
+        );
+        rt.handle_join(&facts(false)).await;
+        let codes = alerted(&rt);
+        assert!(codes.contains(&"forbidden".to_string()), "{codes:?}");
+        assert!(codes.contains(&CODE_SEND_FAILED.to_string()), "{codes:?}");
+        assert_eq!(codes.len(), 2, "{codes:?}");
+    }
+
+    #[tokio::test]
+    async fn the_same_code_is_alerted_once_per_join() {
+        // Three roles that fail for the same reason: one alert, not three.
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW, ROLE_MID, ROLE_HIGH],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::ok(),
+        );
+        let outcome = rt.handle_join(&facts(false)).await;
+        assert_eq!(
+            outcome.role_results.len(),
+            3,
+            "every requested role has its own result"
+        );
+        assert_eq!(
+            alerted(&rt),
+            vec!["forbidden".to_string()],
+            "one alert per distinct code per join"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_different_codes_are_alerted_separately() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW, ROLE_PRIVILEGED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        let codes = alerted(&rt);
+        assert_eq!(codes.len(), 2, "{codes:?}");
+        assert!(codes.contains(&"forbidden".to_string()), "{codes:?}");
+        assert!(
+            codes.contains(&"privileged_permission".to_string()),
+            "{codes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_join_without_a_failure_raises_no_alert() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert!(rt.alerter.alerts.is_empty(), "{:?}", rt.alerter.alerts);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_join_raises_no_alert() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(true)).await;
+        assert!(rt.alerter.alerts.is_empty(), "{:?}", rt.alerter.alerts);
+    }
+
+    #[tokio::test]
+    async fn a_shadow_join_raises_no_alert_and_sends_nothing() {
+        let mut rt = runtime(
+            Mode::Shadow,
+            &[ROLE_PRIVILEGED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert!(
+            rt.alerter.alerts.is_empty(),
+            "a shadow run reports nothing: {:?}",
+            rt.alerter.alerts
+        );
+        assert!(rt.sender.sent.is_empty());
+        assert!(rt.writer.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_alerted_codes_carry_no_name_no_id_and_no_message_text() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::failing(500),
+        );
+        rt.handle_join(&facts(false)).await;
+        for (channel_id, code) in &rt.alerter.alerts {
+            assert_eq!(*channel_id, 799_001);
+            assert!(!code.contains("synthetic-user"), "{code}");
+            assert!(!code.contains("700003"), "{code}");
+            assert!(!code.contains("720001"), "{code}");
+            assert!(!code.contains(' '), "{code}");
+            assert!(!code.contains('@'), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_outcome_alerts_are_the_codes_that_were_reported() {
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_LOW, ROLE_PRIVILEGED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::failing(ROLE_LOW, 403),
+            FakeSender::ok(),
+        );
+        let outcome = rt.handle_join(&facts(false)).await;
+        // The outcome carries what the alerter observed, in the same order.
+        let outcome_codes: Vec<String> =
+            outcome.alerts.iter().map(|code| (*code).to_string()).collect();
+        assert_eq!(outcome_codes, alerted(&rt));
     }
 
     #[tokio::test]

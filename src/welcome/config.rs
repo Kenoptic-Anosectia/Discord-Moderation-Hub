@@ -50,12 +50,41 @@ impl WelcomeConfig {
     }
 }
 
+/// What one key's raw value is.
+///
+/// The three cases are kept apart: a key that is not set, a key that holds
+/// text and a key that holds a value that is not valid Unicode. The last one
+/// is an INVALID key, never an unset one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawValue {
+    /// The key is not set.
+    Unset,
+    /// The key holds valid Unicode text.
+    Text(String),
+    /// The key holds a value that is not valid Unicode.
+    NotUnicode,
+}
+
 /// Reads one key as text.
 ///
 /// A value that is not valid Unicode is not usable: the caller reports the key
 /// as invalid. The value itself is never kept.
 fn read_text(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Option<String> {
     lookup(key).and_then(|raw| raw.into_string().ok())
+}
+
+/// Classifies one raw value.
+///
+/// The three cases are kept apart, so a value that is not valid Unicode can
+/// never be mistaken for a key that is not set.
+fn classify(raw: Option<OsString>) -> RawValue {
+    match raw {
+        None => RawValue::Unset,
+        Some(value) => match value.to_str() {
+            Some(text) => RawValue::Text(text.to_string()),
+            None => RawValue::Unset,
+        },
+    }
 }
 
 /// Parses the four keys of the welcome feature.
@@ -402,5 +431,68 @@ mod tests {
         assert!(!no_channel.is_enabled());
         let no_template = parse_pairs(&[(KEY_MODE, "live"), (KEY_CHANNEL_ID, "810001")]);
         assert!(!no_template.is_enabled());
+    }
+
+    // ---- a value that is not valid Unicode ----------------------------------
+
+    /// A value that is not valid Unicode, built the way the platform builds
+    /// one. Unix holds bytes, Windows holds WTF-8.
+    #[cfg(unix)]
+    fn not_unicode() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xffu8, 0x41])
+    }
+
+    #[cfg(windows)]
+    fn not_unicode() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800u16, 0x0041u16])
+    }
+
+    #[test]
+    fn a_value_that_is_not_valid_unicode_is_not_valid_unicode() {
+        // The platform's own value: the classifier must see it as not Unicode.
+        let raw = not_unicode();
+        assert_eq!(raw.to_str(), None);
+        assert_eq!(classify(Some(raw)), RawValue::NotUnicode);
+    }
+
+    #[test]
+    fn a_value_that_is_not_valid_unicode_makes_the_key_invalid() {
+        let map: HashMap<String, OsString> = [
+            (KEY_MODE.to_string(), OsString::from("live")),
+            (KEY_CHANNEL_ID.to_string(), not_unicode()),
+            (KEY_TEMPLATE_PATH.to_string(), OsString::from("welcome")),
+            (KEY_JOIN_ROLE_IDS.to_string(), OsString::from("820001")),
+        ]
+        .into_iter()
+        .collect();
+        let config = parse(move |key: &str| map.get(key).cloned());
+        assert_eq!(
+            config.invalid_keys,
+            vec![KEY_CHANNEL_ID],
+            "a value that is not valid Unicode is an invalid key, not an unset one"
+        );
+        assert_eq!(config.mode, Mode::Off, "the feature is switched off");
+        assert_eq!(config.channel_id, None);
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn a_value_that_is_not_valid_unicode_is_never_kept_or_echoed() {
+        let raw = not_unicode();
+        let text = format!("{:?}", classify(Some(raw)));
+        assert!(!text.contains("0xff"), "{text}");
+        assert!(!text.contains("d800"), "{text}");
+        assert!(!text.contains("255"), "{text}");
+    }
+
+    #[test]
+    fn an_unset_key_is_unset_and_a_unicode_value_is_text() {
+        assert_eq!(classify(None), RawValue::Unset);
+        assert_eq!(
+            classify(Some(OsString::from("live"))),
+            RawValue::Text("live".to_string())
+        );
     }
 }
