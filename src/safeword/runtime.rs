@@ -16,8 +16,10 @@
 //!   state machine in the order they arrive and executes the actions the
 //!   machine emits, in the order it emits them.
 //! * **Every role change passes the K03 decision.** Grants use
-//!   `GrantPath::SafewordRestore` (the path that exists for restores); every
-//!   removal uses `decide_removal`.
+//!   `GrantPath::SafewordRestore` (the path that exists for restores) and are
+//!   written by the K04 executor (`roles::grant::apply`): it writes only what
+//!   K03 allowed and the member does not hold, and retries a 429 a limited
+//!   number of times. Every removal uses `decide_removal`.
 //! * **A partial role failure is never reported as success.** The step is
 //!   reported to the state machine as failed, so the machine keeps the failed
 //!   step and re-emits it on the next trigger, and a staff alert with a stable
@@ -27,10 +29,12 @@
 //!   nothing else is touched.
 //! * **Shadow mode performs nothing.** No role write, no DM and no alert: it
 //!   only produces a structured would-do record of counts and codes.
-//! * **A failed lookup never costs the member their protection.** A lookup
-//!   that fails is a refusal, never a guess: the runtime writes nothing at
-//!   all, so the member keeps exactly the roles and the safeword role it
-//!   already holds.
+//! * **A failed lookup never costs the member their protection.** If the
+//!   state or the member's roles cannot be read at the start of a run, the
+//!   run writes nothing and alerts, so the member keeps what it holds. A
+//!   lookup that fails later is never read as "holds nothing": a restore
+//!   writes the role anyway (a repeat is harmless) and a hand-over to a new
+//!   activation is not acknowledged until the roles can be read.
 //!
 //! The decision core is Discord-free and clock-free: the ids and the `now`
 //! come in through the request structs, and the Discord calls sit behind
@@ -41,7 +45,9 @@
 use crate::roles::eligibility::{
     decide_removal, Decision, GrantPath, GrantRequest, RoleFacts, SafewordState,
 };
-use crate::roles::grant::Sleeper;
+use crate::roles::grant::{
+    self as k04, FailCode, GrantItem, RoleOutcome, RoleWriter, Sleeper, WriteError,
+};
 use crate::roles::runtime::{
     self as roles_facts, decide_from_facts, DecisionInputs, RuntimeDecision,
 };
@@ -444,10 +450,12 @@ enum StepOutcome {
     },
 }
 
-/// The decision the runtime made for one role write.
+/// The K03 decision for one role write, with a failed lookup kept visible.
 enum GrantDecision {
-    Allow,
-    Denied(&'static str),
+    /// K03 decided on the facts it was given.
+    Decided(Decision),
+    /// A lookup failed, so the role is denied. The code names which one.
+    Unavailable(&'static str),
 }
 
 /// Handle one reaction event.
@@ -501,6 +509,18 @@ pub fn handle_reaction(
     )
 }
 
+/// Everything one run needs besides the collaborators.
+///
+/// Grouping these keeps every function under the argument limit and makes it
+/// impossible to pass the member of one run with the context of another.
+struct Job<'a> {
+    config: &'a SafewordConfig,
+    guild_id: u64,
+    member_id: u64,
+    now: i64,
+    context: &'a Context,
+}
+
 /// Feed one event to the state machine and execute what it emits.
 fn drive(
     config: &SafewordConfig,
@@ -534,28 +554,31 @@ fn drive(
     };
 
     let (next, actions) = step(&state, machine_event, &context);
-    run_actions(
-        config, guild_id, member_id, next, actions, context, version, now, ops, shadow,
-    )
+    let job = Job {
+        config,
+        guild_id,
+        member_id,
+        now,
+        context: &context,
+    };
+    run_actions(&job, next, actions, version, ops, shadow)
 }
 
 /// Run the actions the machine emitted, one at a time, and store the result.
-#[allow(clippy::too_many_arguments)]
 fn run_actions(
-    config: &SafewordConfig,
-    guild_id: u64,
-    member_id: u64,
+    job: &Job<'_>,
     mut state: State,
     mut pending: Vec<Action>,
-    context: Context,
     mut version: u64,
-    now: i64,
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> Outcome {
     let mut failures = 0usize;
     let mut performed = 0usize;
     let mut guard = 0usize;
+    // The machine reads the held roles when a release hands over to a fresh
+    // activation, so this copy is refreshed before such an acknowledgement.
+    let mut context = job.context.clone();
 
     // The machine emits the actions; the runtime runs them one at a time in
     // the order they were emitted and reports each outcome once.
@@ -568,17 +591,25 @@ fn run_actions(
             failures += 1;
             break;
         }
-        let outcome = perform(
-            config,
-            guild_id,
-            member_id,
-            &state,
-            &action,
-            &mut version,
-            now,
-            ops,
-            shadow,
-        );
+        let mut outcome = perform(job, &state, &action, &mut version, ops, shadow);
+        if matches!(outcome, StepOutcome::Done) && reactivation_pending(&state) {
+            // A re-add arrived during the release: the acknowledgement may
+            // start a new activation from the roles held *now*. Stale roles
+            // would snapshot nothing and leave the member unprotected.
+            match ops.members.member_roles(job.member_id) {
+                Ok(held) => context.held_roles = held,
+                Err(_) => {
+                    ops.alerter.alert(CODE_LOOKUP_UNAVAILABLE);
+                    push_code(shadow, CODE_LOOKUP_UNAVAILABLE);
+                    // Not acknowledged: the machine keeps the step and the
+                    // next trigger runs it again.
+                    outcome = StepOutcome::Failed {
+                        machine: FailureCode::TransientHttp,
+                        alert: CODE_LOOKUP_UNAVAILABLE,
+                    };
+                }
+            }
+        }
         match outcome {
             StepOutcome::Done => {
                 performed += 1;
@@ -602,8 +633,12 @@ fn run_actions(
 
     // Persist the state the machine ended in.
     let persisted: Result<u64, &'static str> = match &state {
-        State::Inactive => ops.store.clear(guild_id, member_id, version, now),
-        other => ops.store.store(guild_id, member_id, other, version, now),
+        State::Inactive => ops
+            .store
+            .clear(job.guild_id, job.member_id, version, job.now),
+        other => ops
+            .store
+            .store(job.guild_id, job.member_id, other, version, job.now),
     };
     if let Err(code) = persisted {
         ops.alerter.alert(code);
@@ -622,6 +657,11 @@ fn run_actions(
     } else {
         Outcome::Partial
     }
+}
+
+/// Whether the member asked for the safeword again while it was being released.
+fn reactivation_pending(state: &State) -> bool {
+    matches!(state, State::Releasing(snapshot) if snapshot.pending_reactivate)
 }
 
 /// Load a member's state and version. `Ok(None)` means "no row".
@@ -649,7 +689,7 @@ fn context_for(
     Ok(Context {
         safeword_role: config.role_id,
         restricted_roles: config.restricted_role_ids.clone(),
-        protected_roles: Vec::new(),
+        protected_roles: ops.protected_role_ids.clone(),
         held_roles: held,
         filter_restore: true,
         defer_grants: config.defer_grants,
@@ -657,24 +697,24 @@ fn context_for(
 }
 
 /// Execute one action.
-#[allow(clippy::too_many_arguments)]
 fn perform(
-    config: &SafewordConfig,
-    guild_id: u64,
-    member_id: u64,
+    job: &Job<'_>,
     state: &State,
     action: &Action,
     version: &mut u64,
-    now: i64,
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> StepOutcome {
+    let (guild_id, member_id) = (job.guild_id, job.member_id);
     match action {
         Action::SaveSnapshot => {
             // The snapshot that is stored is the machine's own snapshot: the
             // runtime never builds a second one, so a replayed add can never
             // overwrite it.
-            match ops.store.store(guild_id, member_id, state, *version, now) {
+            match ops
+                .store
+                .store(guild_id, member_id, state, *version, job.now)
+            {
                 Ok(new_version) => {
                     *version = new_version;
                     StepOutcome::Done
@@ -686,30 +726,18 @@ fn perform(
             }
         }
         Action::RemoveRoles(roles) => remove_roles(guild_id, member_id, roles, ops, shadow),
-        Action::AddSafewordRole => {
-            // The member is not on safeword yet: the safeword role itself is
-            // not a restricted role, so the K03 safeword rule does not apply.
-            add_role(
-                guild_id,
-                member_id,
-                config.role_id,
-                false,
-                &config.restricted_role_ids,
-                ops,
-                shadow,
-            )
+        // The member is not on safeword yet: the safeword role itself is not a
+        // restricted role, so the K03 safeword rule does not apply.
+        Action::AddSafewordRole => add_roles(job, &[job.config.role_id], false, ops, shadow),
+        Action::SendDm(kind) => send_dm(job.config, member_id, *kind, ops),
+        Action::RemoveSafewordRole => {
+            remove_role(guild_id, member_id, job.config.role_id, ops, shadow)
         }
-        Action::SendDm(kind) => send_dm(config, member_id, *kind, ops),
-        Action::RemoveSafewordRole => remove_role(guild_id, member_id, config.role_id, ops, shadow),
-        Action::RestoreRoles(roles) => restore_roles(
-            guild_id,
-            member_id,
-            roles,
-            &config.restricted_role_ids,
-            ops,
-            shadow,
-        ),
-        Action::ClearSnapshot => match ops.store.clear(guild_id, member_id, *version, now) {
+        // The member is still on safeword while the release runs, so the K03
+        // safeword rule is live: only the `SafewordRestore` path may give a
+        // restricted role back.
+        Action::RestoreRoles(roles) => add_roles(job, roles, true, ops, shadow),
+        Action::ClearSnapshot => match ops.store.clear(guild_id, member_id, *version, job.now) {
             Ok(new_version) => {
                 *version = new_version;
                 StepOutcome::Done
@@ -788,87 +816,155 @@ fn remove_role(
     }
 }
 
-/// Restore the saved roles, through the K03 `SafewordRestore` path.
-fn restore_roles(
-    guild_id: u64,
-    member_id: u64,
-    roles: &[RoleId],
-    restricted_roles: &[RoleId],
-    ops: &mut Ops,
-    shadow: &mut ShadowRecord,
-) -> StepOutcome {
-    let mut failures = 0usize;
-    let mut written = 0usize;
-    for role_id in roles {
-        // The member is still on safeword while the release runs, so the K03
-        // safeword rule is live: only the `SafewordRestore` path may give a
-        // restricted role back.
-        match add_role(
-            guild_id,
-            member_id,
-            *role_id,
-            true,
-            restricted_roles,
-            ops,
-            shadow,
-        ) {
-            StepOutcome::Done => written += 1,
-            StepOutcome::Failed { .. } => failures += 1,
-        }
-    }
-    if failures == 0 {
-        StepOutcome::Done
-    } else if written == 0 {
-        StepOutcome::Failed {
-            machine: FailureCode::TransientHttp,
-            alert: CODE_ROLE_WRITE_FAILED,
-        }
-    } else {
-        ops.alerter.alert(CODE_PARTIAL_ROLE_FAILURE);
-        push_code(shadow, CODE_PARTIAL_ROLE_FAILURE);
-        StepOutcome::Failed {
-            machine: FailureCode::TransientHttp,
-            alert: CODE_PARTIAL_ROLE_FAILURE,
-        }
+/// Adapts the member-role trait to the K04 executor's writer trait.
+///
+/// The executor classifies a failure from numbers (status and api code), so
+/// the runtime's stable [`WriteCode`] is turned into the numbers the executor
+/// maps back to the same code. A rate-limit hint is not carried, so the
+/// executor falls back to its own backoff.
+struct MemberWriter<'a> {
+    members: &'a mut dyn MemberRoles,
+}
+
+impl RoleWriter for MemberWriter<'_> {
+    fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        self.members
+            .add_role(member_id, role_id)
+            .map_err(|code| match code {
+                WriteCode::Forbidden => write_error(403, None),
+                WriteCode::UnknownRole => write_error(404, Some(k04::API_CODE_UNKNOWN_ROLE)),
+                WriteCode::UnknownMember => write_error(404, Some(k04::API_CODE_UNKNOWN_MEMBER)),
+                WriteCode::RateLimited => write_error(429, None),
+                WriteCode::Other => write_error(500, None),
+            })
     }
 }
 
-/// Add one role, after the K03 grant decision.
+fn write_error(status: u16, api_code: Option<u32>) -> WriteError {
+    WriteError {
+        status,
+        api_code,
+        retry_after_ms: None,
+    }
+}
+
+/// Adapts the boxed sleeper to the executor's generic parameter.
+struct SleepAdapter<'a> {
+    sleeper: &'a mut dyn Sleeper,
+}
+
+impl Sleeper for SleepAdapter<'_> {
+    fn sleep_ms(&mut self, ms: u64) {
+        self.sleeper.sleep_ms(ms);
+    }
+}
+
+/// The machine failure code of an executor failure.
+fn executor_failure_code(code: FailCode) -> FailureCode {
+    match code {
+        FailCode::Forbidden | FailCode::UnknownMember => FailureCode::MissingPermissions,
+        FailCode::UnknownRole => FailureCode::UnknownRole,
+        FailCode::RateLimited => FailureCode::RateLimited,
+        FailCode::Other => FailureCode::TransientHttp,
+    }
+}
+
+/// Add roles through the K03 decision and the K04 grant executor.
 ///
-/// `safeword_active` says whether the member is on safeword right now. It is
-/// `true` for a restore: the member is still recorded as on safeword while
-/// the release runs, so the K03 safeword rule is live and only the
-/// `SafewordRestore` path may give a restricted role back.
-fn add_role(
-    guild_id: u64,
-    member_id: u64,
-    role_id: RoleId,
+/// Every role gets its K03 decision first (the `SafewordRestore` path). The
+/// executor then writes only what K03 allowed and the member does not hold,
+/// retries a 429 a limited number of times through the injected sleeper, and
+/// reports one outcome per role. A role whose facts could not be looked up is
+/// a denial that is never written. `safeword_active` says whether the member
+/// is on safeword right now (`true` for a restore).
+fn add_roles(
+    job: &Job<'_>,
+    roles: &[RoleId],
     safeword_active: bool,
-    restricted_roles: &[RoleId],
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> StepOutcome {
-    match grant_decision(guild_id, role_id, safeword_active, restricted_roles, ops) {
-        GrantDecision::Allow => match ops.members.add_role(member_id, role_id) {
-            Ok(()) => {
+    let mut items: Vec<GrantItem> = Vec::with_capacity(roles.len());
+    let mut failures: Vec<FailureCode> = Vec::new();
+    // The roles held right now, not the ones held when the event arrived: the
+    // earlier steps of this run may have taken roles away. A failed lookup
+    // means "assume nothing is held", so every role is written (a role the
+    // member already has is a harmless repeat), never skipped.
+    let held_now = ops.members.member_roles(job.member_id).unwrap_or_default();
+    for role_id in roles {
+        match grant_decision(job, *role_id, safeword_active, ops) {
+            GrantDecision::Decided(decision) => items.push(GrantItem {
+                role_id: *role_id,
+                decision,
+                already_held: held_now.contains(role_id),
+            }),
+            GrantDecision::Unavailable(code) => {
+                // Left out of the request, so the executor can never write it.
+                ops.alerter.alert(code);
+                push_code(shadow, code);
+                failures.push(FailureCode::HierarchyRejected);
+            }
+        }
+    }
+    let report = {
+        let mut writer = MemberWriter {
+            members: &mut *ops.members,
+        };
+        let mut sleeper = SleepAdapter {
+            sleeper: &mut *ops.sleeper,
+        };
+        k04::apply(
+            &mut writer,
+            &mut sleeper,
+            &k04::GrantRequest {
+                member_id: job.member_id,
+                items: &items,
+            },
+        )
+    };
+    let mut succeeded = 0usize;
+    for result in &report.results {
+        match result.outcome {
+            RoleOutcome::Done => {
                 shadow.role_adds = shadow.role_adds.saturating_add(1);
-                StepOutcome::Done
+                succeeded += 1;
             }
-            Err(code) => {
-                let machine = write_failure_code(code);
-                let alert = alert_code(machine);
-                ops.alerter.alert(alert);
-                push_code(shadow, alert);
-                StepOutcome::Failed { machine, alert }
+            RoleOutcome::NoOp => succeeded += 1,
+            RoleOutcome::Denied(reason) => {
+                ops.alerter.alert(reason.code());
+                push_code(shadow, reason.code());
+                failures.push(FailureCode::HierarchyRejected);
             }
-        },
-        GrantDecision::Denied(code) => {
-            ops.alerter.alert(code);
-            push_code(shadow, code);
-            StepOutcome::Failed {
-                machine: FailureCode::HierarchyRejected,
-                alert: code,
+            RoleOutcome::Failed(code) => {
+                ops.alerter.alert(CODE_ROLE_WRITE_FAILED);
+                push_code(shadow, CODE_ROLE_WRITE_FAILED);
+                failures.push(executor_failure_code(code));
             }
+        }
+    }
+    let Some(first) = failures.first().copied() else {
+        return StepOutcome::Done;
+    };
+    // One reason for every failure is reported as that reason; a mix is a
+    // transient failure the machine retries.
+    let machine = if failures.iter().all(|code| *code == first) {
+        first
+    } else {
+        FailureCode::TransientHttp
+    };
+    if succeeded == 0 {
+        StepOutcome::Failed {
+            machine,
+            alert: CODE_ROLE_WRITE_FAILED,
+        }
+    } else {
+        // A partial failure is never reported as success: the staff alert
+        // names it and the machine keeps the failed step.
+        ops.alerter.alert(CODE_PARTIAL_ROLE_FAILURE);
+        push_code(shadow, CODE_PARTIAL_ROLE_FAILURE);
+        StepOutcome::Failed {
+            machine,
+            alert: CODE_PARTIAL_ROLE_FAILURE,
         }
     }
 }
@@ -913,37 +1009,35 @@ fn alert_code(code: FailureCode) -> &'static str {
 ///
 /// The path is `SafewordRestore`: it is the path that exists for the safeword
 /// restores, so a restricted role can be given back while the member is on
-/// safeword. The restricted set and the safeword state are the real ones, so
-/// the K03 safeword rule is live: another path would be denied.
+/// safeword. The restricted set, the protected set and the safeword state are
+/// the real ones, so the K03 rules are live: another path would be denied.
 fn grant_decision(
-    guild_id: u64,
+    job: &Job<'_>,
     role_id: RoleId,
     safeword_active: bool,
-    restricted_roles: &[RoleId],
     ops: &mut Ops,
 ) -> GrantDecision {
-    let bot_top = match ops.facts.bot_top_position() {
-        Some(position) => position,
-        None => return GrantDecision::Denied(CODE_BOT_TOP_UNKNOWN),
+    let Some(bot_top) = ops.facts.bot_top_position() else {
+        // Without the bot's position nothing can be decided: a denial.
+        return GrantDecision::Unavailable(CODE_BOT_TOP_UNKNOWN);
     };
     let facts = ops.facts.role_facts(role_id);
     let inputs = DecisionInputs {
         path: GrantPath::SafewordRestore,
         bot_top_position: bot_top,
-        guild_id,
-        protected_role_ids: &[],
+        guild_id: job.guild_id,
+        protected_role_ids: &ops.protected_role_ids,
         safeword: if safeword_active {
             SafewordState::Active
         } else {
             SafewordState::Inactive
         },
-        safeword_restricted_role_ids: restricted_roles,
+        safeword_restricted_role_ids: &job.config.restricted_role_ids,
         staff: None,
     };
     match decide_from_facts(facts, role_id, &inputs) {
-        RuntimeDecision::Decided(Decision::Allow) => GrantDecision::Allow,
-        RuntimeDecision::Decided(Decision::Deny(reason)) => GrantDecision::Denied(reason.code()),
-        RuntimeDecision::Unavailable => GrantDecision::Denied(CODE_FACTS_UNAVAILABLE),
+        RuntimeDecision::Decided(decision) => GrantDecision::Decided(decision),
+        RuntimeDecision::Unavailable => GrantDecision::Unavailable(CODE_FACTS_UNAVAILABLE),
     }
 }
 
@@ -1133,7 +1227,18 @@ pub fn reconcile(
     report
 }
 
+/// How many rounds of work the reconcile runs for one member.
+///
+/// Each round runs the actions the machine wants next and acknowledges them.
+/// The cap only stops a machine that never settles: the member is then
+/// reported as failed with [`CODE_STATE_FAILED`].
+const MAX_RECONCILE_ROUNDS: usize = 16;
+
 /// Drive the state machine for one member after a restart.
+///
+/// The machine is asked what to do next, the actions run through
+/// `run_actions` (every outcome is acknowledged and the end state stored), and
+/// the machine is asked again, until it has nothing left to do or a step fails.
 fn reconcile_member(
     config: &SafewordConfig,
     guild_id: u64,
@@ -1143,95 +1248,66 @@ fn reconcile_member(
     ops: &mut Ops,
     report: &mut ReconcileReport,
 ) -> MemberOutcome {
-    let (state, version) = match load_state(ops, guild_id, member_id) {
-        Ok(pair) => pair,
-        Err(code) => {
-            report.push(code);
-            return MemberOutcome::Failed;
-        }
-    };
-
-    let context = match context_for(config, ops, member_id) {
-        Ok(context) => context,
-        Err(code) => {
-            report.push(code);
-            return MemberOutcome::Failed;
-        }
-    };
-
-    match restart_action(&state, reaction_present_now) {
-        RestartAction::NoOp => MemberOutcome::Unchanged,
-        RestartAction::Trigger(event) => {
-            let (next, actions) = step(&state, event, &context);
-            let mut shadow = ShadowRecord::default();
-            let outcome = run_actions(
-                config,
-                guild_id,
-                member_id,
-                next,
-                actions,
-                context,
-                version,
-                now,
-                ops,
-                &mut shadow,
-            );
-            match outcome {
-                Outcome::Done => {
-                    // The reaction is present now, so the member must end on
-                    // safeword; it is absent now, so the member must end off
-                    // it. The state before the run decides which way it went.
+    let mut worked = false;
+    for _ in 0..MAX_RECONCILE_ROUNDS {
+        let (state, version) = match load_state(ops, guild_id, member_id) {
+            Ok(pair) => pair,
+            Err(code) => {
+                report.push(code);
+                return MemberOutcome::Failed;
+            }
+        };
+        let context = match context_for(config, ops, member_id) {
+            Ok(context) => context,
+            Err(code) => {
+                report.push(code);
+                return MemberOutcome::Failed;
+            }
+        };
+        let (next, actions) = match restart_action(&state, reaction_present_now) {
+            RestartAction::NoOp => {
+                return match (worked, reaction_present_now) {
+                    (false, _) => MemberOutcome::Unchanged,
+                    (true, true) => MemberOutcome::Activated,
+                    (true, false) => MemberOutcome::Released,
+                };
+            }
+            RestartAction::Trigger(event) => step(&state, event, &context),
+            RestartAction::Execute(action) => (state.clone(), vec![action]),
+        };
+        let job = Job {
+            config,
+            guild_id,
+            member_id,
+            now,
+            context: &context,
+        };
+        let mut shadow = ShadowRecord::default();
+        match run_actions(&job, next, actions, version, ops, &mut shadow) {
+            Outcome::Done => worked = true,
+            // The machine had nothing to do: it is settled.
+            Outcome::NoWork | Outcome::Ignored => {
+                return if worked {
                     if reaction_present_now {
                         MemberOutcome::Activated
                     } else {
                         MemberOutcome::Released
                     }
-                }
-                Outcome::NoWork => MemberOutcome::Unchanged,
-                Outcome::Partial | Outcome::Failed => {
-                    report.push(CODE_STATE_FAILED);
-                    MemberOutcome::Failed
-                }
-                Outcome::Ignored => MemberOutcome::Unchanged,
-            }
-        }
-        RestartAction::Execute(action) => {
-            // The machine wants exactly one action run now. It is run through
-            // the same path as every other action, and its acknowledgement goes
-            // back into the machine.
-            let mut version = version;
-            let mut shadow = ShadowRecord::default();
-            let outcome = perform(
-                config,
-                guild_id,
-                member_id,
-                &state,
-                &action,
-                &mut version,
-                now,
-                ops,
-                &mut shadow,
-            );
-            match outcome {
-                StepOutcome::Done => {
-                    let (following, _more) = step(&state, Event::ActionDone(action.id()), &context);
-                    let persisted = match &following {
-                        State::Inactive => ops.store.clear(guild_id, member_id, version, now),
-                        other => ops.store.store(guild_id, member_id, other, version, now),
-                    };
-                    if let Err(code) = persisted {
-                        report.push(code);
-                        return MemberOutcome::Failed;
-                    }
+                } else {
                     MemberOutcome::Unchanged
+                };
+            }
+            Outcome::Partial | Outcome::Failed => {
+                // The codes of the failed steps, never text.
+                for code in shadow.codes {
+                    report.push(code);
                 }
-                StepOutcome::Failed { alert, .. } => {
-                    report.push(alert);
-                    MemberOutcome::Failed
-                }
+                return MemberOutcome::Failed;
             }
         }
     }
+    report.push(CODE_STATE_FAILED);
+    MemberOutcome::Failed
 }
 
 /// Read every page of reaction users.
@@ -1458,6 +1534,8 @@ mod tests {
     struct FakeMembers {
         log: Rc<RefCell<MemberLog>>,
         lookup_fails: bool,
+        /// Lookups with an index at or above this fail (index = lookups so far).
+        lookup_cutoff: Rc<Cell<usize>>,
         /// Role ids whose write fails, and with what.
         fail_writes: BTreeMap<u64, WriteCode>,
         /// Role ids whose next ADDs fail a number of times, then succeed.
@@ -1471,6 +1549,7 @@ mod tests {
             Self {
                 log: Rc::new(RefCell::new(MemberLog::default())),
                 lookup_fails: false,
+                lookup_cutoff: Rc::new(Cell::new(usize::MAX)),
                 fail_writes: BTreeMap::new(),
                 transient: BTreeMap::new(),
                 chaos: VecDeque::new(),
@@ -1529,8 +1608,9 @@ mod tests {
 
     impl MemberRoles for FakeMembers {
         fn member_roles(&mut self, member_id: u64) -> Result<Vec<RoleId>, LookupCode> {
+            let index = self.log.borrow().lookups.len();
             self.log.borrow_mut().lookups.push(member_id);
-            if self.lookup_fails {
+            if self.lookup_fails || index >= self.lookup_cutoff.get() {
                 return Err(LookupCode::Unavailable);
             }
             Ok(self
@@ -1860,11 +1940,13 @@ mod tests {
         store_clears: Rc<RefCell<Vec<u64>>>,
         reaction_calls: ReactionCalls,
         slept: Rc<RefCell<Vec<u64>>>,
+        lookup_cutoff: Rc<Cell<usize>>,
     }
 
     impl Harness {
         fn new(members: FakeMembers) -> Self {
             let members_log = Rc::clone(&members.log);
+            let lookup_cutoff = Rc::clone(&members.lookup_cutoff);
             let dms_sent = Rc::new(RefCell::new(Vec::new()));
             let alerts = Rc::new(RefCell::new(Vec::new()));
             let store = FakeStore::new();
@@ -1902,6 +1984,7 @@ mod tests {
                 store_clears,
                 reaction_calls,
                 slept,
+                lookup_cutoff,
             }
         }
 
@@ -1915,6 +1998,9 @@ mod tests {
         }
 
         fn with_store(mut self, store: FakeStore) -> Self {
+            self.store_rows = Rc::clone(&store.rows);
+            self.store_writes = Rc::clone(&store.writes);
+            self.store_clears = Rc::clone(&store.clears);
             self.ops.store = Box::new(store);
             self
         }
@@ -2420,6 +2506,45 @@ mod tests {
     }
 
     #[test]
+    fn off_mode_does_nothing_for_an_event_and_for_the_reconcile() {
+        let cfg = config_in("off");
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
+        let mut shadow = ShadowRecord::default();
+        let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::NoWork);
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(report, ReconcileReport::default());
+        assert!(harness.reaction_calls.borrow().is_empty(), "no read either");
+        assert!(harness.added().is_empty() && harness.removed().is_empty());
+        assert!(harness.dms().is_empty() && harness.alerts().is_empty());
+        assert!(harness.state_of(MEMBER).is_none());
+        assert_eq!(shadow, ShadowRecord::default());
+    }
+
+    #[test]
+    fn shadow_reconcile_counts_what_it_would_do_and_writes_nothing() {
+        use crate::safeword::state::Snapshot;
+        let cfg = config_in("shadow");
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A])
+                .with_roles(OTHER_MEMBER, &[SAFEWORD_ROLE]),
+        )
+        .with_store(FakeStore::new().with_state(OTHER_MEMBER, State::Active(Snapshot::default())))
+        .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(report.activated, 1, "{}", report.summary_line());
+        assert_eq!(report.released, 1, "{}", report.summary_line());
+        assert_eq!(report.failed, 0);
+        assert!(harness.added().is_empty() && harness.removed().is_empty());
+        assert!(harness.dms().is_empty() && harness.alerts().is_empty());
+        assert!(harness.store_writes.borrow().is_empty());
+        assert!(harness.store_clears.borrow().is_empty());
+    }
+
+    #[test]
     fn the_shadow_record_carries_counts_and_codes_only() {
         let record = ShadowRecord {
             activates: 1,
@@ -2777,6 +2902,164 @@ mod tests {
             harness.state_of(MEMBER)
         );
         assert_eq!(harness.dms().len(), 1, "the activation DM went out once");
+    }
+
+    #[test]
+    fn a_re_add_during_a_stalled_release_snapshots_the_roles_held_now() {
+        // The release stalls (one restore write fails once). The member reacts
+        // again, so the machine hands over to a fresh activation as soon as the
+        // restore is acknowledged. The new snapshot must see the roles the
+        // restore just gave back, or the member ends "active" holding them.
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                .failing_write_times(RESTRICTED_A, WriteCode::Other, 1),
+        );
+        let release = activate_then_release(&cfg, &mut harness);
+        assert_eq!(release, Outcome::Partial);
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        let roles = harness.roles_of(MEMBER);
+        assert!(roles.contains(&SAFEWORD_ROLE), "{roles:?}");
+        assert!(!roles.contains(&RESTRICTED_A), "{roles:?}");
+        assert!(!roles.contains(&RESTRICTED_B), "{roles:?}");
+        assert!(
+            matches!(harness.state_of(MEMBER), Some(State::Active(_))),
+            "got {:?}",
+            harness.state_of(MEMBER)
+        );
+    }
+
+    #[test]
+    fn a_lookup_failure_during_the_hand_over_to_a_new_activation_is_not_acknowledged() {
+        // Same stalled release and re-add as above, but the roles cannot be
+        // read at the moment the machine would start the new activation. The
+        // restore must not be acknowledged on a guess: the release stays open,
+        // an alert is raised, and the next trigger finishes the hand-over.
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                .failing_write_times(RESTRICTED_A, WriteCode::Other, 1),
+        );
+        activate_then_release(&cfg, &mut harness);
+        let mut shadow = ShadowRecord::default();
+        // The re-add reads the roles three times: the run's context, the
+        // restore's held check, then the hand-over refresh. Fail the third.
+        let seen = harness.members_log.borrow().lookups.len();
+        harness.lookup_cutoff.set(seen + 2);
+        let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert!(!outcome.is_success(), "got {outcome:?}");
+        assert!(harness.alerts().contains(&CODE_LOOKUP_UNAVAILABLE));
+        assert!(
+            matches!(harness.state_of(MEMBER), Some(State::Releasing(_))),
+            "got {:?}",
+            harness.state_of(MEMBER)
+        );
+        harness.lookup_cutoff.set(usize::MAX);
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        let roles = harness.roles_of(MEMBER);
+        assert!(roles.contains(&SAFEWORD_ROLE), "{roles:?}");
+        assert!(!roles.contains(&RESTRICTED_A) && !roles.contains(&RESTRICTED_B));
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Active(_))));
+    }
+
+    #[test]
+    fn a_failed_held_roles_lookup_never_skips_a_restore() {
+        // The roles cannot be read when the restore checks what is already
+        // held. "Holds nothing" is the safe reading: both roles are written.
+        let cfg = config();
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        // The release reads the roles for its context first, then for the restore.
+        let seen = harness.members_log.borrow().lookups.len();
+        harness.lookup_cutoff.set(seen + 1);
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(writes_of(&harness, RESTRICTED_A), 1);
+        assert_eq!(writes_of(&harness, RESTRICTED_B), 1);
+    }
+
+    #[test]
+    fn one_reason_for_every_failed_restore_is_recorded_and_a_mix_is_transient() {
+        use crate::safeword::state::ActionId;
+        let cfg = config();
+        let last_failure = |forbidden_b: bool| {
+            let second = if forbidden_b {
+                WriteCode::Forbidden
+            } else {
+                WriteCode::RateLimited
+            };
+            let mut harness = Harness::new(
+                FakeMembers::new()
+                    .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                    .failing_write_times(RESTRICTED_A, WriteCode::Forbidden, 99)
+                    .failing_write_times(RESTRICTED_B, second, 99),
+            );
+            let outcome = activate_then_release(&cfg, &mut harness);
+            assert!(!outcome.is_success(), "got {outcome:?}");
+            match harness.state_of(MEMBER) {
+                Some(State::Releasing(snapshot)) => snapshot.last_failure,
+                other => panic!("the release must stay open, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            last_failure(true),
+            Some((ActionId::RestoreRoles, FailureCode::MissingPermissions))
+        );
+        assert_eq!(
+            last_failure(false),
+            Some((ActionId::RestoreRoles, FailureCode::TransientHttp))
+        );
+    }
+
+    #[test]
+    fn a_release_that_finishes_a_stalled_activation_gives_the_roles_back() {
+        // The activation stalled: the role removal failed earlier. The member
+        // releases, so one run removes the roles, adds the safeword role and
+        // then restores. The roles held when the event arrived are not the
+        // roles held when the restore runs, so "already held" must be read at
+        // write time; a stale list would skip the restore and lose the roles.
+        use crate::safeword::state::{ActionId, Snapshot};
+        let cfg = config();
+        let snapshot = Snapshot {
+            saved_roles: vec![RESTRICTED_A, RESTRICTED_B],
+            original_roles: vec![RESTRICTED_A, RESTRICTED_B],
+            snapshot_saved: true,
+            failed_steps: vec![ActionId::RemoveRoles],
+            ..Snapshot::default()
+        };
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_store(FakeStore::new().with_state(MEMBER, State::Activating(snapshot)));
+        let mut shadow = ShadowRecord::default();
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert!(outcome.is_success(), "got {outcome:?}");
+        let mut roles = harness.roles_of(MEMBER);
+        roles.sort_unstable();
+        assert_eq!(roles, vec![RESTRICTED_A, RESTRICTED_B]);
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Inactive)));
+    }
+
+    #[test]
+    fn a_protected_safeword_role_is_denied_by_k03_and_never_written() {
+        // A misconfiguration (the safeword role listed as protected) must fail
+        // loudly, not write a role K03 denies.
+        let cfg = config();
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_protected(&[SAFEWORD_ROLE]);
+        let mut shadow = ShadowRecord::default();
+        let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert!(!outcome.is_success(), "got {outcome:?}");
+        assert_eq!(writes_of(&harness, SAFEWORD_ROLE), 0);
+        assert!(
+            harness.alerts().contains(&"protected_role"),
+            "{:?}",
+            harness.alerts()
+        );
     }
 
     #[test]

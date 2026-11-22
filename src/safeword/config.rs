@@ -16,14 +16,15 @@
 //! * `SAFEWORD_RESTRICTED_ROLE_IDS` is parsed by `settings::parse_id_list`.
 //!   One bad entry refuses the whole list.
 //! * `SAFEWORD_DM` and `SAFEWORD_DEFER_GRANTS` are `on`/`off` tokens
-//!   (case-insensitive, trimmed). A bad token fails closed: `SAFEWORD_DM` to
-//!   `true` (the DM is best effort and never changes state) and
-//!   `SAFEWORD_DEFER_GRANTS` to `true` (the safe reading of "a grant during
-//!   safeword is deferred into the snapshot").
+//!   (case-insensitive, trimmed). An unset key takes the default `on`. A set
+//!   key with any other token (`true`, `yes`, a typo) is refused with an
+//!   error that names the key, so the caller switches the feature off instead
+//!   of guessing what was meant. SW1's older doc says such a value "fails
+//!   closed to true"; the card rule (a bad value switches the feature OFF)
+//!   wins here.
 //!
 //! There is no K06 helper for a boolean, so the two flag keys use a strict
-//! local token check. The token vocabulary is `on`/`off` only, so a typo such
-//! as `true`, `yes` or `enabled` is refused rather than guessed.
+//! local token check.
 //!
 //! Wiring card W2/W3 reads these keys; this module only parses them.
 
