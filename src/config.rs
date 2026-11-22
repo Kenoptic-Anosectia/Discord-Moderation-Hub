@@ -1,7 +1,9 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::{env, ffi::OsStr};
 
+use crate::settings::parse_id_list;
 use crate::tickets::{
     policy::Settings,
     retention::{parse_retention, RetentionPolicy, RETENTION_DAYS_KEY},
@@ -78,6 +80,20 @@ pub struct Config {
     pub tickets: Option<Settings>,
     pub ticket_archive_retention: RetentionPolicy,
     pub ticket_privacy_lockdown: bool,
+    /// Core database file (`CORE_DB_PATH`); `None` when the value is unusable.
+    pub core_db_path: Option<String>,
+    /// Optional guild filter for feature dispatch (`GUILD_ID`).
+    pub guild_id: Option<u64>,
+    /// Optional staff alert channel (`STAFF_ALERT_CHANNEL_ID`).
+    pub staff_alert_channel_id: Option<u64>,
+    /// Channels whose messages are never cached or logged (`LOG_EXCLUDED_CHANNEL_IDS`).
+    pub log_excluded_channel_ids: Vec<u64>,
+    /// Categories whose messages are never cached or logged (`LOG_EXCLUDED_CATEGORY_IDS`).
+    pub log_excluded_category_ids: Vec<u64>,
+    /// Roles automated paths must never grant (`PROTECTED_ROLE_IDS`).
+    pub protected_role_ids: Vec<u64>,
+    /// Keys of the new core settings whose value was unusable (names only).
+    pub invalid_core_keys: Vec<&'static str>,
 }
 
 /// Placeholder printed instead of a secret value.
@@ -107,6 +123,13 @@ impl fmt::Debug for Config {
             tickets,
             ticket_archive_retention,
             ticket_privacy_lockdown,
+            core_db_path,
+            guild_id,
+            staff_alert_channel_id,
+            log_excluded_channel_ids,
+            log_excluded_category_ids,
+            protected_role_ids,
+            invalid_core_keys,
         } = self;
         f.debug_struct("Config")
             .field("discord_token", &REDACTED)
@@ -118,6 +141,13 @@ impl fmt::Debug for Config {
             .field("tickets", tickets)
             .field("ticket_archive_retention", ticket_archive_retention)
             .field("ticket_privacy_lockdown", ticket_privacy_lockdown)
+            .field("core_db_path", core_db_path)
+            .field("guild_id", guild_id)
+            .field("staff_alert_channel_id", staff_alert_channel_id)
+            .field("log_excluded_channel_ids", log_excluded_channel_ids)
+            .field("log_excluded_category_ids", log_excluded_category_ids)
+            .field("protected_role_ids", protected_role_ids)
+            .field("invalid_core_keys", invalid_core_keys)
             .finish()
     }
 }
@@ -133,6 +163,10 @@ impl Config {
                     (None, RetentionPolicy::Disabled)
                 }
             };
+        let core = core_settings(|key| env::var_os(key));
+        for message in core.messages() {
+            eprintln!("{message}");
+        }
         Ok(Self {
             discord_token: required_string("DISCORD_TOKEN")?,
             log_channel_id: required_discord_id("LOG_CHANNEL_ID")?,
@@ -145,6 +179,13 @@ impl Config {
             tickets,
             ticket_archive_retention,
             ticket_privacy_lockdown: optional_string("TICKETS_ENABLED").as_deref() == Some("true"),
+            core_db_path: core.core_db_path,
+            guild_id: core.guild_id,
+            staff_alert_channel_id: core.staff_alert_channel_id,
+            log_excluded_channel_ids: core.log_excluded_channel_ids,
+            log_excluded_category_ids: core.log_excluded_category_ids,
+            protected_role_ids: core.protected_role_ids,
+            invalid_core_keys: core.invalid_keys,
         })
     }
 }
@@ -265,6 +306,159 @@ fn parse_discord_id(raw: &str) -> Result<u64, ConfigValueCode> {
 fn parse_staff_role(raw: Option<&str>) -> Option<u64> {
     raw.and_then(|value| value.parse().ok())
         .filter(|id| *id != 0)
+}
+
+/// Key of the core database path setting.
+pub const CORE_DB_PATH_KEY: &str = "CORE_DB_PATH";
+/// Key of the optional guild filter.
+pub const GUILD_ID_KEY: &str = "GUILD_ID";
+/// Key of the optional staff alert channel.
+pub const STAFF_ALERT_CHANNEL_ID_KEY: &str = "STAFF_ALERT_CHANNEL_ID";
+/// Key of the excluded channel id list.
+pub const LOG_EXCLUDED_CHANNEL_IDS_KEY: &str = "LOG_EXCLUDED_CHANNEL_IDS";
+/// Key of the excluded category id list.
+pub const LOG_EXCLUDED_CATEGORY_IDS_KEY: &str = "LOG_EXCLUDED_CATEGORY_IDS";
+/// Key of the protected role id list.
+pub const PROTECTED_ROLE_IDS_KEY: &str = "PROTECTED_ROLE_IDS";
+/// Default core database file.
+pub const DEFAULT_CORE_DB_PATH: &str = "core.sqlite";
+
+/// The six core settings after parsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreSettings {
+    pub core_db_path: Option<String>,
+    pub guild_id: Option<u64>,
+    pub staff_alert_channel_id: Option<u64>,
+    pub log_excluded_channel_ids: Vec<u64>,
+    pub log_excluded_category_ids: Vec<u64>,
+    pub protected_role_ids: Vec<u64>,
+    pub invalid_keys: Vec<&'static str>,
+}
+
+impl CoreSettings {
+    /// Startup lines for every unusable setting. Each names the key and what
+    /// stays off; none carries the value.
+    pub fn messages(&self) -> Vec<String> {
+        self.invalid_keys
+            .iter()
+            .map(|key| {
+                let effect = match *key {
+                    CORE_DB_PATH_KEY => "the core database and the features that need it stay off",
+                    GUILD_ID_KEY => "optional features stay off until it is fixed",
+                    LOG_EXCLUDED_CHANNEL_IDS_KEY | LOG_EXCLUDED_CATEGORY_IDS_KEY => {
+                        "guild message caching and edit/delete logging are paused until it is fixed"
+                    }
+                    _ => "the setting is switched off",
+                };
+                format!("Setting {key} is unusable: {effect}.")
+            })
+            .collect()
+    }
+}
+
+/// How one environment value reads before it is parsed.
+enum Raw {
+    /// Not set, or only whitespace.
+    Unset,
+    Text(String),
+    /// Set, but not valid Unicode.
+    NotUnicode,
+}
+
+fn read_raw(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Raw {
+    match lookup(key) {
+        None => Raw::Unset,
+        Some(value) => match value.into_string() {
+            Ok(text) if text.trim().is_empty() => Raw::Unset,
+            Ok(text) => Raw::Text(text),
+            Err(_) => Raw::NotUnicode,
+        },
+    }
+}
+
+/// Longest accepted `CORE_DB_PATH`, in bytes.
+const MAX_CORE_DB_PATH_BYTES: usize = 1024;
+
+/// A path is usable only when it is plainly a file path: no control
+/// character, no `file:` URI, not the in-memory name, and not absurdly long.
+/// The storage layer refuses the rest (reserved, UNC, stream names) at open.
+fn plain_core_db_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_CORE_DB_PATH_BYTES
+        && !path.chars().any(char::is_control)
+        && path != ":memory:"
+        && !path.to_ascii_lowercase().starts_with("file:")
+}
+
+/// One Discord id. A list (`1,2`) is not one id, even when it dedupes to one.
+fn single_id(key: &str, text: &str) -> Option<u64> {
+    if text.contains(',') {
+        return None;
+    }
+    match parse_id_list(key, Some(text)).ok()?.as_slice() {
+        [id] => Some(*id),
+        _ => None,
+    }
+}
+
+/// Parses the six core settings.
+///
+/// A blank value counts as unset. A value that cannot be used switches only
+/// that setting off and its key is listed in `invalid_keys`; the value itself
+/// is not kept anywhere.
+pub fn core_settings(lookup: impl Fn(&str) -> Option<OsString>) -> CoreSettings {
+    let mut invalid_keys: Vec<&'static str> = Vec::new();
+
+    let core_db_path = match read_raw(&lookup, CORE_DB_PATH_KEY) {
+        Raw::Unset => Some(DEFAULT_CORE_DB_PATH.to_string()),
+        Raw::Text(text) if plain_core_db_path(text.trim()) => Some(text.trim().to_string()),
+        Raw::Text(_) | Raw::NotUnicode => {
+            invalid_keys.push(CORE_DB_PATH_KEY);
+            None
+        }
+    };
+
+    let mut one_id = |key: &'static str| match read_raw(&lookup, key) {
+        Raw::Unset => None,
+        Raw::Text(text) => {
+            let id = single_id(key, text.trim());
+            if id.is_none() {
+                invalid_keys.push(key);
+            }
+            id
+        }
+        Raw::NotUnicode => {
+            invalid_keys.push(key);
+            None
+        }
+    };
+    let guild_id = one_id(GUILD_ID_KEY);
+    let staff_alert_channel_id = one_id(STAFF_ALERT_CHANNEL_ID_KEY);
+
+    let mut id_list = |key: &'static str| match read_raw(&lookup, key) {
+        Raw::Unset => Vec::new(),
+        Raw::Text(text) => parse_id_list(key, Some(&text)).unwrap_or_else(|_| {
+            invalid_keys.push(key);
+            Vec::new()
+        }),
+        Raw::NotUnicode => {
+            invalid_keys.push(key);
+            Vec::new()
+        }
+    };
+    let log_excluded_channel_ids = id_list(LOG_EXCLUDED_CHANNEL_IDS_KEY);
+    let log_excluded_category_ids = id_list(LOG_EXCLUDED_CATEGORY_IDS_KEY);
+    let protected_role_ids = id_list(PROTECTED_ROLE_IDS_KEY);
+
+    CoreSettings {
+        core_db_path,
+        guild_id,
+        staff_alert_channel_id,
+        log_excluded_channel_ids,
+        log_excluded_category_ids,
+        protected_role_ids,
+        invalid_keys,
+    }
 }
 
 #[cfg(test)]
@@ -600,6 +794,13 @@ mod tests {
             }),
             ticket_archive_retention: RetentionPolicy::AfterDays(30),
             ticket_privacy_lockdown: true,
+            core_db_path: Some("core.sqlite".to_string()),
+            guild_id: None,
+            staff_alert_channel_id: None,
+            log_excluded_channel_ids: Vec::new(),
+            log_excluded_category_ids: Vec::new(),
+            protected_role_ids: Vec::new(),
+            invalid_core_keys: Vec::new(),
         };
         let rendered = format!("{:?}", config);
         assert!(
@@ -657,6 +858,13 @@ mod tests {
             tickets: None,
             ticket_archive_retention: RetentionPolicy::Disabled,
             ticket_privacy_lockdown: false,
+            core_db_path: Some("core.sqlite".to_string()),
+            guild_id: None,
+            staff_alert_channel_id: None,
+            log_excluded_channel_ids: Vec::new(),
+            log_excluded_category_ids: Vec::new(),
+            protected_role_ids: Vec::new(),
+            invalid_core_keys: Vec::new(),
         };
         let rendered = format!("{config:?}");
         for field in [
@@ -669,6 +877,13 @@ mod tests {
             "tickets",
             "ticket_archive_retention",
             "ticket_privacy_lockdown",
+            "core_db_path",
+            "guild_id",
+            "staff_alert_channel_id",
+            "log_excluded_channel_ids",
+            "log_excluded_category_ids",
+            "protected_role_ids",
+            "invalid_core_keys",
         ] {
             assert!(
                 rendered.contains(field),
@@ -778,5 +993,232 @@ mod tests {
             assert_eq!(parse_staff_role(raw), None, "{raw:?}");
         }
         assert_eq!(parse_staff_role(Some("200")), Some(200));
+    }
+
+    // ---- W1 core settings -------------------------------------------------
+
+    /// Builds a lookup from literal (key, value) pairs.
+    fn pairs(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        }
+    }
+
+    #[test]
+    fn core_settings_all_unset_is_the_documented_default() {
+        let parsed = core_settings(|_| None);
+        assert_eq!(parsed.core_db_path.as_deref(), Some("core.sqlite"));
+        assert_eq!(parsed.guild_id, None);
+        assert_eq!(parsed.staff_alert_channel_id, None);
+        assert!(parsed.log_excluded_channel_ids.is_empty());
+        assert!(parsed.log_excluded_category_ids.is_empty());
+        assert!(parsed.protected_role_ids.is_empty());
+        assert!(parsed.invalid_keys.is_empty());
+        assert!(
+            parsed.messages().is_empty(),
+            "an unset configuration prints nothing"
+        );
+    }
+
+    #[test]
+    fn core_settings_blank_values_count_as_unset() {
+        for blank in ["", "   ", "\t"] {
+            let parsed = core_settings(|_| Some(OsString::from(blank)));
+            assert_eq!(parsed.core_db_path.as_deref(), Some("core.sqlite"));
+            assert_eq!(parsed.guild_id, None);
+            assert!(parsed.invalid_keys.is_empty(), "{blank:?}");
+            assert!(parsed.messages().is_empty(), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn core_settings_parse_valid_values() {
+        let parsed = core_settings(pairs(&[
+            ("CORE_DB_PATH", "data/core-test.sqlite"),
+            ("GUILD_ID", "700001"),
+            ("STAFF_ALERT_CHANNEL_ID", "700002"),
+            ("LOG_EXCLUDED_CHANNEL_IDS", "30, 10,20,10"),
+            ("LOG_EXCLUDED_CATEGORY_IDS", "50"),
+            ("PROTECTED_ROLE_IDS", "9,8"),
+        ]));
+        assert_eq!(
+            parsed.core_db_path.as_deref(),
+            Some("data/core-test.sqlite")
+        );
+        assert_eq!(parsed.guild_id, Some(700001));
+        assert_eq!(parsed.staff_alert_channel_id, Some(700002));
+        assert_eq!(parsed.log_excluded_channel_ids, vec![10, 20, 30]);
+        assert_eq!(parsed.log_excluded_category_ids, vec![50]);
+        assert_eq!(parsed.protected_role_ids, vec![8, 9]);
+        assert!(parsed.invalid_keys.is_empty());
+        assert!(parsed.messages().is_empty());
+    }
+
+    #[test]
+    fn bad_single_ids_switch_the_setting_off_and_name_only_the_key() {
+        // GUILD_ID and STAFF_ALERT_CHANNEL_ID are single ids: a list, zero, a
+        // sign, a Unicode digit or an overflow are all unusable.
+        for bad in [
+            "0",
+            "-1",
+            "+5",
+            "12x",
+            "1,2",
+            "5,5",
+            "18446744073709551616",
+            "١٢٣",
+            "S3CR3T-W1-VALUE",
+        ] {
+            let leaked: &'static str = Box::leak(bad.to_string().into_boxed_str());
+            for (key, pick) in [(GUILD_ID_KEY, 0usize), (STAFF_ALERT_CHANNEL_ID_KEY, 1usize)] {
+                let parsed = core_settings(move |k| (k == key).then(|| OsString::from(leaked)));
+                let value = [parsed.guild_id, parsed.staff_alert_channel_id][pick];
+                assert_eq!(value, None, "{key}={bad:?} must switch off");
+                assert_eq!(parsed.invalid_keys, vec![key], "{key}={bad:?}");
+                let messages = parsed.messages();
+                assert_eq!(messages.len(), 1, "{key}={bad:?}");
+                assert!(messages[0].contains(key), "{}", messages[0]);
+                assert!(!messages[0].contains(bad), "value leaked: {}", messages[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn bad_id_lists_switch_the_setting_off_and_name_only_the_key() {
+        // One bad entry makes the whole list unusable (K06: never drop it).
+        for bad in ["10,,20", "10,0", "10,x", "-5", "10,S3CR3T-W1-VALUE", ","] {
+            for key in [
+                LOG_EXCLUDED_CHANNEL_IDS_KEY,
+                LOG_EXCLUDED_CATEGORY_IDS_KEY,
+                PROTECTED_ROLE_IDS_KEY,
+            ] {
+                let leaked: &'static str = Box::leak(bad.to_string().into_boxed_str());
+                let parsed = core_settings(move |k| (k == key).then(|| OsString::from(leaked)));
+                assert!(parsed.log_excluded_channel_ids.is_empty(), "{key}={bad:?}");
+                assert!(parsed.log_excluded_category_ids.is_empty(), "{key}={bad:?}");
+                assert!(parsed.protected_role_ids.is_empty(), "{key}={bad:?}");
+                assert_eq!(parsed.invalid_keys, vec![key], "{key}={bad:?}");
+                let messages = parsed.messages();
+                assert_eq!(messages.len(), 1);
+                assert!(messages[0].contains(key), "{}", messages[0]);
+                assert!(!messages[0].contains(bad), "value leaked: {}", messages[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn bad_core_paths_switch_the_database_off_and_name_only_the_key() {
+        let long = "p".repeat(1025);
+        let leaked_long: &'static str = Box::leak(long.into_boxed_str());
+        for bad in [
+            "file:core.sqlite",
+            "FILE:core.sqlite?mode=memory",
+            ":memory:",
+            "core\n.sqlite",
+            "core\0.sqlite",
+            "S3CR3T-W1-VALUE\u{7}",
+            leaked_long,
+        ] {
+            let leaked: &'static str = Box::leak(bad.to_string().into_boxed_str());
+            let parsed =
+                core_settings(move |k| (k == CORE_DB_PATH_KEY).then(|| OsString::from(leaked)));
+            assert_eq!(parsed.core_db_path, None, "{:?}", bad.len());
+            assert_eq!(parsed.invalid_keys, vec![CORE_DB_PATH_KEY]);
+            let messages = parsed.messages();
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].contains(CORE_DB_PATH_KEY));
+            assert!(!messages[0].contains("S3CR3T"), "{}", messages[0]);
+            assert!(!messages[0].contains("sqlite"), "{}", messages[0]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_value_is_unusable_not_unset() {
+        use std::os::windows::ffi::OsStringExt;
+        let raw = OsString::from_wide(&[0x0063, 0xD800, 0x0064]);
+        for key in [CORE_DB_PATH_KEY, GUILD_ID_KEY, LOG_EXCLUDED_CHANNEL_IDS_KEY] {
+            let raw = raw.clone();
+            let parsed = core_settings(move |k| (k == key).then(|| raw.clone()));
+            assert_eq!(parsed.invalid_keys, vec![key]);
+        }
+    }
+
+    #[test]
+    fn one_unusable_key_does_not_disturb_the_others() {
+        let parsed = core_settings(pairs(&[
+            ("GUILD_ID", "not-an-id"),
+            ("STAFF_ALERT_CHANNEL_ID", "700002"),
+            ("LOG_EXCLUDED_CHANNEL_IDS", "10,20"),
+            ("CORE_DB_PATH", "data/core.sqlite"),
+        ]));
+        assert_eq!(parsed.guild_id, None);
+        assert_eq!(parsed.staff_alert_channel_id, Some(700002));
+        assert_eq!(parsed.log_excluded_channel_ids, vec![10, 20]);
+        assert_eq!(parsed.core_db_path.as_deref(), Some("data/core.sqlite"));
+        assert_eq!(parsed.invalid_keys, vec![GUILD_ID_KEY]);
+    }
+
+    #[test]
+    fn every_unusable_key_gets_exactly_one_message_in_a_fixed_order() {
+        let parsed = core_settings(pairs(&[
+            ("PROTECTED_ROLE_IDS", "x"),
+            ("LOG_EXCLUDED_CATEGORY_IDS", "x"),
+            ("LOG_EXCLUDED_CHANNEL_IDS", "x"),
+            ("STAFF_ALERT_CHANNEL_ID", "x"),
+            ("GUILD_ID", "x"),
+            ("CORE_DB_PATH", ":memory:"),
+        ]));
+        assert_eq!(
+            parsed.invalid_keys,
+            vec![
+                CORE_DB_PATH_KEY,
+                GUILD_ID_KEY,
+                STAFF_ALERT_CHANNEL_ID_KEY,
+                LOG_EXCLUDED_CHANNEL_IDS_KEY,
+                LOG_EXCLUDED_CATEGORY_IDS_KEY,
+                PROTECTED_ROLE_IDS_KEY,
+            ]
+        );
+        assert_eq!(parsed.messages().len(), 6);
+    }
+
+    #[test]
+    fn debug_of_config_never_prints_the_token_with_the_new_fields_set() {
+        const TOKEN: &str = "synthetic-w1-token-must-not-print";
+        let config = Config {
+            discord_token: TOKEN.to_string(),
+            log_channel_id: 700_010,
+            age_role_1: 1,
+            age_role_2: 2,
+            reaction_role_db_path: "reaction_roles.sqlite".to_string(),
+            staff_role_id: None,
+            tickets: None,
+            ticket_archive_retention: RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+            core_db_path: Some("core-test.sqlite".to_string()),
+            guild_id: Some(700_001),
+            staff_alert_channel_id: Some(700_002),
+            log_excluded_channel_ids: vec![700_003],
+            log_excluded_category_ids: vec![700_004],
+            protected_role_ids: vec![700_005],
+            invalid_core_keys: vec![GUILD_ID_KEY],
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        for shown in [
+            "core-test.sqlite",
+            "700001",
+            "700002",
+            "700003",
+            "700004",
+            "700005",
+            "GUILD_ID",
+        ] {
+            assert!(rendered.contains(shown), "{shown} missing: {rendered}");
+        }
     }
 }
