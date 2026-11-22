@@ -11,10 +11,10 @@
 //!
 //! Security notes:
 //! * A room name is attacker-controlled text that ends up in a channel title. The
-//!   sanitiser removes mentions, invite links, URLs, control characters and
-//!   every character that renders nothing (the closed class named in
-//!   `INVISIBLE_RANGES`), so a name can never ping a role or smuggle an invite,
-//!   and it cannot hide a mention behind an invisible character.
+//!   sanitiser keeps only letters, digits, the plain space and a short set of
+//!   ASCII punctuation (an allowlist, see `is_allowed_in_name`), and removes
+//!   mentions, invite links and URLs. `@` is not in the allowlist, so a cleaned
+//!   name cannot ping anybody.
 //! * The permission overwrites of a room are the category's overwrites plus one
 //!   bounded owner overwrite. The owner rights are a compile-time constant that never
 //!   contains `MANAGE_ROLES`, `MANAGE_CHANNELS` or `ADMINISTRATOR`, so an owner
@@ -548,42 +548,104 @@ pub fn decide_rename(
     Decision::Allow
 }
 
+/// The ASCII punctuation a room name may keep, besides letters, digits and the
+/// plain ASCII space.
+///
+/// These are the marks people put in ordinary room names. None of them can form
+/// a mention (`@`, `<` and `>` are not in the set) or a URL path (`/` and `\`
+/// are not in the set).
+pub const NAME_PUNCTUATION: &str = "-_.,'!?&+()#:";
+
 /// Cleans a room name.
 ///
-/// The cleaning removes, in this order: the control and the invisible characters,
-/// the mention tokens `<@..>`, `<@&..>` and `<#..>`, the `@everyone` and `@here`
-/// words, and every link (a URL, a `www.` host, an invite link, and an invite
-/// host that was spread across spaces). What is left is trimmed, shortened to
-/// [`MAX_NAME_CHARS`] characters and, when it is empty, replaced by `default_name`.
+/// The name is cleaned with an ALLOWLIST: a character is kept only if
+/// [`is_allowed_in_name`] says so. Everything else is removed - control,
+/// format, tag, variation-selector, filler and look-alike-space characters,
+/// emoji and symbols, and every code point Unicode has not assigned yet - so
+/// the rule does not depend on a list of the characters that render nothing.
+/// The mentions and the links are removed as well, the runs of spaces are
+/// collapsed, and the result is shortened to [`MAX_NAME_CHARS`] characters.
+/// When nothing is left the cleaned `default_name` is used, and when that is
+/// empty too, [`DEFAULT_ROOM_NAME`].
 ///
-/// The invisible characters are removed FIRST, because an invisible character
-/// inside a mention would otherwise hide the mention from the mention pass and
-/// the mention would be rebuilt when the invisible character was removed. The
-/// mention pass then runs until the text stops changing, so a nested token
-/// cannot reassemble into a live token at any nesting depth.
+/// The output holds no `@`, so a cleaned name cannot ping anybody.
 pub fn sanitize_name(raw: &str, default_name: &str) -> String {
     let cleaned = clean_text(raw);
-    let cleaned = if cleaned.trim().is_empty() {
-        clean_text(default_name)
-    } else {
-        cleaned
-    };
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
-        return DEFAULT_ROOM_NAME.to_string();
+    if !cleaned.is_empty() {
+        return cleaned;
     }
-    truncate_chars(cleaned, MAX_NAME_CHARS)
+    let fallback = clean_text(default_name);
+    if !fallback.is_empty() {
+        return fallback;
+    }
+    DEFAULT_ROOM_NAME.to_string()
 }
 
-/// Removes the invisible characters, then the mentions, until the text stops
-/// changing, and finally the links.
+/// True for the characters a room name may keep: a letter or a digit
+/// (`char::is_alphanumeric`, which includes the alphabetic combining marks)
+/// other than the four Hangul fillers, the plain ASCII space, and the marks in
+/// [`NAME_PUNCTUATION`].
 ///
-/// The links come last on purpose: a mention token can hide the front of a URL,
-/// so the URL is only whole after the mentions are gone.
+/// The Hangul fillers U+115F, U+1160, U+3164 and U+FFA0 are letters (general
+/// category `Lo`) that draw nothing, so `is_alphanumeric` alone would keep
+/// them; they are excluded by name.
+pub fn is_allowed_in_name(c: char) -> bool {
+    c == ' ' || NAME_PUNCTUATION.contains(c) || (c.is_alphanumeric() && !is_hangul_filler(c))
+}
+
+/// True for the four Hangul filler letters, which draw nothing.
+fn is_hangul_filler(c: char) -> bool {
+    matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// Applies [`clean_once`] until the text stops changing.
+///
+/// One pass is not enough: removing a character can join two pieces into a
+/// host (`example.c*om`), and cutting at the cap can leave a host at the end.
+/// Running to the fixed point makes the cleaning idempotent. The loop ends
+/// because every pass returns a subsequence of its input (it only deletes
+/// characters), so a pass that changes the text makes it strictly shorter.
 fn clean_text(raw: &str) -> String {
-    let without_invisible = strip_invisible(raw);
-    let without_mentions = strip_mentions_to_fixpoint(&without_invisible);
-    strip_links(&without_mentions)
+    let mut current = raw.to_string();
+    loop {
+        let next = clean_once(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// One cleaning pass.
+///
+/// 1. Drop every character that is neither allowed nor ASCII punctuation. The
+///    ASCII punctuation (`@`, `<`, `>`, `/` and the rest) stays for now
+///    because the mention and link passes need it to recognise what to
+///    remove; nothing invisible is left that could hide a mention from them.
+/// 2. Remove the mentions until the text stops changing, then the links.
+/// 3. Drop the ASCII punctuation the allowlist does not keep (`@` included),
+///    collapse the runs of spaces, trim, and cut at [`MAX_NAME_CHARS`].
+fn clean_once(text: &str) -> String {
+    let visible: String = text
+        .chars()
+        .filter(|&c| is_allowed_in_name(c) || c.is_ascii_graphic())
+        .collect();
+    let without_mentions = strip_mentions_to_fixpoint(&visible);
+    let without_links = strip_links(&without_mentions);
+    let allowed: String = without_links
+        .chars()
+        .filter(|&c| is_allowed_in_name(c))
+        .collect();
+    let collapsed = collapse_spaces(&allowed);
+    truncate_chars(&collapsed, MAX_NAME_CHARS)
+}
+
+/// Collapses every run of spaces to one space and trims both ends.
+fn collapse_spaces(text: &str) -> String {
+    text.split(' ')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Removes the mention tokens and the `@everyone` and `@here` words, until the
@@ -593,16 +655,13 @@ fn clean_text(raw: &str) -> String {
 /// can expose another one behind it.
 ///
 /// The loop has no fixed pass count. Every pass that changes the text removes
-/// at least one character, so the text strictly shrinks and the loop always
-/// ends; the number of passes a text can need is bounded by the number of
-/// characters it has, and that bound is the one used here. A fixed pass count
-/// would be a bound the caller controls: a mention nested deeper than the
-/// count would come back as a live token.
+/// at least one character, so the text strictly shrinks and the loop ends; the
+/// number of passes a text can need is bounded by the number of characters it
+/// has, and that bound is the one used here.
 fn strip_mentions_to_fixpoint(raw: &str) -> String {
     let mut current = strip_mentions(raw);
     // Every pass that changes the text removes at least one character, so at
-    // most `len` passes can change it; one more pass proves that it has
-    // stopped changing.
+    // most `len` passes can change it; one more pass shows that it stopped.
     let bound = current.chars().count() + 1;
     for _ in 0..bound {
         let next = strip_mentions(&current);
@@ -681,143 +740,6 @@ fn mention_word_len(chars: &[char], start: usize) -> Option<usize> {
         }
     }
     None
-}
-
-/// Removes the control and the invisible characters.
-fn strip_invisible(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !c.is_control() && !is_invisible(*c))
-        .collect()
-}
-
-/// True for the characters that are invisible but still occupy a position.
-///
-/// The rule is a class rule over the ranges that render nothing, not a hand
-/// list of examples:
-///
-/// * the control characters, which `char::is_control` already covers;
-/// * the whitespace characters other than the plain ASCII space, which
-///   `char::is_whitespace` already covers (the tab and the newline are
-///   control characters and are already gone);
-/// * the **closed class** of the code points that render nothing, which
-///   [`INVISIBLE_RANGES`] names in full.
-///
-/// The plain ASCII space is kept: it separates the words of a name.
-fn is_invisible(c: char) -> bool {
-    if c == ' ' {
-        return false;
-    }
-    if c.is_whitespace() {
-        // Every other space character is a look-alike of the plain space and
-        // is removed.
-        return true;
-    }
-    is_rendering_nothing(c)
-}
-
-/// The closed class of the code points that render nothing, as ranges.
-///
-/// The class is the union of three Unicode sets:
-///
-/// * the **format characters**, the code points whose general category is
-///   `Cf`: they have no visible effect wherever they appear;
-/// * the **default ignorable** code points, the code points Unicode defines
-///   as having no visible effect. This set is NOT the same as the format
-///   characters: `DerivedCoreProperties.txt` builds it as
-///   `Other_Default_Ignorable_Code_Point + Cf + Variation_Selector`
-///   `minus White_Space minus FFF9..FFFB`, so it also holds the variation
-///   selectors, the Mongolian free variation selectors, the Khmer inherent
-///   vowels, the Hangul fillers, the reserved code points U+FFF0..U+FFF8 and
-///   the tag characters - and it does NOT hold the interlinear annotation
-///   characters U+FFF9..U+FFFB nor the Egyptian format controls
-///   U+13430..U+1343F, which are `Cf` but not default ignorable;
-/// * the **blank fillers**, the code points that occupy a position and draw
-///   nothing but belong to neither set above.
-///
-/// The union is the class, so a code point is in it if it is in ANY of the
-/// three sets. The table below is the whole class for the Unicode version
-/// named here, not a list of the examples that were thought of: a hand list
-/// left out the Mongolian free variation selectors, the shorthand format
-/// controls, the reserved part of the tag block, every format character
-/// Unicode does not make default ignorable, and the reserved default
-/// ignorables U+FFF0..U+FFF8, and those came back in a name as
-/// blank-looking text.
-///
-/// The ranges were generated from the Unicode character database files
-/// `DerivedCoreProperties.txt` (the `Default_Ignorable_Code_Point` property)
-/// and `UnicodeData.txt` (the `Cf` general category), both of **Unicode
-/// 17.0.0** - the Unicode version this crate's Rust standard library ships
-/// (`char::UNICODE_VERSION`). The table is checked by
-/// `every_character_that_renders_nothing_is_removed` (which walks every code
-/// point of every range), `the_class_holds_every_code_point_of_the_default_ignorable_set`
-/// (which pins the total) and `a_character_just_outside_the_class_survives`
-/// (which checks the edge). Those three read the production table, so they
-/// only show that the implementation agrees with itself: a range that was
-/// moved by one code point but kept its size would pass all three. The table
-/// is therefore ALSO checked against `EXPECTED_CLASS`, a second copy of the
-/// class written as raw literals that do not come from this constant.
-const INVISIBLE_RANGES: &[(u32, u32)] = &[
-    // The soft hyphen.
-    (0x00AD, 0x00AD),
-    // The combining grapheme joiner.
-    (0x034F, 0x034F),
-    // The Arabic number sign and the number marks above it.
-    (0x0600, 0x0605),
-    // The Arabic letter mark.
-    (0x061C, 0x061C),
-    // The Arabic end of ayah.
-    (0x06DD, 0x06DD),
-    // The Syriac abbreviation mark.
-    (0x070F, 0x070F),
-    // The Arabic pound and piastre marks.
-    (0x0890, 0x0891),
-    // The Arabic disputed end of ayah.
-    (0x08E2, 0x08E2),
-    // The Hangul choseong and jungseong fillers.
-    (0x115F, 0x1160),
-    // The Khmer inherent vowels.
-    (0x17B4, 0x17B5),
-    // The Mongolian free variation selectors and the vowel separator.
-    (0x180B, 0x180F),
-    // The zero-width characters.
-    (0x200B, 0x200F),
-    // The bidirectional embedding, override and isolate controls.
-    (0x202A, 0x202E),
-    // The word joiner, the invisible operators and the isolates.
-    (0x2060, 0x206F),
-    // The Braille pattern blank.
-    (0x2800, 0x2800),
-    // The Hangul filler.
-    (0x3164, 0x3164),
-    // The variation selectors.
-    (0xFE00, 0xFE0F),
-    // The byte order mark.
-    (0xFEFF, 0xFEFF),
-    // The halfwidth Hangul filler.
-    (0xFFA0, 0xFFA0),
-    // The reserved code points U+FFF0..U+FFF8 and the interlinear annotation
-    // characters U+FFF9..U+FFFB. The reserved ones are default ignorable but
-    // are NOT format characters, so they have to be named here.
-    (0xFFF0, 0xFFFB),
-    // The Kaithi number signs.
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    // The Egyptian hieroglyph format controls.
-    (0x13430, 0x1343F),
-    // The shorthand format controls.
-    (0x1BCA0, 0x1BCA3),
-    // The musical format controls.
-    (0x1D173, 0x1D17A),
-    // The tag characters, including the part Unicode reserves for more.
-    (0xE0000, 0xE0FFF),
-];
-
-/// True for the code points that render nothing.
-fn is_rendering_nothing(c: char) -> bool {
-    let cp = c as u32;
-    INVISIBLE_RANGES
-        .iter()
-        .any(|(start, end)| cp >= *start && cp <= *end)
 }
 
 /// Removes the links: URLs, `www.` hosts and invite links.
@@ -2566,10 +2488,9 @@ mod tests {
         assert_eq!(expect_deny(&decision), DenyReason::NotRoomOwner);
     }
 
-    /// The invisible set is the closed class of the code points that render
-    /// nothing, in ranges: the Unicode format characters (`Cf`), the
-    /// `Default_Ignorable_Code_Point` code points and the blank fillers.
-    /// Every one of the characters below renders nothing and must be removed.
+    /// Characters that draw nothing (format marks, a joiner, a variation
+    /// selector, Hangul fillers, the Braille blank) are outside the allowlist
+    /// and are removed.
     #[test]
     fn the_default_ignorable_characters_are_removed() {
         // U+061C ARABIC LETTER MARK, U+034F COMBINING GRAPHEME JOINER,
@@ -2592,12 +2513,12 @@ mod tests {
             let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
             assert_eq!(
                 cleaned, "party",
-                "the character {c:?} renders nothing and must be removed"
+                "the character {c:?} draws nothing and must be removed"
             );
         }
     }
 
-    /// A name made only of characters that render nothing is an empty name:
+    /// A name made only of characters that draw nothing is an empty name:
     /// it falls back to the default name instead of coming back blank.
     #[test]
     fn a_name_of_only_blank_characters_falls_back_to_the_default() {
@@ -2622,7 +2543,7 @@ mod tests {
     }
 
     /// The bidi controls and the tag characters are removed as well: they are
-    /// part of the same closed class.
+    /// not letters, digits or allowed punctuation.
     #[test]
     fn the_bidi_and_tag_characters_are_removed() {
         assert_eq!(sanitize_name("a\u{202A}b\u{202C}c", "Voice Room"), "abc");
@@ -3179,88 +3100,6 @@ mod tests {
         );
     }
 
-    /// The closed class of the characters that render nothing.
-    ///
-    /// This is the whole class, as ranges: the Unicode format characters
-    /// (`Cf`), the `Default_Ignorable_Code_Point` code points and the blank
-    /// fillers. Every code point in a range renders nothing, so every one of
-    /// them must be removed.
-    ///
-    /// This table is the production table, so a test built from it checks
-    /// that the implementation agrees with itself. That is not enough on its
-    /// own: a range that was moved by one code point but kept its size would
-    /// still pass such a test, because the walk only visits the code points
-    /// the table names and the count is unchanged. The class is therefore
-    /// also checked against a SECOND, independently written copy of it in
-    /// `EXPECTED_CLASS`, which is raw literals and does not come from the
-    /// production constant.
-    const INVISIBLE_CLASS: &[(u32, u32)] = INVISIBLE_RANGES;
-
-    /// Every code point of the closed class renders nothing, so every one of
-    /// them must be removed from a name.
-    ///
-    /// The test walks the whole class range by range: a range that the
-    /// implementation misses at its far end fails here, so the rule is a
-    /// class rule and not a list of the examples that were thought of.
-    #[test]
-    fn every_character_that_renders_nothing_is_removed() {
-        let mut checked = 0usize;
-        for &(start, end) in INVISIBLE_CLASS {
-            for cp in start..=end {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
-                checked += 1;
-                let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
-                assert_eq!(
-                    cleaned, "party",
-                    "U+{cp:04X} renders nothing and must be removed"
-                );
-            }
-        }
-        assert_eq!(
-            checked, 4207,
-            "the closed class must hold every code point of every range"
-        );
-    }
-
-    /// The class has an edge: a code point just outside a range draws
-    /// something, so it must survive.
-    ///
-    /// Without this the rule could be "remove everything", which would also
-    /// pass the test above but would eat the whole name.
-    #[test]
-    fn a_character_just_outside_the_class_survives() {
-        // The code points on both sides of every range, skipping the ones that
-        // are control characters or spaces (those are removed by the other
-        // rules, not by the invisible class).
-        let mut edges = Vec::new();
-        for &(start, end) in INVISIBLE_CLASS {
-            for cp in [start.checked_sub(1), Some(end + 1)].into_iter().flatten() {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
-                if c.is_control() || c.is_whitespace() {
-                    continue;
-                }
-                edges.push(c);
-            }
-        }
-        assert!(
-            !edges.is_empty(),
-            "the class must have edges to test against"
-        );
-        for c in edges {
-            let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
-            assert_eq!(
-                cleaned,
-                format!("par{c}ty"),
-                "U+{:04X} draws something and must survive",
-                c as u32
-            );
-        }
-    }
-
     /// A name made only of characters that render nothing is an empty name:
     /// it falls back to the default name instead of coming back blank.
     ///
@@ -3277,8 +3116,8 @@ mod tests {
         );
     }
 
-    /// A name made only of a format character from the part of the class the
-    /// earlier test did not use is an empty name too.
+    /// A name made only of shorthand format controls (U+1BCA0..U+1BCA3) is
+    /// an empty name too.
     #[test]
     fn a_name_of_only_shorthand_format_controls_falls_back_to_the_default() {
         let only_format = "\u{1BCA0}\u{1BCA1}\u{1BCA2}\u{1BCA3}";
@@ -3289,15 +3128,13 @@ mod tests {
     /// render nothing and must be removed from a name.
     ///
     /// They are `Default_Ignorable_Code_Point` but they are NOT format
-    /// characters (`Cf`): they are reserved, unassigned code points. A table
-    /// built from the format characters alone leaves them out, and then they
-    /// come back in a name as nine invisible characters.
+    /// characters (`Cf`): they are reserved, unassigned code points. The
+    /// allowlist removes them because an unassigned code point is not
+    /// alphanumeric.
     #[test]
     fn the_reserved_default_ignorables_are_removed() {
         for cp in 0xFFF0u32..=0xFFF8 {
-            let Some(c) = char::from_u32(cp) else {
-                continue;
-            };
+            let c = char::from_u32(cp).expect("U+FFF0..U+FFF8 are characters");
             assert_eq!(
                 sanitize_name(&format!("par{c}ty"), "Voice Room"),
                 "party",
@@ -3317,191 +3154,5 @@ mod tests {
             "Voice Room",
             "nine reserved default ignorables render nothing, so the name is empty"
         );
-    }
-
-    /// The class holds every code point of the whole default ignorable set.
-    ///
-    /// The count is the sum of the lengths of the ranges, so it pins the table
-    /// against the class it claims to be: a range that was dropped or
-    /// shortened changes the count and fails here.
-    #[test]
-    fn the_class_holds_every_code_point_of_the_default_ignorable_set() {
-        let counted: usize = INVISIBLE_CLASS
-            .iter()
-            .map(|&(start, end)| (end - start + 1) as usize)
-            .sum();
-        assert_eq!(
-            counted, 4207,
-            "the closed class must hold every code point of every range"
-        );
-    }
-
-    /// The class, written out as raw literals: the expected first and last
-    /// code point of each of the 26 ranges, with the code point just below
-    /// and the code point just above each range.
-    ///
-    /// This table is a SECOND copy of the class, transcribed by hand from the
-    /// Unicode 17.0.0 character database, and it does NOT come from
-    /// `INVISIBLE_RANGES`. That is the whole point of it: the other tests
-    /// build their inputs from the production constant, so they only check
-    /// that the implementation agrees with itself. A range that was moved by
-    /// one code point but kept its size passes all of them, because the walk
-    /// only ever visits the code points the table names and the count is
-    /// unchanged.
-    ///
-    /// The neighbours are `None` where the neighbour is removed by another
-    /// rule rather than by the class (the whitespace rule removes U+200A,
-    /// U+2029, U+202F and U+205F), so only the neighbours that must survive
-    /// are asserted.
-    ///
-    /// Every neighbour that IS given must be a real character, because a
-    /// neighbour that is not one cannot be asserted on at all: the tests
-    /// that walk them used to skip it, and then the end of the range it
-    /// belongs to was never checked from that side. The neighbour below the
-    /// tag range (U+E0000..U+E0FFF) is therefore U+DFFFF, the nearest
-    /// character below U+E0000 - it is in plane 13 and is NOT a surrogate.
-    /// The surrogate block is U+D800..U+DFFF, which is a different block
-    /// entirely, and U+DFFF is its LAST surrogate, so it is not a character
-    /// and cannot be used here.
-    const EXPECTED_CLASS: &[(u32, u32, Option<u32>, Option<u32>)] = &[
-        (0x00AD, 0x00AD, Some(0x00AC), Some(0x00AE)),
-        (0x034F, 0x034F, Some(0x034E), Some(0x0350)),
-        (0x0600, 0x0605, Some(0x05FF), Some(0x0606)),
-        (0x061C, 0x061C, Some(0x061B), Some(0x061D)),
-        (0x06DD, 0x06DD, Some(0x06DC), Some(0x06DE)),
-        (0x070F, 0x070F, Some(0x070E), Some(0x0710)),
-        (0x0890, 0x0891, Some(0x088F), Some(0x0892)),
-        (0x08E2, 0x08E2, Some(0x08E1), Some(0x08E3)),
-        (0x115F, 0x1160, Some(0x115E), Some(0x1161)),
-        (0x17B4, 0x17B5, Some(0x17B3), Some(0x17B6)),
-        (0x180B, 0x180F, Some(0x180A), Some(0x1810)),
-        (0x200B, 0x200F, None, Some(0x2010)),
-        (0x202A, 0x202E, None, None),
-        (0x2060, 0x206F, None, Some(0x2070)),
-        (0x2800, 0x2800, Some(0x27FF), Some(0x2801)),
-        (0x3164, 0x3164, Some(0x3163), Some(0x3165)),
-        (0xFE00, 0xFE0F, Some(0xFDFF), Some(0xFE10)),
-        (0xFEFF, 0xFEFF, Some(0xFEFE), Some(0xFF00)),
-        (0xFFA0, 0xFFA0, Some(0xFF9F), Some(0xFFA1)),
-        (0xFFF0, 0xFFFB, Some(0xFFEF), Some(0xFFFC)),
-        (0x110BD, 0x110BD, Some(0x110BC), Some(0x110BE)),
-        (0x110CD, 0x110CD, Some(0x110CC), Some(0x110CE)),
-        (0x13430, 0x1343F, Some(0x1342F), Some(0x13440)),
-        (0x1BCA0, 0x1BCA3, Some(0x1BC9F), Some(0x1BCA4)),
-        (0x1D173, 0x1D17A, Some(0x1D172), Some(0x1D17B)),
-        (0xE0000, 0xE0FFF, Some(0xDFFFF), Some(0xE1000)),
-    ];
-
-    /// The production table must BE the class, checked against a second,
-    /// independently written copy of it.
-    ///
-    /// The check is on the observable behaviour, not on a field: for every
-    /// range of the expected class, the first and the last code point are
-    /// removed from a name, and the code point just outside each end is
-    /// kept. A range that was moved by one code point but kept its size
-    /// either lets a code point of the class survive or removes a code point
-    /// that draws something, and either way this test fails.
-    #[test]
-    fn the_class_is_the_one_the_unicode_character_database_names() {
-        assert_eq!(
-            EXPECTED_CLASS.len(),
-            26,
-            "the class must hold the 26 ranges of Unicode 17.0.0"
-        );
-        let mut removed = 0usize;
-        for &(first, last, below, above) in EXPECTED_CLASS {
-            for cp in [first, last] {
-                let c = char::from_u32(cp).unwrap_or_else(|| {
-                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
-                });
-                removed += 1;
-                assert_eq!(
-                    sanitize_name(&format!("par{c}ty"), "Voice Room"),
-                    "party",
-                    "U+{cp:04X} renders nothing and must be removed"
-                );
-            }
-            for cp in [below, above].into_iter().flatten() {
-                let c = char::from_u32(cp).unwrap_or_else(|| {
-                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
-                });
-                assert_eq!(
-                    sanitize_name(&format!("par{c}ty"), "Voice Room"),
-                    format!("par{c}ty"),
-                    "U+{cp:04X} draws something and must survive"
-                );
-            }
-        }
-        assert_eq!(
-            removed, 52,
-            "every range has a first and a last code point to check"
-        );
-    }
-
-    /// The production table must hold exactly the ranges of the expected
-    /// class: no range is missing, none is extra, and every range starts and
-    /// ends where the expected one does.
-    ///
-    /// This is the direct check on the table, so a range that was shifted or
-    /// dropped is caught here even when the count stays the same.
-    #[test]
-    fn the_production_table_is_the_expected_class() {
-        let mut expected: Vec<(u32, u32)> =
-            EXPECTED_CLASS.iter().map(|&(f, l, _, _)| (f, l)).collect();
-        expected.sort_unstable();
-        let mut actual: Vec<(u32, u32)> = INVISIBLE_CLASS.to_vec();
-        actual.sort_unstable();
-        assert_eq!(
-            actual, expected,
-            "the production table must be exactly the 26 ranges of the class"
-        );
-    }
-
-    /// The code point just outside each range of the expected class must
-    /// survive on its own, not only inside a word.
-    ///
-    /// The word test above could pass for a code point that the class
-    /// removes only when it is between two letters, so this test pins the
-    /// code point alone as well.
-    ///
-    /// A neighbour that is not a character at all is a FAILURE here, not a
-    /// skip: the tests above used `let ... else { continue }`, so a neighbour
-    /// that is not a char was silently skipped and the check below that end
-    /// of the range never ran. A surrogate (U+D800..U+DFFF are not
-    /// characters) is exactly such a neighbour, and it hid the check below
-    /// the tag range.
-    #[test]
-    fn a_code_point_just_outside_the_expected_class_survives_on_its_own() {
-        for &(_, _, below, above) in EXPECTED_CLASS {
-            for cp in [below, above].into_iter().flatten() {
-                let c = char::from_u32(cp).unwrap_or_else(|| {
-                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
-                });
-                assert_eq!(
-                    sanitize_name(&format!("a{c}b"), "Voice Room"),
-                    format!("a{c}b"),
-                    "U+{cp:04X} draws something and must survive"
-                );
-            }
-        }
-    }
-
-    /// Every neighbour of the expected class must be a real character.
-    ///
-    /// A neighbour that is not a character cannot be asserted on: the tests
-    /// that walk the neighbours skip it, so the end of the range it belongs
-    /// to is never checked from that side. This test makes such a neighbour
-    /// a failure, so the table cannot carry one again.
-    #[test]
-    fn every_neighbour_of_the_expected_class_is_a_character() {
-        for &(first, last, below, above) in EXPECTED_CLASS {
-            for cp in [below, above].into_iter().flatten() {
-                assert!(
-                    char::from_u32(cp).is_some(),
-                    "U+{cp:05X} (below/above the range {first:05X}..{last:05X}) is not a \
-                     character, so the check from that side of the range never runs"
-                );
-            }
-        }
     }
 }
