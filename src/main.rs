@@ -4,6 +4,7 @@ mod bump;
 mod config;
 mod deletion_attribution;
 mod embeds;
+mod features;
 mod flash;
 mod jobs;
 mod preflight;
@@ -55,7 +56,12 @@ struct Data {
     message_cache: Arc<RwLock<HashMap<serenity::MessageId, CachedMessage>>>,
     rr_db: Arc<Connection>,
     tickets: Option<tickets::repository::Repository>,
+    features: Arc<AppFeatures>,
+    log_exclusion: features::LogExclusion,
 }
+
+/// The feature registry as the running bot uses it.
+type AppFeatures = features::Features<serenity::Context, Data>;
 
 #[derive(Clone)]
 struct CachedMessage {
@@ -641,6 +647,386 @@ mod tests {
         ))
         .await;
         assert_eq!(runs, 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // W1: feature dispatch, guild filter and log exclusions on the real
+    // routing seam (`route_event`), with synthetic ids only.
+    // ---------------------------------------------------------------------
+
+    const W1_GUILD: u64 = 700_001;
+    const W1_OTHER_GUILD: u64 = 700_002;
+    const W1_PLAIN: u64 = 710_001;
+    const W1_EXCLUDED: u64 = 710_002;
+    const W1_IN_EXCLUDED_CATEGORY: u64 = 710_003;
+    const W1_EXCLUDED_CATEGORY: u64 = 720_001;
+
+    struct W1Lookup(HashMap<u64, tickets::privacy::Lookup>);
+
+    impl W1Lookup {
+        fn new() -> Self {
+            use tickets::privacy::Lookup::Guild;
+            let mut m = HashMap::new();
+            m.insert(W1_PLAIN, Guild { parent: None });
+            m.insert(W1_EXCLUDED, Guild { parent: None });
+            m.insert(
+                W1_IN_EXCLUDED_CATEGORY,
+                Guild {
+                    parent: Some(W1_EXCLUDED_CATEGORY),
+                },
+            );
+            m.insert(W1_EXCLUDED_CATEGORY, Guild { parent: None });
+            W1Lookup(m)
+        }
+    }
+
+    impl tickets::privacy::ChannelLookup for W1Lookup {
+        async fn lookup(&self, channel: serenity::ChannelId) -> tickets::privacy::Lookup {
+            self.0
+                .get(&channel.get())
+                .copied()
+                .unwrap_or(tickets::privacy::Lookup::Unknown)
+        }
+    }
+
+    /// A feature that only records that dispatch reached it.
+    struct Trace(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl features::Feature<(), Data> for Trace {
+        fn name(&self) -> &'static str {
+            "trace"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a (),
+            _event: &'a serenity::FullEvent,
+            _data: &'a Data,
+            _guild: Option<u64>,
+            _core_db: Option<&'a Connection>,
+        ) -> jobs::runner::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push("dispatch");
+            })
+        }
+    }
+
+    fn w1_settings(guild: features::GuildFilter) -> features::Settings {
+        features::Settings {
+            guild,
+            core_db_path: None,
+            reserved_db_paths: vec![],
+            staff_alert_channel: None,
+            protected_role_count: 0,
+            log_excluded_channels: 0,
+            log_excluded_categories: 0,
+        }
+    }
+
+    async fn w1_features(
+        guild: features::GuildFilter,
+        order: &Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> features::Features<(), Data> {
+        let settings = w1_settings(guild);
+        features::Features::start(
+            features::StartRequest {
+                features: vec![Box::new(Trace(order.clone()))],
+                settings: &settings,
+            },
+            &features::TokioJobStarter,
+        )
+        .await
+    }
+
+    async fn w1_data() -> Data {
+        let settings = w1_settings(features::GuildFilter::Any);
+        let no_features = features::Features::<serenity::Context, Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &settings,
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        Data {
+            config: Arc::new(Config {
+                discord_token: "synthetic-token".to_string(),
+                log_channel_id: 700_010,
+                age_role_1: 1,
+                age_role_2: 2,
+                reaction_role_db_path: "reaction-test.sqlite".to_string(),
+                staff_role_id: None,
+                tickets: None,
+                ticket_archive_retention: tickets::retention::RetentionPolicy::Disabled,
+                ticket_privacy_lockdown: false,
+                core_db_path: None,
+                guild_id: None,
+                staff_alert_channel_id: None,
+                log_excluded_channel_ids: vec![],
+                log_excluded_category_ids: vec![],
+                protected_role_ids: vec![],
+                invalid_core_keys: vec![],
+            }),
+            message_cache: Arc::new(RwLock::new(HashMap::new())),
+            rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
+            tickets: None,
+            features: Arc::new(no_features),
+            log_exclusion: features::LogExclusion::Off,
+        }
+    }
+
+    fn w1_scope() -> features::LogExclusion {
+        features::LogExclusion::Scope(privacy_scope::Scope::new(
+            vec![W1_EXCLUDED],
+            vec![W1_EXCLUDED_CATEGORY],
+            vec![],
+        ))
+    }
+
+    /// Routes `event` through the real `route_event`; the sink is the real cache
+    /// insert for a message-create event, and records its order.
+    async fn w1_route(
+        features: &features::Features<(), Data>,
+        data: &Data,
+        exclusion: &features::LogExclusion,
+        lockdown: bool,
+        event: &serenity::FullEvent,
+        order: &Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        let lookup = W1Lookup::new();
+        route_event(
+            Route {
+                features,
+                ctx: &(),
+                data,
+                event,
+                lookup: &lookup,
+                exclusion,
+                ticket_lockdown: lockdown,
+                ticket_settings: None,
+                ticket_repo: None,
+            },
+            || async {
+                order.lock().unwrap().push("sink");
+                if let serenity::FullEvent::Message { new_message } = event {
+                    insert_cache(
+                        data,
+                        new_message.id,
+                        cached_message_from_message(new_message),
+                    )
+                    .await;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn w1_events(ch: u64) -> Vec<serenity::FullEvent> {
+        vec![
+            synthetic_message(ch, Some(W1_GUILD)),
+            synthetic_update(ch, Some(W1_GUILD)),
+            synthetic_delete(ch, Some(W1_GUILD)),
+            synthetic_bulk_delete(ch, Some(W1_GUILD)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn with_everything_off_a_message_is_cached_and_logged_as_before() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let none = features::Features::<(), Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &w1_settings(features::GuildFilter::Any),
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        let data = w1_data().await;
+        for event in w1_events(W1_PLAIN) {
+            w1_route(
+                &none,
+                &data,
+                &features::LogExclusion::Off,
+                false,
+                &event,
+                &order,
+            )
+            .await;
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["sink"; 4],
+            "every event reaches the logger"
+        );
+        assert_eq!(
+            data.message_cache.read().await.len(),
+            1,
+            "the message was cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_runs_before_the_guard_and_before_the_logger() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let f = w1_features(features::GuildFilter::Any, &order).await;
+        let data = w1_data().await;
+        let event = synthetic_message(W1_PLAIN, Some(W1_GUILD));
+        w1_route(
+            &f,
+            &data,
+            &features::LogExclusion::Off,
+            false,
+            &event,
+            &order,
+        )
+        .await;
+        assert_eq!(*order.lock().unwrap(), vec!["dispatch", "sink"]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_still_runs_when_the_guard_skips_and_never_touches_the_message_cache() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let f = w1_features(features::GuildFilter::Any, &order).await;
+        let data = w1_data().await;
+        // Ticket lockdown without settings: the real guard skips message events.
+        let event = synthetic_message(W1_PLAIN, Some(W1_GUILD));
+        w1_route(
+            &f,
+            &data,
+            &features::LogExclusion::Off,
+            true,
+            &event,
+            &order,
+        )
+        .await;
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["dispatch"],
+            "dispatch ran, the logger did not"
+        );
+        assert!(
+            data.message_cache.read().await.is_empty(),
+            "nothing was cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_channels_and_categories_are_never_cached_or_logged() {
+        let data = w1_data().await;
+        let none = w1_features(
+            features::GuildFilter::Any,
+            &Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+        .await;
+        for ch in [W1_EXCLUDED, W1_IN_EXCLUDED_CATEGORY] {
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for event in w1_events(ch) {
+                w1_route(&none, &data, &w1_scope(), false, &event, &order).await;
+            }
+            assert!(
+                !order.lock().unwrap().contains(&"sink"),
+                "channel {ch}: no create, edit, delete or bulk delete may reach the logger"
+            );
+            assert!(
+                data.message_cache.read().await.is_empty(),
+                "channel {ch}: nothing cached"
+            );
+        }
+        // The same events in a channel that is not excluded are unchanged.
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for event in w1_events(W1_PLAIN) {
+            w1_route(&none, &data, &w1_scope(), false, &event, &order).await;
+        }
+        let sinks = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| **s == "sink")
+            .count();
+        assert_eq!(sinks, 4);
+        assert_eq!(data.message_cache.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_excluded_channel_still_reaches_feature_dispatch() {
+        // Exclusions are a logging rule: they must not blind the features.
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let f = w1_features(features::GuildFilter::Any, &order).await;
+        let data = w1_data().await;
+        let event = synthetic_message(W1_EXCLUDED, Some(W1_GUILD));
+        w1_route(&f, &data, &w1_scope(), false, &event, &order).await;
+        assert_eq!(*order.lock().unwrap(), vec!["dispatch"]);
+    }
+
+    #[tokio::test]
+    async fn the_stricter_of_the_ticket_guard_and_the_exclusion_wins() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let none = w1_features(
+            features::GuildFilter::Any,
+            &Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+        .await;
+        let data = w1_data().await;
+        let event = synthetic_message(W1_PLAIN, Some(W1_GUILD));
+        // Ticket guard skips (lockdown, no settings), exclusion allows: skipped.
+        w1_route(&none, &data, &w1_scope(), true, &event, &order).await;
+        assert!(order.lock().unwrap().is_empty());
+        // Ticket guard allows, exclusion skips: skipped.
+        let excluded = synthetic_message(W1_EXCLUDED, Some(W1_GUILD));
+        w1_route(&none, &data, &w1_scope(), false, &excluded, &order).await;
+        assert!(order.lock().unwrap().is_empty());
+        // An unreadable exclusion list blocks messages but not other events.
+        w1_route(
+            &none,
+            &data,
+            &features::LogExclusion::BlockMessages,
+            false,
+            &event,
+            &order,
+        )
+        .await;
+        assert!(order.lock().unwrap().is_empty());
+        let voice = synthetic_voice(Some(W1_GUILD));
+        w1_route(
+            &none,
+            &data,
+            &features::LogExclusion::BlockMessages,
+            false,
+            &voice,
+            &order,
+        )
+        .await;
+        assert_eq!(*order.lock().unwrap(), vec!["sink"]);
+    }
+
+    #[tokio::test]
+    async fn an_event_from_another_guild_is_ignored_by_dispatch_but_still_logged() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let f = w1_features(features::GuildFilter::Only(W1_GUILD), &order).await;
+        let data = w1_data().await;
+        let foreign = synthetic_message(W1_PLAIN, Some(W1_OTHER_GUILD));
+        w1_route(
+            &f,
+            &data,
+            &features::LogExclusion::Off,
+            false,
+            &foreign,
+            &order,
+        )
+        .await;
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["sink"],
+            "GUILD_ID filters features, not the logger"
+        );
+        order.lock().unwrap().clear();
+        let own = synthetic_message(W1_PLAIN, Some(W1_GUILD));
+        w1_route(&f, &data, &features::LogExclusion::Off, false, &own, &order).await;
+        assert_eq!(*order.lock().unwrap(), vec!["dispatch", "sink"]);
     }
 }
 
@@ -1566,19 +1952,59 @@ async fn event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<(), Error> {
-    // Fail-closed private-scope guard: ALL cache insertion / log construction runs inside the
-    // sink, which is only invoked when the guard allows the event.
-    tickets::privacy::guarded(
-        data.config.ticket_privacy_lockdown,
-        data.config.tickets.as_ref(),
-        data.tickets.as_ref(),
-        event,
-        &tickets::privacy::SerenityLookup(ctx),
-        &tickets::privacy::COUNTERS,
+    route_event(
+        Route {
+            features: &data.features,
+            ctx,
+            data,
+            event,
+            lookup: &tickets::privacy::SerenityLookup(ctx),
+            exclusion: &data.log_exclusion,
+            ticket_lockdown: data.config.ticket_privacy_lockdown,
+            ticket_settings: data.config.tickets.as_ref(),
+            ticket_repo: data.tickets.as_ref(),
+        },
         || log_event(ctx, event, data),
     )
     .await
-    .unwrap_or(Ok(()))
+}
+
+/// Everything `route_event` needs besides the log sink.
+struct Route<'a, X, D, L> {
+    features: &'a features::Features<X, D>,
+    ctx: &'a X,
+    data: &'a D,
+    event: &'a serenity::FullEvent,
+    lookup: &'a L,
+    exclusion: &'a features::LogExclusion,
+    ticket_lockdown: bool,
+    ticket_settings: Option<&'a tickets::policy::Settings>,
+    ticket_repo: Option<&'a tickets::repository::Repository>,
+}
+
+/// Routes one event: feature dispatch first, then the guarded logger.
+///
+/// STUB for the RED commit: only the sink runs.
+async fn route_event<X, D, L, F, Fut>(route: Route<'_, X, D, L>, sink: F) -> Result<(), Error>
+where
+    X: Sync + 'static,
+    D: Sync + 'static,
+    L: tickets::privacy::ChannelLookup,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    let _ = (
+        route.features,
+        route.ctx,
+        route.data,
+        route.event,
+        route.lookup,
+        route.exclusion,
+        route.ticket_lockdown,
+        route.ticket_settings,
+        route.ticket_repo,
+    );
+    sink().await
 }
 
 async fn log_event(
@@ -2949,6 +3375,9 @@ async fn main() -> Result<(), Error> {
 
     let config = Arc::new(Config::from_env()?);
     let token = config.discord_token.clone();
+    // Filled by `setup` once the feature registry is built, so shutdown can stop its runner.
+    let features_slot: Arc<std::sync::OnceLock<Arc<AppFeatures>>> =
+        Arc::new(std::sync::OnceLock::new());
 
     let intents = serenity::GatewayIntents::GUILDS
         | serenity::GatewayIntents::GUILD_MEMBERS
@@ -2972,8 +3401,10 @@ async fn main() -> Result<(), Error> {
         })
         .setup({
             let config = config.clone();
+            let features_slot = features_slot.clone();
             move |ctx, ready, framework| {
                 let config = config.clone();
+                let features_slot = features_slot.clone();
                 Box::pin(async move {
                     println!("Bot is online as {}", ready.user.name);
 
@@ -2993,11 +3424,30 @@ async fn main() -> Result<(), Error> {
                     }
                     if config.ticket_privacy_lockdown { println!("Ticket privacy lockdown: channel events in private ticket scope are skipped fail-closed; ticket opening remains gated."); }
 
+                    let feature_settings = features::Settings::from_config(&config);
+                    println!("{}", feature_settings.summary());
+                    let features = Arc::new(
+                        AppFeatures::start(
+                            features::StartRequest {
+                                features: features::production_features(),
+                                settings: &feature_settings,
+                            },
+                            &features::TokioJobStarter,
+                        )
+                        .await,
+                    );
+                    for line in features.lines() {
+                        println!("{line}");
+                    }
+                    let _ = features_slot.set(features.clone());
+
                     Ok(Data {
+                        log_exclusion: features::LogExclusion::from_config(&config),
                         config,
                         message_cache: Arc::new(RwLock::new(HashMap::new())),
                         rr_db,
                         tickets,
+                        features,
                     })
                 })
             }
@@ -3008,7 +3458,12 @@ async fn main() -> Result<(), Error> {
         .framework(framework)
         .await?;
 
-    client.start().await?;
+    let outcome = client.start().await;
+    // Stop the job runner (if one was started) before the process leaves.
+    if let Some(features) = features_slot.get() {
+        features.stop().await;
+    }
+    outcome?;
 
     Ok(())
 }
