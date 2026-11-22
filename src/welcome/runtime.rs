@@ -251,6 +251,12 @@ pub trait MessageSender {
 /// Reports a failure to the staff alert channel.
 ///
 /// The alert carries a stable code only, never message text, a name or an id.
+///
+/// The runtime reports EVERY distinct failure code of a join exactly once:
+/// a failed role grant (the executor's own codes), a policy denial of a
+/// configured join role, `facts_unavailable` for a role the lookup could not
+/// resolve, and a message that could not be sent. Flooding across many
+/// joins is the wiring card's alerter to handle, not this trait's.
 pub trait StaffAlerter {
     fn alert(&mut self, channel_id: u64, code: &str);
 }
@@ -268,6 +274,19 @@ pub enum MessageOutcome {
     Failed(&'static str),
 }
 
+/// The role part of one join.
+///
+/// It holds the executor's results and the codes that must reach the staff
+/// alert channel. The codes are the distinct ones: a join with three roles
+/// failing for the same reason carries that code once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolePart {
+    /// One result per requested join role, in request order.
+    results: Vec<RoleResult>,
+    /// The distinct codes that must be reported to the staff alert channel.
+    alerts: Vec<&'static str>,
+}
+
 /// What the runtime did for one join.
 ///
 /// Every item keeps its own outcome: a later failure never overwrites an
@@ -280,7 +299,11 @@ pub struct JoinOutcome {
     pub role_results: Vec<RoleResult>,
     /// What happened to the welcome message.
     pub message: Option<MessageOutcome>,
-    /// The stable codes that were reported to the staff alert channel.
+    /// The distinct stable codes that were reported to the staff alert
+    /// channel, in the order they were reported.
+    ///
+    /// Every code here reached the alerter: the outcome never carries a code
+    /// that was not reported.
     pub alerts: Vec<&'static str>,
     /// The structured would-do record of a shadow run.
     pub would_do: Option<WouldDo>,
@@ -521,12 +544,8 @@ where
 
         // The roles: the role service decides, the grant executor writes. A
         // failure here is reported, and the message is still posted.
-        outcome.role_results = self.grant_roles(facts, &actions).await;
-        for result in &outcome.role_results {
-            if let crate::roles::grant::RoleOutcome::Failed(code) = result.outcome {
-                outcome.alerts.push(code.code());
-            }
-        }
+        let mut role_part = self.grant_roles(facts, &actions).await;
+        outcome.role_results = role_part.results;
 
         // The message: rendered from the template and posted to the channel. A
         // failure here is reported, and the roles stay granted.
@@ -543,9 +562,20 @@ where
             Err(error) => {
                 let code = error.code();
                 outcome.message = Some(MessageOutcome::Failed(code));
-                outcome.alerts.push(code);
-                self.report(code);
+                role_part.alerts.push(code);
             }
+        }
+
+        // EVERY distinct failure code of this join reaches the staff alert
+        // channel, once per code: a failed grant, a policy denial, a role the
+        // lookup could not resolve and a message that could not be sent. The
+        // codes are stable and carry no name, no id and no message text.
+        for code in role_part.alerts {
+            if outcome.alerts.contains(&code) {
+                continue;
+            }
+            outcome.alerts.push(code);
+            self.report(code);
         }
 
         outcome
@@ -554,23 +584,27 @@ where
     /// The role part of a join: the policy decides, the executor writes.
     ///
     /// One result per requested join role, in request order.
-    async fn grant_roles(&mut self, facts: &JoinFacts, actions: &JoinActions) -> Vec<RoleResult> {
+    async fn grant_roles(&mut self, facts: &JoinFacts, actions: &JoinActions) -> RolePart {
         let roles = match self.source.roles(facts.guild_id).await {
             Ok(roles) => roles,
             Err(_) => {
                 // The guild's roles could not be looked up: no role may be
-                // granted, and the reason stays visible.
-                return actions
-                    .grant_role_ids
-                    .iter()
-                    .map(|role_id| RoleResult {
-                        role_id: *role_id,
-                        outcome: crate::roles::grant::RoleOutcome::Denied(
-                            crate::roles::eligibility::DenyReason::RoleDeleted,
-                        ),
-                        writer_calls: 0,
-                    })
-                    .collect();
+                // granted and the reason stays visible. The code is
+                // `facts_unavailable`, not a guess that the roles are gone.
+                return RolePart {
+                    results: actions
+                        .grant_role_ids
+                        .iter()
+                        .map(|role_id| RoleResult {
+                            role_id: *role_id,
+                            outcome: crate::roles::grant::RoleOutcome::Denied(
+                                crate::roles::eligibility::DenyReason::RoleDeleted,
+                            ),
+                            writer_calls: 0,
+                        })
+                        .collect(),
+                    alerts: vec![CODE_FACTS_UNAVAILABLE],
+                };
             }
         };
         let bot_roles = self
@@ -596,7 +630,16 @@ where
             decisions.push((*role_id, decision));
         }
         // A role whose facts could not be looked up is left out of the request,
-        // so the executor can never write it.
+        // so the executor can never write it. Its code is still reported: the
+        // caller is the one that tells the staff channel.
+        let mut alerts: Vec<&'static str> = Vec::new();
+        for (_, decision) in &decisions {
+            if let Some(code) = decision.deny_code() {
+                if !alerts.contains(&code) {
+                    alerts.push(code);
+                }
+            }
+        }
         let items: Vec<GrantItem> =
             crate::roles::runtime::grant_items(&decisions, &facts.member_role_ids);
         let request = GrantRequest {
@@ -604,7 +647,19 @@ where
             items: &items,
         };
         let report = crate::roles::grant::apply(&mut self.writer, &mut self.sleeper, &request);
-        report.results
+        // A failed write has its own code, which is reported as well.
+        for result in &report.results {
+            if let crate::roles::grant::RoleOutcome::Failed(code) = result.outcome {
+                let code = code.code();
+                if !alerts.contains(&code) {
+                    alerts.push(code);
+                }
+            }
+        }
+        RolePart {
+            results: report.results,
+            alerts,
+        }
     }
 
     /// The shadow run: nothing is sent, nothing is granted, only a record.
@@ -1315,8 +1370,14 @@ mod tests {
     // ---- the alert rules ----------------------------------------------------
 
     /// The codes the alerter observed, without the channel id.
-    fn alerted(rt: &WelcomeRuntime<FakeSource, FakeWriter, FakeSleeper, FakeSender, FakeAlerter>) -> Vec<String> {
-        rt.alerter.alerts.iter().map(|(_, code)| code.clone()).collect()
+    fn alerted(
+        rt: &WelcomeRuntime<FakeSource, FakeWriter, FakeSleeper, FakeSender, FakeAlerter>,
+    ) -> Vec<String> {
+        rt.alerter
+            .alerts
+            .iter()
+            .map(|(_, code)| code.clone())
+            .collect()
     }
 
     #[tokio::test]
@@ -1556,8 +1617,11 @@ mod tests {
         );
         let outcome = rt.handle_join(&facts(false)).await;
         // The outcome carries what the alerter observed, in the same order.
-        let outcome_codes: Vec<String> =
-            outcome.alerts.iter().map(|code| (*code).to_string()).collect();
+        let outcome_codes: Vec<String> = outcome
+            .alerts
+            .iter()
+            .map(|code| (*code).to_string())
+            .collect();
         assert_eq!(outcome_codes, alerted(&rt));
     }
 

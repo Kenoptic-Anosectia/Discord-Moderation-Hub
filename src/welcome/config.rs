@@ -65,12 +65,23 @@ pub enum RawValue {
     NotUnicode,
 }
 
-/// Reads one key as text.
+/// Reads one key and names it invalid when its value is not valid Unicode.
 ///
-/// A value that is not valid Unicode is not usable: the caller reports the key
-/// as invalid. The value itself is never kept.
-fn read_text(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Option<String> {
-    lookup(key).and_then(|raw| raw.into_string().ok())
+/// The value itself is never kept: a key that holds one is dropped and only
+/// its name is reported.
+fn read_usable(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+    key: &'static str,
+    invalid_keys: &mut Vec<&'static str>,
+) -> Option<String> {
+    match classify(lookup(key)) {
+        RawValue::Unset => None,
+        RawValue::Text(text) => Some(text),
+        RawValue::NotUnicode => {
+            invalid_keys.push(key);
+            None
+        }
+    }
 }
 
 /// Classifies one raw value.
@@ -82,7 +93,7 @@ fn classify(raw: Option<OsString>) -> RawValue {
         None => RawValue::Unset,
         Some(value) => match value.to_str() {
             Some(text) => RawValue::Text(text.to_string()),
-            None => RawValue::Unset,
+            None => RawValue::NotUnicode,
         },
     }
 }
@@ -97,10 +108,13 @@ fn classify(raw: Option<OsString>) -> RawValue {
 pub fn parse(lookup: impl Fn(&str) -> Option<OsString>) -> WelcomeConfig {
     let mut invalid_keys: Vec<&'static str> = Vec::new();
 
-    let mode = settings::parse_mode(KEY_MODE, read_text(&lookup, KEY_MODE).as_deref())
-        .unwrap_or(Mode::Off);
+    let mode = settings::parse_mode(
+        KEY_MODE,
+        read_usable(&lookup, KEY_MODE, &mut invalid_keys).as_deref(),
+    )
+    .unwrap_or(Mode::Off);
 
-    let channel_id = match read_text(&lookup, KEY_CHANNEL_ID) {
+    let channel_id = match read_usable(&lookup, KEY_CHANNEL_ID, &mut invalid_keys) {
         None => None,
         Some(text) => {
             let trimmed = text.trim();
@@ -119,7 +133,7 @@ pub fn parse(lookup: impl Fn(&str) -> Option<OsString>) -> WelcomeConfig {
         }
     };
 
-    let template_path = match read_text(&lookup, KEY_TEMPLATE_PATH) {
+    let template_path = match read_usable(&lookup, KEY_TEMPLATE_PATH, &mut invalid_keys) {
         None => None,
         Some(text) => {
             let trimmed = text.trim();
@@ -144,7 +158,7 @@ pub fn parse(lookup: impl Fn(&str) -> Option<OsString>) -> WelcomeConfig {
 
     let join_role_ids = match settings::parse_id_list(
         KEY_JOIN_ROLE_IDS,
-        read_text(&lookup, KEY_JOIN_ROLE_IDS).as_deref(),
+        read_usable(&lookup, KEY_JOIN_ROLE_IDS, &mut invalid_keys).as_deref(),
     ) {
         Ok(ids) => ids,
         Err(_) => {
