@@ -38,7 +38,9 @@
 use crate::roles::eligibility::{
     decide_removal, Decision, GrantPath, GrantRequest, RoleFacts, SafewordState,
 };
-use crate::roles::runtime::{self as roles_facts, decide_from_facts, DecisionInputs, RuntimeDecision};
+use crate::roles::runtime::{
+    self as roles_facts, decide_from_facts, DecisionInputs, RuntimeDecision,
+};
 use crate::safeword::config::SafewordConfig;
 use crate::safeword::state::{
     restart_action, step, Action, Context, DmKind, Event, FailureCode, RestartAction, RoleId, State,
@@ -276,7 +278,8 @@ pub trait StaffAlerter {
 /// The durable safeword state (SW2's repository behind a trait).
 pub trait StateStore {
     /// Load one member's state and its version. `Ok(None)` means no row.
-    fn load(&mut self, guild_id: u64, member_id: u64) -> Result<Option<(State, u64)>, &'static str>;
+    fn load(&mut self, guild_id: u64, member_id: u64)
+        -> Result<Option<(State, u64)>, &'static str>;
     /// Compare-and-swap write. Returns the new version.
     fn store(
         &mut self,
@@ -449,9 +452,44 @@ pub fn handle_reaction(
     ops: &mut Ops,
     shadow: &mut ShadowRecord,
 ) -> Outcome {
-    // STUB (RED): the behaviour is not implemented yet.
-    let _ = (config, event, now, ops, shadow);
-    Outcome::NoWork
+    let decision = decide_reaction(config, event);
+    let member_id = match decision {
+        ReactionDecision::Ignore(_) => {
+            shadow.ignored = shadow.ignored.saturating_add(1);
+            return Outcome::Ignored;
+        }
+        ReactionDecision::Activate(member) | ReactionDecision::Release(member) => member,
+    };
+
+    if config.mode == crate::settings::Mode::Shadow {
+        // Shadow performs nothing: no read of the live state, no write.
+        match decision {
+            ReactionDecision::Activate(_) => shadow.activates = shadow.activates.saturating_add(1),
+            ReactionDecision::Release(_) => shadow.releases = shadow.releases.saturating_add(1),
+            ReactionDecision::Ignore(_) => {}
+        }
+        shadow.role_removals = shadow
+            .role_removals
+            .saturating_add(config.restricted_role_ids.len() as u32);
+        shadow.role_adds = shadow.role_adds.saturating_add(1);
+        shadow.dms = shadow.dms.saturating_add(u32::from(config.dm));
+        return Outcome::NoWork;
+    }
+
+    let machine_event = match decision {
+        ReactionDecision::Activate(_) => Event::ReactionAdded,
+        ReactionDecision::Release(_) => Event::ReactionRemoved,
+        ReactionDecision::Ignore(_) => unreachable!("ignored above"),
+    };
+    drive(
+        config,
+        event.guild_id,
+        member_id,
+        machine_event,
+        now,
+        ops,
+        shadow,
+    )
 }
 
 /// Feed one event to the state machine and execute what it emits.
@@ -488,16 +526,7 @@ fn drive(
 
     let (next, actions) = step(&state, machine_event, &context);
     run_actions(
-        config,
-        guild_id,
-        member_id,
-        next,
-        actions,
-        context,
-        version,
-        now,
-        ops,
-        shadow,
+        config, guild_id, member_id, next, actions, context, version, now, ops, shadow,
     )
 }
 
@@ -587,11 +616,7 @@ fn run_actions(
 }
 
 /// Load a member's state and version. `Ok(None)` means "no row".
-fn load_state(
-    ops: &mut Ops,
-    guild_id: u64,
-    member_id: u64,
-) -> Result<(State, u64), &'static str> {
+fn load_state(ops: &mut Ops, guild_id: u64, member_id: u64) -> Result<(State, u64), &'static str> {
     match ops.store.load(guild_id, member_id) {
         Ok(Some((state, version))) => Ok((state, version)),
         Ok(None) => Ok((State::Inactive, 0)),
@@ -640,10 +665,7 @@ fn perform(
             // The snapshot that is stored is the machine's own snapshot: the
             // runtime never builds a second one, so a replayed add can never
             // overwrite it.
-            match ops
-                .store
-                .store(guild_id, member_id, state, *version, now)
-            {
+            match ops.store.store(guild_id, member_id, state, *version, now) {
                 Ok(new_version) => {
                     *version = new_version;
                     StepOutcome::Done
@@ -657,9 +679,7 @@ fn perform(
         Action::RemoveRoles(roles) => remove_roles(guild_id, member_id, roles, ops, shadow),
         Action::AddSafewordRole => add_role(guild_id, member_id, config.role_id, ops, shadow),
         Action::SendDm(kind) => send_dm(config, member_id, *kind, ops),
-        Action::RemoveSafewordRole => {
-            remove_role(guild_id, member_id, config.role_id, ops, shadow)
-        }
+        Action::RemoveSafewordRole => remove_role(guild_id, member_id, config.role_id, ops, shadow),
         Action::RestoreRoles(roles) => restore_roles(guild_id, member_id, roles, ops, shadow),
         Action::ClearSnapshot => match ops.store.clear(guild_id, member_id, *version, now) {
             Ok(new_version) => {
@@ -863,9 +883,7 @@ fn grant_decision(guild_id: u64, role_id: RoleId, ops: &mut Ops) -> GrantDecisio
     };
     match decide_from_facts(facts, role_id, &inputs) {
         RuntimeDecision::Decided(Decision::Allow) => GrantDecision::Allow,
-        RuntimeDecision::Decided(Decision::Deny(reason)) => {
-            GrantDecision::Denied(reason.code())
-        }
+        RuntimeDecision::Decided(Decision::Deny(reason)) => GrantDecision::Denied(reason.code()),
         RuntimeDecision::Unavailable => GrantDecision::Denied(CODE_FACTS_UNAVAILABLE),
     }
 }
@@ -1008,9 +1026,52 @@ pub fn reconcile(
     max_pages: u32,
     ops: &mut Ops,
 ) -> ReconcileReport {
-    // STUB (RED): the behaviour is not implemented yet.
-    let _ = (config, guild_id, now, max_pages, ops);
-    ReconcileReport::default()
+    let mut report = ReconcileReport::default();
+
+    let reacting = match collect_reaction_users(config, max_pages, ops, &mut report) {
+        Some(users) => users,
+        None => return report,
+    };
+
+    let stored = match ops.store.members_with_state(guild_id) {
+        Ok(members) => members,
+        Err(code) => {
+            // Without the stored members the reconcile cannot find the members
+            // that must be released. It reports and does nothing.
+            report.push(code);
+            report.failed = report.failed.saturating_add(1);
+            return report;
+        }
+    };
+
+    let reacting_set: BTreeSet<u64> = reacting.iter().copied().collect();
+
+    // Every member that has the reaction: make the state match.
+    for member_id in &reacting_set {
+        let outcome = reconcile_member(config, guild_id, *member_id, true, now, ops, &mut report);
+        match outcome {
+            MemberOutcome::Activated => report.activated = report.activated.saturating_add(1),
+            MemberOutcome::Released => report.released = report.released.saturating_add(1),
+            MemberOutcome::Unchanged => report.unchanged = report.unchanged.saturating_add(1),
+            MemberOutcome::Failed => report.failed = report.failed.saturating_add(1),
+        }
+    }
+
+    // Every member that is stored but no longer has the reaction: release it.
+    for member_id in &stored {
+        if reacting_set.contains(member_id) {
+            continue;
+        }
+        let outcome = reconcile_member(config, guild_id, *member_id, false, now, ops, &mut report);
+        match outcome {
+            MemberOutcome::Activated => report.activated = report.activated.saturating_add(1),
+            MemberOutcome::Released => report.released = report.released.saturating_add(1),
+            MemberOutcome::Unchanged => report.unchanged = report.unchanged.saturating_add(1),
+            MemberOutcome::Failed => report.failed = report.failed.saturating_add(1),
+        }
+    }
+
+    report
 }
 
 /// Drive the state machine for one member after a restart.
@@ -1058,10 +1119,13 @@ fn reconcile_member(
             );
             match outcome {
                 Outcome::Done => {
-                    if matches!(state, State::Inactive) {
+                    // The reaction is present now, so the member must end on
+                    // safeword; it is absent now, so the member must end off
+                    // it. The state before the run decides which way it went.
+                    if reaction_present_now {
                         MemberOutcome::Activated
                     } else {
-                        MemberOutcome::Unchanged
+                        MemberOutcome::Released
                     }
                 }
                 Outcome::NoWork => MemberOutcome::Unchanged,
@@ -1155,6 +1219,127 @@ fn collect_reaction_users(
     Some(users)
 }
 
+// ---------------------------------------------------------------------------
+// The feature registry hook
+// ---------------------------------------------------------------------------
+
+/// What the wiring card's context must provide so the safeword runtime can
+/// act on an event.
+///
+/// The registry calls a feature with a shared context (`&X`), so the
+/// collaborators are handed out as owned boxes. The wiring card decides what
+/// they are (serenity clients, the SW2 repository, the staff alert channel).
+pub trait SafewordContext {
+    /// The collaborators for one guild, or `None` when the feature cannot act.
+    fn safeword_ops(&self, guild_id: u64) -> Option<Ops>;
+    /// The unix second the handling happens in.
+    fn safeword_now(&self) -> i64;
+}
+
+/// The safeword feature, as the registry sees it.
+///
+/// The feature is **not registered**: wiring card W2/W3 adds it to
+/// `features::production_features`. Nothing here is called by `main.rs` yet.
+pub struct SafewordFeature<C> {
+    /// The parsed configuration.
+    pub config: SafewordConfig,
+    /// The context the wiring card supplies.
+    pub context: C,
+    /// The would-do record of the shadow runs.
+    pub shadow: std::sync::Mutex<ShadowRecord>,
+}
+
+impl<C> SafewordFeature<C> {
+    /// Build the feature from a configuration and a context.
+    pub fn new(config: SafewordConfig, context: C) -> Self {
+        Self {
+            config,
+            context,
+            shadow: std::sync::Mutex::new(ShadowRecord::default()),
+        }
+    }
+}
+
+impl<C> crate::features::Feature<(), ()> for SafewordFeature<C>
+where
+    C: SafewordContext + Send + Sync,
+{
+    fn name(&self) -> &'static str {
+        "safeword"
+    }
+
+    fn enabled(&self) -> bool {
+        !self.config.is_off()
+    }
+
+    fn needs_core_db(&self) -> bool {
+        true
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a (),
+        event: &'a poise::serenity_prelude::FullEvent,
+        _data: &'a (),
+        guild: Option<u64>,
+        _core_db: Option<&'a tokio_rusqlite::Connection>,
+    ) -> crate::jobs::runner::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(guild_id) = guild else {
+                return;
+            };
+            let Some(reaction) = reaction_event(event) else {
+                return;
+            };
+            let Some(mut ops) = self.context.safeword_ops(guild_id) else {
+                return;
+            };
+            let now = self.context.safeword_now();
+            let mut shadow = self.shadow.lock().unwrap_or_else(|e| e.into_inner());
+            handle_reaction(&self.config, &reaction, now, &mut ops, &mut shadow);
+        })
+    }
+}
+
+/// The reaction event of a serenity event, in plain values.
+///
+/// `None` when the event is not a reaction add or remove, when it has no
+/// guild, or when the emoji has no id (a unicode emoji can never be the
+/// configured custom emoji).
+pub fn reaction_event(event: &poise::serenity_prelude::FullEvent) -> Option<ReactionEvent> {
+    use poise::serenity_prelude::FullEvent as E;
+    use poise::serenity_prelude::ReactionType;
+
+    let (reaction, added) = match event {
+        E::ReactionAdd { add_reaction } => (add_reaction, true),
+        E::ReactionRemove { removed_reaction } => (removed_reaction, false),
+        _ => return None,
+    };
+    let guild_id = reaction.guild_id?.get();
+    let member_id = reaction.user_id?.get();
+    let emoji_id = match &reaction.emoji {
+        ReactionType::Custom { id, .. } => id.get(),
+        // A unicode emoji has no id, and any future variant has none either:
+        // neither can match the configured custom emoji, so both are ignored.
+        ReactionType::Unicode(_) => return None,
+        _ => return None,
+    };
+    // A bot is ignored, so the reactor's bot flag is read here.
+    let author_is_bot = reaction
+        .member
+        .as_ref()
+        .map(|member| member.user.bot)
+        .unwrap_or(false);
+    Some(ReactionEvent {
+        guild_id,
+        channel_id: reaction.channel_id.get(),
+        message_id: reaction.message_id.get(),
+        emoji_id,
+        member_id,
+        author_is_bot,
+        added,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,10 +1437,7 @@ mod tests {
                 Some(code) => Err(*code),
                 None => {
                     let mut log = self.log.borrow_mut();
-                    log.roles
-                        .entry(member_id)
-                        .or_default()
-                        .push(role_id);
+                    log.roles.entry(member_id).or_default().push(role_id);
                     Ok(())
                 }
             }
@@ -1396,12 +1578,19 @@ mod tests {
         }
 
         fn version_of(&self, member_id: u64) -> Option<u64> {
-            self.rows.borrow().get(&member_id).map(|(_, version)| *version)
+            self.rows
+                .borrow()
+                .get(&member_id)
+                .map(|(_, version)| *version)
         }
     }
 
     impl StateStore for FakeStore {
-        fn load(&mut self, _guild_id: u64, member_id: u64) -> Result<Option<(State, u64)>, &'static str> {
+        fn load(
+            &mut self,
+            _guild_id: u64,
+            member_id: u64,
+        ) -> Result<Option<(State, u64)>, &'static str> {
             if self.load_fails {
                 return Err(CODE_STATE_FAILED);
             }
@@ -1420,7 +1609,10 @@ mod tests {
                 return Err(CODE_STATE_FAILED);
             }
             let mut rows = self.rows.borrow_mut();
-            let current = rows.get(&member_id).map(|(_, version)| *version).unwrap_or(0);
+            let current = rows
+                .get(&member_id)
+                .map(|(_, version)| *version)
+                .unwrap_or(0);
             if current != expected_version {
                 return Err(CODE_STATE_FAILED);
             }
@@ -1441,7 +1633,10 @@ mod tests {
                 return Err(CODE_STATE_FAILED);
             }
             let mut rows = self.rows.borrow_mut();
-            let current = rows.get(&member_id).map(|(_, version)| *version).unwrap_or(0);
+            let current = rows
+                .get(&member_id)
+                .map(|(_, version)| *version)
+                .unwrap_or(0);
             if current != expected_version {
                 return Err(CODE_STATE_FAILED);
             }
@@ -1459,10 +1654,13 @@ mod tests {
         }
     }
 
+    /// The reaction-user calls the fake recorded: the cursor and the limit.
+    type ReactionCalls = Rc<RefCell<Vec<(Option<u64>, u32)>>>;
+
     /// The reaction-user fake: a scripted list of pages.
     struct FakeReactionUsers {
         pages: Vec<Vec<u64>>,
-        calls: Rc<RefCell<Vec<(Option<u64>, u32)>>>,
+        calls: ReactionCalls,
         failure: bool,
     }
 
@@ -1532,7 +1730,7 @@ mod tests {
         store_rows: Rc<RefCell<BTreeMap<u64, (State, u64)>>>,
         store_writes: Rc<RefCell<Vec<(u64, State)>>>,
         store_clears: Rc<RefCell<Vec<u64>>>,
-        reaction_calls: Rc<RefCell<Vec<(Option<u64>, u32)>>>,
+        reaction_calls: ReactionCalls,
     }
 
     impl Harness {
@@ -1590,6 +1788,7 @@ mod tests {
         }
 
         fn with_reactions(mut self, reactions: FakeReactionUsers) -> Self {
+            self.reaction_calls = Rc::clone(&reactions.calls);
             self.ops.reactions = Box::new(reactions);
             self
         }
@@ -1793,9 +1992,8 @@ mod tests {
     #[test]
     fn a_replayed_add_never_overwrites_the_snapshot() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        );
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
         let mut shadow = ShadowRecord::default();
         assert_eq!(
             handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow),
@@ -1830,9 +2028,8 @@ mod tests {
     #[test]
     fn remove_before_add_leaves_the_member_inactive() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        );
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
         let mut shadow = ShadowRecord::default();
         // The reaction is removed before the bot ever saw the add.
         let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
@@ -1849,9 +2046,8 @@ mod tests {
     #[test]
     fn a_replayed_add_after_a_completed_release_activates_again() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        );
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
         let mut shadow = ShadowRecord::default();
         handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
         handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
@@ -1882,25 +2078,33 @@ mod tests {
     #[test]
     fn removing_the_reaction_restores_the_roles_and_dms() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        );
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
         let mut shadow = ShadowRecord::default();
         handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
-        harness.members_log.borrow_mut().roles.insert(
-            MEMBER,
-            vec![SAFEWORD_ROLE],
-        );
+        harness
+            .members_log
+            .borrow_mut()
+            .roles
+            .insert(MEMBER, vec![SAFEWORD_ROLE]);
         let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
         assert_eq!(outcome, Outcome::Done);
         assert_eq!(
             harness.added(),
-            vec![(MEMBER, RESTRICTED_A), (MEMBER, RESTRICTED_B)],
-            "the saved roles were given back"
+            vec![
+                (MEMBER, SAFEWORD_ROLE),
+                (MEMBER, RESTRICTED_A),
+                (MEMBER, RESTRICTED_B),
+            ],
+            "the saved roles were given back after the safeword role was added"
         );
         assert_eq!(
             harness.removed(),
-            vec![(MEMBER, RESTRICTED_A), (MEMBER, RESTRICTED_B), (MEMBER, SAFEWORD_ROLE)],
+            vec![
+                (MEMBER, RESTRICTED_A),
+                (MEMBER, RESTRICTED_B),
+                (MEMBER, SAFEWORD_ROLE)
+            ],
             "the safeword role was taken away"
         );
         let dms = harness.dms();
@@ -1963,10 +2167,8 @@ mod tests {
     #[test]
     fn a_failed_state_read_costs_the_member_nothing_and_alerts() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]),
-        )
-        .with_store(FakeStore::new().failing_load());
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_store(FakeStore::new().failing_load());
         let mut shadow = ShadowRecord::default();
         let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
         assert_eq!(outcome, Outcome::Failed);
@@ -1978,10 +2180,9 @@ mod tests {
     #[test]
     fn a_dm_failure_never_changes_the_roles_or_the_snapshot() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        )
-        .with_dm_failure(DmCode::Closed);
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_dm_failure(DmCode::Closed);
         let mut shadow = ShadowRecord::default();
         let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
         assert!(
@@ -2011,14 +2212,16 @@ mod tests {
     #[test]
     fn an_unknown_bot_top_position_denies_the_role_write_and_alerts() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]),
-        )
-        .with_facts(FakeFacts::new().no_top());
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_facts(FakeFacts::new().no_top());
         let mut shadow = ShadowRecord::default();
         let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
-        assert_eq!(outcome, Outcome::Failed);
+        assert!(
+            !outcome.is_success(),
+            "a denied role write is never a success, got {outcome:?}"
+        );
         assert!(harness.removed().is_empty());
+        assert!(harness.added().is_empty());
         assert!(
             harness.alerts().contains(&CODE_BOT_TOP_UNKNOWN),
             "the alert names the unknown bot position, got {:?}",
@@ -2029,14 +2232,16 @@ mod tests {
     #[test]
     fn unavailable_role_facts_deny_the_role_write_and_alert() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]),
-        )
-        .with_facts(FakeFacts::new().unavailable());
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_facts(FakeFacts::new().unavailable());
         let mut shadow = ShadowRecord::default();
         let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
-        assert_eq!(outcome, Outcome::Failed);
+        assert!(
+            !outcome.is_success(),
+            "a denied role write is never a success, got {outcome:?}"
+        );
         assert!(harness.removed().is_empty());
+        assert!(harness.added().is_empty());
         assert!(
             harness.alerts().contains(&CODE_FACTS_UNAVAILABLE),
             "the alert names the unavailable facts, got {:?}",
@@ -2051,9 +2256,8 @@ mod tests {
     #[test]
     fn shadow_mode_performs_nothing_and_only_records_counts() {
         let cfg = config_in("shadow");
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-        );
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
         let mut shadow = ShadowRecord::default();
         let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
         assert_eq!(outcome, Outcome::NoWork);
@@ -2100,26 +2304,31 @@ mod tests {
         for i in 0..100u64 {
             first.push(900_000 + i);
         }
-        let mut harness = Harness::new(FakeMembers::new()).with_reactions(FakeReactionUsers::new(vec![
-            first.clone(),
-            vec![MEMBER],
-        ]));
+        let mut harness = Harness::new(FakeMembers::new())
+            .with_reactions(FakeReactionUsers::new(vec![first.clone(), vec![MEMBER]]));
         let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
         let calls = harness.reaction_calls.borrow().clone();
         assert_eq!(calls.len(), 2, "the reconcile read two pages");
         assert_eq!(calls[0], (None, REACTION_PAGE_SIZE));
         assert_eq!(
             calls[1],
-            (Some(*first.last().expect("the page is not empty")), REACTION_PAGE_SIZE),
+            (
+                Some(*first.last().expect("the page is not empty")),
+                REACTION_PAGE_SIZE
+            ),
             "the second page asks for the users after the last id of the first"
         );
-        assert_eq!(report.activated, 1);
+        assert_eq!(
+            report.activated, 101,
+            "every user of both pages was reconciled"
+        );
     }
 
     #[test]
     fn the_reconcile_reports_a_failed_reaction_user_list_instead_of_guessing() {
         let cfg = config();
-        let mut harness = Harness::new(FakeMembers::new()).with_reactions(FakeReactionUsers::failing());
+        let mut harness =
+            Harness::new(FakeMembers::new()).with_reactions(FakeReactionUsers::failing());
         let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
         assert_eq!(report.activated, 0);
         assert_eq!(report.released, 0);
@@ -2146,10 +2355,8 @@ mod tests {
     #[test]
     fn the_reconcile_activates_a_member_who_has_the_reaction_and_no_state() {
         let cfg = config();
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]),
-        )
-        .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+            .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]));
         let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
         assert_eq!(report.activated, 1);
         assert_eq!(report.released, 0);
@@ -2175,11 +2382,9 @@ mod tests {
             roles_restored: false,
             ..Default::default()
         });
-        let mut harness = Harness::new(
-            FakeMembers::new().with_roles(MEMBER, &[SAFEWORD_ROLE]),
-        )
-        .with_store(FakeStore::new().with_state(MEMBER, stored))
-        .with_reactions(FakeReactionUsers::new(vec![vec![]]));
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[SAFEWORD_ROLE]))
+            .with_store(FakeStore::new().with_state(MEMBER, stored))
+            .with_reactions(FakeReactionUsers::new(vec![vec![]]));
         let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
         assert_eq!(report.released, 1);
         assert!(
@@ -2228,9 +2433,8 @@ mod tests {
         };
 
         for round in 0..64u64 {
-            let mut harness = Harness::new(
-                FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]),
-            );
+            let mut harness =
+                Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]));
             // The writer fails on one role in some rounds.
             let failing_role = if next() % 3 == 0 {
                 Some(RESTRICTED_B)
@@ -2238,9 +2442,11 @@ mod tests {
                 None
             };
             if let Some(role) = failing_role {
-                harness.ops.members = Box::new(FakeMembers::new()
-                    .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
-                    .failing_write(role, WriteCode::RateLimited));
+                harness.ops.members = Box::new(
+                    FakeMembers::new()
+                        .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
+                        .failing_write(role, WriteCode::RateLimited),
+                );
             }
             let mut shadow = ShadowRecord::default();
 
@@ -2248,7 +2454,8 @@ mod tests {
             let steps = 1 + (next() % 6) as usize;
             for _ in 0..steps {
                 let added = next() % 2 == 0;
-                let outcome = handle_reaction(&cfg, &event(added), NOW, &mut harness.ops, &mut shadow);
+                let outcome =
+                    handle_reaction(&cfg, &event(added), NOW, &mut harness.ops, &mut shadow);
                 assert!(
                     matches!(
                         outcome,
@@ -2261,7 +2468,10 @@ mod tests {
                     assert!(
                         matches!(
                             state,
-                            State::Inactive | State::Activating(_) | State::Active(_) | State::Releasing(_)
+                            State::Inactive
+                                | State::Activating(_)
+                                | State::Active(_)
+                                | State::Releasing(_)
                         ),
                         "round {round}: the stored state is one the machine knows: {state:?}"
                     );
@@ -2372,5 +2582,114 @@ mod tests {
     #[allow(dead_code)]
     fn member_set(ids: &[u64]) -> BTreeSet<u64> {
         ids.iter().copied().collect()
+    }
+
+    // ------------------------------------------------------------------
+    // The feature registry hook
+    // ------------------------------------------------------------------
+
+    /// A context that hands out no collaborators: the feature hook's own
+    /// behaviour (name, mode, database use) is what this test checks.
+    #[derive(Default)]
+    struct TestContext {
+        now: i64,
+    }
+
+    impl SafewordContext for TestContext {
+        fn safeword_ops(&self, _guild_id: u64) -> Option<Ops> {
+            None
+        }
+
+        fn safeword_now(&self) -> i64 {
+            self.now
+        }
+    }
+
+    #[test]
+    fn the_feature_reports_its_name_its_mode_and_its_database_use() {
+        use crate::features::Feature;
+        let live = SafewordFeature::new(config(), TestContext { now: NOW });
+        assert_eq!(live.name(), "safeword");
+        assert!(live.enabled());
+        assert!(
+            live.needs_core_db(),
+            "the safeword state lives in the core database"
+        );
+
+        let off = SafewordFeature::new(config_in("off"), TestContext { now: NOW });
+        assert!(!off.enabled(), "the feature is off in off mode");
+
+        let shadow = SafewordFeature::new(config_in("shadow"), TestContext { now: NOW });
+        assert!(shadow.enabled(), "the feature runs in shadow mode");
+    }
+
+    #[test]
+    fn a_serene_reaction_event_becomes_a_plain_reaction_event() {
+        use poise::serenity_prelude::FullEvent;
+        let payload = serde_json::json!({
+            "channel_id": CHANNEL.to_string(),
+            "message_id": MESSAGE.to_string(),
+            "user_id": MEMBER.to_string(),
+            "guild_id": GUILD.to_string(),
+            "emoji": {"id": EMOJI.to_string(), "name": "synthetic"},
+            "burst": false, "burst_colours": [], "type": 0,
+        });
+        let event = FullEvent::ReactionAdd {
+            add_reaction: serde_json::from_value(payload).expect("the payload deserialises"),
+        };
+        let reaction = reaction_event(&event).expect("a reaction event is read");
+        assert_eq!(reaction.guild_id, GUILD);
+        assert_eq!(reaction.channel_id, CHANNEL);
+        assert_eq!(reaction.message_id, MESSAGE);
+        assert_eq!(reaction.emoji_id, EMOJI);
+        assert_eq!(reaction.member_id, MEMBER);
+        assert!(reaction.added);
+        assert!(!reaction.author_is_bot);
+    }
+
+    #[test]
+    fn a_unicode_emoji_has_no_id_and_is_never_read_as_a_reaction() {
+        use poise::serenity_prelude::FullEvent;
+        let payload = serde_json::json!({
+            "channel_id": CHANNEL.to_string(),
+            "message_id": MESSAGE.to_string(),
+            "user_id": MEMBER.to_string(),
+            "guild_id": GUILD.to_string(),
+            "emoji": {"name": "SYNTHETIC_UNICODE"},
+            "burst": false, "burst_colours": [], "type": 0,
+        });
+        let event = FullEvent::ReactionAdd {
+            add_reaction: serde_json::from_value(payload).expect("the payload deserialises"),
+        };
+        assert!(
+            reaction_event(&event).is_none(),
+            "an emoji without an id can never be the configured one"
+        );
+    }
+
+    #[test]
+    fn an_event_that_is_not_a_reaction_is_not_read_as_one() {
+        use poise::serenity_prelude::FullEvent;
+        let event = FullEvent::ShardsReady { total_shards: 1 };
+        assert!(reaction_event(&event).is_none());
+    }
+
+    #[test]
+    fn a_reaction_without_a_guild_is_not_read_as_one() {
+        use poise::serenity_prelude::FullEvent;
+        let payload = serde_json::json!({
+            "channel_id": CHANNEL.to_string(),
+            "message_id": MESSAGE.to_string(),
+            "user_id": MEMBER.to_string(),
+            "emoji": {"id": EMOJI.to_string(), "name": "synthetic"},
+            "burst": false, "burst_colours": [], "type": 0,
+        });
+        let event = FullEvent::ReactionAdd {
+            add_reaction: serde_json::from_value(payload).expect("the payload deserialises"),
+        };
+        assert!(
+            reaction_event(&event).is_none(),
+            "a direct-message reaction has no guild"
+        );
     }
 }
