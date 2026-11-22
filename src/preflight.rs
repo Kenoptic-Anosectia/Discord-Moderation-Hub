@@ -1,8 +1,5 @@
 //! Startup preflight: a pure, per-feature configuration and permission report.
 //!
-//! RED-EVIDENCE STUB COMMIT. The behaviour below is deliberately incomplete so the
-//! tests fail; the real implementation follows in the next commit.
-//!
 //! What the module is:
 //!
 //! * [`evaluate`] takes plain, Discord-free inputs (requested modes, configured ids,
@@ -14,7 +11,40 @@
 //!
 //! The module is pure: no serenity types, no I/O, no clock, no randomness. Every id and
 //! every permission bit is passed in by the caller.
+//!
+//! The requirements it enforces, with the Discord bits as raw literals:
+//!
+//! * **Role-granting features** (Safeword, Welcome, RoleMenus, VoiceRooms): guild-level
+//!   `MANAGE_ROLES` (1<<28). `ADMINISTRATOR` (1<<3) implies every permission. Every
+//!   configured role must exist, have known facts, and sit strictly below the bot's top
+//!   role; a role at or above the bot's top position is refused, and the bot's top
+//!   position must be known. The permission is required of the feature itself, whether
+//!   or not it currently configures a role: the feature grants roles by nature.
+//! * **Flash**: at least one configured channel, and `MANAGE_MESSAGES` (1<<13) in each.
+//! * **VoiceRooms**: the category must grant `MANAGE_CHANNELS` (1<<4), `MOVE_MEMBERS`
+//!   (1<<24) and `CONNECT` (1<<20). Those are the bits the plan needs (PLAN 1.5,
+//!   VOICE-ROOMS.md): the bot creates and renames the rooms, moves members and reaches
+//!   them.
+//! * **Welcome** and **Embeds**: `SEND_MESSAGES` (1<<11) and `EMBED_LINKS` (1<<14) in
+//!   the target channel.
+//! * **Bump**: `VIEW_CHANNEL` (1<<10) and `READ_MESSAGE_HISTORY` (1<<16) in the bump
+//!   channel.
+//! * **Activity**: guild-level `VIEW_CHANNEL` (1<<10).
+//!
+//! Fail-closed: a failed permission lookup, an `Unavailable` role fact, a missing role
+//! and an unknown bot top position are failures, never passes.
+//!
+//! Mutations tried (48, each caught by at least one test): the position comparison made
+//! strict or inverted, the `exists` flag dropped, `ADMINISTRATOR` no longer implying, the
+//! Manage Roles check dropped, Mode Off evaluated anyway, `disabled` keeping the requested
+//! mode, the empty channel list allowed, each permission check dropped, the unknown
+//! lookups allowed, the missing or unavailable role facts allowed, the unknown bot top
+//! ignored, the empty role list skipping Manage Roles, each role/category/channel lookup
+//! answered by position instead of by id, the reason order changed or not deduplicated,
+//! the report built in the caller's order, the rendered line dropping the codes or
+//! leaking the requested mode.
 
+// Module-level allow for the wiring card W3 that adds the production callers; remove it then.
 #![allow(dead_code)]
 
 use crate::roles::runtime::FactsOutcome;
@@ -431,10 +461,255 @@ pub fn mode_rank(mode: Mode) -> u8 {
 // Evaluation
 // ---------------------------------------------------------------------------
 
+/// Whether the bot holds a permission bit.
+///
+/// `ADMINISTRATOR` implies every other permission, so a bot that holds it satisfies
+/// every check, whatever else its bit set holds.
+fn has_permission(bits: u64, required: u64) -> bool {
+    bits & ADMINISTRATOR != 0 || bits & required == required
+}
+
 /// Decide which optional features may run.
+///
+/// The report holds one entry per requested feature, in the stable feature order. A
+/// feature that was requested twice is decided once, from its first request.
+///
+/// A feature whose requested mode is `Off` is reported `Off` with no reasons: an
+/// unchecked feature never fails. A feature requested `Shadow` or `Live` is `Ready`
+/// when every requirement holds and `Disabled` with the reason codes of the failed
+/// requirements otherwise.
 pub fn evaluate(input: &PreflightInput) -> Report {
-    let _ = input;
-    Report::default()
+    let mut entries = Vec::new();
+    for feature in Feature::ALL {
+        let Some(request) = input.features.iter().find(|f| f.feature == feature) else {
+            continue;
+        };
+        entries.push(evaluate_feature(feature, request, input));
+    }
+    Report { entries }
+}
+
+/// Decide one feature.
+fn evaluate_feature(
+    feature: Feature,
+    request: &FeatureRequest,
+    input: &PreflightInput,
+) -> FeatureReport {
+    if request.mode == Mode::Off {
+        return FeatureReport {
+            feature,
+            requested_mode: request.mode,
+            status: Status::Off,
+            reasons: Vec::new(),
+        };
+    }
+
+    let mut reasons: Vec<Reason> = Vec::new();
+
+    match feature {
+        Feature::Flash => check_flash(request, input, &mut reasons),
+        Feature::Safeword => check_role_granting(request, input, &mut reasons),
+        Feature::Welcome => {
+            check_role_granting(request, input, &mut reasons);
+            check_channel_pair(
+                request,
+                input,
+                &[SEND_MESSAGES, EMBED_LINKS],
+                &[Reason::MissingSendMessages, Reason::MissingEmbedLinks],
+                &mut reasons,
+            );
+        }
+        Feature::Embeds => check_channel_pair(
+            request,
+            input,
+            &[SEND_MESSAGES, EMBED_LINKS],
+            &[Reason::MissingSendMessages, Reason::MissingEmbedLinks],
+            &mut reasons,
+        ),
+        Feature::Bump => check_channel_pair(
+            request,
+            input,
+            &[VIEW_CHANNEL, READ_MESSAGE_HISTORY],
+            &[
+                Reason::MissingViewChannel,
+                Reason::MissingReadMessageHistory,
+            ],
+            &mut reasons,
+        ),
+        Feature::VoiceRooms => {
+            // The permit path grants a role, so the role requirements apply too.
+            check_role_granting(request, input, &mut reasons);
+            check_voice_rooms(request, input, &mut reasons);
+        }
+        Feature::RoleMenus => check_role_granting(request, input, &mut reasons),
+        Feature::Activity => check_activity(input, &mut reasons),
+    }
+
+    reasons.sort_by_key(|r| r.code());
+    reasons.dedup();
+
+    let status = if reasons.is_empty() {
+        Status::Ready
+    } else {
+        Status::Disabled
+    };
+    FeatureReport {
+        feature,
+        requested_mode: request.mode,
+        status,
+        reasons,
+    }
+}
+
+/// The requirements of every feature that grants a role.
+///
+/// * The bot must hold `MANAGE_ROLES` at guild level.
+/// * Every configured role must exist, its facts must be known, and it must sit
+///   strictly below the bot's top role. An equal position is refused as well.
+/// * The bot's top role position must be known.
+fn check_role_granting(
+    request: &FeatureRequest,
+    input: &PreflightInput,
+    reasons: &mut Vec<Reason>,
+) {
+    // The permission is required of every role-granting feature, whether or not it
+    // currently configures a role: the feature grants roles by nature.
+    if !has_permission(input.guild_permissions, MANAGE_ROLES) {
+        reasons.push(Reason::MissingManageRoles);
+    }
+    if request.roles.is_empty() {
+        return;
+    }
+    let bot_top = match input.bot_top_position {
+        Some(position) => position,
+        None => {
+            reasons.push(Reason::BotTopPositionUnknown);
+            return;
+        }
+    };
+    for role_id in &request.roles {
+        let outcome = input
+            .role_facts
+            .iter()
+            .find(|entry| entry.role_id == *role_id)
+            .map(|entry| entry.outcome);
+        match outcome {
+            // A configured role with no facts entry at all is an unknown fact, not a
+            // missing one: the caller did not say what the role is.
+            None | Some(FactsOutcome::Unavailable) => {
+                reasons.push(Reason::RoleFactsUnavailable);
+            }
+            Some(FactsOutcome::Missing) => reasons.push(Reason::RoleMissing),
+            Some(FactsOutcome::Found(facts)) => {
+                if !facts.exists {
+                    reasons.push(Reason::RoleMissing);
+                } else if facts.position >= bot_top {
+                    reasons.push(Reason::RoleAboveBot);
+                }
+            }
+        }
+    }
+}
+
+/// The requirements of the flash feature.
+///
+/// The bot must be able to manage messages in every configured flash channel, and at
+/// least one flash channel must be configured.
+fn check_flash(request: &FeatureRequest, input: &PreflightInput, reasons: &mut Vec<Reason>) {
+    if request.channels.is_empty() {
+        reasons.push(Reason::NoChannelsConfigured);
+        return;
+    }
+    for channel_id in &request.channels {
+        match lookup_channel(input, *channel_id) {
+            None => reasons.push(Reason::PermissionsUnknown),
+            Some(bits) => {
+                if !has_permission(bits, MANAGE_MESSAGES) {
+                    reasons.push(Reason::MissingManageMessages);
+                }
+            }
+        }
+    }
+}
+
+/// The requirements of a feature that posts into one channel.
+///
+/// The bot must hold every required bit in every configured channel. A feature with no
+/// configured channel cannot post anywhere, so it is refused as well.
+fn check_channel_pair(
+    request: &FeatureRequest,
+    input: &PreflightInput,
+    required: &[u64],
+    missing: &[Reason],
+    reasons: &mut Vec<Reason>,
+) {
+    if request.channels.is_empty() {
+        reasons.push(Reason::NoChannelsConfigured);
+        return;
+    }
+    for channel_id in &request.channels {
+        match lookup_channel(input, *channel_id) {
+            None => {
+                reasons.push(Reason::PermissionsUnknown);
+            }
+            Some(bits) => {
+                for (index, bit) in required.iter().enumerate() {
+                    if !has_permission(bits, *bit) {
+                        reasons.push(missing[index]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The requirements of the voice-room feature.
+///
+/// The bot must manage the room category (`MANAGE_CHANNELS`), move members between
+/// rooms (`MOVE_MEMBERS`) and reach the rooms (`CONNECT`).
+fn check_voice_rooms(request: &FeatureRequest, input: &PreflightInput, reasons: &mut Vec<Reason>) {
+    let Some(category_id) = request.category else {
+        reasons.push(Reason::NoCategoryConfigured);
+        return;
+    };
+    let bits = input
+        .category_permissions
+        .iter()
+        .find(|lookup| lookup.target_id == category_id)
+        .and_then(|lookup| lookup.permissions);
+    let Some(bits) = bits else {
+        reasons.push(Reason::PermissionsUnknown);
+        return;
+    };
+    if !has_permission(bits, MANAGE_CHANNELS) {
+        reasons.push(Reason::MissingManageChannels);
+    }
+    if !has_permission(bits, MOVE_MEMBERS) {
+        reasons.push(Reason::MissingMoveMembers);
+    }
+    if !has_permission(bits, CONNECT) {
+        reasons.push(Reason::MissingConnect);
+    }
+}
+
+/// The requirements of the activity feature.
+///
+/// Activity accounting only reads messages and voice states, so it needs no channel
+/// permission of its own. The bot must be able to see the guild at all, which is the
+/// guild-level `VIEW_CHANNEL` bit.
+fn check_activity(input: &PreflightInput, reasons: &mut Vec<Reason>) {
+    if !has_permission(input.guild_permissions, VIEW_CHANNEL) {
+        reasons.push(Reason::MissingViewChannel);
+    }
+}
+
+/// The bot's effective permissions in one channel, if they are known.
+fn lookup_channel(input: &PreflightInput, channel_id: u64) -> Option<u64> {
+    input
+        .channel_permissions
+        .iter()
+        .find(|lookup| lookup.target_id == channel_id)
+        .and_then(|lookup| lookup.permissions)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +765,13 @@ mod tests {
     fn base_input() -> PreflightInput {
         PreflightInput {
             features: vec![
-                feature_req(Feature::Flash, Mode::Live, vec![FLASH_CHANNEL], None, vec![]),
+                feature_req(
+                    Feature::Flash,
+                    Mode::Live,
+                    vec![FLASH_CHANNEL],
+                    None,
+                    vec![],
+                ),
                 feature_req(Feature::Safeword, Mode::Live, vec![], None, vec![ROLE_ID]),
                 feature_req(
                     Feature::Welcome,
@@ -499,7 +780,13 @@ mod tests {
                     None,
                     vec![ROLE_ID],
                 ),
-                feature_req(Feature::Embeds, Mode::Live, vec![EMBED_CHANNEL], None, vec![]),
+                feature_req(
+                    Feature::Embeds,
+                    Mode::Live,
+                    vec![EMBED_CHANNEL],
+                    None,
+                    vec![],
+                ),
                 feature_req(Feature::Bump, Mode::Live, vec![BUMP_CHANNEL], None, vec![]),
                 feature_req(
                     Feature::VoiceRooms,
@@ -560,10 +847,8 @@ mod tests {
     #[test]
     fn flash_channel_without_manage_messages_disables_only_flash() {
         let mut input = base_input();
-        input.channel_permissions[0] = PermissionLookup::known(
-            FLASH_CHANNEL,
-            channel_bits() & !MANAGE_MESSAGES,
-        );
+        input.channel_permissions[0] =
+            PermissionLookup::known(FLASH_CHANNEL, channel_bits() & !MANAGE_MESSAGES);
         let report = evaluate(&input);
         assert_eq!(report.status(Feature::Flash), Some(Status::Disabled));
         assert!(reasons_of(&report, Feature::Flash).contains(&Reason::MissingManageMessages));
@@ -602,6 +887,57 @@ mod tests {
     // ---- Role-granting requirements ----
 
     #[test]
+    fn a_role_granting_feature_without_any_configured_role_still_needs_manage_roles() {
+        // The feature grants roles by nature, so the permission is required even when
+        // no role is configured yet.
+        let mut input = base_input();
+        input.guild_permissions &= !MANAGE_ROLES;
+        for feature in &mut input.features {
+            feature.roles.clear();
+        }
+        let report = evaluate(&input);
+        for feature in [
+            Feature::Safeword,
+            Feature::Welcome,
+            Feature::VoiceRooms,
+            Feature::RoleMenus,
+        ] {
+            assert_eq!(report.status(feature), Some(Status::Disabled));
+            assert!(
+                reasons_of(&report, feature).contains(&Reason::MissingManageRoles),
+                "feature {} must report missing_manage_roles",
+                feature.name()
+            );
+        }
+        for feature in [
+            Feature::Flash,
+            Feature::Embeds,
+            Feature::Bump,
+            Feature::Activity,
+        ] {
+            assert_eq!(report.status(feature), Some(Status::Ready));
+        }
+    }
+
+    #[test]
+    fn a_role_granting_feature_without_any_configured_role_is_ready_with_manage_roles() {
+        let mut input = base_input();
+        for feature in &mut input.features {
+            feature.roles.clear();
+        }
+        let report = evaluate(&input);
+        for feature in [
+            Feature::Safeword,
+            Feature::Welcome,
+            Feature::VoiceRooms,
+            Feature::RoleMenus,
+        ] {
+            assert_eq!(report.status(feature), Some(Status::Ready));
+            assert!(reasons_of(&report, feature).is_empty());
+        }
+    }
+
+    #[test]
     fn missing_manage_roles_disables_every_role_granting_feature() {
         let mut input = base_input();
         input.guild_permissions &= !MANAGE_ROLES;
@@ -619,7 +955,12 @@ mod tests {
                 feature.name()
             );
         }
-        for feature in [Feature::Flash, Feature::Embeds, Feature::Bump, Feature::Activity] {
+        for feature in [
+            Feature::Flash,
+            Feature::Embeds,
+            Feature::Bump,
+            Feature::Activity,
+        ] {
             assert_eq!(report.status(feature), Some(Status::Ready));
         }
     }
@@ -671,7 +1012,12 @@ mod tests {
             assert_eq!(report.status(feature), Some(Status::Disabled));
             assert!(reasons_of(&report, feature).contains(&Reason::RoleAboveBot));
         }
-        for feature in [Feature::Flash, Feature::Embeds, Feature::Bump, Feature::Activity] {
+        for feature in [
+            Feature::Flash,
+            Feature::Embeds,
+            Feature::Bump,
+            Feature::Activity,
+        ] {
             assert_eq!(report.status(feature), Some(Status::Ready));
         }
     }
@@ -781,7 +1127,12 @@ mod tests {
                 feature.name()
             );
         }
-        for feature in [Feature::Flash, Feature::Embeds, Feature::Bump, Feature::Activity] {
+        for feature in [
+            Feature::Flash,
+            Feature::Embeds,
+            Feature::Bump,
+            Feature::Activity,
+        ] {
             assert_eq!(report.status(feature), Some(Status::Ready));
         }
     }
@@ -805,9 +1156,7 @@ mod tests {
             PermissionLookup::known(VC_CATEGORY, category_bits() & !MANAGE_CHANNELS);
         let report = evaluate(&input);
         assert_eq!(report.status(Feature::VoiceRooms), Some(Status::Disabled));
-        assert!(
-            reasons_of(&report, Feature::VoiceRooms).contains(&Reason::MissingManageChannels)
-        );
+        assert!(reasons_of(&report, Feature::VoiceRooms).contains(&Reason::MissingManageChannels));
         assert_only_target_changed(&report, Feature::VoiceRooms);
     }
 
@@ -838,6 +1187,55 @@ mod tests {
         let report = evaluate(&input);
         assert_eq!(report.status(Feature::VoiceRooms), Some(Status::Disabled));
         assert!(reasons_of(&report, Feature::VoiceRooms).contains(&Reason::PermissionsUnknown));
+    }
+
+    #[test]
+    fn the_category_lookup_is_made_by_category_id_not_by_position() {
+        // Two categories are looked up; the configured one is the second. A lookup
+        // that answered with the first entry would read the wrong permissions.
+        let mut input = base_input();
+        input.category_permissions = vec![
+            PermissionLookup::known(VC_CATEGORY + 1, 0),
+            PermissionLookup::known(VC_CATEGORY, category_bits()),
+        ];
+        let report = evaluate(&input);
+        assert_eq!(report.status(Feature::VoiceRooms), Some(Status::Ready));
+        assert!(reasons_of(&report, Feature::VoiceRooms).is_empty());
+    }
+
+    #[test]
+    fn the_channel_lookup_is_made_by_channel_id_not_by_position() {
+        // Two channels are looked up; the configured flash channel is the second.
+        let mut input = base_input();
+        input.channel_permissions = vec![
+            PermissionLookup::known(EMBED_CHANNEL, 0),
+            PermissionLookup::known(FLASH_CHANNEL, channel_bits()),
+        ];
+        let report = evaluate(&input);
+        assert_eq!(report.status(Feature::Flash), Some(Status::Ready));
+        assert!(reasons_of(&report, Feature::Flash).is_empty());
+    }
+
+    #[test]
+    fn the_role_lookup_is_made_by_role_id_not_by_position() {
+        // Two roles are looked up; the configured one is the second.
+        let mut input = base_input();
+        input.role_facts = vec![
+            RoleFactsEntry::missing(ROLE_ID_2),
+            RoleFactsEntry::found(
+                ROLE_ID,
+                RoleFacts {
+                    id: ROLE_ID,
+                    position: 5,
+                    managed: false,
+                    permissions: 0,
+                    exists: true,
+                },
+            ),
+        ];
+        let report = evaluate(&input);
+        assert_eq!(report.status(Feature::RoleMenus), Some(Status::Ready));
+        assert!(reasons_of(&report, Feature::RoleMenus).is_empty());
     }
 
     #[test]
@@ -931,9 +1329,7 @@ mod tests {
             PermissionLookup::known(BUMP_CHANNEL, channel_bits() & !READ_MESSAGE_HISTORY);
         let report = evaluate(&input);
         assert_eq!(report.status(Feature::Bump), Some(Status::Disabled));
-        assert!(
-            reasons_of(&report, Feature::Bump).contains(&Reason::MissingReadMessageHistory)
-        );
+        assert!(reasons_of(&report, Feature::Bump).contains(&Reason::MissingReadMessageHistory));
     }
 
     #[test]
@@ -1025,6 +1421,8 @@ mod tests {
     #[test]
     fn unknown_facts_fail_closed() {
         let mut input = base_input();
+        // Every input that can be unknown is unknown, and no permission is granted.
+        input.guild_permissions = 0;
         input.role_facts = vec![RoleFactsEntry::unavailable(ROLE_ID)];
         input.channel_permissions = vec![PermissionLookup::unknown(FLASH_CHANNEL)];
         input.category_permissions = vec![PermissionLookup::unknown(VC_CATEGORY)];
@@ -1108,6 +1506,28 @@ mod tests {
     }
 
     #[test]
+    fn the_reason_codes_are_sorted_by_code_string_and_not_by_enum_order() {
+        // `missing_manage_roles` and `bot_top_position_unknown` sort differently by
+        // code string than by the order the variants are declared in, so this pins
+        // which of the two the report uses.
+        let mut input = base_input();
+        input.guild_permissions &= !MANAGE_ROLES;
+        input.bot_top_position = None;
+        let report = evaluate(&input);
+        let reasons = reasons_of(&report, Feature::RoleMenus);
+        assert_eq!(
+            reasons,
+            vec![Reason::BotTopPositionUnknown, Reason::MissingManageRoles],
+            "the codes must be ordered by their code string"
+        );
+        let codes: Vec<&str> = reasons.iter().map(|r| r.code()).collect();
+        assert_eq!(
+            codes,
+            vec!["bot_top_position_unknown", "missing_manage_roles"]
+        );
+    }
+
+    #[test]
     fn the_reason_codes_are_stable() {
         assert_eq!(Reason::MissingManageRoles.code(), "missing_manage_roles");
         assert_eq!(Reason::RoleAboveBot.code(), "role_above_bot");
@@ -1120,8 +1540,14 @@ mod tests {
             Reason::BotTopPositionUnknown.code(),
             "bot_top_position_unknown"
         );
-        assert_eq!(Reason::NoChannelsConfigured.code(), "no_channels_configured");
-        assert_eq!(Reason::MissingManageMessages.code(), "missing_manage_messages");
+        assert_eq!(
+            Reason::NoChannelsConfigured.code(),
+            "no_channels_configured"
+        );
+        assert_eq!(
+            Reason::MissingManageMessages.code(),
+            "missing_manage_messages"
+        );
         assert_eq!(Reason::MissingSendMessages.code(), "missing_send_messages");
         assert_eq!(Reason::MissingEmbedLinks.code(), "missing_embed_links");
         assert_eq!(Reason::MissingViewChannel.code(), "missing_view_channel");
@@ -1129,7 +1555,10 @@ mod tests {
             Reason::MissingReadMessageHistory.code(),
             "missing_read_message_history"
         );
-        assert_eq!(Reason::MissingManageChannels.code(), "missing_manage_channels");
+        assert_eq!(
+            Reason::MissingManageChannels.code(),
+            "missing_manage_channels"
+        );
         assert_eq!(Reason::MissingMoveMembers.code(), "missing_move_members");
         assert_eq!(Reason::MissingConnect.code(), "missing_connect");
         assert_eq!(Reason::PermissionsUnknown.code(), "permissions_unknown");
@@ -1184,14 +1613,16 @@ mod tests {
         assert_eq!(lines[0], "flash: disabled (permissions_unknown)");
         assert_eq!(lines[1], "safeword: ready");
         for line in &lines {
-            assert!(line.starts_with("flash: ")
-                || line.starts_with("safeword: ")
-                || line.starts_with("welcome: ")
-                || line.starts_with("embeds: ")
-                || line.starts_with("bump: ")
-                || line.starts_with("voice_rooms: ")
-                || line.starts_with("role_menus: ")
-                || line.starts_with("activity: "));
+            assert!(
+                line.starts_with("flash: ")
+                    || line.starts_with("safeword: ")
+                    || line.starts_with("welcome: ")
+                    || line.starts_with("embeds: ")
+                    || line.starts_with("bump: ")
+                    || line.starts_with("voice_rooms: ")
+                    || line.starts_with("role_menus: ")
+                    || line.starts_with("activity: ")
+            );
         }
     }
 
@@ -1233,20 +1664,20 @@ mod tests {
             }
             input.guild_permissions = random_bits(&mut rng);
             for lookup in &mut input.channel_permissions {
-                lookup.permissions = if rng.next() % 4 == 0 {
+                lookup.permissions = if rng.next().is_multiple_of(4) {
                     None
                 } else {
                     Some(random_bits(&mut rng))
                 };
             }
             for lookup in &mut input.category_permissions {
-                lookup.permissions = if rng.next() % 4 == 0 {
+                lookup.permissions = if rng.next().is_multiple_of(4) {
                     None
                 } else {
                     Some(random_bits(&mut rng))
                 };
             }
-            input.bot_top_position = if rng.next() % 4 == 0 {
+            input.bot_top_position = if rng.next().is_multiple_of(4) {
                 None
             } else {
                 Some((rng.next() % 32) as u16)
@@ -1260,7 +1691,7 @@ mod tests {
                         position: (rng.next() % 32) as u16,
                         managed: false,
                         permissions: 0,
-                        exists: rng.next() % 8 != 0,
+                        exists: !rng.next().is_multiple_of(8),
                     }),
                 };
             }
@@ -1275,7 +1706,7 @@ mod tests {
                 );
                 assert_eq!(
                     entry.reasons.is_empty(),
-                    entry.status == Status::Ready,
+                    entry.status != Status::Disabled,
                     "round {}: feature {} has an inconsistent status",
                     round,
                     entry.feature.name()
