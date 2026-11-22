@@ -12,7 +12,9 @@
 //! Security notes:
 //! * A room name is attacker-controlled text that ends up in a channel title. The
 //!   sanitiser removes mentions, invite links, URLs, control characters and
-//!   zero-width characters, so a name can never ping a role or smuggle an invite.
+//!   every character that renders nothing (the closed class named in
+//!   `INVISIBLE_RANGES`), so a name can never ping a role or smuggle an invite,
+//!   and it cannot hide a mention behind an invisible character.
 //! * The permission overwrites of a room are the category's overwrites plus one
 //!   bounded owner overwrite. The owner rights are a compile-time constant that never
 //!   contains `MANAGE_ROLES`, `MANAGE_CHANNELS` or `ADMINISTRATOR`, so an owner
@@ -739,7 +741,7 @@ fn is_invisible(c: char) -> bool {
 /// `every_character_that_renders_nothing_is_removed` walks every code point
 /// of every range, and `a_character_just_outside_the_class_survives` checks
 /// the edge, so the class is pinned in both directions.
-const INVISIBLE_RANGES: [(u32, u32); 26] = [
+const INVISIBLE_RANGES: &[(u32, u32)] = &[
     // The soft hyphen.
     (0x00AD, 0x00AD),
     // The combining grapheme joiner.
@@ -2841,7 +2843,7 @@ mod tests {
     /// cannot drift apart. The ranges are the class, not a list of examples: a
     /// range that grew would still be covered, because every code point of
     /// the range is tested.
-    const INVISIBLE_CLASS: [(u32, u32); 26] = INVISIBLE_RANGES;
+    const INVISIBLE_CLASS: &[(u32, u32)] = INVISIBLE_RANGES;
 
     /// Every code point of the closed class renders nothing, so every one of
     /// them must be removed from a name.
@@ -2852,7 +2854,7 @@ mod tests {
     #[test]
     fn every_character_that_renders_nothing_is_removed() {
         let mut checked = 0usize;
-        for (start, end) in INVISIBLE_CLASS {
+        for &(start, end) in INVISIBLE_CLASS {
             for cp in start..=end {
                 let Some(c) = char::from_u32(cp) else {
                     continue;
@@ -2882,7 +2884,7 @@ mod tests {
         // are control characters or spaces (those are removed by the other
         // rules, not by the invisible class).
         let mut edges = Vec::new();
-        for (start, end) in INVISIBLE_CLASS {
+        for &(start, end) in INVISIBLE_CLASS {
             for cp in [start.checked_sub(1), Some(end + 1)].into_iter().flatten() {
                 let Some(c) = char::from_u32(cp) else {
                     continue;
