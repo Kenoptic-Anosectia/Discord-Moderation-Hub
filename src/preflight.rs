@@ -34,15 +34,17 @@
 //! Fail-closed: a failed permission lookup, an `Unavailable` role fact, a missing role
 //! and an unknown bot top position are failures, never passes.
 //!
-//! Mutations tried (48, each caught by at least one test): the position comparison made
-//! strict or inverted, the `exists` flag dropped, `ADMINISTRATOR` no longer implying, the
-//! Manage Roles check dropped, Mode Off evaluated anyway, `disabled` keeping the requested
-//! mode, the empty channel list allowed, each permission check dropped, the unknown
+//! Mutations tried (53, each caught by at least one test): the position comparison made
+//! strict, inverted or off by one, the `exists` flag dropped, `ADMINISTRATOR` no longer
+//! implying, the Manage Roles check dropped or checked against the wrong bits, the empty
+//! role list skipping Manage Roles, Mode Off evaluated anyway, `disabled` keeping the
+//! requested mode, `ready` becoming off, shadow becoming live, off becoming shadow, the
+//! empty channel or category list allowed, each permission check dropped, the unknown
 //! lookups allowed, the missing or unavailable role facts allowed, the unknown bot top
-//! ignored, the empty role list skipping Manage Roles, each role/category/channel lookup
-//! answered by position instead of by id, the reason order changed or not deduplicated,
-//! the report built in the caller's order, the rendered line dropping the codes or
-//! leaking the requested mode.
+//! ignored or treated as zero, each role/category/channel lookup answered by position
+//! instead of by id, the reason order changed or not deduplicated, the report built in the
+//! caller's order, the rendered line dropping the codes, swapping the fields or leaking
+//! the requested mode, and each feature losing its own check.
 
 // Module-level allow for the wiring card W3 that adds the production callers; remove it then.
 #![allow(dead_code)]

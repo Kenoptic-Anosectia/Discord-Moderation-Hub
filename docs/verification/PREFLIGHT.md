@@ -17,7 +17,7 @@ Pure `src/preflight.rs`: `evaluate(&PreflightInput) -> Report` decides at startu
 
 ## What is tested (50 tests in `src/preflight.rs`)
 One test per requirement (each flips exactly its own feature, the others stay ready); Mode Off never fails; `ADMINISTRATOR` satisfies every check; unknown facts fail closed; the effective mode never exceeds the requested one; the ordering and the codes are stable; the report never carries an id (sentinel `0x533343523354` in Debug, Display, lines); a seeded 2000-round LCG sweep asserts the effective mode and that with every input unknown no feature is `ready`.
-RED evidence: commit `ce23dde` ran the suite against a stub `evaluate` -> 7 passed, 37 failed (the 7 are the ones a stub already satisfies); 48 mutations were tried, each caught by at least one test (list in the module comment).
+RED evidence: commit `ce23dde` ran the suite against a stub `evaluate` -> 7 passed, 37 failed (the 7 are the ones a stub already satisfies); 53 mutations were tried, each caught by at least one test (list in the module comment).
 
 ## Config keys (READ by the wiring card W3, not by this module)
 None are read here. W3 supplies the parsed inputs and stages `<FEATURE>_MODE` (default `off`; an unknown value -> `off`) plus the id lists the features already document (`FLASH_CHANNEL_IDS`, `VOICE_ROOM_CATEGORY_ID`, `WELCOME_TEMPLATE_PATH`, `EMBED_TEMPLATE_DIR`, `BUMP_BOT_ID`, `ACTIVITY_EXCLUDED_CHANNEL_IDS`; default empty/unset, a malformed entry refuses the whole key (K06), so the feature fails closed here).
