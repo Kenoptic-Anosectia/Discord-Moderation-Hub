@@ -6,6 +6,7 @@ mod deletion_attribution;
 mod embeds;
 mod flash;
 mod jobs;
+mod preflight;
 mod privacy_scope;
 mod role_menus;
 mod roles;
