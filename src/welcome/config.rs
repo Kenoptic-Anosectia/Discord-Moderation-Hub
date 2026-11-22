@@ -7,7 +7,7 @@
 //!
 //! Wiring card W3 stages the keys in `.env.example` and calls [`parse`].
 
-use crate::settings::Mode;
+use crate::settings::{self, Mode};
 use std::ffi::OsString;
 use std::fmt;
 
@@ -50,19 +50,93 @@ impl WelcomeConfig {
     }
 }
 
+/// Reads one key as text.
+///
+/// A value that is not valid Unicode is not usable: the caller reports the key
+/// as invalid. The value itself is never kept.
+fn read_text(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Option<String> {
+    lookup(key).and_then(|raw| raw.into_string().ok())
+}
+
 /// Parses the four keys of the welcome feature.
 ///
 /// The lookup closure is the only source of values; this module reads no
 /// environment variable itself.
+///
+/// A value that is not valid Unicode is not usable: the key is named as
+/// invalid. The value itself is never kept.
 pub fn parse(lookup: impl Fn(&str) -> Option<OsString>) -> WelcomeConfig {
-    // RED scaffold: the configuration is not parsed yet.
-    let _ = lookup;
+    let mut invalid_keys: Vec<&'static str> = Vec::new();
+
+    let mode = settings::parse_mode(KEY_MODE, read_text(&lookup, KEY_MODE).as_deref())
+        .unwrap_or(Mode::Off);
+
+    let channel_id = match read_text(&lookup, KEY_CHANNEL_ID) {
+        None => None,
+        Some(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                match settings::parse_id_list(KEY_CHANNEL_ID, Some(trimmed)) {
+                    // The channel is ONE id: a list is not a channel.
+                    Ok(ids) if ids.len() == 1 => Some(ids[0]),
+                    _ => {
+                        invalid_keys.push(KEY_CHANNEL_ID);
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    let template_path = match read_text(&lookup, KEY_TEMPLATE_PATH) {
+        None => None,
+        Some(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                // The template name uses the one path-safety rule the repo
+                // already has (EM1): ONE canonical spelling that can never
+                // walk out of the template directory. A path with a separator,
+                // a `..`, a drive letter or a URI scheme is refused as a
+                // class, not one spelling at a time.
+                match crate::embeds::posts::validate_key(trimmed) {
+                    Ok(()) => Some(trimmed.to_string()),
+                    Err(_) => {
+                        invalid_keys.push(KEY_TEMPLATE_PATH);
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    let join_role_ids = match settings::parse_id_list(
+        KEY_JOIN_ROLE_IDS,
+        read_text(&lookup, KEY_JOIN_ROLE_IDS).as_deref(),
+    ) {
+        Ok(ids) => ids,
+        Err(_) => {
+            invalid_keys.push(KEY_JOIN_ROLE_IDS);
+            Vec::new()
+        }
+    };
+
+    // A key that could not be used switches the whole feature off.
+    let mode = if invalid_keys.is_empty() {
+        mode
+    } else {
+        Mode::Off
+    };
+
     WelcomeConfig {
-        mode: Mode::Off,
-        channel_id: None,
-        template_path: None,
-        join_role_ids: Vec::new(),
-        invalid_keys: Vec::new(),
+        mode,
+        channel_id,
+        template_path,
+        join_role_ids,
+        invalid_keys,
     }
 }
 

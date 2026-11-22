@@ -19,10 +19,14 @@
 //! * Shadow mode sends nothing, grants nothing and only produces a structured
 //!   would-do record (counts and codes, no user content).
 
-use crate::roles::eligibility::SafewordState;
-use crate::roles::grant::{GrantReport, RoleResult, RoleWriter, Sleeper};
-use crate::roles::runtime::RoleSource;
-use crate::welcome::config::WelcomeConfig;
+use crate::roles::eligibility::{GrantPath, RoleFacts, SafewordState};
+use crate::roles::grant::{GrantItem, GrantRequest, RoleResult, RoleWriter, Sleeper};
+use crate::roles::runtime::{
+    bot_top_position, decide_from_facts, role_facts, DecisionInputs, FactsOutcome, RoleSource,
+    RuntimeDecision,
+};
+use crate::settings::Mode;
+use crate::welcome::config::{WelcomeConfig, KEY_JOIN_ROLE_IDS};
 use crate::welcome::render::{IdMap, MemberContext, RenderedEmbed, WelcomeTemplate};
 use std::fmt;
 
@@ -37,10 +41,11 @@ pub const CODE_SEND_FAILED: &str = "welcome_send_failed";
 pub const CODE_SEND_FORBIDDEN: &str = "welcome_send_forbidden";
 /// The stable code for a message that hit the rate limit.
 pub const CODE_SEND_RATE_LIMITED: &str = "welcome_send_rate_limited";
-/// The stable code for a grant that could not be written.
-pub const CODE_GRANT_FAILED: &str = "welcome_grant_failed";
 /// The stable code for a role whose facts could not be looked up.
 pub const CODE_FACTS_UNAVAILABLE: &str = "facts_unavailable";
+/// The stable code for a join role checked while the bot's top role position
+/// is unknown.
+pub const CODE_BOT_TOP_UNKNOWN: &str = "bot_top_position_unknown";
 
 // ---------------------------------------------------------------------------
 // Facts about the join
@@ -147,9 +152,28 @@ pub enum JoinDecision {
 /// skipped. A bot is skipped for the roles AND for the message: nothing is
 /// granted and nothing is posted.
 pub fn decide_join(facts: &JoinFacts, config: &WelcomeConfig) -> JoinDecision {
-    // RED scaffold: the decision is not implemented yet.
-    let _ = (facts, config);
-    JoinDecision::Skip(SkipReason::FeatureDisabled)
+    if config.mode == Mode::Off {
+        return JoinDecision::Skip(SkipReason::FeatureDisabled);
+    }
+    let Some(channel_id) = config.channel_id else {
+        return JoinDecision::Skip(SkipReason::NoChannel);
+    };
+    if config.template_path.is_none() {
+        return JoinDecision::Skip(SkipReason::NoTemplate);
+    }
+    if facts.is_bot {
+        return JoinDecision::Skip(SkipReason::Bot);
+    }
+    JoinDecision::Act(JoinActions {
+        grant_role_ids: config.join_role_ids.clone(),
+        send_message: true,
+        channel_id,
+        allowed_mentions: AllowedMentions {
+            users: vec![facts.user_id],
+            roles: Vec::new(),
+            everyone: false,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -269,12 +293,10 @@ pub struct JoinOutcome {
 pub struct WouldDo {
     /// How many roles would have been granted.
     pub roles_to_grant: usize,
-    /// How many roles would have been refused, and why.
+    /// The reason code of every role that would have been refused.
     pub roles_refused: Vec<&'static str>,
     /// Whether the welcome message would have been posted.
     pub message_would_be_sent: bool,
-    /// The stable code of the message failure, when there is one.
-    pub message_code: Option<&'static str>,
 }
 
 impl JoinOutcome {
@@ -324,15 +346,72 @@ pub fn validate_join_roles(
     bot_top_position: Option<u16>,
     facts: &[crate::preflight::RoleFactsEntry],
 ) -> Vec<JoinRoleRefusal> {
-    // RED scaffold: the validation is not implemented yet.
-    let _ = (
-        role_ids,
-        guild_id,
-        protected_role_ids,
-        bot_top_position,
-        facts,
-    );
-    Vec::new()
+    let mut refusals = Vec::new();
+    for role_id in role_ids {
+        let outcome = facts
+            .iter()
+            .find(|entry| entry.role_id == *role_id)
+            .map(|entry| entry.outcome);
+        let Some(outcome) = outcome else {
+            // The caller did not say what the role is: an unknown fact, never
+            // a pass.
+            refusals.push(JoinRoleRefusal {
+                key: KEY_JOIN_ROLE_IDS,
+                role_id: *role_id,
+                reason: CODE_FACTS_UNAVAILABLE,
+            });
+            continue;
+        };
+        if matches!(outcome, FactsOutcome::Unavailable) {
+            refusals.push(JoinRoleRefusal {
+                key: KEY_JOIN_ROLE_IDS,
+                role_id: *role_id,
+                reason: CODE_FACTS_UNAVAILABLE,
+            });
+            continue;
+        }
+        let Some(bot_top) = bot_top_position else {
+            refusals.push(JoinRoleRefusal {
+                key: KEY_JOIN_ROLE_IDS,
+                role_id: *role_id,
+                reason: CODE_BOT_TOP_UNKNOWN,
+            });
+            continue;
+        };
+        // The policy decides; this function only reports its reason code.
+        let request = crate::roles::eligibility::GrantRequest {
+            path: GrantPath::JoinRole,
+            role: match outcome {
+                FactsOutcome::Found(facts) => facts,
+                // A role that is not in the guild's role list: the policy
+                // denies it as deleted.
+                FactsOutcome::Missing => RoleFacts {
+                    id: *role_id,
+                    position: 0,
+                    managed: false,
+                    permissions: 0,
+                    exists: false,
+                },
+                FactsOutcome::Unavailable => unreachable!("handled above"),
+            },
+            bot_top_position: bot_top,
+            guild_id,
+            protected_role_ids,
+            safeword: SafewordState::Inactive,
+            safeword_restricted_role_ids: &[],
+            staff: None,
+        };
+        if let crate::roles::eligibility::Decision::Deny(reason) =
+            crate::roles::eligibility::decide(&request)
+        {
+            refusals.push(JoinRoleRefusal {
+                key: KEY_JOIN_ROLE_IDS,
+                role_id: *role_id,
+                reason: reason.code(),
+            });
+        }
+    }
+    refusals
 }
 
 // ---------------------------------------------------------------------------
@@ -390,12 +469,6 @@ pub struct WelcomeRuntime<S, W, P, M, A> {
     pub grant_policy: GrantPolicy,
 }
 
-/// The result of the role part of one join.
-struct RolePart {
-    results: Vec<RoleResult>,
-    report: GrantReport,
-}
-
 impl<S, W, P, M, A> WelcomeRuntime<S, W, P, M, A>
 where
     S: RoleSource,
@@ -411,47 +484,181 @@ where
     /// code and the roles stay granted, and a grant failure never stops the
     /// message.
     pub async fn handle_join(&mut self, facts: &JoinFacts) -> JoinOutcome {
-        // RED scaffold: the runtime is not implemented yet.
-        let _ = facts;
-        JoinOutcome {
-            skipped: Some(SkipReason::FeatureDisabled),
+        let decision = decide_join(facts, &self.config);
+        let JoinDecision::Act(actions) = decision else {
+            let reason = match decision {
+                JoinDecision::Skip(reason) => reason,
+                JoinDecision::Act(_) => unreachable!("the decision is one of two"),
+            };
+            // A shadow run records what it would NOT do: nothing was sent and
+            // nothing was granted.
+            let would_do = if self.config.mode == Mode::Shadow {
+                Some(WouldDo::default())
+            } else {
+                None
+            };
+            return JoinOutcome {
+                skipped: Some(reason),
+                role_results: Vec::new(),
+                message: None,
+                alerts: Vec::new(),
+                would_do,
+            };
+        };
+
+        if self.config.mode == Mode::Shadow {
+            return self.shadow_join(facts, &actions).await;
+        }
+
+        let mut outcome = JoinOutcome {
+            skipped: None,
             role_results: Vec::new(),
             message: None,
             alerts: Vec::new(),
             would_do: None,
+        };
+
+        // The roles: the role service decides, the grant executor writes. A
+        // failure here is reported, and the message is still posted.
+        outcome.role_results = self.grant_roles(facts, &actions).await;
+        for result in &outcome.role_results {
+            if let crate::roles::grant::RoleOutcome::Failed(code) = result.outcome {
+                outcome.alerts.push(code.code());
+            }
         }
+
+        // The message: rendered from the template and posted to the channel. A
+        // failure here is reported, and the roles stay granted.
+        let member = MemberContext {
+            user_id: facts.user_id,
+            username: facts.username.clone(),
+            server_name: facts.server_name.clone(),
+            member_count: facts.member_count,
+            is_bot: facts.is_bot,
+        };
+        let message = OutgoingMessage::render(&self.template, &member, &self.ids);
+        match self.sender.send(actions.channel_id, &message) {
+            Ok(()) => outcome.message = Some(MessageOutcome::Sent),
+            Err(error) => {
+                let code = error.code();
+                outcome.message = Some(MessageOutcome::Failed(code));
+                outcome.alerts.push(code);
+                self.report(code);
+            }
+        }
+
+        outcome
     }
 
     /// The role part of a join: the policy decides, the executor writes.
-    async fn grant_roles(&mut self, facts: &JoinFacts, actions: &JoinActions) -> RolePart {
-        // RED scaffold: the runtime is not implemented yet.
-        let _ = (facts, actions);
-        RolePart {
-            results: Vec::<RoleResult>::new(),
-            report: GrantReport {
-                member_id: 0,
-                results: Vec::new(),
-            },
+    ///
+    /// One result per requested join role, in request order.
+    async fn grant_roles(&mut self, facts: &JoinFacts, actions: &JoinActions) -> Vec<RoleResult> {
+        let roles = match self.source.roles(facts.guild_id).await {
+            Ok(roles) => roles,
+            Err(_) => {
+                // The guild's roles could not be looked up: no role may be
+                // granted, and the reason stays visible.
+                return actions
+                    .grant_role_ids
+                    .iter()
+                    .map(|role_id| RoleResult {
+                        role_id: *role_id,
+                        outcome: crate::roles::grant::RoleOutcome::Denied(
+                            crate::roles::eligibility::DenyReason::RoleDeleted,
+                        ),
+                        writer_calls: 0,
+                    })
+                    .collect();
+            }
+        };
+        let bot_roles = self
+            .source
+            .member_roles(facts.guild_id, self.bot_user_id)
+            .await
+            .unwrap_or_default();
+        let bot_top = bot_top_position(&roles, &bot_roles);
+        let inputs = DecisionInputs {
+            path: GrantPath::JoinRole,
+            bot_top_position: bot_top,
+            guild_id: facts.guild_id,
+            protected_role_ids: &self.grant_policy.protected_role_ids,
+            safeword: self.grant_policy.safeword,
+            safeword_restricted_role_ids: &self.grant_policy.safeword_restricted_role_ids,
+            staff: None,
+        };
+        let mut decisions: Vec<(u64, RuntimeDecision)> =
+            Vec::with_capacity(actions.grant_role_ids.len());
+        for role_id in &actions.grant_role_ids {
+            let outcome = role_facts(&roles, *role_id);
+            let decision = decide_from_facts(outcome, *role_id, &inputs);
+            decisions.push((*role_id, decision));
         }
+        // A role whose facts could not be looked up is left out of the request,
+        // so the executor can never write it.
+        let items: Vec<GrantItem> =
+            crate::roles::runtime::grant_items(&decisions, &facts.member_role_ids);
+        let request = GrantRequest {
+            member_id: facts.user_id,
+            items: &items,
+        };
+        let report = crate::roles::grant::apply(&mut self.writer, &mut self.sleeper, &request);
+        report.results
     }
 
     /// The shadow run: nothing is sent, nothing is granted, only a record.
     async fn shadow_join(&mut self, facts: &JoinFacts, actions: &JoinActions) -> JoinOutcome {
-        // RED scaffold: the runtime is not implemented yet.
-        let _ = (facts, actions);
+        let roles = self.source.roles(facts.guild_id).await.unwrap_or_default();
+        let bot_roles = self
+            .source
+            .member_roles(facts.guild_id, self.bot_user_id)
+            .await
+            .unwrap_or_default();
+        let bot_top = bot_top_position(&roles, &bot_roles);
+        let inputs = DecisionInputs {
+            path: GrantPath::JoinRole,
+            bot_top_position: bot_top,
+            guild_id: facts.guild_id,
+            protected_role_ids: &self.grant_policy.protected_role_ids,
+            safeword: self.grant_policy.safeword,
+            safeword_restricted_role_ids: &self.grant_policy.safeword_restricted_role_ids,
+            staff: None,
+        };
+        let mut refused: Vec<&'static str> = Vec::new();
+        let mut grantable = 0usize;
+        for role_id in &actions.grant_role_ids {
+            let outcome = role_facts(&roles, *role_id);
+            match decide_from_facts(outcome, *role_id, &inputs) {
+                RuntimeDecision::Decided(crate::roles::eligibility::Decision::Allow) => {
+                    grantable += 1;
+                }
+                RuntimeDecision::Decided(crate::roles::eligibility::Decision::Deny(reason)) => {
+                    refused.push(reason.code());
+                }
+                RuntimeDecision::Unavailable => refused.push(CODE_FACTS_UNAVAILABLE),
+            }
+        }
         JoinOutcome {
             skipped: None,
             role_results: Vec::new(),
             message: None,
             alerts: Vec::new(),
-            would_do: Some(WouldDo::default()),
+            would_do: Some(WouldDo {
+                roles_to_grant: grantable,
+                roles_refused: refused,
+                message_would_be_sent: actions.send_message,
+            }),
         }
     }
 
     /// Reports a failure to the staff alert channel, when one is configured.
+    ///
+    /// The alert carries the stable code only: never message text, a name or
+    /// an id.
     fn report(&mut self, code: &'static str) {
-        // RED scaffold: the runtime is not implemented yet.
-        let _ = code;
+        if let Some(channel_id) = self.staff_alert_channel {
+            self.alerter.alert(channel_id, code);
+        }
     }
 }
 
@@ -1153,7 +1360,13 @@ mod tests {
         for kind in [JOB_KIND_GRANT_ROLES, JOB_KIND_SEND_MESSAGE] {
             let job = NewJob {
                 kind,
-                dedupe_key: "join-700003",
+                // The dedupe key is unique across kinds, so the two jobs of one
+                // join carry one key each.
+                dedupe_key: if kind == JOB_KIND_GRANT_ROLES {
+                    "join-700003-roles"
+                } else {
+                    "join-700003-message"
+                },
                 payload_json: "{}",
                 due_at: now,
             };
