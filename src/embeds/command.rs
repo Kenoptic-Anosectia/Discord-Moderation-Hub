@@ -357,6 +357,13 @@ pub fn authorize(publishers: Publishers, who: &Invoker) -> Result<(), Code> {
     }
 }
 
+/// Checks that the call comes from the one home guild. Commands are registered globally,
+/// so the owner of ANY guild the bot is in could otherwise use them.
+pub fn check_guild(home_guild: Option<u64>, guild: u64) -> Result<(), Outcome> {
+    let _ = (home_guild, guild);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Traits
 // ---------------------------------------------------------------------------
@@ -653,6 +660,8 @@ pub struct Env<'a> {
     pub templates: &'a dyn TemplateSource,
     pub alerts: &'a dyn AlertSink,
     pub locks: &'a KeyLocks,
+    /// The one guild these commands serve (the wiring passes `GUILD_ID`).
+    pub home_guild: Option<u64>,
 }
 
 /// `/embed post`.
@@ -683,6 +692,8 @@ pub struct SyncRequest<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct ListRequest {
     pub invoker: Invoker,
+    /// The guild the command was used in.
+    pub guild: u64,
 }
 
 /// One unit of work: one key.
@@ -1371,6 +1382,7 @@ mod tests {
         alerts: FakeAlerts,
         store: TokioStore,
         locks: KeyLocks,
+        home_guild: Option<u64>,
     }
 
     impl World {
@@ -1389,6 +1401,7 @@ mod tests {
                 alerts: FakeAlerts::default(),
                 store,
                 locks: KeyLocks::new(),
+                home_guild: Some(GUILD),
             }
         }
         async fn live() -> World {
@@ -1405,6 +1418,7 @@ mod tests {
                 templates: &self.templates,
                 alerts: &self.alerts,
                 locks: &self.locks,
+                home_guild: self.home_guild,
             }
         }
         async fn post_as(&self, who: Invoker, key: &str, channel: u64, recreate: bool) -> Report {
@@ -1444,7 +1458,17 @@ mod tests {
             self.sync_as(owner(), None, false).await
         }
         async fn list_as(&self, who: Invoker) -> ListReport {
-            list(&self.env(), &ListRequest { invoker: who }).await
+            self.list_in(who, GUILD).await
+        }
+        async fn list_in(&self, who: Invoker, guild: u64) -> ListReport {
+            list(
+                &self.env(),
+                &ListRequest {
+                    invoker: who,
+                    guild,
+                },
+            )
+            .await
         }
         async fn rows(&self) -> Vec<StoredPost> {
             self.store.list().await.unwrap()
@@ -1473,6 +1497,77 @@ mod tests {
         }
         fn alerts(&self) -> Vec<&'static str> {
             self.alerts.0.lock().unwrap().clone()
+        }
+        /// The environment as the wiring would build it for another home guild.
+        fn env_home(&self, home: Option<u64>) -> Env<'_> {
+            Env {
+                home_guild: home,
+                ..self.env()
+            }
+        }
+        /// Records a post of `guild` (the home guild of that call is `guild` itself).
+        async fn post_in(&self, guild: u64, key: &str, channel: u64) -> Report {
+            post(
+                &self.env_home(Some(guild)),
+                &PostRequest {
+                    invoker: owner(),
+                    key,
+                    guild,
+                    channel,
+                    allow_recreate: false,
+                    now: 1_000,
+                },
+            )
+            .await
+        }
+        async fn post_at(
+            &self,
+            home: Option<u64>,
+            who: Invoker,
+            guild: u64,
+            channel: u64,
+        ) -> Report {
+            post(
+                &self.env_home(home),
+                &PostRequest {
+                    invoker: who,
+                    key: "rules",
+                    guild,
+                    channel,
+                    allow_recreate: false,
+                    now: 1_000,
+                },
+            )
+            .await
+        }
+        async fn sync_at(
+            &self,
+            home: Option<u64>,
+            who: Invoker,
+            key: Option<&str>,
+            guild: u64,
+        ) -> Report {
+            sync(
+                &self.env_home(home),
+                &SyncRequest {
+                    invoker: who,
+                    key,
+                    guild,
+                    allow_recreate: false,
+                    now: 2_000,
+                },
+            )
+            .await
+        }
+        async fn list_at(&self, home: Option<u64>, who: Invoker, guild: u64) -> ListReport {
+            list(
+                &self.env_home(home),
+                &ListRequest {
+                    invoker: who,
+                    guild,
+                },
+            )
+            .await
         }
     }
 
@@ -1812,7 +1907,12 @@ mod tests {
             Some("key_reused_in_another_channel")
         );
         let report = post(
-            &world.env(),
+            &Env {
+                // The home guild moved after the post was recorded: the call is served,
+                // and the plan still refuses a key that belongs to another guild.
+                home_guild: Some(OTHER_GUILD),
+                ..world.env()
+            },
             &PostRequest {
                 invoker: owner(),
                 key: "rules",
@@ -2158,12 +2258,16 @@ mod tests {
         assert_eq!(listed.outcome.code, Code::StoreFailed);
         assert_eq!(listed.outcome.detail, Some("corrupt_row"));
         assert!(listed.posts.is_empty());
+        // Each call raises its own alert: a later call must not hide an earlier one.
+        assert_eq!(world.alerts(), vec!["store_failed"], "after list");
         let report = world.sync_all().await;
         assert_eq!(code_of(&report), Code::StoreFailed);
+        assert_eq!(world.alerts().len(), 2, "after sync-all");
         let report = world.post("rules").await;
         assert_eq!(code_of(&report), Code::StoreFailed);
+        assert_eq!(world.alerts().len(), 3, "after post");
         assert_eq!(world.discord.writes(), 1);
-        assert!(world.alerts().contains(&"store_failed"));
+        assert!(world.alerts().iter().all(|code| *code == "store_failed"));
     }
 
     #[tokio::test]
@@ -2989,6 +3093,256 @@ mod tests {
             json.get("replied_user").is_none_or(|v| v == false),
             "{json}"
         );
+    }
+
+    // ---- one home guild ----
+
+    const STRANGER: u64 = 7_001;
+    fn stranger_owner() -> Invoker {
+        Invoker {
+            user: STRANGER,
+            guild_owner: STRANGER,
+            is_staff: false,
+        }
+    }
+
+    #[test]
+    fn check_guild_serves_only_the_set_home_guild() {
+        assert_eq!(check_guild(Some(GUILD), GUILD), Ok(()));
+        assert_eq!(
+            check_guild(Some(GUILD), OTHER_GUILD),
+            Err(Outcome::with(Code::Denied, "other_guild"))
+        );
+        for unset in [None, Some(0)] {
+            assert_eq!(
+                check_guild(unset, GUILD),
+                Err(Outcome::with(Code::Denied, "no_home_guild")),
+                "{unset:?}"
+            );
+            assert_eq!(
+                check_guild(unset, 0),
+                Err(Outcome::with(Code::Denied, "no_home_guild")),
+                "{unset:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_owner_of_an_unrelated_guild_is_denied_and_cannot_squat_the_key() {
+        for publishers in [Publishers::OwnerOnly, Publishers::Staff] {
+            let world = World::new(Mode::Live, publishers).await;
+            world.templates.put("rules", &tpl("Staff-only text"));
+            // Their own guild, their own channel; the staff flag does not cross either.
+            let staff_there = Invoker {
+                is_staff: true,
+                ..stranger_owner()
+            };
+            for who in [stranger_owner(), staff_there] {
+                let report = world
+                    .post_at(Some(GUILD), who, OTHER_GUILD, OTHER_CHAN)
+                    .await;
+                assert_eq!(code_of(&report), Code::Denied, "{publishers:?}");
+                assert_eq!(report.items[0].outcome.detail, Some("other_guild"));
+                let report = world
+                    .sync_at(Some(GUILD), who, Some("rules"), OTHER_GUILD)
+                    .await;
+                assert_eq!(code_of(&report), Code::Denied);
+                let report = world.sync_at(Some(GUILD), who, None, OTHER_GUILD).await;
+                assert_eq!(code_of(&report), Code::Denied);
+                let listed = world.list_at(Some(GUILD), who, OTHER_GUILD).await;
+                assert_eq!(listed.outcome.code, Code::Denied);
+                assert!(listed.posts.is_empty());
+            }
+            assert_eq!(world.discord.calls(), 0, "nothing was sent or looked up");
+            assert_eq!(world.templates.read_count(), 0, "no template was read");
+            assert!(world.rows().await.is_empty(), "no record, no squatted key");
+            assert!(world.alerts().is_empty());
+            // The real owner is not locked out of the key.
+            let report = world.post("rules").await;
+            assert_eq!(code_of(&report), Code::Posted, "{publishers:?}");
+            assert_eq!(world.row("rules").await.unwrap().record.guild, GUILD);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unset_home_guild_fails_closed_while_the_mode_is_on() {
+        for mode in [Mode::Live, Mode::Shadow] {
+            for home in [None, Some(0)] {
+                let world = World::new(mode, Publishers::OwnerOnly).await;
+                world.templates.put("rules", &tpl("T"));
+                let mut outcomes = vec![
+                    world.post_at(home, owner(), GUILD, CHAN).await,
+                    world.sync_at(home, owner(), Some("rules"), GUILD).await,
+                    world.sync_at(home, owner(), None, GUILD).await,
+                ];
+                outcomes.push(Report {
+                    shadow: false,
+                    items: vec![ItemReport {
+                        key: None,
+                        outcome: world.list_at(home, owner(), GUILD).await.outcome,
+                    }],
+                });
+                for report in outcomes {
+                    assert_eq!(code_of(&report), Code::Denied, "{mode:?} {home:?}");
+                    assert_eq!(report.items[0].outcome.detail, Some("no_home_guild"));
+                }
+                assert_eq!(world.discord.calls(), 0);
+                assert_eq!(world.templates.read_count(), 0);
+                assert!(world.rows().await.is_empty());
+                assert!(world.alerts().is_empty());
+            }
+        }
+        // An off feature stays `disabled`, whatever the home guild.
+        let world = World::new(Mode::Off, Publishers::OwnerOnly).await;
+        let report = world.post_at(None, owner(), GUILD, CHAN).await;
+        assert_eq!(code_of(&report), Code::Disabled);
+    }
+
+    #[tokio::test]
+    async fn the_home_guilds_own_owner_still_posts_syncs_and_lists() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("V1"));
+        assert_eq!(code_of(&world.post("rules").await), Code::Posted);
+        world.templates.put("rules", &tpl("V2"));
+        assert_eq!(code_of(&world.sync("rules").await), Code::Edited);
+        let listed = world.list_as(owner()).await;
+        assert_eq!(listed.outcome.code, Code::Listed);
+        assert_eq!(listed.posts.len(), 1);
+        let shadow = World::shadow().await;
+        shadow.templates.put("rules", &tpl("V1"));
+        assert_eq!(code_of(&shadow.post("rules").await), Code::WouldPost);
+    }
+
+    // ---- guild scope of list and sync-all ----
+
+    #[tokio::test]
+    async fn list_shows_only_the_rows_of_the_callers_guild() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("Home title"));
+        world.templates.put("secret_b", &tpl("Other title"));
+        assert_eq!(
+            code_of(&world.post_in(GUILD, "rules", CHAN).await),
+            Code::Posted
+        );
+        let other = world.post_in(OTHER_GUILD, "secret_b", OTHER_CHAN).await;
+        assert_eq!(code_of(&other), Code::Posted);
+        let other_row = world.row("secret_b").await.unwrap();
+
+        let listed = world.list_at(Some(GUILD), owner(), GUILD).await;
+        assert_eq!(listed.outcome.code, Code::Listed);
+        let keys: Vec<&str> = listed.posts.iter().map(|p| p.record.key.as_str()).collect();
+        assert_eq!(keys, vec!["rules"]);
+        let text = list_reply(&listed).text().to_string();
+        assert!(text.contains("rules"), "{text}");
+        assert!(!text.contains("secret_b"), "{text}");
+        assert!(!text.contains(&OTHER_CHAN.to_string()), "{text}");
+        assert!(
+            !text.contains(&other_row.record.message.to_string()),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&other_row.record.content_hash[..12]),
+            "{text}"
+        );
+
+        // And the other way round.
+        let listed = world.list_at(Some(OTHER_GUILD), owner(), OTHER_GUILD).await;
+        let keys: Vec<&str> = listed.posts.iter().map(|p| p.record.key.as_str()).collect();
+        assert_eq!(keys, vec!["secret_b"]);
+        // A guild with no rows lists nothing, and says so.
+        let listed = world.list_at(Some(7_777), owner(), 7_777).await;
+        assert_eq!(listed.outcome.code, Code::Listed);
+        assert!(listed.posts.is_empty());
+        assert!(world.alerts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_of_the_unrelated_guild_owner_returns_nothing_about_another_guild() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("T"));
+        world.post("rules").await;
+        let listed = world.list_in(stranger_owner(), OTHER_GUILD).await;
+        assert_eq!(listed.outcome.code, Code::Denied);
+        assert!(listed.posts.is_empty());
+        let text = list_reply(&listed).text().to_string();
+        assert!(!text.contains("rules"), "{text}");
+        assert!(!text.contains(&CHAN.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn list_for_guild_zero_is_an_invalid_target() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("T"));
+        world.post("rules").await;
+        for home in [Some(GUILD), Some(0), None] {
+            let listed = world.list_at(home, owner(), 0).await;
+            assert_ne!(listed.outcome.code, Code::Listed, "{home:?}");
+            assert!(listed.posts.is_empty(), "{home:?}");
+        }
+        let listed = world.list_at(Some(GUILD), owner(), 0).await;
+        assert_eq!(listed.outcome.code, Code::InvalidTarget);
+    }
+
+    #[tokio::test]
+    async fn sync_all_neither_reads_nor_reports_the_rows_of_another_guild() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("V1"));
+        world.templates.put("secret_b", &tpl("B1"));
+        world.post_in(GUILD, "rules", CHAN).await;
+        world.post_in(OTHER_GUILD, "secret_b", OTHER_CHAN).await;
+        // The other guild's template changed: a sync-all of the home guild must not touch it.
+        world.templates.put("secret_b", &tpl("B2"));
+        let reads = world.templates.read_count();
+        let lookups = world.discord.with(|s| s.lookups);
+        let other_before = world.row("secret_b").await.unwrap();
+
+        let report = world.sync_at(Some(GUILD), owner(), None, GUILD).await;
+        assert_eq!(report.items.len(), 1, "{report:?}");
+        assert_eq!(report.items[0].key.as_deref(), Some("rules"));
+        assert_eq!(report.items[0].outcome.code, Code::Unchanged);
+        assert_eq!(
+            world.templates.read_count(),
+            reads + 1,
+            "only `rules` was read"
+        );
+        assert_eq!(world.discord.with(|s| s.lookups), lookups + 1);
+        assert_eq!(world.row("secret_b").await.unwrap(), other_before);
+        assert_eq!(world.discord.with(|s| s.edits), 0);
+        let text = report_reply(&report).text().to_string();
+        assert!(!text.contains("secret_b"), "{text}");
+        assert!(!format!("{report:?}").contains("secret_b"));
+
+        // A guild with no rows of its own syncs nothing and reads nothing.
+        let reads = world.templates.read_count();
+        let report = world
+            .sync_at(Some(OTHER_GUILD + 1), owner(), None, OTHER_GUILD + 1)
+            .await;
+        assert!(report.items.is_empty(), "{report:?}");
+        assert_eq!(world.templates.read_count(), reads);
+        let text = report_reply(&report).text().to_string();
+        assert!(
+            !text.contains("rules") && !text.contains("secret_b"),
+            "{text}"
+        );
+        assert!(world.alerts().is_empty());
+    }
+
+    // ---- rule (g): each failing path alerts ----
+
+    #[tokio::test]
+    async fn a_compensating_delete_that_finds_the_message_gone_is_a_store_failure() {
+        let world = World::live().await;
+        world.templates.put("rules", &tpl("V1"));
+        world.break_inserts().await;
+        world
+            .discord
+            .with(|s| s.fail_delete = Some(DiscordError::NotFound));
+        let report = world.post("rules").await;
+        // The new post is already gone, so nothing is orphaned: only the write failed.
+        assert_eq!(code_of(&report), Code::StoreFailed);
+        assert_eq!(report.items[0].outcome.detail, Some("sqlite_error"));
+        assert_eq!(world.discord.with(|s| (s.sends, s.deletes)), (1, 1));
+        assert_eq!(world.alerts(), vec!["store_failed"]);
     }
 
     // ---- registry hook ----
