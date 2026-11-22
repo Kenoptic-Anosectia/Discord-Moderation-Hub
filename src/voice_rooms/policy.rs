@@ -747,11 +747,15 @@ fn is_invisible(c: char) -> bool {
 /// `DerivedCoreProperties.txt` (the `Default_Ignorable_Code_Point` property)
 /// and `UnicodeData.txt` (the `Cf` general category), both of **Unicode
 /// 17.0.0** - the Unicode version this crate's Rust standard library ships
-/// (`char::UNICODE_VERSION`). The test
-/// `every_character_that_renders_nothing_is_removed` walks every code point
-/// of every range, `the_class_holds_every_code_point_of_the_default_ignorable_set`
-/// pins the total, and `a_character_just_outside_the_class_survives` checks
-/// the edge, so the class is pinned in all three directions.
+/// (`char::UNICODE_VERSION`). The table is checked by
+/// `every_character_that_renders_nothing_is_removed` (which walks every code
+/// point of every range), `the_class_holds_every_code_point_of_the_default_ignorable_set`
+/// (which pins the total) and `a_character_just_outside_the_class_survives`
+/// (which checks the edge). Those three read the production table, so they
+/// only show that the implementation agrees with itself: a range that was
+/// moved by one code point but kept its size would pass all three. The table
+/// is therefore ALSO checked against `EXPECTED_CLASS`, a second copy of the
+/// class written as raw literals that do not come from this constant.
 const INVISIBLE_RANGES: &[(u32, u32)] = &[
     // The soft hyphen.
     (0x00AD, 0x00AD),
@@ -776,11 +780,7 @@ const INVISIBLE_RANGES: &[(u32, u32)] = &[
     // The Mongolian free variation selectors and the vowel separator.
     (0x180B, 0x180F),
     // The zero-width characters.
-    // RED COMMIT: this range is deliberately shifted down by one code point
-    // (0x200A..0x200E instead of 0x200B..0x200F) so the new class tests in
-    // this commit FAIL and show that they catch a range that was moved. The
-    // next commit puts the range back.
-    (0x200A, 0x200E),
+    (0x200B, 0x200F),
     // The bidirectional embedding, override and isolate controls.
     (0x202A, 0x202E),
     // The word joiner, the invisible operators and the isolates.
@@ -2856,10 +2856,14 @@ mod tests {
     /// fillers. Every code point in a range renders nothing, so every one of
     /// them must be removed.
     ///
-    /// The table under test is the production table, so the test and the rule
-    /// cannot drift apart. The ranges are the class, not a list of examples: a
-    /// range that grew would still be covered, because every code point of
-    /// the range is tested.
+    /// This table is the production table, so a test built from it checks
+    /// that the implementation agrees with itself. That is not enough on its
+    /// own: a range that was moved by one code point but kept its size would
+    /// still pass such a test, because the walk only visits the code points
+    /// the table names and the count is unchanged. The class is therefore
+    /// also checked against a SECOND, independently written copy of it in
+    /// `EXPECTED_CLASS`, which is raw literals and does not come from the
+    /// production constant.
     const INVISIBLE_CLASS: &[(u32, u32)] = INVISIBLE_RANGES;
 
     /// Every code point of the closed class renders nothing, so every one of
