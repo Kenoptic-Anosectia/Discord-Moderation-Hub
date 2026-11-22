@@ -46,6 +46,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> i64;
     fn sleep(&self, d: Duration) -> BoxFuture<'_, ()>;
+    /// Sleep until `deadline` (unix seconds); ready at once if it has passed.
+    /// An absolute deadline, not a duration, so time that passes between the
+    /// caller reading `now` and calling this is not added to the wait.
+    fn sleep_until(&self, deadline: i64) -> BoxFuture<'_, ()>;
 }
 
 /// The real clock. The only place in this module that reads wall-clock time.
@@ -61,6 +65,14 @@ impl Clock for SystemClock {
 
     fn sleep(&self, d: Duration) -> BoxFuture<'_, ()> {
         Box::pin(tokio::time::sleep(d))
+    }
+
+    fn sleep_until(&self, deadline: i64) -> BoxFuture<'_, ()> {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let target = Duration::from_secs(u64::try_from(deadline).unwrap_or(0));
+        Box::pin(tokio::time::sleep(target.saturating_sub(since_epoch)))
     }
 }
 
@@ -158,8 +170,21 @@ impl Registry {
         F: Fn(ClaimedJob) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = HandlerResult> + Send + 'static,
     {
-        let _ = (kind, policy, handler, MAX_KIND_LEN);
-        unimplemented!("RED stub")
+        let plain = !kind.is_empty()
+            && kind.len() <= MAX_KIND_LEN
+            && kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !plain {
+            return Err(RunnerError::InvalidKind);
+        }
+        if self.entries.contains_key(kind) {
+            return Err(RunnerError::DuplicateKind);
+        }
+        let handler: Handler = Arc::new(move |job| Box::pin(handler(job)));
+        self.entries
+            .insert(kind.to_string(), Entry { policy, handler });
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -200,7 +225,15 @@ impl RunnerConfig {
     };
 
     pub fn validate(&self) -> Result<(), RunnerError> {
-        unimplemented!("RED stub")
+        if !(1..=MAX_CONCURRENCY).contains(&self.concurrency) {
+            return Err(RunnerError::InvalidConcurrency);
+        }
+        if !(MIN_POLL..=MAX_POLL).contains(&self.max_poll) {
+            return Err(RunnerError::InvalidPoll);
+        }
+        self.retry
+            .validate()
+            .map_err(|_| RunnerError::InvalidRetryPolicy)
     }
 }
 
@@ -266,8 +299,15 @@ impl<C: Clock> Runner<C> {
         registry: Registry,
         cfg: RunnerConfig,
     ) -> Result<Self, RunnerError> {
-        let _ = (db, clock, registry, cfg);
-        unimplemented!("RED stub")
+        cfg.validate()?;
+        Ok(Runner {
+            db,
+            clock,
+            registry: Arc::new(registry),
+            cfg,
+            wake: WakeHandle::default(),
+            shutdown: ShutdownHandle(Arc::new(watch::channel(false).0)),
+        })
     }
 
     pub fn wake_handle(&self) -> WakeHandle {
@@ -281,12 +321,342 @@ impl<C: Clock> Runner<C> {
     /// Reconcile jobs found `running` (a previous process died or was stopped
     /// mid-run) using the registry's policies, BEFORE anything is claimed.
     pub async fn start(self) -> Result<Started<C>, RunnerError> {
-        let _ = HashMap::<i64, i64>::new();
-        let _ = JoinSet::<()>::new();
-        let _ = FailOutcome::Failed { attempts: 0 };
-        let _ = queue::reconcile_after_restart;
-        let _ = self;
-        unimplemented!("RED stub")
+        let table = self.registry.kind_table();
+        let retry = self.cfg.retry;
+        let now = self.clock.now();
+        let report = self
+            .db
+            .call(move |c| {
+                let table: Vec<(&str, RestartPolicy)> =
+                    table.iter().map(|(k, p)| (k.as_str(), *p)).collect();
+                queue::reconcile_after_restart(c, now, &table, &retry)
+            })
+            .await
+            .map_err(map_db)?;
+        Ok(Started {
+            runner: self,
+            report,
+        })
+    }
+}
+
+fn map_db(e: tokio_rusqlite::Error<QueueError>) -> RunnerError {
+    match e {
+        tokio_rusqlite::Error::Error(q) => RunnerError::Queue(q),
+        _ => RunnerError::DbClosed,
+    }
+}
+
+/// Retry policy that makes the first `fail` terminal: used where running the
+/// job again cannot help (no handler) or may repeat an effect (at-most-once
+/// panic).
+const TERMINAL: RetryPolicy = RetryPolicy {
+    base_secs: 1,
+    cap_secs: 1,
+    max_attempts: 1,
+};
+
+/// A handler result waiting to be written to the queue.
+#[derive(Debug, Clone, Copy)]
+enum Ack {
+    Complete {
+        id: i64,
+    },
+    Fail {
+        id: i64,
+        code: &'static str,
+        terminal: bool,
+    },
+}
+
+impl Ack {
+    fn id(&self) -> i64 {
+        match self {
+            Ack::Complete { id } | Ack::Fail { id, .. } => *id,
+        }
+    }
+}
+
+enum AckDone {
+    Completed,
+    Retried,
+    Failed,
+}
+
+enum AckError {
+    /// Connection thread gone.
+    Closed,
+    /// Engine error: keep the acknowledgement and try again.
+    Transient,
+    /// The queue says the job is not `running` (or unknown): nothing to write.
+    Refused,
+}
+
+type JoinResult = Result<(tokio::task::Id, HandlerResult), tokio::task::JoinError>;
+
+/// Mutable state of one `run`.
+struct Live {
+    set: JoinSet<HandlerResult>,
+    /// task id -> (job id, restart policy of its kind)
+    tasks: HashMap<tokio::task::Id, (i64, RestartPolicy)>,
+    acks: Vec<Ack>,
+    sum: RunSummary,
+}
+
+impl Live {
+    /// Turn a finished handler task into an acknowledgement to write.
+    fn finish(&mut self, res: JoinResult) {
+        let ack = match res {
+            Ok((tid, result)) => {
+                let Some((id, _)) = self.tasks.remove(&tid) else {
+                    return;
+                };
+                match result {
+                    Ok(()) => Ack::Complete { id },
+                    Err(e) => Ack::Fail {
+                        id,
+                        code: e.code(),
+                        terminal: false,
+                    },
+                }
+            }
+            Err(join_err) => {
+                let Some((id, policy)) = self.tasks.remove(&join_err.id()) else {
+                    return;
+                };
+                let code = if join_err.is_panic() {
+                    CODE_PANICKED
+                } else {
+                    CODE_CANCELLED
+                };
+                // A panic or cancel may have come after the effect: an
+                // at-most-once job must not be run again.
+                Ack::Fail {
+                    id,
+                    code,
+                    terminal: policy == RestartPolicy::AtMostOnce,
+                }
+            }
+        };
+        self.acks.push(ack);
+    }
+
+    fn reap_finished(&mut self) {
+        while let Some(r) = self.set.try_join_next_with_id() {
+            self.finish(r);
+        }
+    }
+}
+
+impl<C: Clock> Runner<C> {
+    async fn claim(&self, now: i64, limit: u32) -> Result<queue::ClaimBatch, RunnerError> {
+        self.db
+            .call(move |c| queue::claim_due(c, now, limit))
+            .await
+            .map_err(map_db)
+    }
+
+    /// Earliest `due_at` among pending jobs. The queue module has no such
+    /// call, so this is the one read-only statement the runner issues itself.
+    async fn next_due(&self) -> Result<Option<i64>, RunnerError> {
+        self.db
+            .call(|c| {
+                c.query_row(
+                    "SELECT MIN(due_at) FROM jobs WHERE state = 'pending'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .map_err(QueueError::from)
+            })
+            .await
+            .map_err(map_db)
+    }
+
+    async fn write_ack(&self, ack: Ack) -> Result<AckDone, AckError> {
+        let now = self.clock.now();
+        let retry = match ack {
+            Ack::Fail { terminal: true, .. } => TERMINAL,
+            _ => self.cfg.retry,
+        };
+        let res = self
+            .db
+            .call(move |c| match ack {
+                Ack::Complete { id } => queue::complete(c, id, now).map(|()| AckDone::Completed),
+                Ack::Fail { id, code, .. } => {
+                    queue::fail(c, id, code, now, &retry).map(|o| match o {
+                        FailOutcome::Retry { .. } => AckDone::Retried,
+                        FailOutcome::Failed { .. } => AckDone::Failed,
+                    })
+                }
+            })
+            .await;
+        match res {
+            Ok(done) => Ok(done),
+            Err(tokio_rusqlite::Error::Error(QueueError::Sqlite | QueueError::Storage(_))) => {
+                Err(AckError::Transient)
+            }
+            Err(tokio_rusqlite::Error::Error(_)) => Err(AckError::Refused),
+            Err(_) => Err(AckError::Closed),
+        }
+    }
+
+    /// Write every pending acknowledgement once. Returns `true` when some
+    /// could not be written (they stay queued for the next pass).
+    async fn flush_acks(&self, live: &mut Live) -> Result<bool, RunnerError> {
+        let pending = std::mem::take(&mut live.acks);
+        let mut left = false;
+        let mut it = pending.into_iter();
+        while let Some(ack) = it.next() {
+            match self.write_ack(ack).await {
+                Ok(AckDone::Completed) => live.sum.completed += 1,
+                Ok(AckDone::Retried) => live.sum.retried += 1,
+                Ok(AckDone::Failed) => live.sum.failed += 1,
+                Err(AckError::Refused) => {}
+                Err(AckError::Transient) => {
+                    live.sum.db_errors += 1;
+                    live.acks.push(ack);
+                    left = true;
+                }
+                Err(AckError::Closed) => {
+                    live.acks.push(ack);
+                    live.acks.extend(it);
+                    return Err(RunnerError::DbClosed);
+                }
+            }
+        }
+        Ok(left)
+    }
+
+    /// Run the handler for `job` as its own task, or queue the terminal
+    /// failure for a kind with no handler.
+    fn dispatch(&self, live: &mut Live, job: ClaimedJob) {
+        live.sum.claimed += 1;
+        let id = job.id;
+        let Some(entry) = self.registry.entries.get(&job.kind) else {
+            live.acks.push(Ack::Fail {
+                id,
+                code: CODE_NO_HANDLER,
+                terminal: true,
+            });
+            return;
+        };
+        let handler = entry.handler.clone();
+        // The handler is called inside the task, so even a handler function
+        // that panics before returning its future cannot reach the loop.
+        let handle = live.set.spawn(async move { (*handler)(job).await });
+        live.tasks.insert(handle.id(), (id, entry.policy));
+    }
+
+    /// Deadline (unix seconds) to sleep until when nothing can be claimed now.
+    async fn idle_deadline(&self, now: i64, live: &mut Live) -> Result<i64, RunnerError> {
+        let poll = i64::try_from(self.cfg.max_poll.as_secs()).unwrap_or(i64::MAX);
+        let latest = now.saturating_add(poll);
+        match self.next_due().await {
+            Ok(None) => Ok(latest),
+            // At least 1 s ahead: a due job that could not be claimed (another
+            // claimer won it) must not turn into a spin.
+            Ok(Some(due)) => Ok(due.max(now.saturating_add(1)).min(latest)),
+            Err(RunnerError::DbClosed) => Err(RunnerError::DbClosed),
+            Err(_) => {
+                live.sum.db_errors += 1;
+                Ok(now.saturating_add(1))
+            }
+        }
+    }
+
+    async fn main_loop(
+        &self,
+        live: &mut Live,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<(), RunnerError> {
+        let slots = self.cfg.concurrency;
+        loop {
+            if *stop.borrow() {
+                return Ok(());
+            }
+            live.reap_finished();
+            let mut trouble = self.flush_acks(live).await?;
+            let now = self.clock.now();
+            let free = slots.saturating_sub(live.set.len());
+            if free > 0 {
+                let limit = u32::try_from(free).unwrap_or(u32::MAX);
+                match self.claim(now, limit).await {
+                    Ok(batch) => {
+                        live.sum.refused_at_claim += batch.payload_failed.len() as u64;
+                        let progressed =
+                            !batch.claimed.is_empty() || !batch.payload_failed.is_empty();
+                        for job in batch.claimed {
+                            self.dispatch(live, job);
+                        }
+                        if progressed {
+                            // More may be due; loop without sleeping. Each
+                            // such pass changed at least one row, so it ends.
+                            continue;
+                        }
+                    }
+                    Err(RunnerError::DbClosed) => return Err(RunnerError::DbClosed),
+                    Err(_) => {
+                        live.sum.db_errors += 1;
+                        trouble = true;
+                    }
+                }
+            }
+            let free = slots.saturating_sub(live.set.len());
+            let sleeper: Option<BoxFuture<'_, ()>> = if trouble {
+                Some(self.clock.sleep(DB_RETRY_DELAY))
+            } else if free > 0 {
+                Some(self.clock.sleep_until(self.idle_deadline(now, live).await?))
+            } else {
+                // Every slot is busy: only a finishing handler (or shutdown)
+                // can change anything, so no timer is needed.
+                None
+            };
+            let mut joined = None;
+            tokio::select! {
+                biased;
+                _ = stop.changed() => {}
+                r = live.set.join_next_with_id(), if !live.set.is_empty() => { joined = r; }
+                _ = self.wake.0.notified() => {}
+                _ = async {
+                    match sleeper {
+                        Some(s) => s.await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+            if let Some(r) = joined {
+                live.finish(r);
+            }
+        }
+    }
+
+    /// Shutdown: claim nothing, give in-flight handlers `shutdown_grace`,
+    /// write their results, abandon the rest (their jobs stay `running`).
+    async fn drain(&self, live: &mut Live) {
+        if !live.set.is_empty() {
+            let mut grace = self.clock.sleep(self.cfg.shutdown_grace);
+            while !live.set.is_empty() {
+                let mut joined = None;
+                let mut timed_out = false;
+                tokio::select! {
+                    biased;
+                    r = live.set.join_next_with_id() => { joined = r; }
+                    _ = &mut grace => { timed_out = true; }
+                }
+                if let Some(r) = joined {
+                    live.finish(r);
+                    if self.flush_acks(live).await.is_err() {
+                        break;
+                    }
+                }
+                if timed_out {
+                    live.reap_finished();
+                    break;
+                }
+            }
+        }
+        let _ = self.flush_acks(live).await;
+        live.set.abort_all();
     }
 }
 
@@ -298,8 +668,26 @@ impl<C: Clock> Started<C> {
 
     /// Run until shutdown is triggered (or the database goes away).
     pub async fn run(self) -> Result<RunSummary, RunnerError> {
-        let _ = self.runner.cfg;
-        unimplemented!("RED stub")
+        let runner = self.runner;
+        let mut live = Live {
+            set: JoinSet::new(),
+            tasks: HashMap::new(),
+            acks: Vec::new(),
+            sum: RunSummary::default(),
+        };
+        let mut stop = runner.shutdown.0.subscribe();
+        runner.main_loop(&mut live, &mut stop).await?;
+        runner.drain(&mut live).await;
+        let mut left: Vec<i64> = live
+            .tasks
+            .values()
+            .map(|(id, _)| *id)
+            .chain(live.acks.iter().map(Ack::id))
+            .collect();
+        left.sort_unstable();
+        left.dedup();
+        live.sum.left_running = left;
+        Ok(live.sum)
     }
 }
 
@@ -323,6 +711,7 @@ mod tests {
         now_calls: AtomicUsize,
         sleep_calls: AtomicUsize,
         last_sleep_ms: AtomicI64,
+        last_deadline: AtomicI64,
     }
 
     impl FakeClock {
@@ -332,6 +721,7 @@ mod tests {
                 now_calls: AtomicUsize::new(0),
                 sleep_calls: AtomicUsize::new(0),
                 last_sleep_ms: AtomicI64::new(-1),
+                last_deadline: AtomicI64::new(-1),
             })
         }
         fn advance(&self, secs: i64) {
@@ -349,6 +739,22 @@ mod tests {
         fn last_sleep_secs(&self) -> i64 {
             self.last_sleep_ms.load(SeqCst) / 1000
         }
+        fn last_deadline(&self) -> i64 {
+            self.last_deadline.load(SeqCst)
+        }
+        fn wait_until_ms(&self, target: i64) -> BoxFuture<'_, ()> {
+            let mut rx = self.ms.subscribe();
+            Box::pin(async move {
+                loop {
+                    if *rx.borrow_and_update() >= target {
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
     }
 
     impl Clock for FakeClock {
@@ -361,17 +767,12 @@ mod tests {
             let d_ms = i64::try_from(d.as_millis()).unwrap();
             self.last_sleep_ms.store(d_ms, SeqCst);
             let target = *self.ms.borrow() + d_ms;
-            let mut rx = self.ms.subscribe();
-            Box::pin(async move {
-                loop {
-                    if *rx.borrow_and_update() >= target {
-                        return;
-                    }
-                    if rx.changed().await.is_err() {
-                        return;
-                    }
-                }
-            })
+            self.wait_until_ms(target)
+        }
+        fn sleep_until(&self, deadline: i64) -> BoxFuture<'_, ()> {
+            self.sleep_calls.fetch_add(1, SeqCst);
+            self.last_deadline.store(deadline, SeqCst);
+            self.wait_until_ms(deadline * 1000)
         }
     }
 
@@ -412,7 +813,13 @@ mod tests {
         c.into()
     }
 
-    async fn sched(db: &tokio_rusqlite::Connection, kind: &str, key: &str, payload: &str, due: i64) -> i64 {
+    async fn sched(
+        db: &tokio_rusqlite::Connection,
+        kind: &str,
+        key: &str,
+        payload: &str,
+        due: i64,
+    ) -> i64 {
         let (kind, key, payload) = (kind.to_string(), key.to_string(), payload.to_string());
         let out = db
             .call(move |c| {
@@ -461,7 +868,25 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        panic!("job {id} never reached {want:?}; is {:?}", view(db, id).await.state);
+        panic!(
+            "job {id} never reached {want:?}; is {:?}",
+            view(db, id).await.state
+        );
+    }
+
+    /// Wait until the job has been run `attempts` times and put back to
+    /// `pending` with a recorded error (a bare `pending` is also its state
+    /// before the first claim, so state alone proves nothing).
+    async fn wait_retry(db: &tokio_rusqlite::Connection, id: i64, attempts: i64) {
+        for _ in 0..10_000 {
+            let v = view(db, id).await;
+            if v.state == JobState::Pending && v.attempts == attempts && v.last_error_code.is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("job {id} never returned to pending after attempt {attempts}");
     }
 
     /// Give a runner that should stay quiet a real chance to misbehave.
@@ -477,7 +902,12 @@ mod tests {
         report: Report,
     }
 
-    async fn boot(db: &tokio_rusqlite::Connection, clock: &Arc<FakeClock>, reg: Registry, cfg: RunnerConfig) -> Up {
+    async fn boot(
+        db: &tokio_rusqlite::Connection,
+        clock: &Arc<FakeClock>,
+        reg: Registry,
+        cfg: RunnerConfig,
+    ) -> Up {
         let runner = Runner::new(db.clone(), clock.clone(), reg, cfg).unwrap();
         let wake = runner.wake_handle();
         let stop = runner.shutdown_handle();
@@ -535,25 +965,102 @@ mod tests {
         assert_eq!(RunnerConfig::DEFAULT.validate(), Ok(()));
         let ok = |c: RunnerConfig| c.validate();
         let base = cfg(1);
-        assert_eq!(ok(RunnerConfig { concurrency: 0, ..base }), Err(RunnerError::InvalidConcurrency));
-        assert_eq!(ok(RunnerConfig { concurrency: MAX_CONCURRENCY + 1, ..base }), Err(RunnerError::InvalidConcurrency));
-        assert_eq!(ok(RunnerConfig { concurrency: MAX_CONCURRENCY, ..base }), Ok(()));
-        assert_eq!(ok(RunnerConfig { concurrency: usize::MAX, ..base }), Err(RunnerError::InvalidConcurrency));
-        assert_eq!(ok(RunnerConfig { max_poll: MIN_POLL - Duration::from_millis(1), ..base }), Err(RunnerError::InvalidPoll));
-        assert_eq!(ok(RunnerConfig { max_poll: Duration::ZERO, ..base }), Err(RunnerError::InvalidPoll));
-        assert_eq!(ok(RunnerConfig { max_poll: MIN_POLL, ..base }), Ok(()));
-        assert_eq!(ok(RunnerConfig { max_poll: MAX_POLL, ..base }), Ok(()));
-        assert_eq!(ok(RunnerConfig { max_poll: MAX_POLL + Duration::from_millis(1), ..base }), Err(RunnerError::InvalidPoll));
-        let bad_retry = RetryPolicy { base_secs: 0, cap_secs: 10, max_attempts: 3 };
-        assert_eq!(ok(RunnerConfig { retry: bad_retry, ..base }), Err(RunnerError::InvalidRetryPolicy));
-        let zero_attempts = RetryPolicy { base_secs: 1, cap_secs: 10, max_attempts: 0 };
-        assert_eq!(ok(RunnerConfig { retry: zero_attempts, ..base }), Err(RunnerError::InvalidRetryPolicy));
+        assert_eq!(
+            ok(RunnerConfig {
+                concurrency: 0,
+                ..base
+            }),
+            Err(RunnerError::InvalidConcurrency)
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                concurrency: MAX_CONCURRENCY + 1,
+                ..base
+            }),
+            Err(RunnerError::InvalidConcurrency)
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                concurrency: MAX_CONCURRENCY,
+                ..base
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                concurrency: usize::MAX,
+                ..base
+            }),
+            Err(RunnerError::InvalidConcurrency)
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                max_poll: MIN_POLL - Duration::from_millis(1),
+                ..base
+            }),
+            Err(RunnerError::InvalidPoll)
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                max_poll: Duration::ZERO,
+                ..base
+            }),
+            Err(RunnerError::InvalidPoll)
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                max_poll: MIN_POLL,
+                ..base
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                max_poll: MAX_POLL,
+                ..base
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            ok(RunnerConfig {
+                max_poll: MAX_POLL + Duration::from_millis(1),
+                ..base
+            }),
+            Err(RunnerError::InvalidPoll)
+        );
+        let bad_retry = RetryPolicy {
+            base_secs: 0,
+            cap_secs: 10,
+            max_attempts: 3,
+        };
+        assert_eq!(
+            ok(RunnerConfig {
+                retry: bad_retry,
+                ..base
+            }),
+            Err(RunnerError::InvalidRetryPolicy)
+        );
+        let zero_attempts = RetryPolicy {
+            base_secs: 1,
+            cap_secs: 10,
+            max_attempts: 0,
+        };
+        assert_eq!(
+            ok(RunnerConfig {
+                retry: zero_attempts,
+                ..base
+            }),
+            Err(RunnerError::InvalidRetryPolicy)
+        );
     }
 
     #[tokio::test]
     async fn runner_new_refuses_an_invalid_config() {
         let clock = FakeClock::new();
-        let bad = RunnerConfig { concurrency: 0, ..cfg(1) };
+        let bad = RunnerConfig {
+            concurrency: 0,
+            ..cfg(1)
+        };
         let err = Runner::new(mem_db(), clock, Registry::new(), bad).err();
         assert_eq!(err, Some(RunnerError::InvalidConcurrency));
     }
@@ -564,8 +1071,19 @@ mod tests {
         let long = "a".repeat(MAX_KIND_LEN);
         let too_long = "a".repeat(MAX_KIND_LEN + 1);
         let kinds = [
-            "ok_kind", "a", "k9", "_", long.as_str(), "", "Upper", "has space", "dash-ed",
-            "uni\u{e9}", "nul\0byte", too_long.as_str(), "dot.ted",
+            "ok_kind",
+            "a",
+            "k9",
+            "_",
+            long.as_str(),
+            "",
+            "Upper",
+            "has space",
+            "dash-ed",
+            "uni\u{e9}",
+            "nul\0byte",
+            too_long.as_str(),
+            "dot.ted",
         ];
         for (i, kind) in kinds.iter().enumerate() {
             let mut reg = Registry::new();
@@ -578,7 +1096,12 @@ mod tests {
                 .call(move |c| {
                     queue::schedule(
                         c,
-                        &NewJob { kind: &kind_owned, dedupe_key: &key, payload_json: "{}", due_at: T0 },
+                        &NewJob {
+                            kind: &kind_owned,
+                            dedupe_key: &key,
+                            payload_json: "{}",
+                            due_at: T0,
+                        },
                         T0,
                     )
                 })
@@ -588,7 +1111,9 @@ mod tests {
             assert_eq!(reg.len(), usize::from(reg_ok));
         }
         let mut reg = Registry::new();
-        assert!(reg.register("dup", RestartPolicy::RunAgain, |_| async { Ok(()) }).is_ok());
+        assert!(reg
+            .register("dup", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .is_ok());
         assert_eq!(
             reg.register("dup", RestartPolicy::AtMostOnce, |_| async { Ok(()) }),
             Err(RunnerError::DuplicateKind)
@@ -611,7 +1136,10 @@ mod tests {
         }
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut reg = Registry::new();
-        for (kind, policy) in [("rerun", RestartPolicy::RunAgain), ("once", RestartPolicy::AtMostOnce)] {
+        for (kind, policy) in [
+            ("rerun", RestartPolicy::RunAgain),
+            ("once", RestartPolicy::AtMostOnce),
+        ] {
             let calls = calls.clone();
             reg.register(kind, policy, move |j| {
                 let calls = calls.clone();
@@ -624,8 +1152,12 @@ mod tests {
         }
         let up = boot(&db, &clock, reg, cfg(2)).await;
         // The report is what the caller logs: it names every job found running.
-        let mut seen: Vec<(i64, ReconcileOutcome)> =
-            up.report.entries.iter().map(|e| (e.id, e.outcome)).collect();
+        let mut seen: Vec<(i64, ReconcileOutcome)> = up
+            .report
+            .entries
+            .iter()
+            .map(|e| (e.id, e.outcome))
+            .collect();
         seen.sort_by_key(|(id, _)| *id);
         assert_eq!(
             seen,
@@ -681,7 +1213,11 @@ mod tests {
         wait_state(&db, d, JobState::Done).await;
         linger().await;
         assert_eq!(*order.lock().unwrap(), vec![a, c, b, d]);
-        assert_eq!(view(&db, later).await.state, JobState::Pending, "due in 1 s: not yet");
+        assert_eq!(
+            view(&db, later).await.state,
+            JobState::Pending,
+            "due in 1 s: not yet"
+        );
         clock.advance(1);
         wait_state(&db, later, JobState::Done).await;
         assert_eq!(*order.lock().unwrap(), vec![a, c, b, d, later]);
@@ -707,9 +1243,12 @@ mod tests {
         })
         .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
-        wait_state(&db, id, JobState::Pending).await;
+        wait_retry(&db, id, 1).await;
         let v = view(&db, id).await;
-        assert_eq!((v.attempts, v.due_at, v.last_error_code.as_deref()), (1, T0 + 30, Some("upstream_down")));
+        assert_eq!(
+            (v.attempts, v.due_at, v.last_error_code.as_deref()),
+            (1, T0 + 30, Some("upstream_down"))
+        );
         assert_eq!(calls.load(SeqCst), 1);
         // 29 s later it still must not have run again; at 30 s it does.
         clock.advance(29);
@@ -717,7 +1256,7 @@ mod tests {
         assert_eq!(calls.load(SeqCst), 1, "backoff not over");
         clock.advance(1);
         eventually("second run", || calls.load(SeqCst) == 2).await;
-        wait_state(&db, id, JobState::Pending).await;
+        wait_retry(&db, id, 2).await;
         let v = view(&db, id).await;
         assert_eq!((v.attempts, v.due_at), (2, T0 + 30 + 60), "doubled backoff");
         clock.advance(59);
@@ -726,7 +1265,10 @@ mod tests {
         clock.advance(1);
         wait_state(&db, id, JobState::Failed).await;
         let v = view(&db, id).await;
-        assert_eq!((v.attempts, v.last_error_code.as_deref()), (3, Some("upstream_down")));
+        assert_eq!(
+            (v.attempts, v.last_error_code.as_deref()),
+            (3, Some("upstream_down"))
+        );
         // Terminal: no further run however much time passes.
         clock.advance(100_000);
         up.wake.wake();
@@ -758,8 +1300,15 @@ mod tests {
         wait_state(&db, ghost, JobState::Failed).await;
         wait_state(&db, good, JobState::Done).await;
         let v = view(&db, ghost).await;
-        assert_eq!((v.attempts, v.last_error_code.as_deref()), (1, Some(CODE_NO_HANDLER)));
-        assert_eq!(*ran.lock().unwrap(), vec![good], "the ghost job reached no handler");
+        assert_eq!(
+            (v.attempts, v.last_error_code.as_deref()),
+            (1, Some(CODE_NO_HANDLER))
+        );
+        assert_eq!(
+            *ran.lock().unwrap(),
+            vec![good],
+            "the ghost job reached no handler"
+        );
         let summary = up.stop_idle().await;
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.completed, 1);
@@ -789,10 +1338,14 @@ mod tests {
         })
         .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
-        wait_state(&db, bad, JobState::Pending).await;
+        wait_retry(&db, bad, 1).await;
         let v = view(&db, bad).await;
         assert_eq!(v.last_error_code.as_deref(), Some(CODE_PANICKED));
-        assert_eq!(v.due_at, T0 + 30, "a RunAgain panic is retried with backoff");
+        assert_eq!(
+            v.due_at,
+            T0 + 30,
+            "a RunAgain panic is retried with backoff"
+        );
         // The runner survived: a job scheduled afterwards still runs.
         let after = sched(&db, "fine", "b", "{}", T0).await;
         up.wake.wake();
@@ -807,7 +1360,10 @@ mod tests {
         assert!(!up.join.is_finished(), "runner must still be up");
         let summary = up.stop_idle().await;
         let text = format!("{summary:?}");
-        assert!(!text.contains("SECRET_PAYLOAD") && !text.contains("PANIC_TEXT"), "{text}");
+        assert!(
+            !text.contains("SECRET_PAYLOAD") && !text.contains("PANIC_TEXT"),
+            "{text}"
+        );
         assert_eq!(ok_calls.load(SeqCst), 1);
     }
 
@@ -833,7 +1389,10 @@ mod tests {
         let up = boot(&db, &clock, reg, cfg(1)).await;
         wait_state(&db, id, JobState::Failed).await;
         let v = view(&db, id).await;
-        assert_eq!((v.attempts, v.last_error_code.as_deref()), (1, Some(CODE_PANICKED)));
+        assert_eq!(
+            (v.attempts, v.last_error_code.as_deref()),
+            (1, Some(CODE_PANICKED))
+        );
         clock.advance(10_000);
         up.wake.wake();
         linger().await;
@@ -847,7 +1406,11 @@ mod tests {
         let clock = FakeClock::new();
         let bad_payload = sched(&db, "t", "a", "not json", T0 - 3).await;
         let bad_kind = sched(&db, "t", "b", "{}", T0 - 2).await;
-        sql(&db, "UPDATE jobs SET kind = 'Bad Kind!' WHERE dedupe_key = 'b'").await;
+        sql(
+            &db,
+            "UPDATE jobs SET kind = 'Bad Kind!' WHERE dedupe_key = 'b'",
+        )
+        .await;
         let good = sched(&db, "t", "c", "{}", T0 - 1).await;
         let calls = Arc::new(Mutex::new(Vec::<i64>::new()));
         let mut reg = Registry::new();
@@ -862,8 +1425,14 @@ mod tests {
         .unwrap();
         let up = boot(&db, &clock, reg, cfg(3)).await;
         wait_state(&db, good, JobState::Done).await;
-        assert_eq!(view(&db, bad_payload).await.last_error_code.as_deref(), Some(queue::CODE_PAYLOAD_MALFORMED));
-        assert_eq!(view(&db, bad_kind).await.last_error_code.as_deref(), Some(queue::CODE_KIND_MALFORMED));
+        assert_eq!(
+            view(&db, bad_payload).await.last_error_code.as_deref(),
+            Some(queue::CODE_PAYLOAD_MALFORMED)
+        );
+        assert_eq!(
+            view(&db, bad_kind).await.last_error_code.as_deref(),
+            Some(queue::CODE_KIND_MALFORMED)
+        );
         assert_eq!(*calls.lock().unwrap(), vec![good]);
         let summary = up.stop_idle().await;
         assert_eq!(summary.refused_at_claim, 2);
@@ -880,8 +1449,11 @@ mod tests {
         })
         .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
-        wait_state(&db, id, JobState::Pending).await;
-        assert_eq!(view(&db, id).await.last_error_code.as_deref(), Some(queue::CODE_INVALID_CODE));
+        wait_retry(&db, id, 1).await;
+        assert_eq!(
+            view(&db, id).await.last_error_code.as_deref(),
+            Some(queue::CODE_INVALID_CODE)
+        );
         up.stop_idle().await;
     }
 
@@ -916,12 +1488,24 @@ mod tests {
             let i3 = inflight.clone();
             eventually("n handlers in flight", || i3.load(SeqCst) == n).await;
             linger().await;
-            assert_eq!(inflight.load(SeqCst), n, "n={n}: stays at the limit while the rest wait");
+            assert_eq!(
+                inflight.load(SeqCst),
+                n,
+                "n={n}: stays at the limit while the rest wait"
+            );
             let pending = db
-                .call(|c| c.query_row("SELECT COUNT(*) FROM jobs WHERE state='pending'", [], |r| r.get::<_, i64>(0)))
+                .call(|c| {
+                    c.query_row("SELECT COUNT(*) FROM jobs WHERE state='pending'", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                })
                 .await
                 .unwrap();
-            assert_eq!(pending, 12 - i64::try_from(n).unwrap(), "unclaimed jobs stay pending, not running");
+            assert_eq!(
+                pending,
+                12 - i64::try_from(n).unwrap(),
+                "unclaimed jobs stay pending, not running"
+            );
             gate.open();
             for id in &ids {
                 wait_state(&db, *id, JobState::Done).await;
@@ -938,14 +1522,23 @@ mod tests {
         let db = mem_db();
         let clock = FakeClock::new();
         let mut reg = Registry::new();
-        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) }).unwrap();
+        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .unwrap();
         let up = boot(&db, &clock, reg, cfg(2)).await;
         let c = clock.clone();
         eventually("first sleep", || c.sleeps() >= 1).await;
-        assert_eq!(clock.last_sleep_secs(), 30, "sleeps the max poll interval");
+        assert_eq!(
+            clock.last_deadline(),
+            T0 + 30,
+            "sleeps the max poll interval"
+        );
         let sample = (clock.nows(), clock.sleeps());
         linger().await;
-        assert_eq!((clock.nows(), clock.sleeps()), sample, "no wake-ups while nothing happens");
+        assert_eq!(
+            (clock.nows(), clock.sleeps()),
+            sample,
+            "no wake-ups while nothing happens"
+        );
         // One poll interval later: exactly one more pass.
         clock.advance(30);
         let c = clock.clone();
@@ -962,11 +1555,16 @@ mod tests {
         let clock = FakeClock::new();
         let soon = sched(&db, "t", "a", "{}", T0 + 10).await;
         let mut reg = Registry::new();
-        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) }).unwrap();
+        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
         let c = clock.clone();
         eventually("sleep", || c.sleeps() >= 1).await;
-        assert_eq!(clock.last_sleep_secs(), 10, "wakes exactly when the job is due");
+        assert_eq!(
+            clock.last_deadline(),
+            T0 + 10,
+            "wakes exactly when the job is due"
+        );
         clock.advance(10);
         wait_state(&db, soon, JobState::Done).await;
         let far = sched(&db, "t", "b", "{}", T0 + 10 + 500).await;
@@ -974,7 +1572,7 @@ mod tests {
         let before = clock.sleeps();
         let c = clock.clone();
         eventually("re-sleep", || c.sleeps() > before).await;
-        assert_eq!(clock.last_sleep_secs(), 30, "capped at max_poll");
+        assert_eq!(clock.last_deadline(), T0 + 10 + 30, "capped at max_poll");
         assert_eq!(view(&db, far).await.state, JobState::Pending);
         up.stop_idle().await;
     }
@@ -984,13 +1582,18 @@ mod tests {
         let db = mem_db();
         let clock = FakeClock::new();
         let mut reg = Registry::new();
-        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) }).unwrap();
+        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
         let c = clock.clone();
         eventually("asleep", || c.sleeps() >= 1).await;
         let id = sched(&db, "t", "a", "{}", T0).await;
         linger().await;
-        assert_eq!(view(&db, id).await.state, JobState::Pending, "no wake, no clock movement: still asleep");
+        assert_eq!(
+            view(&db, id).await.state,
+            JobState::Pending,
+            "no wake, no clock movement: still asleep"
+        );
         up.wake.wake();
         wait_state(&db, id, JobState::Done).await;
         // A wake sent while the runner is busy is not lost either.
@@ -1015,7 +1618,10 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let make_reg = |calls: Arc<Mutex<HashMap<String, usize>>>, gate: Arc<Gate>| {
             let mut reg = Registry::new();
-            for (kind, policy) in [("rerun", RestartPolicy::RunAgain), ("once", RestartPolicy::AtMostOnce)] {
+            for (kind, policy) in [
+                ("rerun", RestartPolicy::RunAgain),
+                ("once", RestartPolicy::AtMostOnce),
+            ] {
                 let (calls, gate) = (calls.clone(), gate.clone());
                 reg.register(kind, policy, move |j| {
                     let (calls, gate) = (calls.clone(), gate.clone());
@@ -1032,7 +1638,10 @@ mod tests {
         // Run 1: both handlers are stuck when shutdown arrives.
         let up = boot(&db, &clock, make_reg(calls.clone(), gate.clone()), cfg(2)).await;
         let cl = calls.clone();
-        eventually("both started", || cl.lock().unwrap().values().sum::<usize>() == 2).await;
+        eventually("both started", || {
+            cl.lock().unwrap().values().sum::<usize>() == 2
+        })
+        .await;
         let summary = up.stop_after_grace(5).await;
         assert_eq!(summary.left_running, vec![rerun, once]);
         assert_eq!(summary.completed, 0);
@@ -1043,18 +1652,38 @@ mod tests {
         gate.open();
         let db2 = file_db(path);
         let up2 = boot(&db2, &clock, make_reg(calls.clone(), gate.clone()), cfg(2)).await;
-        let mut seen: Vec<(i64, ReconcileOutcome)> = up2.report.entries.iter().map(|e| (e.id, e.outcome)).collect();
+        let mut seen: Vec<(i64, ReconcileOutcome)> = up2
+            .report
+            .entries
+            .iter()
+            .map(|e| (e.id, e.outcome))
+            .collect();
         seen.sort_by_key(|(id, _)| *id);
-        assert_eq!(seen, vec![(rerun, ReconcileOutcome::Requeued), (once, ReconcileOutcome::AbandonedAtMostOnce)]);
+        assert_eq!(
+            seen,
+            vec![
+                (rerun, ReconcileOutcome::Requeued),
+                (once, ReconcileOutcome::AbandonedAtMostOnce)
+            ]
+        );
         let abandoned = up2.report.abandoned();
         assert_eq!(abandoned.len(), 1);
-        assert_eq!((abandoned[0].id, abandoned[0].kind.as_str()), (once, "once"));
+        assert_eq!(
+            (abandoned[0].id, abandoned[0].kind.as_str()),
+            (once, "once")
+        );
         wait_state(&db2, rerun, JobState::Done).await;
         linger().await;
         assert_eq!(view(&db2, once).await.state, JobState::Abandoned);
-        let c = calls.lock().unwrap();
-        assert_eq!((c["rerun"], c["once"]), (2, 1), "RunAgain re-ran, AtMostOnce did not");
-        drop(c);
+        let (reruns, onces) = {
+            let c = calls.lock().unwrap();
+            (c["rerun"], c["once"])
+        };
+        assert_eq!(
+            (reruns, onces),
+            (2, 1),
+            "RunAgain re-ran, AtMostOnce did not"
+        );
         up2.stop_idle().await;
     }
 
@@ -1088,7 +1717,11 @@ mod tests {
         assert_eq!(summary.left_running, Vec::<i64>::new());
         assert_eq!(summary.completed, 1);
         assert_eq!(view(&db, first).await.state, JobState::Done);
-        assert_eq!(view(&db, second).await.state, JobState::Pending, "not claimed after shutdown");
+        assert_eq!(
+            view(&db, second).await.state,
+            JobState::Pending,
+            "not claimed after shutdown"
+        );
         assert_eq!(started.load(SeqCst), 1);
     }
 
@@ -1155,7 +1788,11 @@ mod tests {
         let up = boot(&db, &clock, reg, cfg(1)).await;
         let c = clock.clone();
         eventually("retry sleep", || c.last_sleep_secs() == 1).await;
-        assert_eq!(view(&db, id).await.state, JobState::Running, "ack could not be written yet");
+        assert_eq!(
+            view(&db, id).await.state,
+            JobState::Running,
+            "ack could not be written yet"
+        );
         sql(&db, "UPDATE test_flags SET block = 0").await;
         clock.advance(1);
         wait_state(&db, id, JobState::Done).await;
@@ -1178,7 +1815,8 @@ mod tests {
         .await;
         let id = sched(&db, "t", "a", "{}", T0).await;
         let mut reg = Registry::new();
-        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) }).unwrap();
+        reg.register("t", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .unwrap();
         let up = boot(&db, &clock, reg, cfg(1)).await;
         let c = clock.clone();
         eventually("retry sleep", || c.last_sleep_secs() == 1).await;
@@ -1215,7 +1853,10 @@ mod tests {
         let codes: BTreeSet<&str> = all.iter().map(|e| e.code()).collect();
         assert_eq!(codes.len(), all.len());
         for e in all {
-            assert!(e.code().bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+            assert!(e
+                .code()
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_'));
             assert_eq!(e.to_string(), e.code());
         }
     }
@@ -1225,6 +1866,15 @@ mod tests {
         let c = SystemClock;
         assert!(c.now() > 0);
         c.sleep(Duration::from_millis(2)).await;
+        // A deadline that has passed is ready at once; one far ahead is not.
+        c.sleep_until(0).await;
+        c.sleep_until(c.now() - 1000).await;
+        let far =
+            tokio::time::timeout(Duration::from_millis(20), c.sleep_until(c.now() + 3600)).await;
+        assert!(
+            far.is_err(),
+            "a deadline an hour away must still be pending"
+        );
     }
 
     // ---- liveness ----
@@ -1232,7 +1882,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) % n
         }
     }
@@ -1303,7 +1956,9 @@ mod tests {
             let rows: Vec<(i64, String, i64)> = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<_, _>>()?;
-            let stray_running = rows.iter().any(|(id, s, _)| s == "running" && !hung.contains(id));
+            let stray_running = rows
+                .iter()
+                .any(|(id, s, _)| s == "running" && !hung.contains(id));
             let due_waiting = rows.iter().any(|(_, s, d)| s == "pending" && *d <= now);
             Ok(!stray_running && (!due_waiting || hung_n >= slots))
         })
@@ -1311,10 +1966,21 @@ mod tests {
         .unwrap()
     }
 
-    async fn settle(db: &tokio_rusqlite::Connection, model: &Model, clock: &FakeClock, slots: usize, seed: u64) {
-        for _ in 0..10_000 {
+    async fn settle(
+        db: &tokio_rusqlite::Connection,
+        model: &Model,
+        clock: &FakeClock,
+        slots: usize,
+        seed: u64,
+    ) {
+        for i in 0..10_000 {
             if quiet(db, model, clock.secs(), slots).await {
                 return;
+            }
+            if i % 4 == 3 {
+                // Time keeps flowing: a runner that was not yet asleep when a
+                // job arrived unannounced finds it at its next poll.
+                clock.advance(30);
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -1324,7 +1990,7 @@ mod tests {
     #[tokio::test]
     async fn liveness_random_schedule_fail_panic_and_restart_always_reaches_terminal_states() {
         const SLOTS: usize = 3;
-        for seed in 1..=6u64 {
+        for seed in 1..=12u64 {
             let mut rng = Lcg(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
             let db = mem_db();
             let clock = FakeClock::new();
@@ -1345,6 +2011,9 @@ mod tests {
                         all_ids.push((id, kind));
                         if rng.below(2) == 0 {
                             up.wake.wake();
+                        } else {
+                            // No wake: the job is found by the poll interval.
+                            clock.advance(30);
                         }
                     }
                     5..=6 => clock.advance(i64::try_from(rng.below(90)).unwrap() + 1),
@@ -1358,7 +2027,10 @@ mod tests {
                             up.stop_after_grace(5).await
                         };
                         let left: BTreeSet<i64> = summary.left_running.iter().copied().collect();
-                        assert_eq!(left, hung_before, "seed {seed}: left_running is exactly the hung jobs");
+                        assert_eq!(
+                            left, hung_before,
+                            "seed {seed}: left_running is exactly the hung jobs"
+                        );
                         up = boot(&db, &clock, live_registry(&model), cfg(SLOTS)).await;
                         for e in up.report.abandoned() {
                             reported_abandoned.insert(e.id);
@@ -1388,13 +2060,19 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                if states.iter().all(|s| matches!(s.as_str(), "done" | "failed" | "abandoned")) {
+                if states
+                    .iter()
+                    .all(|s| matches!(s.as_str(), "done" | "failed" | "abandoned"))
+                {
                     terminal = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            assert!(terminal, "seed {seed}: jobs left non-terminal with the runner up");
+            assert!(
+                terminal,
+                "seed {seed}: jobs left non-terminal with the runner up"
+            );
             let mut abandoned = BTreeSet::new();
             for (id, kind) in &all_ids {
                 let v = view(&db, *id).await;
@@ -1410,7 +2088,10 @@ mod tests {
                     ("t_flaky", s) => assert_eq!(s, JobState::Done, "seed {seed}"),
                     ("t_fail", s) => {
                         assert_eq!(s, JobState::Failed);
-                        assert_eq!((v.attempts, v.last_error_code.as_deref()), (3, Some("always_fails")));
+                        assert_eq!(
+                            (v.attempts, v.last_error_code.as_deref()),
+                            (3, Some("always_fails"))
+                        );
                     }
                     ("t_panic", s) => {
                         assert_eq!(s, JobState::Failed);
@@ -1422,17 +2103,26 @@ mod tests {
                     }
                     ("o_ok", s) => assert_eq!(s, JobState::Done),
                     ("o_hang", s) => {
-                        assert!(matches!(s, JobState::Done | JobState::Abandoned), "seed {seed}");
+                        assert!(
+                            matches!(s, JobState::Done | JobState::Abandoned),
+                            "seed {seed}"
+                        );
                         assert_eq!(runs, 1, "seed {seed}: at-most-once job ran twice");
                     }
-                    ("t_hang", s) => assert!(matches!(s, JobState::Done | JobState::Failed), "seed {seed}"),
+                    ("t_hang", s) => assert!(
+                        matches!(s, JobState::Done | JobState::Failed),
+                        "seed {seed}"
+                    ),
                     other => panic!("unexpected {other:?}"),
                 }
                 if v.state == JobState::Abandoned {
                     abandoned.insert(*id);
                 }
             }
-            assert_eq!(abandoned, reported_abandoned, "seed {seed}: every abandonment was reported");
+            assert_eq!(
+                abandoned, reported_abandoned,
+                "seed {seed}: every abandonment was reported"
+            );
             up.stop_idle().await;
         }
     }
