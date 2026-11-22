@@ -37,7 +37,7 @@ pub const CODE_PANICKED: &str = "handler_panicked";
 pub const CODE_CANCELLED: &str = "handler_cancelled";
 
 /// Wait before retrying after a database error (claim, acknowledge or the
-/// next-due lookup failed): one retry per second, never a tight loop.
+/// next-due lookup failed): the loop sleeps this long before trying again.
 const DB_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
