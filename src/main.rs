@@ -1051,6 +1051,176 @@ mod tests {
         w1_route(&f, &data, &features::LogExclusion::Off, false, &own, &order).await;
         assert_eq!(*order.lock().unwrap(), vec!["dispatch", "sink"]);
     }
+
+    // ---------------------------------------------------------------------
+    // W1B: the two glue lines (`build_data` carries the configured exclusion,
+    // `event_route` hands it to `route_event`) on the real code path.
+    // ---------------------------------------------------------------------
+
+    fn w1b_config(channels: Vec<u64>, categories: Vec<u64>, invalid: Vec<&'static str>) -> Config {
+        Config {
+            discord_token: "synthetic-token".to_string(),
+            log_channel_id: 700_010,
+            age_role_1: 1,
+            age_role_2: 2,
+            reaction_role_db_path: "reaction-test.sqlite".to_string(),
+            staff_role_id: None,
+            tickets: None,
+            ticket_archive_retention: tickets::retention::RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+            core_db_path: None,
+            guild_id: None,
+            staff_alert_channel_id: None,
+            log_excluded_channel_ids: channels,
+            log_excluded_category_ids: categories,
+            protected_role_ids: vec![],
+            invalid_core_keys: invalid,
+        }
+    }
+
+    /// `Data` built by the production `build_data` from a config, with offline parts.
+    async fn w1b_data(config: Config) -> Data {
+        let settings = w1_settings(features::GuildFilter::Any);
+        let features = features::Features::<serenity::Context, Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &settings,
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        build_data(
+            Arc::new(config),
+            DataParts {
+                rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
+                tickets: None,
+                features: Arc::new(features),
+            },
+        )
+    }
+
+    /// Routes `event` through the production `event_route` and the real
+    /// `route_event`; returns how many times the sink (cache insert + log) ran.
+    async fn w1b_route(data: &Data, event: &serenity::FullEvent) -> usize {
+        let none = features::Features::<(), Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &w1_settings(features::GuildFilter::Any),
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        let lookup = W1Lookup::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = runs.clone();
+        route_event(event_route(&none, &(), data, event, &lookup), || async {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let serenity::FullEvent::Message { new_message } = event {
+                insert_cache(
+                    data,
+                    new_message.id,
+                    cached_message_from_message(new_message),
+                )
+                .await;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn w1b_gate(data: &Data, ch: u64) -> features::Gate {
+        let event = synthetic_message(ch, Some(W1_GUILD));
+        features::message_gate(&data.log_exclusion, &event, &W1Lookup::new()).await
+    }
+
+    #[tokio::test]
+    async fn built_data_carries_an_enabled_exclusion_that_blocks_the_excluded_channel() {
+        let data = w1b_data(w1b_config(
+            vec![W1_EXCLUDED],
+            vec![W1_EXCLUDED_CATEGORY],
+            vec![],
+        ))
+        .await;
+        let skip = features::Gate::Skip(features::GateReason::Excluded);
+        assert_eq!(w1b_gate(&data, W1_EXCLUDED).await, skip, "excluded channel");
+        assert_eq!(
+            w1b_gate(&data, W1_IN_EXCLUDED_CATEGORY).await,
+            skip,
+            "channel under an excluded category"
+        );
+        assert_eq!(
+            w1b_gate(&data, 999_999).await,
+            skip,
+            "an unresolvable channel is skipped while exclusions are configured"
+        );
+        assert_eq!(w1b_gate(&data, W1_PLAIN).await, features::Gate::Allow);
+    }
+
+    #[tokio::test]
+    async fn built_data_keeps_the_off_and_unusable_list_modes() {
+        // Nothing configured: a plain channel and an unresolvable one are both allowed.
+        let off = w1b_data(w1b_config(vec![], vec![], vec![])).await;
+        for ch in [W1_PLAIN, 999_999] {
+            assert_eq!(w1b_gate(&off, ch).await, features::Gate::Allow);
+        }
+        // An unusable list in either key: guild messages are blocked.
+        for key in [
+            config::LOG_EXCLUDED_CHANNEL_IDS_KEY,
+            config::LOG_EXCLUDED_CATEGORY_IDS_KEY,
+        ] {
+            let blocked = w1b_data(w1b_config(vec![], vec![], vec![key])).await;
+            assert_eq!(
+                w1b_gate(&blocked, W1_PLAIN).await,
+                features::Gate::Skip(features::GateReason::ConfigInvalid),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_excluded_message_routed_with_built_data_is_not_cached_or_logged() {
+        let data = w1b_data(w1b_config(
+            vec![W1_EXCLUDED],
+            vec![W1_EXCLUDED_CATEGORY],
+            vec![],
+        ))
+        .await;
+        for ch in [W1_EXCLUDED, W1_IN_EXCLUDED_CATEGORY] {
+            for event in w1_events(ch) {
+                assert_eq!(
+                    w1b_route(&data, &event).await,
+                    0,
+                    "channel {ch}: logger ran"
+                );
+            }
+            assert!(
+                data.message_cache.read().await.is_empty(),
+                "channel {ch}: nothing cached"
+            );
+        }
+        // Control: the same four events in a plain channel reach the logger.
+        for event in w1_events(W1_PLAIN) {
+            assert_eq!(w1b_route(&data, &event).await, 1);
+        }
+        assert_eq!(data.message_cache.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_list_routed_with_built_data_blocks_guild_messages() {
+        let data = w1b_data(w1b_config(
+            vec![],
+            vec![],
+            vec![config::LOG_EXCLUDED_CHANNEL_IDS_KEY],
+        ))
+        .await;
+        let event = synthetic_message(W1_PLAIN, Some(W1_GUILD));
+        assert_eq!(w1b_route(&data, &event).await, 0);
+        assert!(data.message_cache.read().await.is_empty());
+        // Not a message event: still logged.
+        assert_eq!(w1b_route(&data, &synthetic_voice(Some(W1_GUILD))).await, 1);
+    }
 }
 
 fn build_log_footer() -> CreateEmbedFooter {
@@ -1969,6 +2139,52 @@ async fn reactionrole_list(
     Ok(())
 }
 
+/// The parts of `Data` that `setup` opens at runtime (database handles and the
+/// started feature registry); everything else in `Data` comes from `Config`.
+struct DataParts {
+    rr_db: Arc<Connection>,
+    tickets: Option<tickets::repository::Repository>,
+    features: Arc<AppFeatures>,
+}
+
+/// Builds the shared bot state. `setup` is the only production caller, so the
+/// log exclusion the event handler later reads is derived from `config` here.
+fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
+    Data {
+        log_exclusion: features::LogExclusion::Off,
+        config,
+        message_cache: Arc::new(RwLock::new(HashMap::new())),
+        rr_db: parts.rr_db,
+        tickets: parts.tickets,
+        features: parts.features,
+    }
+}
+
+static NO_EXCLUSION: features::LogExclusion = features::LogExclusion::Off;
+
+/// Builds the `Route` for one event from the shared state. `event_handler` is the
+/// only production caller; the registry and context are passed in so a test can
+/// supply offline ones.
+fn event_route<'a, X, L>(
+    features: &'a features::Features<X, Data>,
+    ctx: &'a X,
+    data: &'a Data,
+    event: &'a serenity::FullEvent,
+    lookup: &'a L,
+) -> Route<'a, X, Data, L> {
+    Route {
+        features,
+        ctx,
+        data,
+        event,
+        lookup,
+        exclusion: &NO_EXCLUSION,
+        ticket_lockdown: data.config.ticket_privacy_lockdown,
+        ticket_settings: data.config.tickets.as_ref(),
+        ticket_repo: data.tickets.as_ref(),
+    }
+}
+
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -1976,17 +2192,13 @@ async fn event_handler(
     data: &Data,
 ) -> Result<(), Error> {
     route_event(
-        Route {
-            features: &data.features,
+        event_route(
+            data.features.as_ref(),
             ctx,
             data,
             event,
-            lookup: &tickets::privacy::SerenityLookup(ctx),
-            exclusion: &data.log_exclusion,
-            ticket_lockdown: data.config.ticket_privacy_lockdown,
-            ticket_settings: data.config.tickets.as_ref(),
-            ticket_repo: data.tickets.as_ref(),
-        },
+            &tickets::privacy::SerenityLookup(ctx),
+        ),
         || log_event(ctx, event, data),
     )
     .await
@@ -3481,14 +3693,14 @@ async fn main() -> Result<(), Error> {
                     }
                     let _ = features_slot.set(features.clone());
 
-                    Ok(Data {
-                        log_exclusion: features::LogExclusion::from_config(&config),
+                    Ok(build_data(
                         config,
-                        message_cache: Arc::new(RwLock::new(HashMap::new())),
-                        rr_db,
-                        tickets,
-                        features,
-                    })
+                        DataParts {
+                            rr_db,
+                            tickets,
+                            features,
+                        },
+                    ))
                 })
             }
         })
