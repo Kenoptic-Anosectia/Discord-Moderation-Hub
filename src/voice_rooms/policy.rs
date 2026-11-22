@@ -2796,4 +2796,131 @@ mod tests {
             state.rooms
         );
     }
+
+    /// The closed class of the characters that render nothing.
+    ///
+    /// This is the whole class, as ranges: the Unicode format characters
+    /// (`Cf`), the `Default_Ignorable_Code_Point` code points and the blank
+    /// fillers. Every code point in a range renders nothing, so every one of
+    /// them must be removed.
+    ///
+    /// The table is the class, not a list of examples: a range that grew would
+    /// still be covered, because every code point of the range is tested.
+    const INVISIBLE_CLASS: [(u32, u32); 26] = [
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x0600, 0x0605),
+        (0x061C, 0x061C),
+        (0x06DD, 0x06DD),
+        (0x070F, 0x070F),
+        (0x0890, 0x0891),
+        (0x08E2, 0x08E2),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x2800, 0x2800),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    ];
+
+    /// Every code point of the closed class renders nothing, so every one of
+    /// them must be removed from a name.
+    ///
+    /// The test walks the whole class range by range: a range that the
+    /// implementation misses at its far end fails here, so the rule is a
+    /// class rule and not a list of the examples that were thought of.
+    #[test]
+    fn every_character_that_renders_nothing_is_removed() {
+        let mut checked = 0usize;
+        for (start, end) in INVISIBLE_CLASS {
+            for cp in start..=end {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                checked += 1;
+                let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
+                assert_eq!(
+                    cleaned, "party",
+                    "U+{cp:04X} renders nothing and must be removed"
+                );
+            }
+        }
+        assert_eq!(
+            checked, 4198,
+            "the closed class must hold every code point of every range"
+        );
+    }
+
+    /// The class has an edge: a code point just outside a range draws
+    /// something, so it must survive.
+    ///
+    /// Without this the rule could be "remove everything", which would also
+    /// pass the test above but would eat the whole name.
+    #[test]
+    fn a_character_just_outside_the_class_survives() {
+        // The code points on both sides of every range, skipping the ones that
+        // are control characters or spaces (those are removed by the other
+        // rules, not by the invisible class).
+        let mut edges = Vec::new();
+        for (start, end) in INVISIBLE_CLASS {
+            for cp in [start.checked_sub(1), Some(end + 1)].into_iter().flatten() {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                if c.is_control() || c.is_whitespace() {
+                    continue;
+                }
+                edges.push(c);
+            }
+        }
+        assert!(
+            !edges.is_empty(),
+            "the class must have edges to test against"
+        );
+        for c in edges {
+            let cleaned = sanitize_name(&format!("par{c}ty"), "Voice Room");
+            assert_eq!(
+                cleaned,
+                format!("par{c}ty"),
+                "U+{:04X} draws something and must survive",
+                c as u32
+            );
+        }
+    }
+
+    /// A name made only of characters that render nothing is an empty name:
+    /// it falls back to the default name instead of coming back blank.
+    ///
+    /// The characters here are outside the set the earlier test used, which is
+    /// how the blank-name limit was missed: five Mongolian free variation
+    /// selectors render nothing, so five of them are a blank name.
+    #[test]
+    fn a_name_of_only_mongolian_variation_selectors_falls_back_to_the_default() {
+        let five = "\u{180B}\u{180B}\u{180B}\u{180B}\u{180B}";
+        assert_eq!(
+            sanitize_name(five, "Voice Room"),
+            "Voice Room",
+            "five Mongolian free variation selectors render nothing, so the name is empty"
+        );
+    }
+
+    /// A name made only of a format character from the part of the class the
+    /// earlier test did not use is an empty name too.
+    #[test]
+    fn a_name_of_only_shorthand_format_controls_falls_back_to_the_default() {
+        let only_format = "\u{1BCA0}\u{1BCA1}\u{1BCA2}\u{1BCA3}";
+        assert_eq!(sanitize_name(only_format, "Voice Room"), "Voice Room");
+    }
 }
