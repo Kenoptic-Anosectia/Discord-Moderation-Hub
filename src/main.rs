@@ -108,7 +108,7 @@ mod tests {
         let params: Vec<_> = command
             .parameters
             .iter()
-            .map(|p| (p.name.as_str(), p.required))
+            .map(|p| (&*p.name, p.required))
             .collect();
         assert_eq!(params, [("action", true), ("id", false), ("offset", false)]);
     }
@@ -123,7 +123,7 @@ mod tests {
         }
         let on = configured_commands(true);
         let rec = on.iter().find(|c| c.name == "ticket-recover").unwrap();
-        let names: Vec<_> = rec.parameters.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<_> = rec.parameters.iter().map(|p| &*p.name).collect();
         assert_eq!(
             names,
             ["ticket_id", "action", "channel", "confirm", "reason"]
@@ -2961,7 +2961,10 @@ async fn main() -> Result<(), Error> {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: configured_commands(config.tickets.is_some()),
-            event_handler: |ctx, event, framework, data| {
+            // poise 0.7 passes (framework, event); the serenity context and our Data live inside the
+            // framework context, so adapt here and keep `event_handler` itself unchanged.
+            event_handler: |framework, event| {
+                let (ctx, data) = (framework.serenity_context, framework.user_data);
                 Box::pin(event_handler(ctx, event, framework, data))
             },
             ..Default::default()
