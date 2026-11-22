@@ -1849,6 +1849,45 @@ mod tests {
         assert!(w.feat.shadow_summary().is_empty());
     }
 
+    /// The Off/inactive gate sits in front of the thread-parent lookup (a Discord HTTP read).
+    /// A flash-channel message cannot pin it (the inner `Mode::Off` arm gives the same answer),
+    /// so use attachment messages in an unconfigured channel and in a thread.
+    #[tokio::test]
+    async fn off_and_inactive_features_answer_off_without_any_port_call_for_every_channel_kind() {
+        let empty = [("FLASH_CHANNEL_IDS", "")];
+        let cases: [(&str, &[(&str, &str)]); 2] = [("off", &[]), ("live", &empty)];
+        for (mode, extra) in cases {
+            for (what, channel) in [
+                ("flash channel", FLASH_CH),
+                ("other channel", OTHER_CH),
+                ("thread", THREAD_CH),
+            ] {
+                let db = mem_db();
+                let net = Net::probing(&db);
+                net.parents
+                    .lock()
+                    .unwrap()
+                    .insert(THREAD_CH, ParentLookup::Parent(FLASH_CH));
+                let clock = FakeClock::new();
+                let feat = feature(&net, &clock, settings(mode, extra));
+                assert!(!Feature::<(), ()>::enabled(&feat), "{mode}/{what}");
+                let out = feat
+                    .process(
+                        MessageFacts {
+                            channel_id: channel,
+                            ..facts()
+                        },
+                        Some(&db),
+                    )
+                    .await;
+                assert_eq!(out, Outcome::Off, "{mode} / {what}");
+                assert!(net.calls().is_empty(), "{mode} / {what}: {:?}", net.calls());
+                assert!(jobs(&db).await.is_empty(), "{mode} / {what}");
+                assert!(feat.shadow_summary().is_empty(), "{mode} / {what}");
+            }
+        }
+    }
+
     #[test]
     fn the_registry_hooks_follow_the_mode() {
         let net = Net::new();
@@ -2688,6 +2727,11 @@ mod tests {
             let mut notices_posted = 0usize;
             let mut crashes = 0;
             let mut next_message = MESSAGE;
+            // Transient (`Unavailable`) delete failures scripted: each yields exactly one
+            // `DeleteFailed` alert, so any more means something else was treated as a failure.
+            let mut transient_scripted = 0usize;
+            // Claims lost to a simulated crash, per (kind, payload): they count as attempts.
+            let mut crash_claims: HashMap<(String, String), i64> = HashMap::new();
             for _ in 0..60 {
                 match rng.below(10) {
                     0..=3 => {
@@ -2705,14 +2749,20 @@ mod tests {
                                     w.net.peek_next_notice(),
                                     &[PortError::Unavailable],
                                 );
+                                transient_scripted += 1;
                             }
                         } else {
                             w.net.script_notice(Err(PortError::Unavailable));
                         }
                         match fate {
-                            Fate::AlreadyGone => w
-                                .net
-                                .script_delete_failures(next_message, &[PortError::NotFound]),
+                            // A message that is really gone answers 404 every time.
+                            Fate::AlreadyGone => {
+                                w.net
+                                    .delete_always
+                                    .lock()
+                                    .unwrap()
+                                    .insert(next_message, PortError::NotFound);
+                            }
                             Fate::Forbidden => {
                                 w.net
                                     .delete_always
@@ -2722,6 +2772,7 @@ mod tests {
                             }
                             Fate::Normal => {
                                 let transient = rng.below(3) as usize;
+                                transient_scripted += transient;
                                 w.net.script_delete_failures(
                                     next_message,
                                     &[PortError::Unavailable; 2][..transient],
@@ -2749,9 +2800,16 @@ mod tests {
                         crashes += 1;
                         // A runner claims up to two due jobs and dies before acknowledging.
                         let now = w.clock.secs();
-                        w.db.call(move |c| queue::claim_due(c, now, 2))
-                            .await
-                            .unwrap();
+                        let batch =
+                            w.db.call(move |c| queue::claim_due(c, now, 2))
+                                .await
+                                .unwrap();
+                        // A claim counts as an attempt even though the runner died: remember it.
+                        for lost in batch.claimed {
+                            *crash_claims
+                                .entry((lost.kind, lost.payload_json))
+                                .or_insert(0) += 1;
+                        }
                         let report =
                             w.db.call(move |c| {
                                 queue::reconcile_after_restart(
@@ -2840,7 +2898,21 @@ mod tests {
                         assert!(w.net.deleted.lock().unwrap().contains(message));
                     }
                     Fate::AlreadyGone => {
-                        assert_eq!(row.state, "done", "seed {seed} message {message}")
+                        assert_eq!(row.state, "done", "seed {seed} message {message}");
+                        assert_eq!(
+                            row.attempts,
+                            1 + crash_claims
+                                .get(&(row.kind.clone(), row.payload.clone()))
+                                .copied()
+                                .unwrap_or(0),
+                            "seed {seed} message {message}: a 404 is final, no retry \
+                             (only a crash-lost claim may add an attempt)"
+                        );
+                        assert_eq!(
+                            w.net.deletes().iter().filter(|(_, m)| m == message).count(),
+                            1,
+                            "seed {seed} message {message}: exactly one delete call"
+                        );
                     }
                 }
             }
@@ -2850,6 +2922,17 @@ mod tests {
                     "seed {seed}: notice deletes only see transient faults"
                 );
             }
+            // Already-gone (404) sources raise no `DeleteFailed`: only the scripted transient
+            // faults do, one alert each.
+            assert_eq!(
+                w.net
+                    .alerts()
+                    .iter()
+                    .filter(|a| **a == AlertCode::DeleteFailed)
+                    .count(),
+                transient_scripted,
+                "seed {seed}: DeleteFailed alerts only for transient faults"
+            );
         }
     }
 }
