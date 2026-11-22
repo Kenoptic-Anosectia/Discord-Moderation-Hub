@@ -6,6 +6,7 @@ mod jobs;
 mod privacy_scope;
 mod roles;
 mod safeword;
+mod settings;
 mod storage;
 mod text_helpers;
 mod tickets;
