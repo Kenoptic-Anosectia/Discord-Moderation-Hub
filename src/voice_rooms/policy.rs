@@ -3126,17 +3126,43 @@ mod tests {
     /// The word test above could pass for a code point that the class
     /// removes only when it is between two letters, so this test pins the
     /// code point alone as well.
+    ///
+    /// A neighbour that is not a character at all is a FAILURE here, not a
+    /// skip: the tests above used `let ... else { continue }`, so a neighbour
+    /// that is not a char was silently skipped and the check below that end
+    /// of the range never ran. A surrogate (U+D800..U+DFFF are not
+    /// characters) is exactly such a neighbour, and it hid the check below
+    /// the tag range.
     #[test]
     fn a_code_point_just_outside_the_expected_class_survives_on_its_own() {
         for &(_, _, below, above) in EXPECTED_CLASS {
             for cp in [below, above].into_iter().flatten() {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
+                let c = char::from_u32(cp).unwrap_or_else(|| {
+                    panic!("U+{cp:05X} is not a character, so it cannot be checked")
+                });
                 assert_eq!(
                     sanitize_name(&format!("a{c}b"), "Voice Room"),
                     format!("a{c}b"),
                     "U+{cp:04X} draws something and must survive"
+                );
+            }
+        }
+    }
+
+    /// Every neighbour of the expected class must be a real character.
+    ///
+    /// A neighbour that is not a character cannot be asserted on: the tests
+    /// that walk the neighbours skip it, so the end of the range it belongs
+    /// to is never checked from that side. This test makes such a neighbour
+    /// a failure, so the table cannot carry one again.
+    #[test]
+    fn every_neighbour_of_the_expected_class_is_a_character() {
+        for &(first, last, below, above) in EXPECTED_CLASS {
+            for cp in [below, above].into_iter().flatten() {
+                assert!(
+                    char::from_u32(cp).is_some(),
+                    "U+{cp:05X} (below/above the range {first:05X}..{last:05X}) is not a \
+                     character, so the check from that side of the range never runs"
                 );
             }
         }
