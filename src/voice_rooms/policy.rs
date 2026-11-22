@@ -697,17 +697,10 @@ fn strip_invisible(raw: &str) -> String {
 /// * the whitespace characters other than the plain ASCII space, which
 ///   `char::is_whitespace` already covers (the tab and the newline are
 ///   control characters and are already gone);
-/// * the **default ignorable** code points, the characters Unicode defines
-///   as having no visible effect wherever they appear: the format
-///   characters (`Cf`), the variation selectors, the interlinear
-///   annotation characters, the Hangul fillers, the Khmer inherent vowels
-///   and the tag characters;
-/// * the **blank** code points, the characters that occupy a position but
-///   draw nothing: the Braille pattern blank, the Hangul fillers and the
-///   halfwidth Hangul filler.
+/// * the **closed class** of the code points that render nothing, which
+///   [`INVISIBLE_RANGES`] names in full.
 ///
-/// The ranges below are the ones that render nothing. The plain ASCII space
-/// is kept: it separates the words of a name.
+/// The plain ASCII space is kept: it separates the words of a name.
 fn is_invisible(c: char) -> bool {
     if c == ' ' {
         return false;
@@ -717,56 +710,95 @@ fn is_invisible(c: char) -> bool {
         // is removed.
         return true;
     }
-    is_default_ignorable(c) || is_blank(c)
+    is_rendering_nothing(c)
 }
 
-/// True for the default ignorable code points.
+/// The closed class of the code points that render nothing, as ranges.
 ///
-/// These are the characters Unicode defines as having no visible effect
-/// wherever they appear: the format characters (which include the
-/// zero-width characters, the bidirectional controls and the isolate
-/// controls), the variation selectors, the interlinear annotation
-/// characters, the Khmer inherent vowels and the tag characters.
-fn is_default_ignorable(c: char) -> bool {
-    matches!(c,
-        // The soft hyphen and the zero-width characters.
-        '\u{00AD}'
-            | '\u{200B}'..='\u{200F}'
-            // The bidirectional embedding, override and isolate controls.
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{206F}'
-            // The word joiner and the invisible operators.
-            | '\u{2060}'..='\u{2064}'
-            // The Mongolian vowel separator and the Arabic letter mark.
-            | '\u{180E}'
-            | '\u{061C}'
-            // The combining marks that join nothing: the combining grapheme
-            // joiner and the Khmer inherent vowels.
-            | '\u{034F}'
-            | '\u{17B4}'..='\u{17B5}'
-            // The variation selectors, the musical format controls and the
-            // interlinear annotation characters.
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{E0100}'..='\u{E01EF}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            // The tag characters.
-            | '\u{E0000}'..='\u{E007F}'
-            // The byte order mark.
-            | '\u{FEFF}'
-    )
-}
+/// The class is the union of three Unicode sets, and every code point of it
+/// is covered:
+///
+/// * the **format characters**, the code points whose general category is
+///   `Cf`: they have no visible effect wherever they appear;
+/// * the **default ignorable** code points, the code points Unicode defines
+///   as having no visible effect: the format characters above plus the
+///   variation selectors, the Mongolian free variation selectors, the
+///   Khmer inherent vowels, the Hangul fillers and the tag characters;
+/// * the **blank fillers**, the code points that occupy a position and draw
+///   nothing but belong to neither set above.
+///
+/// The table is the whole class, not a list of the examples that were
+/// thought of: a hand list left out the Mongolian free variation selectors,
+/// the shorthand format controls, the reserved part of the tag block and
+/// every format character that Unicode does not make default ignorable, and
+/// those came back in a name as blank-looking text.
+///
+/// The ranges were taken from the Unicode character database of the same
+/// Unicode version the Rust standard library ships, so they describe the
+/// characters this crate actually sees. The test
+/// `every_character_that_renders_nothing_is_removed` walks every code point
+/// of every range, and `a_character_just_outside_the_class_survives` checks
+/// the edge, so the class is pinned in both directions.
+const INVISIBLE_RANGES: [(u32, u32); 26] = [
+    // The soft hyphen.
+    (0x00AD, 0x00AD),
+    // The combining grapheme joiner.
+    (0x034F, 0x034F),
+    // The Arabic number sign and the number marks above it.
+    (0x0600, 0x0605),
+    // The Arabic letter mark.
+    (0x061C, 0x061C),
+    // The Arabic end of ayah.
+    (0x06DD, 0x06DD),
+    // The Syriac abbreviation mark.
+    (0x070F, 0x070F),
+    // The Arabic pound and piastre marks.
+    (0x0890, 0x0891),
+    // The Arabic disputed end of ayah.
+    (0x08E2, 0x08E2),
+    // The Hangul choseong and jungseong fillers.
+    (0x115F, 0x1160),
+    // The Khmer inherent vowels.
+    (0x17B4, 0x17B5),
+    // The Mongolian free variation selectors and the vowel separator.
+    (0x180B, 0x180F),
+    // The zero-width characters.
+    (0x200B, 0x200F),
+    // The bidirectional embedding, override and isolate controls.
+    (0x202A, 0x202E),
+    // The word joiner, the invisible operators and the isolates.
+    (0x2060, 0x206F),
+    // The Braille pattern blank.
+    (0x2800, 0x2800),
+    // The Hangul filler.
+    (0x3164, 0x3164),
+    // The variation selectors.
+    (0xFE00, 0xFE0F),
+    // The byte order mark.
+    (0xFEFF, 0xFEFF),
+    // The halfwidth Hangul filler.
+    (0xFFA0, 0xFFA0),
+    // The interlinear annotation characters.
+    (0xFFF9, 0xFFFB),
+    // The Kaithi number signs.
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    // The Egyptian hieroglyph format controls.
+    (0x13430, 0x1343F),
+    // The shorthand format controls.
+    (0x1BCA0, 0x1BCA3),
+    // The musical format controls.
+    (0x1D173, 0x1D17A),
+    // The tag characters, including the part Unicode reserves for more.
+    (0xE0000, 0xE0FFF),
+];
 
-/// True for the characters that occupy a position but draw nothing.
-///
-/// These are the fillers a text can be padded with: the Hangul choseong and
-/// jungseong fillers, the Hangul filler, the halfwidth Hangul filler and
-/// the Braille pattern blank.
-fn is_blank(c: char) -> bool {
-    matches!(
-        c,
-        '\u{115F}'..='\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
-    )
+/// True for the code points that render nothing.
+fn is_rendering_nothing(c: char) -> bool {
+    let cp = c as u32;
+    INVISIBLE_RANGES
+        .iter()
+        .any(|(start, end)| cp >= *start && cp <= *end)
 }
 
 /// Removes the links: URLs, `www.` hosts and invite links.
@@ -2515,9 +2547,10 @@ mod tests {
         assert_eq!(expect_deny(&decision), DenyReason::NotRoomOwner);
     }
 
-    /// The invisible set is the whole Unicode "default ignorable" class plus
-    /// the blank fillers, not a hand list: every one of the characters below
-    /// renders nothing and must be removed.
+    /// The invisible set is the closed class of the code points that render
+    /// nothing, in ranges: the Unicode format characters (`Cf`), the
+    /// `Default_Ignorable_Code_Point` code points and the blank fillers.
+    /// Every one of the characters below renders nothing and must be removed.
     #[test]
     fn the_default_ignorable_characters_are_removed() {
         // U+061C ARABIC LETTER MARK, U+034F COMBINING GRAPHEME JOINER,
@@ -2570,7 +2603,7 @@ mod tests {
     }
 
     /// The bidi controls and the tag characters are removed as well: they are
-    /// part of the same default-ignorable class.
+    /// part of the same closed class.
     #[test]
     fn the_bidi_and_tag_characters_are_removed() {
         assert_eq!(sanitize_name("a\u{202A}b\u{202C}c", "Voice Room"), "abc");
@@ -2804,36 +2837,11 @@ mod tests {
     /// fillers. Every code point in a range renders nothing, so every one of
     /// them must be removed.
     ///
-    /// The table is the class, not a list of examples: a range that grew would
-    /// still be covered, because every code point of the range is tested.
-    const INVISIBLE_CLASS: [(u32, u32); 26] = [
-        (0x00AD, 0x00AD),
-        (0x034F, 0x034F),
-        (0x0600, 0x0605),
-        (0x061C, 0x061C),
-        (0x06DD, 0x06DD),
-        (0x070F, 0x070F),
-        (0x0890, 0x0891),
-        (0x08E2, 0x08E2),
-        (0x115F, 0x1160),
-        (0x17B4, 0x17B5),
-        (0x180B, 0x180F),
-        (0x200B, 0x200F),
-        (0x202A, 0x202E),
-        (0x2060, 0x206F),
-        (0x2800, 0x2800),
-        (0x3164, 0x3164),
-        (0xFE00, 0xFE0F),
-        (0xFEFF, 0xFEFF),
-        (0xFFA0, 0xFFA0),
-        (0xFFF9, 0xFFFB),
-        (0x110BD, 0x110BD),
-        (0x110CD, 0x110CD),
-        (0x13430, 0x1343F),
-        (0x1BCA0, 0x1BCA3),
-        (0x1D173, 0x1D17A),
-        (0xE0000, 0xE0FFF),
-    ];
+    /// The table under test is the production table, so the test and the rule
+    /// cannot drift apart. The ranges are the class, not a list of examples: a
+    /// range that grew would still be covered, because every code point of
+    /// the range is tested.
+    const INVISIBLE_CLASS: [(u32, u32); 26] = INVISIBLE_RANGES;
 
     /// Every code point of the closed class renders nothing, so every one of
     /// them must be removed from a name.
