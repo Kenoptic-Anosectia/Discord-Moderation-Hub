@@ -28,6 +28,7 @@ use crate::roles::runtime::{
 use crate::settings::Mode;
 use crate::welcome::config::{WelcomeConfig, KEY_JOIN_ROLE_IDS};
 use crate::welcome::render::{IdMap, MemberContext, RenderedEmbed, WelcomeTemplate};
+use poise::serenity_prelude as s;
 use std::fmt;
 
 /// The job kind that grants the join roles.
@@ -665,12 +666,150 @@ where
 /// The restart policy of every job kind this feature uses.
 ///
 /// A granted role and a posted welcome message are both user-visible and
-/// irreversible, so neither may be repeated after a restart.
+/// irreversible, so neither may be repeated after a restart. An unknown kind
+/// is `AtMostOnce` too: the runtime never repeats work it does not know.
 pub fn restart_policy(kind: &str) -> crate::jobs::queue::RestartPolicy {
     use crate::jobs::queue::RestartPolicy;
     match kind {
         JOB_KIND_GRANT_ROLES | JOB_KIND_SEND_MESSAGE => RestartPolicy::AtMostOnce,
         _ => RestartPolicy::AtMostOnce,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The feature registry hook
+// ---------------------------------------------------------------------------
+
+/// The guild facts the welcome message needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildFacts {
+    /// The name of the server.
+    pub name: String,
+    /// The number of members in the server after the join.
+    pub member_count: u64,
+}
+
+/// Where the guild facts come from.
+///
+/// The wiring card implements this over the serenity cache; the tests use a
+/// fake.
+#[s::async_trait]
+pub trait GuildLookup: Send + Sync {
+    /// The facts of the guild, or `None` when they cannot be looked up.
+    async fn guild_facts(&self, guild_id: u64) -> Option<GuildFacts>;
+}
+
+/// The shared runtime of the welcome feature.
+///
+/// The feature is handed to the registry, which shares it between events, so
+/// it sits behind a lock.
+pub type SharedRuntime<S, W, P, M, A> =
+    std::sync::Arc<tokio::sync::Mutex<WelcomeRuntime<S, W, P, M, A>>>;
+
+/// The welcome feature, as the registry sees it.
+///
+/// The feature implements the registry's hook but is NOT registered: the
+/// wiring card W3 adds it to `features::production_features`.
+pub struct WelcomeFeature<S, W, P, M, A, G> {
+    /// The runtime that does the work.
+    pub runtime: SharedRuntime<S, W, P, M, A>,
+    /// Where the guild facts come from.
+    pub guilds: G,
+    /// The mode the feature was configured in. The registry asks for it
+    /// synchronously, so it is kept here and not read through the lock.
+    pub mode: Mode,
+}
+
+impl<S, W, P, M, A, G> WelcomeFeature<S, W, P, M, A, G>
+where
+    S: RoleSource,
+    W: RoleWriter,
+    P: Sleeper,
+    M: MessageSender,
+    A: StaffAlerter,
+    G: GuildLookup,
+{
+    /// Builds the feature around a runtime.
+    pub fn new(runtime: WelcomeRuntime<S, W, P, M, A>, guilds: G) -> Self {
+        let mode = runtime.config.mode;
+        WelcomeFeature {
+            runtime: std::sync::Arc::new(tokio::sync::Mutex::new(runtime)),
+            guilds,
+            mode,
+        }
+    }
+}
+
+/// The facts of a member that joined, read from the gateway event.
+///
+/// A member with no id is not a member the runtime can write about: the
+/// event is ignored.
+fn facts_from_event(event: &s::FullEvent) -> Option<JoinFacts> {
+    let s::FullEvent::GuildMemberAddition { new_member } = event else {
+        return None;
+    };
+    let guild_id = new_member.guild_id.get();
+    let user_id = new_member.user.id.get();
+    if user_id == 0 || guild_id == 0 {
+        return None;
+    }
+    let username = new_member
+        .user
+        .global_name
+        .clone()
+        .unwrap_or_else(|| new_member.user.name.clone());
+    Some(JoinFacts {
+        guild_id,
+        user_id,
+        username,
+        server_name: String::new(),
+        member_count: 0,
+        is_bot: new_member.user.bot,
+        member_role_ids: new_member.roles.iter().map(|id| id.get()).collect(),
+    })
+}
+
+impl<X, D, S, W, P, M, A, G> crate::features::Feature<X, D> for WelcomeFeature<S, W, P, M, A, G>
+where
+    X: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    S: RoleSource + Send + Sync + 'static,
+    W: RoleWriter + Send + Sync + 'static,
+    P: Sleeper + Send + Sync + 'static,
+    M: MessageSender + Send + Sync + 'static,
+    A: StaffAlerter + Send + Sync + 'static,
+    G: GuildLookup + 'static,
+{
+    fn name(&self) -> &'static str {
+        "welcome"
+    }
+
+    fn enabled(&self) -> bool {
+        // The feature is on when its mode asks for it. The rest of the
+        // configuration is read by the runtime.
+        self.mode != Mode::Off
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a X,
+        event: &'a s::FullEvent,
+        _data: &'a D,
+        _guild: Option<u64>,
+        _core_db: Option<&'a tokio_rusqlite::Connection>,
+    ) -> crate::jobs::runner::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(mut facts) = facts_from_event(event) else {
+                return;
+            };
+            let guild_facts = self.guilds.guild_facts(facts.guild_id).await;
+            if let Some(guild) = guild_facts {
+                facts.server_name = guild.name;
+                facts.member_count = guild.member_count;
+            }
+            let mut runtime = self.runtime.lock().await;
+            runtime.handle_join(&facts).await;
+        })
     }
 }
 
@@ -1376,6 +1515,160 @@ mod tests {
             restart_policy(JOB_KIND_GRANT_ROLES),
             RestartPolicy::AtMostOnce
         );
+    }
+
+    // ---- the feature registry hook -----------------------------------------
+
+    /// A guild lookup with a fixed answer.
+    struct FakeGuilds {
+        facts: Option<GuildFacts>,
+    }
+
+    impl FakeGuilds {
+        fn with(name: &str, member_count: u64) -> Self {
+            FakeGuilds {
+                facts: Some(GuildFacts {
+                    name: name.to_string(),
+                    member_count,
+                }),
+            }
+        }
+        fn unknown() -> Self {
+            FakeGuilds { facts: None }
+        }
+    }
+
+    #[s::async_trait]
+    impl GuildLookup for FakeGuilds {
+        async fn guild_facts(&self, _guild_id: u64) -> Option<GuildFacts> {
+            self.facts.clone()
+        }
+    }
+
+    /// A member that joined, as the gateway delivers it.
+    fn member_added(user_id: u64, bot: bool) -> s::FullEvent {
+        use s::all::{GuildId, UserId};
+        let mut user = s::User::default();
+        user.id = UserId::new(user_id);
+        user.name = "synthetic-user".to_string();
+        user.bot = bot;
+        let mut member = s::Member::default();
+        member.user = user;
+        member.guild_id = GuildId::new(GUILD);
+        s::FullEvent::GuildMemberAddition { new_member: member }
+    }
+
+    #[tokio::test]
+    async fn the_feature_hook_reaches_the_runtime_with_the_guild_facts() {
+        let feature = WelcomeFeature::new(
+            runtime(
+                Mode::Live,
+                &[ROLE_LOW],
+                FakeSource::with_roles(guild_roles()),
+                FakeWriter::default(),
+                FakeSender::ok(),
+            ),
+            FakeGuilds::with("synthetic-server", 42),
+        );
+        {
+            use crate::features::Feature;
+            feature
+                .handle(&0u8, &member_added(MEMBER, false), &0u16, Some(GUILD), None)
+                .await;
+        }
+        let runtime = feature.runtime.lock().await;
+        assert_eq!(
+            runtime.sender.sent.len(),
+            1,
+            "the welcome was posted through the feature hook"
+        );
+        assert_eq!(runtime.sender.sent[0].0, CHANNEL);
+        assert_eq!(runtime.writer.calls, vec![(MEMBER, ROLE_LOW)]);
+        // The rendered message carries the guild facts the lookup gave: the
+        // member count comes from the lookup and is rendered as the ordinal.
+        let embed = &runtime.sender.sent[0].1.embed;
+        let description = embed.description.clone().unwrap_or_default();
+        assert_eq!(
+            description, "You are our 42nd member.",
+            "the member count came from the guild lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_feature_is_off_when_its_mode_is_off() {
+        let feature = WelcomeFeature::new(
+            runtime(
+                Mode::Off,
+                &[ROLE_LOW],
+                FakeSource::with_roles(guild_roles()),
+                FakeWriter::default(),
+                FakeSender::ok(),
+            ),
+            FakeGuilds::with("synthetic-server", 42),
+        );
+        {
+            use crate::features::Feature;
+            assert!(!<WelcomeFeature<_, _, _, _, _, _> as Feature<u8, u16>>::enabled(&feature));
+        }
+        // And an event that reaches it does nothing.
+        {
+            use crate::features::Feature;
+            feature
+                .handle(&0u8, &member_added(MEMBER, false), &0u16, Some(GUILD), None)
+                .await;
+        }
+        let runtime = feature.runtime.lock().await;
+        assert!(runtime.sender.sent.is_empty());
+        assert!(runtime.writer.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_feature_hook_ignores_every_event_but_a_member_join() {
+        let feature = WelcomeFeature::new(
+            runtime(
+                Mode::Live,
+                &[ROLE_LOW],
+                FakeSource::with_roles(guild_roles()),
+                FakeWriter::default(),
+                FakeSender::ok(),
+            ),
+            FakeGuilds::with("synthetic-server", 42),
+        );
+        {
+            use crate::features::Feature;
+            let event = s::FullEvent::GuildMemberRemoval {
+                guild_id: s::all::GuildId::new(GUILD),
+                user: s::User::default(),
+                member_data_if_available: None,
+            };
+            feature.handle(&0u8, &event, &0u16, Some(GUILD), None).await;
+        }
+        let runtime = feature.runtime.lock().await;
+        assert!(runtime.sender.sent.is_empty());
+        assert!(runtime.writer.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_feature_hook_skips_a_bot_that_joined() {
+        let feature = WelcomeFeature::new(
+            runtime(
+                Mode::Live,
+                &[ROLE_LOW],
+                FakeSource::with_roles(guild_roles()),
+                FakeWriter::default(),
+                FakeSender::ok(),
+            ),
+            FakeGuilds::with("synthetic-server", 42),
+        );
+        {
+            use crate::features::Feature;
+            feature
+                .handle(&0u8, &member_added(MEMBER, true), &0u16, Some(GUILD), None)
+                .await;
+        }
+        let runtime = feature.runtime.lock().await;
+        assert!(runtime.sender.sent.is_empty());
+        assert!(runtime.writer.calls.is_empty());
     }
 
     // ---- the durable work (the real job queue) -------------------------------
