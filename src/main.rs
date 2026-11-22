@@ -2151,7 +2151,7 @@ struct DataParts {
 /// log exclusion the event handler later reads is derived from `config` here.
 fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
     Data {
-        log_exclusion: features::LogExclusion::Off,
+        log_exclusion: features::LogExclusion::from_config(&config),
         config,
         message_cache: Arc::new(RwLock::new(HashMap::new())),
         rr_db: parts.rr_db,
@@ -2159,8 +2159,6 @@ fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
         features: parts.features,
     }
 }
-
-static NO_EXCLUSION: features::LogExclusion = features::LogExclusion::Off;
 
 /// Builds the `Route` for one event from the shared state. `event_handler` is the
 /// only production caller; the registry and context are passed in so a test can
@@ -2178,7 +2176,7 @@ fn event_route<'a, X, L>(
         data,
         event,
         lookup,
-        exclusion: &NO_EXCLUSION,
+        exclusion: &data.log_exclusion,
         ticket_lockdown: data.config.ticket_privacy_lockdown,
         ticket_settings: data.config.tickets.as_ref(),
         ticket_repo: data.tickets.as_ref(),
