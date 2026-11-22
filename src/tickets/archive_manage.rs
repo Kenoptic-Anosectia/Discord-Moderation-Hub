@@ -126,14 +126,24 @@ fn recorded_channel(row: &Row<'_>) -> rusqlite::Result<Option<u64>> {
         .filter(|&channel| channel != 0))
 }
 
+/// Read a SQLite integer column as `u64`. SQLite integers are signed, and newer rusqlite no longer
+/// converts to `u64` implicitly; a negative stored value is corrupt data and stays an error
+/// (never wraps to a huge count), exactly as the old implicit conversion behaved.
+fn get_u64(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Integer, Box::new(e))
+    })
+}
+
 fn scan_entry(row: &Row<'_>, channel: u64) -> rusqlite::Result<ScanEntry> {
     Ok(ScanEntry {
         ticket: row.get(0)?,
         seq: row.get(1)?,
         dir_name: row.get(2)?,
         manifest_sha256: row.get(3)?,
-        messages: row.get(4)?,
-        assets: row.get(5)?,
+        messages: get_u64(row, 4)?,
+        assets: get_u64(row, 5)?,
         channel,
     })
 }
@@ -588,6 +598,21 @@ mod tests {
     const STAFF: u64 = 200;
     const ARCHIVE_ID: &str = "arc-00000000000000000000000000000000";
 
+    #[test]
+    fn get_u64_reads_counts_and_rejects_negative_values_instead_of_wrapping() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let read = |sql: &str| conn.query_row(sql, [], |row| get_u64(row, 0));
+        assert_eq!(read("SELECT 0").unwrap(), 0);
+        assert_eq!(read("SELECT 12345").unwrap(), 12345);
+        assert_eq!(read("SELECT 9223372036854775807").unwrap(), i64::MAX as u64);
+        assert!(matches!(
+            read("SELECT -1"),
+            Err(rusqlite::Error::FromSqlConversionFailure(0, _, _))
+        ));
+        assert!(read("SELECT 'text'").is_err());
+        assert!(read("SELECT NULL").is_err());
+    }
+
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -818,7 +843,7 @@ mod tests {
                 if let Some(at) = closed_at {
                     c.execute("INSERT INTO ticket_history(ticket,at,from_status,to_status,actor,note) VALUES(?1,?2,'verified','closed','8','confirmed')", params![ticket, at])?;
                 }
-                c.execute("INSERT INTO ticket_archives VALUES(?1,1,?2,?3,?4,?5,50)", params![ticket,published.dir_name,published.manifest_sha256,published.messages,published.assets])?;
+                c.execute("INSERT INTO ticket_archives VALUES(?1,1,?2,?3,?4,?5,50)", params![ticket,published.dir_name,published.manifest_sha256,i64::try_from(published.messages).unwrap(),i64::try_from(published.assets).unwrap()])?;
                 Ok(())
             }).await.unwrap();
             id
@@ -832,7 +857,11 @@ mod tests {
                     for seq in 2..=n + 1 {
                         tx.execute(
                             "INSERT INTO ticket_archives VALUES(?1,?2,?3,'unused',1,1,50)",
-                            params![ticket, seq, format!("ticket-{ticket}-{seq}")],
+                            params![
+                                ticket,
+                                i64::try_from(seq).unwrap(),
+                                format!("ticket-{ticket}-{seq}")
+                            ],
                         )?;
                     }
                     tx.commit()
