@@ -2506,7 +2506,12 @@ mod tests {
             release.notify_one();
             (again, post_again, other)
         };
-        let (first, (again, post_again, other)) = tokio::join!(first, second);
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(first, second)
+        })
+        .await;
+        let (first, (again, post_again, other)) =
+            joined.expect("a second call for a held key must be refused, not wait for it");
         assert_eq!(code_of(&first), Code::Edited);
         assert_eq!(code_of(&again), Code::Busy);
         assert_eq!(code_of(&post_again), Code::Busy);
