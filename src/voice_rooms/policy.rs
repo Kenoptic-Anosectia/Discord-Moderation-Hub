@@ -2933,4 +2933,57 @@ mod tests {
         let only_format = "\u{1BCA0}\u{1BCA1}\u{1BCA2}\u{1BCA3}";
         assert_eq!(sanitize_name(only_format, "Voice Room"), "Voice Room");
     }
+
+    /// The reserved code points U+FFF0..U+FFF8 are default ignorable, so they
+    /// render nothing and must be removed from a name.
+    ///
+    /// They are `Default_Ignorable_Code_Point` but they are NOT format
+    /// characters (`Cf`): they are reserved, unassigned code points. A table
+    /// built from the format characters alone leaves them out, and then they
+    /// come back in a name as nine invisible characters.
+    #[test]
+    fn the_reserved_default_ignorables_are_removed() {
+        for cp in 0xFFF0u32..=0xFFF8 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            assert_eq!(
+                sanitize_name(&format!("par{c}ty"), "Voice Room"),
+                "party",
+                "U+{cp:04X} renders nothing and must be removed"
+            );
+        }
+    }
+
+    /// A name made only of the reserved default ignorables is an empty name:
+    /// it falls back to the default name instead of coming back blank.
+    #[test]
+    fn a_name_of_only_the_reserved_default_ignorables_falls_back_to_the_default() {
+        let only_reserved: String = (0xFFF0u32..=0xFFF8)
+            .filter_map(char::from_u32)
+            .collect();
+        assert_eq!(only_reserved.chars().count(), 9);
+        assert_eq!(
+            sanitize_name(&only_reserved, "Voice Room"),
+            "Voice Room",
+            "nine reserved default ignorables render nothing, so the name is empty"
+        );
+    }
+
+    /// The class holds every code point of the whole default ignorable set.
+    ///
+    /// The count is the sum of the lengths of the ranges, so it pins the table
+    /// against the class it claims to be: a range that was dropped or
+    /// shortened changes the count and fails here.
+    #[test]
+    fn the_class_holds_every_code_point_of_the_default_ignorable_set() {
+        let counted: usize = INVISIBLE_CLASS
+            .iter()
+            .map(|&(start, end)| (end - start + 1) as usize)
+            .sum();
+        assert_eq!(
+            counted, 4207,
+            "the closed class must hold every code point of every range"
+        );
+    }
 }
