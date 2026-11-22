@@ -1,3 +1,4 @@
+mod activity;
 mod archive_safety;
 mod bump;
 mod config;
