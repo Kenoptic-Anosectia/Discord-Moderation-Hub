@@ -101,9 +101,7 @@ fn one_id(
     key: &'static str,
     invalid: &mut Vec<&'static str>,
 ) -> Option<u64> {
-    let Some(raw) = read(lookup, key) else {
-        return None;
-    };
+    let raw = read(lookup, key)?;
     match parse_id_list(key, Some(&raw)) {
         Ok(ids) if ids.len() == 1 => Some(ids[0]),
         _ => {
@@ -129,30 +127,92 @@ pub fn bump_settings(
     lookup: impl Fn(&str) -> Option<String>,
     guild_id: Option<u64>,
 ) -> BumpSettings {
+    let mut invalid: Vec<&'static str> = Vec::new();
+
+    // Mode first: an off feature must not complain about ids it will never use.
     let mode_raw = read(&lookup, KEY_MODE);
     let mode = parse_mode(KEY_MODE, mode_raw.as_deref()).unwrap_or(Mode::Off);
-    // STUB (RED): no value is parsed and no key is refused.
-    let _ = (
-        one_id(&lookup, KEY_CHANNEL_ID, &mut Vec::new()),
-        one_id(&lookup, KEY_ROLE_ID, &mut Vec::new()),
-        one_id(&lookup, KEY_BOT_ID, &mut Vec::new()),
-        parse_duration_secs(
+    if mode_raw.is_some() && mode == Mode::Off {
+        // `parse_mode` maps anything it does not know to `Off`. A present value that
+        // is not the literal "off" is a typo, and the key is named so the wiring
+        // card can report it.
+        let trimmed = mode_raw
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        if trimmed != "off" {
+            invalid.push(KEY_MODE);
+        }
+    }
+
+    let channel_id = one_id(&lookup, KEY_CHANNEL_ID, &mut invalid);
+    let role_id = one_id(&lookup, KEY_ROLE_ID, &mut invalid);
+    let bot_id = one_id(&lookup, KEY_BOT_ID, &mut invalid);
+
+    let interval_secs = match read(&lookup, KEY_INTERVAL_SECS) {
+        None => DEFAULT_INTERVAL_SECS,
+        Some(raw) => match parse_duration_secs(
             KEY_INTERVAL_SECS,
-            read(&lookup, KEY_INTERVAL_SECS).as_deref(),
+            Some(&raw),
             MIN_INTERVAL_SECS,
             MAX_INTERVAL_SECS,
-        ),
-        lookup(KEY_SUCCESS_MARKER),
-    );
+        ) {
+            Ok(secs) => secs,
+            Err(_) => {
+                invalid.push(KEY_INTERVAL_SECS);
+                DEFAULT_INTERVAL_SECS
+            }
+        },
+    };
+
+    let success_marker = match lookup(KEY_SUCCESS_MARKER) {
+        // An unset key takes the default.
+        None => DEFAULT_SUCCESS_MARKER.to_string(),
+        Some(raw) => {
+            // A present value is validated by the policy's own constructor (blank,
+            // longer than the policy's cap or holding a control character are
+            // refused). A blank value is a bad value, not an unset key.
+            let probe = BumpConfig::new(
+                guild_id.unwrap_or(1),
+                bot_id.unwrap_or(1),
+                &raw,
+                interval_secs,
+            );
+            if probe.is_err() {
+                invalid.push(KEY_SUCCESS_MARKER);
+                DEFAULT_SUCCESS_MARKER.to_string()
+            } else {
+                raw
+            }
+        }
+    };
+
+    // A live or shadow feature needs a channel, a role and the listing bot.
+    if mode != Mode::Off {
+        if channel_id.is_none() {
+            invalid.push(KEY_CHANNEL_ID);
+        }
+        if role_id.is_none() {
+            invalid.push(KEY_ROLE_ID);
+        }
+        if bot_id.is_none() {
+            invalid.push(KEY_BOT_ID);
+        }
+    }
+
+    invalid.sort_unstable();
+    invalid.dedup();
+
     BumpSettings {
         mode,
-        channel_id: None,
-        role_id: None,
-        bot_id: None,
-        interval_secs: DEFAULT_INTERVAL_SECS,
-        success_marker: DEFAULT_SUCCESS_MARKER.to_string(),
+        channel_id,
+        role_id,
+        bot_id,
+        interval_secs,
+        success_marker,
         guild_id,
-        invalid_keys: Vec::new(),
+        invalid_keys: invalid,
     }
 }
 
@@ -170,12 +230,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        move |key: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        }
+        move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     fn full() -> impl Fn(&str) -> Option<String> {
@@ -241,9 +296,22 @@ mod tests {
 
     #[test]
     fn a_bad_id_names_the_key_and_switches_the_feature_off() {
-        for bad in ["0", "-1", "abc", "1,,2", "+5", "１２３", "18446744073709551616"] {
+        for bad in [
+            "0",
+            "-1",
+            "abc",
+            "1,,2",
+            "+5",
+            "１２３",
+            "18446744073709551616",
+        ] {
             let s = bump_settings(
-                env(&[(KEY_MODE, "live"), (KEY_CHANNEL_ID, bad), (KEY_ROLE_ID, "5000001"), (KEY_BOT_ID, "2000001")]),
+                env(&[
+                    (KEY_MODE, "live"),
+                    (KEY_CHANNEL_ID, bad),
+                    (KEY_ROLE_ID, "5000001"),
+                    (KEY_BOT_ID, "2000001"),
+                ]),
                 Some(GUILD),
             );
             assert_eq!(s.effective_mode(), Mode::Off, "value {bad:?}");
@@ -282,7 +350,10 @@ mod tests {
         for (raw, want) in [("600", 600u64), ("7200", 7_200), ("86400", 86_400)] {
             let s = bump_settings(env(&[(KEY_INTERVAL_SECS, raw)]), Some(GUILD));
             assert_eq!(s.interval_secs, want, "value {raw:?}");
-            assert!(!s.invalid_keys.contains(&KEY_INTERVAL_SECS), "value {raw:?}");
+            assert!(
+                !s.invalid_keys.contains(&KEY_INTERVAL_SECS),
+                "value {raw:?}"
+            );
         }
     }
 
@@ -290,7 +361,10 @@ mod tests {
     fn a_blank_marker_names_the_key_and_falls_back_to_the_default() {
         for bad in ["", "   ", "\t"] {
             let s = bump_settings(env(&[(KEY_SUCCESS_MARKER, bad)]), Some(GUILD));
-            assert!(s.invalid_keys.contains(&KEY_SUCCESS_MARKER), "value {bad:?}");
+            assert!(
+                s.invalid_keys.contains(&KEY_SUCCESS_MARKER),
+                "value {bad:?}"
+            );
             assert_eq!(s.success_marker, DEFAULT_SUCCESS_MARKER);
         }
     }

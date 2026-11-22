@@ -17,7 +17,7 @@
 
 use super::policy::State;
 use crate::storage::{self, Migration, StorageError};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Feature name used with `storage::migrate`.
 pub const FEATURE: &str = "bump";
@@ -150,17 +150,68 @@ impl Repository {
     /// A row that cannot be read back exactly is an error, never a default state: a
     /// damaged row must not look like "no cycle", which would re-arm a reminder.
     pub fn load(&self, guild: u64) -> Result<Option<BumpState>, RepoError> {
-        // STUB (RED): no row is ever read.
-        let _ = guild;
-        let _ = params![];
-        Ok(None)
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT last_bump_at, last_bumper, next_due_at, cycle, reminded \
+                 FROM bump_state WHERE guild = ?1",
+                params![guild.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((last_bump_at, last_bumper, next_due_at, cycle, reminded)) = raw else {
+            return Ok(None);
+        };
+        let last_bumper = match last_bumper {
+            None => None,
+            Some(text) => Some(text.parse::<u64>().map_err(|_| RepoError::CorruptRow)?),
+        };
+        let reminded = match reminded {
+            0 => false,
+            1 => true,
+            _ => return Err(RepoError::CorruptRow),
+        };
+        if cycle < 0 {
+            return Err(RepoError::CorruptRow);
+        }
+        Ok(Some(BumpState {
+            guild,
+            last_bump_at,
+            last_bumper,
+            next_due_at,
+            cycle,
+            reminded,
+        }))
     }
 
     /// Writes the row for its guild, replacing any row already there.
-    ///
-    /// STUB (RED): nothing is written.
     pub fn save(&mut self, state: &BumpState) -> Result<(), RepoError> {
-        let _ = state;
+        self.conn.execute(
+            "INSERT INTO bump_state (guild, last_bump_at, last_bumper, next_due_at, cycle, reminded) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(guild) DO UPDATE SET \
+               last_bump_at = excluded.last_bump_at, \
+               last_bumper = excluded.last_bumper, \
+               next_due_at = excluded.next_due_at, \
+               cycle = excluded.cycle, \
+               reminded = excluded.reminded",
+            params![
+                state.guild.to_string(),
+                state.last_bump_at,
+                state.last_bumper.map(|id| id.to_string()),
+                state.next_due_at,
+                state.cycle,
+                i64::from(state.reminded),
+            ],
+        )?;
         Ok(())
     }
 
@@ -301,15 +352,13 @@ mod tests {
         drop(repo);
         // The CHECK constraint refuses the write: a row can never hold a value the
         // reader does not understand.
-        let written = Connection::open(&path)
-            .unwrap()
-            .execute(
-                "UPDATE bump_state SET reminded = 7 WHERE guild = ?1",
-                params![GUILD.to_string()],
-            );
+        let written = Connection::open(&path).unwrap().execute(
+            "UPDATE bump_state SET reminded = 7 WHERE guild = ?1",
+            params![GUILD.to_string()],
+        );
         assert!(written.is_err(), "the schema accepted reminded = 7");
         let repo = Repository::open(path.to_str().unwrap(), &[]).unwrap();
-        assert_eq!(repo.load(GUILD).unwrap().unwrap().reminded, false);
+        assert!(!repo.load(GUILD).unwrap().unwrap().reminded);
     }
 
     #[test]
@@ -318,12 +367,10 @@ mod tests {
         let mut repo = Repository::open(path.to_str().unwrap(), &[]).unwrap();
         repo.save(&state()).unwrap();
         drop(repo);
-        let written = Connection::open(&path)
-            .unwrap()
-            .execute(
-                "UPDATE bump_state SET cycle = -1 WHERE guild = ?1",
-                params![GUILD.to_string()],
-            );
+        let written = Connection::open(&path).unwrap().execute(
+            "UPDATE bump_state SET cycle = -1 WHERE guild = ?1",
+            params![GUILD.to_string()],
+        );
         assert!(written.is_err(), "the schema accepted cycle = -1");
         let repo = Repository::open(path.to_str().unwrap(), &[]).unwrap();
         assert_eq!(repo.load(GUILD).unwrap().unwrap().cycle, 3);

@@ -38,10 +38,7 @@ pub const KIND_REMINDER: &str = "bump_reminder";
 
 /// The `(kind, policy)` table the job queue's restart reconciliation uses.
 pub const KIND_TABLE: &[(&str, crate::jobs::queue::RestartPolicy)] =
-    &[(
-        KIND_REMINDER,
-        crate::jobs::queue::RestartPolicy::AtMostOnce,
-    )];
+    &[(KIND_REMINDER, crate::jobs::queue::RestartPolicy::AtMostOnce)];
 
 /// Stable reason codes. Never carries message text, a name or a member id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,9 +266,7 @@ pub fn build_reminder(settings: &BumpSettings, cycle: i64) -> Reminder {
     Reminder {
         channel_id: settings.channel_id.unwrap_or(0),
         role_id: settings.role_id,
-        content: format!(
-            "Bump reminder: the server can be bumped again (cycle {cycle})."
-        ),
+        content: format!("Bump reminder: the server can be bumped again (cycle {cycle})."),
     }
 }
 
@@ -299,10 +294,12 @@ pub fn status_reply(state: &BumpState, status: ReminderStatus, now: i64) -> Stri
             format!("next reminder: already sent for this cycle (due at {due_at})")
         }
     };
-    let state_text = if state.reminded { "reminded" } else { "not reminded" };
-    format!(
-        "Bump status (cycle {cycle}): {last}; {next}; {state_text}; checked at {now}."
-    )
+    let state_text = if state.reminded {
+        "reminded"
+    } else {
+        "not reminded"
+    };
+    format!("Bump status (cycle {cycle}): {last}; {next}; {state_text}; checked at {now}.")
 }
 
 /// The reply of `/bump reset` for a caller who is not staff.
@@ -336,7 +333,10 @@ impl Runtime<'_> {
     /// The stored row for the configured guild, or an empty state when there is none.
     pub fn load_state(&self) -> Result<BumpState, RuntimeError> {
         let guild = self.config.guild_id();
-        Ok(self.repo.load(guild)?.unwrap_or_else(|| BumpState::empty(guild)))
+        Ok(self
+            .repo
+            .load(guild)?
+            .unwrap_or_else(|| BumpState::empty(guild)))
     }
 
     /// Observe one message: detect a bump, persist the cycle and schedule the
@@ -350,9 +350,37 @@ impl Runtime<'_> {
     /// In shadow mode the decision is still made and reported, but nothing is
     /// written and no job is scheduled: a shadow run must not arm a real reminder.
     pub fn observe(&mut self, facts: &MessageFacts, now: i64) -> Result<Observation, RuntimeError> {
-        let _ = (facts, now);
-        // STUB (RED): nothing is detected, written or scheduled.
-        Ok(Observation::Disabled)
+        if !self.is_enabled() {
+            return Ok(Observation::Disabled);
+        }
+        let current = self.load_state()?;
+        let policy_state = current.to_policy();
+        let (decision, next_state) = policy::observe(facts, &self.config, &policy_state, now);
+        let Decision::Confirmed(confirmation) = decision else {
+            return Ok(Observation::Ignored(ignore_reason(&decision)));
+        };
+        let cycle = current.cycle + 1;
+        if self.is_shadow() {
+            // Shadow writes nothing and schedules nothing.
+            return Ok(Observation::Confirmed {
+                message_id: confirmation.message_id,
+                next_due: confirmation.next_due,
+                cycle,
+            });
+        }
+        let next = BumpState::from_policy(
+            self.config.guild_id(),
+            cycle,
+            &next_state,
+            Some(confirmation.next_due),
+        );
+        self.repo.save(&next)?;
+        self.schedule_for(&next, now)?;
+        Ok(Observation::Confirmed {
+            message_id: confirmation.message_id,
+            next_due: confirmation.next_due,
+            cycle,
+        })
     }
 
     /// Make sure the job for `state`'s cycle is scheduled.
@@ -360,9 +388,17 @@ impl Runtime<'_> {
     /// The dedupe key names the cycle, so a second call for the same cycle creates
     /// nothing: exactly one job per cycle, however often this runs.
     fn schedule_for(&self, state: &BumpState, now: i64) -> Result<ScheduleOutcome, RuntimeError> {
-        // STUB (RED): no job is scheduled.
-        let _ = (state, now);
-        Ok(ScheduleOutcome::Created)
+        if state.cycle <= 0 {
+            return Ok(ScheduleOutcome::Duplicate);
+        }
+        let due_at = state.next_due_at.unwrap_or(now).max(now);
+        let request = JobRequest {
+            kind: KIND_REMINDER,
+            dedupe_key: dedupe_key(state.guild, state.cycle),
+            payload_json: payload_json(state.guild, state.cycle),
+            due_at,
+        };
+        self.queue.schedule(&request)
     }
 
     /// Re-arm the reminder after a restart.
@@ -374,9 +410,28 @@ impl Runtime<'_> {
     ///
     /// Returns `true` when a job was scheduled (or already existed) for the cycle.
     pub fn rearm(&mut self, now: i64) -> Result<bool, RuntimeError> {
-        // STUB (RED): nothing is re-armed.
-        let _ = now;
-        Ok(false)
+        if !self.is_enabled() || self.is_shadow() {
+            return Ok(false);
+        }
+        let state = self.load_state()?;
+        if state.cycle <= 0 || state.reminded {
+            return Ok(false);
+        }
+        let status = policy::reminder_status(&state.to_policy(), &self.config, now);
+        if matches!(status, ReminderStatus::NoCycle) {
+            return Ok(false);
+        }
+        // The stored due time may be stale (the interval was changed). The policy
+        // decides what is due now; the job is scheduled for that moment.
+        let due_at = match status {
+            ReminderStatus::NotYet { due_at } | ReminderStatus::Due { due_at } => due_at,
+            _ => return Ok(false),
+        };
+        let mut fresh = state.clone();
+        fresh.next_due_at = Some(due_at);
+        self.repo.save(&fresh)?;
+        self.schedule_for(&fresh, now)?;
+        Ok(true)
     }
 
     /// The outcome of the reminder job for one cycle.
@@ -397,17 +452,35 @@ impl Runtime<'_> {
     ///
     /// In shadow mode nothing is written and nothing is posted.
     pub async fn run_reminder(&mut self, now: i64) -> Result<bool, RuntimeError> {
-        // STUB (RED): no reminder is ever posted.
-        let _ = now;
-        Ok(false)
+        if !self.is_enabled() || self.is_shadow() {
+            return Ok(false);
+        }
+        let mut state = self.load_state()?;
+        if state.cycle <= 0 {
+            return Ok(false);
+        }
+        if !self.reminder_due(&state, now) {
+            return Ok(false);
+        }
+        // Mark first: at most once, even across a restart.
+        state.reminded = true;
+        self.repo.save(&state)?;
+        let reminder = build_reminder(self.settings, state.cycle);
+        self.channel.send(&reminder).await?;
+        Ok(true)
     }
 
     /// `/bump status`: report the stored cycle.
     pub fn status(&mut self, now: i64) -> Result<CommandOutcome, RuntimeError> {
-        // STUB (RED): no status is read.
-        let _ = now;
-        Ok(CommandOutcome::Disabled {
-            reply: "The bump feature is off.".to_string(),
+        if !self.is_enabled() {
+            return Ok(CommandOutcome::Disabled {
+                reply: "The bump feature is off.".to_string(),
+            });
+        }
+        let state = self.load_state()?;
+        let status = policy::reminder_status(&state.to_policy(), &self.config, now);
+        Ok(CommandOutcome::Done {
+            reply: status_reply(&state, status, now),
         })
     }
 
@@ -419,10 +492,31 @@ impl Runtime<'_> {
     ///
     /// In shadow mode nothing is written and no job is scheduled.
     pub fn reset(&mut self, staff: StaffCheck, now: i64) -> Result<CommandOutcome, RuntimeError> {
-        // STUB (RED): no reset happens.
-        let _ = (staff, now);
-        Ok(CommandOutcome::Disabled {
-            reply: "The bump feature is off.".to_string(),
+        if !self.is_enabled() {
+            return Ok(CommandOutcome::Disabled {
+                reply: "The bump feature is off.".to_string(),
+            });
+        }
+        if staff != StaffCheck::Staff {
+            return Ok(CommandOutcome::NotStaff {
+                reply: reset_reply_not_staff(),
+            });
+        }
+        let current = self.load_state()?;
+        let reset_state = current.to_policy().reset(now);
+        let cycle = current.cycle + 1;
+        let next_due = now.saturating_add(self.config.interval_secs() as i64);
+        let mut next =
+            BumpState::from_policy(self.config.guild_id(), cycle, &reset_state, Some(next_due));
+        // A reset clears the "reminded" mark of the old cycle: the new cycle owes its
+        // own reminder.
+        next.reminded = false;
+        if !self.is_shadow() {
+            self.repo.save(&next)?;
+            self.schedule_for(&next, now)?;
+        }
+        Ok(CommandOutcome::Done {
+            reply: reset_reply_done(&next),
         })
     }
 
@@ -430,9 +524,26 @@ impl Runtime<'_> {
     ///
     /// It carries counts and stable codes only. No message text, no member id.
     pub fn would_do(&mut self, facts: &MessageFacts, now: i64) -> Result<WouldDo, RuntimeError> {
-        // STUB (RED): nothing is computed.
-        let _ = (facts, now);
-        Ok(WouldDo::default())
+        let mut record = WouldDo::default();
+        if !self.is_enabled() {
+            record.note("disabled");
+            return Ok(record);
+        }
+        let current = self.load_state()?;
+        let (decision, next_state) =
+            policy::observe(facts, &self.config, &current.to_policy(), now);
+        let Decision::Confirmed(confirmation) = decision else {
+            record.note(ignore_code(&decision));
+            return Ok(record);
+        };
+        let cycle = current.cycle + 1;
+        record.cycles = 1;
+        record.jobs = 1;
+        record.reminders = 1;
+        record.note("confirmed");
+        // The shadow record says what would happen; nothing is written or sent.
+        let _ = (confirmation, next_state, cycle);
+        Ok(record)
     }
 }
 
@@ -580,19 +691,14 @@ mod tests {
     // ---- helpers ---------------------------------------------------------------------
 
     fn settings(mode: &str) -> BumpSettings {
-        let pairs = vec![
+        let pairs = [
             ("BUMP_MODE".to_string(), mode.to_string()),
             ("BUMP_CHANNEL_ID".to_string(), CHANNEL.to_string()),
             ("BUMP_ROLE_ID".to_string(), ROLE.to_string()),
             ("BUMP_BOT_ID".to_string(), BOT.to_string()),
         ];
         bump_settings(
-            move |key: &str| {
-                pairs
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.clone())
-            },
+            move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
             Some(GUILD),
         )
     }
@@ -697,7 +803,10 @@ mod tests {
             let mut rt = h.runtime();
             rt.observe(&facts, NOW).unwrap()
         };
-        assert_eq!(observation, Observation::Ignored(IgnoreReason::NotListingBot));
+        assert_eq!(
+            observation,
+            Observation::Ignored(IgnoreReason::NotListingBot)
+        );
         assert!(h.queue.requests().is_empty());
         assert!(h.repo.load(GUILD).unwrap().is_none());
     }
@@ -730,7 +839,10 @@ mod tests {
             let mut rt = h.runtime();
             rt.observe(&facts, NOW + 3_000).unwrap()
         };
-        assert_eq!(observation, Observation::Ignored(IgnoreReason::NoSuccessMarker));
+        assert_eq!(
+            observation,
+            Observation::Ignored(IgnoreReason::NoSuccessMarker)
+        );
         let after = h.repo.load(GUILD).unwrap().unwrap();
         assert_eq!(after, before, "the cooldown reply changed the state");
     }
@@ -760,7 +872,8 @@ mod tests {
         }
         let observation = {
             let mut rt = h.runtime();
-            rt.observe(&success(200), NOW + INTERVAL as i64 + 10).unwrap()
+            rt.observe(&success(200), NOW + INTERVAL as i64 + 10)
+                .unwrap()
         };
         assert_eq!(
             observation,
@@ -807,7 +920,11 @@ mod tests {
         }
         // The observe and the two rearms all ask for the same cycle: the queue
         // refuses every duplicate, so one job exists for the cycle.
-        assert_eq!(h.queue.requests().len(), 3, "not every schedule was recorded");
+        assert_eq!(
+            h.queue.requests().len(),
+            3,
+            "not every schedule was recorded"
+        );
         assert_eq!(
             h.queue.keys(),
             vec!["bump:1000001:1", "bump:1000001:1", "bump:1000001:1"],
@@ -944,7 +1061,10 @@ mod tests {
         };
         assert!(reply.contains("cycle 1"), "{reply}");
         assert!(reply.contains(&NOW.to_string()), "{reply}");
-        assert!(reply.contains(&(NOW + INTERVAL as i64).to_string()), "{reply}");
+        assert!(
+            reply.contains(&(NOW + INTERVAL as i64).to_string()),
+            "{reply}"
+        );
         assert!(reply.contains("message 100"), "{reply}");
         assert!(!reply.contains(&USER.to_string()), "{reply}");
     }
@@ -976,7 +1096,11 @@ mod tests {
         };
         assert!(matches!(outcome, CommandOutcome::NotStaff { .. }));
         assert_eq!(h.repo.load(GUILD).unwrap().unwrap(), before);
-        assert_eq!(h.queue.requests().len(), 1, "a non-staff reset scheduled a job");
+        assert_eq!(
+            h.queue.requests().len(),
+            1,
+            "a non-staff reset scheduled a job"
+        );
     }
 
     #[test]
@@ -1029,14 +1153,19 @@ mod tests {
         assert_eq!(h.channel.sent().len(), 1);
         {
             let mut rt = h.runtime();
-            rt.reset(StaffCheck::Staff, NOW + INTERVAL as i64 + 1).unwrap();
+            rt.reset(StaffCheck::Staff, NOW + INTERVAL as i64 + 1)
+                .unwrap();
         }
         let reset_at = NOW + INTERVAL as i64 + 1;
         {
             let mut rt = h.runtime();
             assert!(rt.run_reminder(reset_at + INTERVAL as i64).await.unwrap());
         }
-        assert_eq!(h.channel.sent().len(), 2, "the reset did not reopen the reminder");
+        assert_eq!(
+            h.channel.sent().len(),
+            2,
+            "the reset did not reopen the reminder"
+        );
     }
 
     #[test]
@@ -1075,6 +1204,37 @@ mod tests {
             rt.run_reminder(NOW + INTERVAL as i64).await.unwrap();
         }
         assert!(h.channel.sent().is_empty(), "shadow posted a reminder");
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_sends_nothing_even_when_a_cycle_is_due() {
+        // A cycle that is due and waiting: the shadow guard alone must stop the post.
+        // (Without it the cycle check would hide the bug, because shadow never
+        // writes a cycle of its own.)
+        let mut h = Harness::new("shadow");
+        let state = BumpState {
+            guild: GUILD,
+            last_bump_at: Some(NOW),
+            last_bumper: Some(100),
+            next_due_at: Some(NOW + INTERVAL as i64),
+            cycle: 1,
+            reminded: false,
+        };
+        // The stored row is written directly, so the cycle really is due.
+        h.repo.save(&state).unwrap();
+        let due = NOW + INTERVAL as i64;
+        {
+            let mut rt = h.runtime();
+            assert!(
+                !rt.run_reminder(due).await.unwrap(),
+                "shadow reported a sent reminder"
+            );
+        }
+        assert!(h.channel.sent().is_empty(), "shadow posted a reminder");
+        assert!(
+            !h.repo.load(GUILD).unwrap().unwrap().reminded,
+            "shadow marked the cycle as reminded"
+        );
     }
 
     #[test]
@@ -1302,7 +1462,7 @@ mod tests {
                     }
                     4 if model_cycle > 0 => {
                         // the reminder runs; the channel may fail
-                        let failed = lcg(&mut seed) % 5 == 0;
+                        let failed = lcg(&mut seed).is_multiple_of(5);
                         if failed {
                             h.channel.fail();
                         } else {
@@ -1348,7 +1508,10 @@ mod tests {
                 reminders += 1;
             }
             let sent = h.channel.sent().len();
-            assert_eq!(sent, reminders, "seed {seed0}: sent {sent}, model {reminders}");
+            assert_eq!(
+                sent, reminders,
+                "seed {seed0}: sent {sent}, model {reminders}"
+            );
             // At most one reminder per cycle: never more sends than cycles.
             assert!(reminders <= model_cycle as usize, "seed {seed0}");
         }
