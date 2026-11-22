@@ -314,11 +314,23 @@ pub trait StateStore {
     fn members_with_state(&mut self, guild_id: u64) -> Result<Vec<u64>, &'static str>;
 }
 
+/// One user of a reaction-user page: the id and whether the user is a bot.
+///
+/// Discord's reaction-user endpoint returns full user objects, so the bot flag
+/// is known here (unlike on a reaction-remove event, which carries no member).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactionUser {
+    /// The user's id.
+    pub id: u64,
+    /// Whether the user is a bot.
+    pub is_bot: bool,
+}
+
 /// Lists the users who added a reaction, one page at a time.
 ///
 /// Discord's reaction-user endpoint returns at most [`REACTION_PAGE_SIZE`]
 /// users per page; `after` is the cursor of the last user of the previous
-/// page.
+/// page (a bot counts for the cursor, the reconcile skips it afterwards).
 pub trait ReactionUsers {
     /// The users who added the emoji, at most `limit` of them, after `after`.
     fn reaction_users(
@@ -328,7 +340,7 @@ pub trait ReactionUsers {
         emoji_id: u64,
         after: Option<u64>,
         limit: u32,
-    ) -> Result<Vec<u64>, &'static str>;
+    ) -> Result<Vec<ReactionUser>, &'static str>;
 }
 
 /// How many users one reaction-user page holds.
@@ -1129,6 +1141,8 @@ pub struct ReconcileReport {
     pub unchanged: u32,
     /// How many members the reconcile could not process.
     pub failed: u32,
+    /// How many bot reactors the reconcile skipped.
+    pub bots_skipped: u32,
     /// The stable codes of the problems the reconcile hit.
     pub codes: Vec<&'static str>,
 }
@@ -1137,11 +1151,12 @@ impl ReconcileReport {
     /// One line for the start-up log: counts and codes only.
     pub fn summary_line(&self) -> String {
         format!(
-            "safeword reconcile: activated={} released={} unchanged={} failed={} codes={}",
+            "safeword reconcile: activated={} released={} unchanged={} failed={} bots_skipped={} codes={}",
             self.activated,
             self.released,
             self.unchanged,
             self.failed,
+            self.bots_skipped,
             self.codes.join(",")
         )
     }
@@ -1398,8 +1413,8 @@ fn collect_reaction_users(
             return None;
         }
         let count = page.len();
-        let last = page.last().copied();
-        users.extend(page);
+        let last = page.last().map(|user| user.id);
+        users.extend(page.iter().map(|user| user.id));
         if count < REACTION_PAGE_SIZE as usize {
             break;
         }
@@ -1560,6 +1575,7 @@ mod tests {
     const EMOJI: u64 = 600_060;
     const MEMBER: u64 = 600_100;
     const OTHER_MEMBER: u64 = 600_101;
+    const BOT_USER: u64 = 600_199;
     const NOW: i64 = 1_700_000_000;
 
     // ------------------------------------------------------------------
@@ -1904,6 +1920,8 @@ mod tests {
         pages: Vec<Vec<u64>>,
         calls: ReactionCalls,
         failure: bool,
+        /// Users the fake reports as bots.
+        bots: Vec<u64>,
     }
 
     impl FakeReactionUsers {
@@ -1912,6 +1930,7 @@ mod tests {
                 pages,
                 calls: Rc::new(RefCell::new(Vec::new())),
                 failure: false,
+                bots: Vec::new(),
             }
         }
 
@@ -1920,7 +1939,14 @@ mod tests {
                 pages: Vec::new(),
                 calls: Rc::new(RefCell::new(Vec::new())),
                 failure: true,
+                bots: Vec::new(),
             }
+        }
+
+        /// These users are bots.
+        fn with_bots(mut self, bots: &[u64]) -> Self {
+            self.bots = bots.to_vec();
+            self
         }
     }
 
@@ -1932,7 +1958,7 @@ mod tests {
             _emoji_id: u64,
             after: Option<u64>,
             limit: u32,
-        ) -> Result<Vec<u64>, &'static str> {
+        ) -> Result<Vec<ReactionUser>, &'static str> {
             self.calls.borrow_mut().push((after, limit));
             if self.failure {
                 return Err(CODE_REACTION_USERS_FAILED);
@@ -1941,7 +1967,6 @@ mod tests {
                 None => 0,
                 Some(cursor) => {
                     // The cursor is the last id of the previous page.
-                    let mut seen = 0usize;
                     let mut found = None;
                     for (i, page) in self.pages.iter().enumerate() {
                         if let Some(last) = page.last() {
@@ -1950,8 +1975,6 @@ mod tests {
                                 break;
                             }
                         }
-                        seen += page.len();
-                        let _ = seen;
                     }
                     match found {
                         Some(index) => index,
@@ -1959,7 +1982,17 @@ mod tests {
                     }
                 }
             };
-            Ok(self.pages.get(index).cloned().unwrap_or_default())
+            Ok(self
+                .pages
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| ReactionUser {
+                    id,
+                    is_bot: self.bots.contains(&id),
+                })
+                .collect())
         }
     }
 
@@ -2487,6 +2520,96 @@ mod tests {
     }
 
     #[test]
+    fn a_member_with_closed_dms_is_activated_and_can_still_be_released() {
+        let cfg = config();
+        let mut harness =
+            Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B]))
+                .with_dm_failure(DmCode::Closed);
+        let mut shadow = ShadowRecord::default();
+
+        let activated = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(
+            activated,
+            Outcome::Partial,
+            "the DM failure is never a success"
+        );
+        assert!(
+            matches!(harness.state_of(MEMBER), Some(State::Active(_))),
+            "a DM the member cannot receive must not hold the machine in Activating, got {:?}",
+            harness.state_of(MEMBER)
+        );
+        assert_eq!(harness.roles_of(MEMBER), vec![SAFEWORD_ROLE]);
+        assert_eq!(
+            harness.alerts(),
+            vec![CODE_DM_FAILED],
+            "one alert for the one failed DM"
+        );
+
+        let released = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(released, Outcome::Partial, "the release DM failed too");
+        assert!(
+            matches!(harness.state_of(MEMBER), None | Some(State::Inactive)),
+            "the member is released, got {:?}",
+            harness.state_of(MEMBER)
+        );
+        let roles = harness.roles_of(MEMBER);
+        assert!(
+            !roles.contains(&SAFEWORD_ROLE),
+            "the safeword role is gone: {roles:?}"
+        );
+        assert!(
+            roles.contains(&RESTRICTED_A) && roles.contains(&RESTRICTED_B),
+            "the restricted roles are back: {roles:?}"
+        );
+        assert!(harness.dms().is_empty(), "no DM ever arrived");
+    }
+
+    #[test]
+    fn every_kind_of_dm_failure_is_alerted_once_and_never_traps_the_member() {
+        for code in [DmCode::Closed, DmCode::RateLimited, DmCode::Other] {
+            let cfg = config();
+            let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
+                .with_dm_failure(code);
+            let mut shadow = ShadowRecord::default();
+            let outcome = handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+            assert_eq!(outcome, Outcome::Partial, "{code:?}");
+            assert!(
+                matches!(harness.state_of(MEMBER), Some(State::Active(_))),
+                "{code:?}: got {:?}",
+                harness.state_of(MEMBER)
+            );
+            assert_eq!(harness.alerts(), vec![CODE_DM_FAILED], "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_dm_failure_found_by_the_reconcile_is_acknowledged_too() {
+        use crate::safeword::state::Snapshot;
+        // A crash left the activation with only the DM to send, and the
+        // member's DMs are closed: the reconcile must still settle the state.
+        let cfg = config();
+        let snapshot = Snapshot {
+            saved_roles: vec![RESTRICTED_A],
+            original_roles: vec![RESTRICTED_A],
+            snapshot_saved: true,
+            roles_removed: true,
+            safeword_added: true,
+            ..Snapshot::default()
+        };
+        let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[SAFEWORD_ROLE]))
+            .with_store(FakeStore::new().with_state(MEMBER, State::Activating(snapshot)))
+            .with_reactions(FakeReactionUsers::new(vec![vec![MEMBER]]))
+            .with_dm_failure(DmCode::Closed);
+        reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert!(
+            matches!(harness.state_of(MEMBER), Some(State::Active(_))),
+            "got {:?}",
+            harness.state_of(MEMBER)
+        );
+        assert!(harness.alerts().contains(&CODE_DM_FAILED));
+    }
+
+    #[test]
     fn an_unknown_bot_top_position_denies_the_role_write_and_alerts() {
         let cfg = config();
         let mut harness = Harness::new(FakeMembers::new().with_roles(MEMBER, &[RESTRICTED_A]))
@@ -2548,6 +2671,28 @@ mod tests {
         assert_eq!(shadow.role_adds, 1);
         assert_eq!(shadow.dms, 1);
         assert!(shadow.codes.is_empty());
+    }
+
+    #[test]
+    fn the_shadow_record_of_a_release_counts_only_release_effects() {
+        let cfg = config_in("shadow");
+        let mut harness = Harness::new(FakeMembers::new());
+        let mut shadow = ShadowRecord::default();
+        let outcome = handle_reaction(&cfg, &event(false), NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::NoWork);
+        assert_eq!(shadow.releases, 1);
+        assert_eq!(shadow.activates, 0);
+        assert_eq!(
+            shadow.role_removals, 1,
+            "a release removes the safeword role and nothing else"
+        );
+        assert_eq!(
+            shadow.role_adds, 2,
+            "a release gives the two restricted roles back"
+        );
+        assert_eq!(shadow.dms, 1);
+        assert!(harness.added().is_empty() && harness.removed().is_empty());
+        assert!(harness.state_of(MEMBER).is_none());
     }
 
     #[test]
@@ -2666,6 +2811,91 @@ mod tests {
             report.codes
         );
         assert_eq!(report.activated, 0, "nothing was done on half the truth");
+    }
+
+    #[test]
+    fn the_reconcile_never_activates_a_bot_that_has_the_reaction() {
+        // The bot that seeds the reaction (as /reactionrole does) is in the
+        // reaction-user list, beside a real member.
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(BOT_USER, &[RESTRICTED_A])
+                .with_roles(MEMBER, &[RESTRICTED_A]),
+        )
+        .with_reactions(
+            FakeReactionUsers::new(vec![vec![BOT_USER, MEMBER]]).with_bots(&[BOT_USER]),
+        );
+        let report = reconcile(&cfg, GUILD, NOW, 4, &mut harness.ops);
+        assert_eq!(report.activated, 1, "{}", report.summary_line());
+        assert_eq!(report.bots_skipped, 1, "{}", report.summary_line());
+        assert!(
+            harness.state_of(BOT_USER).is_none(),
+            "the bot has no safeword state"
+        );
+        assert_eq!(
+            harness.roles_of(BOT_USER),
+            vec![RESTRICTED_A],
+            "the bot kept its role"
+        );
+        assert!(harness.added().iter().all(|(who, _)| *who != BOT_USER));
+        assert!(harness.removed().iter().all(|(who, _)| *who != BOT_USER));
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Active(_))));
+    }
+
+    #[test]
+    fn a_bot_at_the_end_of_a_full_page_still_moves_the_cursor_on() {
+        let cfg = config();
+        let mut first: Vec<u64> = (0..99u64).map(|i| 900_000 + i).collect();
+        first.push(BOT_USER);
+        let mut harness = Harness::new(FakeMembers::new()).with_reactions(
+            FakeReactionUsers::new(vec![first, vec![MEMBER]]).with_bots(&[BOT_USER]),
+        );
+        let report = reconcile(&cfg, GUILD, NOW, MAX_RECONCILE_PAGES, &mut harness.ops);
+        let calls = harness.reaction_calls.borrow().clone();
+        assert_eq!(calls.len(), 2, "the second page was read: {calls:?}");
+        assert_eq!(calls[1].0, Some(BOT_USER), "the bot is the cursor");
+        assert_eq!(report.activated, 100, "99 members and MEMBER, not the bot");
+        assert_eq!(report.bots_skipped, 1);
+    }
+
+    #[test]
+    fn a_bots_removal_event_releases_nobody_and_writes_nothing() {
+        // Discord sends no member on a removal, so a bot's removal looks like
+        // any user's. It is harmless: the bot was never activated, so the
+        // machine has nothing to release, and another member is untouched.
+        let cfg = config();
+        let mut harness = Harness::new(
+            FakeMembers::new()
+                .with_roles(BOT_USER, &[RESTRICTED_A])
+                .with_roles(MEMBER, &[RESTRICTED_A]),
+        );
+        let mut shadow = ShadowRecord::default();
+        handle_reaction(&cfg, &event(true), NOW, &mut harness.ops, &mut shadow);
+        let before = harness.roles_of(MEMBER);
+        let writes_before = (harness.added().len(), harness.removed().len());
+
+        let removal = ReactionEvent {
+            member_id: BOT_USER,
+            author_is_bot: false,
+            ..event(false)
+        };
+        let outcome = handle_reaction(&cfg, &removal, NOW, &mut harness.ops, &mut shadow);
+        assert_eq!(outcome, Outcome::NoWork);
+        assert_eq!(harness.roles_of(BOT_USER), vec![RESTRICTED_A]);
+        assert_eq!(
+            (harness.added().len(), harness.removed().len()),
+            writes_before,
+            "no role was written for the bot's removal"
+        );
+        assert_eq!(
+            harness.roles_of(MEMBER),
+            before,
+            "MEMBER is still protected"
+        );
+        assert!(matches!(harness.state_of(MEMBER), Some(State::Active(_))));
+        assert_eq!(harness.dms().len(), 1, "only MEMBER's activation DM");
+        assert!(harness.alerts().is_empty());
     }
 
     #[test]
@@ -3174,10 +3404,21 @@ mod tests {
                     .with_roles(MEMBER, &[RESTRICTED_A, RESTRICTED_B])
                     .with_chaos(chaos),
             );
+            // The member's DMs: sometimes fine, sometimes failing a few times,
+            // sometimes failing for good (closed DMs, a permanent error).
+            let (dm_failure, dm_fail_next) = match next() % 4 {
+                0 => (None, 0),
+                1 => (None, (next() % 3) as u32),
+                2 => (Some(DmCode::Closed), 0),
+                _ => (
+                    Some([DmCode::Other, DmCode::RateLimited][(next() % 2) as usize]),
+                    0,
+                ),
+            };
             harness.ops.dms = Box::new(FakeDms {
                 sent: Rc::clone(&harness.dms_sent),
-                failure: None,
-                fail_next: (next() % 3) as u32,
+                failure: dm_failure,
+                fail_next: dm_fail_next,
             });
             let mut shadow = ShadowRecord::default();
             let mut present = false;
