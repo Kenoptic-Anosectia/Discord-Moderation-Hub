@@ -478,6 +478,10 @@ pub fn handle_reaction(
         ReactionDecision::Activate(member) | ReactionDecision::Release(member) => member,
     };
 
+    if config.mode == crate::settings::Mode::Off {
+        // Off performs nothing at all: not even a read.
+        return Outcome::NoWork;
+    }
     if config.mode == crate::settings::Mode::Shadow {
         // Shadow performs nothing: no read of the live state, no write.
         match decision {
@@ -1180,6 +1184,10 @@ pub fn reconcile(
     ops: &mut Ops,
 ) -> ReconcileReport {
     let mut report = ReconcileReport::default();
+    if config.is_off() {
+        // Off performs nothing at all: not even a read.
+        return report;
+    }
 
     let reacting = match collect_reaction_users(config, max_pages, ops, &mut report) {
         Some(users) => users,
@@ -1198,6 +1206,11 @@ pub fn reconcile(
     };
 
     let reacting_set: BTreeSet<u64> = reacting.iter().copied().collect();
+
+    if config.is_shadow() {
+        shadow_reconcile(guild_id, &reacting_set, &stored, ops, &mut report);
+        return report;
+    }
 
     // Every member that has the reaction: make the state match.
     for member_id in &reacting_set {
@@ -1225,6 +1238,38 @@ pub fn reconcile(
     }
 
     report
+}
+
+/// What the reconcile would do in shadow mode: counts only, nothing written.
+///
+/// It reads the stored states (a read changes nothing) and counts the members
+/// that would be activated or released. A state that cannot be read is
+/// reported and counted as failed, never guessed.
+fn shadow_reconcile(
+    guild_id: u64,
+    reacting: &BTreeSet<u64>,
+    stored: &[u64],
+    ops: &mut Ops,
+    report: &mut ReconcileReport,
+) {
+    let everyone: BTreeSet<u64> = reacting.iter().chain(stored.iter()).copied().collect();
+    for member_id in everyone {
+        let present = reacting.contains(&member_id);
+        let state = match load_state(ops, guild_id, member_id) {
+            Ok((state, _)) => state,
+            Err(code) => {
+                report.push(code);
+                report.failed = report.failed.saturating_add(1);
+                continue;
+            }
+        };
+        let inactive = matches!(state, State::Inactive);
+        match (present, inactive) {
+            (true, true) => report.activated = report.activated.saturating_add(1),
+            (false, false) => report.released = report.released.saturating_add(1),
+            _ => report.unchanged = report.unchanged.saturating_add(1),
+        }
+    }
 }
 
 /// How many rounds of work the reconcile runs for one member.
@@ -3137,7 +3182,7 @@ mod tests {
             let mut shadow = ShadowRecord::default();
             let mut present = false;
             for _ in 0..(1 + next() % 6) {
-                present = next() % 2 == 0;
+                present = next().is_multiple_of(2);
                 let before = harness.alerts().len();
                 let outcome =
                     handle_reaction(&cfg, &event(present), NOW, &mut harness.ops, &mut shadow);
