@@ -3,17 +3,32 @@
 //! The thin layer between the pure policy (`super::policy`), the durable job queue
 //! (`crate::jobs`) and Discord. Discord is reached only through two small traits
 //! ([`FlashPorts`], [`StaffAlerter`]) so tests inject fakes; the decisions are plain
-//! functions in this file.
+//! functions in this file. [`SerenityFlashPorts`] is the one serenity-facing adapter
+//! and has not been run against Discord.
 //!
-//! RED STUB: every body below is `unimplemented!()` until the GREEN commit.
+//! Flow in `live` mode for a message the policy expires:
+//! 1. schedule the source delete (durable) at `now + delay`;
+//! 2. post the notice; a failure is alerted and the source delete stays scheduled;
+//! 3. schedule the notice delete at the same due time.
+//!
+//! The source delete is scheduled before the notice is posted so that no crash between
+//! the two steps can leave the user's media without a deletion. Both job kinds are
+//! `RunAgain`: a delete is idempotent (a 404 counts as done), so a restart re-runs a cut
+//! off delete and an overdue delete runs at once.
+//!
+//! Job payloads hold ids only. Alerts carry a stable code only. `shadow` posts, deletes
+//! and schedules nothing; it only counts.
 
 use super::config::FlashSettings;
-use super::policy::{AllowedMentions, IgnoreReason, MessageFacts};
+use super::policy::{AllowedMentions, Decision, ExpirePlan, IgnoreReason, MessageFacts};
 use crate::features::{Feature, JobSignal};
-use crate::jobs::queue::{ClaimedJob, RestartPolicy};
-use crate::jobs::runner::{BoxFuture, Clock, HandlerResult, Registry, RunnerError};
+use crate::jobs::queue::{self, ClaimedJob, NewJob, RestartPolicy, ScheduleOutcome};
+use crate::jobs::runner::{BoxFuture, Clock, HandlerError, HandlerResult, Registry, RunnerError};
+use crate::settings::Mode;
 use poise::serenity_prelude as serenity;
-use std::sync::Arc;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Job kind that deletes the user's flashed message.
 pub const KIND_DELETE_SOURCE: &str = "flash_delete_source";
@@ -82,14 +97,20 @@ pub enum AlertCode {
 impl AlertCode {
     /// The stable code.
     pub fn code(self) -> &'static str {
-        unimplemented!("FL2 RED stub")
+        match self {
+            AlertCode::NoticeSendFailed => "flash_notice_send_failed",
+            AlertCode::SourceScheduleFailed => "flash_source_schedule_failed",
+            AlertCode::NoticeScheduleFailed => "flash_notice_schedule_failed",
+            AlertCode::DeleteForbidden => "flash_delete_forbidden",
+            AlertCode::DeleteFailed => "flash_delete_failed",
+            AlertCode::PayloadInvalid => "flash_payload_invalid",
+        }
     }
 }
 
 /// The staff alert text for a code: the code and nothing else.
 pub fn alert_text(code: AlertCode) -> String {
-    let _ = code;
-    unimplemented!("FL2 RED stub")
+    format!("flash alert: {}", code.code())
 }
 
 /// Discord calls of the flash runtime.
@@ -99,7 +120,9 @@ pub trait FlashPorts: Send + Sync {
     async fn send_notice(&self, req: &NoticeRequest) -> Result<u64, PortError>;
     /// Deletes one message.
     async fn delete_message(&self, channel_id: u64, message_id: u64) -> Result<(), PortError>;
-    /// Says whether `channel_id` is a thread and of which channel. Cache first.
+    /// Says whether `channel_id` is a thread and of which channel. Implementations
+    /// should answer from the cache first: this is asked for every attachment message
+    /// outside the configured channels.
     async fn thread_parent(&self, guild_id: u64, channel_id: u64) -> ParentLookup;
 }
 
@@ -126,27 +149,45 @@ pub struct PayloadInvalid;
 
 /// The JSON payload of a delete job. Ids only.
 pub fn delete_payload(target: DeleteTarget) -> String {
-    let _ = target;
-    unimplemented!("FL2 RED stub")
+    format!(
+        "{{\"channel_id\":{},\"message_id\":{}}}",
+        target.channel_id, target.message_id
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTarget {
+    channel_id: u64,
+    message_id: u64,
 }
 
 /// Parses a delete payload strictly: exactly the two keys, both JSON integers, both
 /// non-zero. Anything else is refused.
 pub fn parse_delete_payload(raw: &str) -> Result<DeleteTarget, PayloadInvalid> {
-    let _ = raw;
-    unimplemented!("FL2 RED stub")
+    // serde also reads a struct from a JSON array (`[1, 2]`); only the object form is a
+    // payload.
+    if !raw.trim_start().starts_with('{') {
+        return Err(PayloadInvalid);
+    }
+    let parsed: RawTarget = serde_json::from_str(raw).map_err(|_| PayloadInvalid)?;
+    if parsed.channel_id == 0 || parsed.message_id == 0 {
+        return Err(PayloadInvalid);
+    }
+    Ok(DeleteTarget {
+        channel_id: parsed.channel_id,
+        message_id: parsed.message_id,
+    })
 }
 
 /// Dedupe key of the source delete job.
 pub fn source_dedupe_key(message_id: u64) -> String {
-    let _ = message_id;
-    unimplemented!("FL2 RED stub")
+    format!("flash_src_{message_id}")
 }
 
 /// Dedupe key of the notice delete job.
 pub fn notice_dedupe_key(notice_message_id: u64) -> String {
-    let _ = notice_message_id;
-    unimplemented!("FL2 RED stub")
+    format!("flash_ntc_{notice_message_id}")
 }
 
 /// What a delete attempt means for its job.
@@ -165,32 +206,79 @@ pub enum DeleteVerdict {
 
 /// Decides a delete attempt's verdict. 404 is done; 403 and everything else fail.
 pub fn delete_verdict(result: Result<(), PortError>) -> DeleteVerdict {
-    let _ = result;
-    unimplemented!("FL2 RED stub")
+    match result {
+        Ok(()) | Err(PortError::NotFound) => DeleteVerdict::Done,
+        Err(PortError::Forbidden) => DeleteVerdict::Failed {
+            alert: AlertCode::DeleteForbidden,
+            code: "delete_forbidden",
+        },
+        Err(PortError::Unavailable) => DeleteVerdict::Failed {
+            alert: AlertCode::DeleteFailed,
+            code: "delete_unavailable",
+        },
+    }
 }
 
 /// Maps an HTTP status (if the failure was an HTTP response) to a [`PortError`].
 pub fn port_error_from_status(status: Option<u16>) -> PortError {
-    let _ = status;
-    unimplemented!("FL2 RED stub")
+    match status {
+        Some(404) => PortError::NotFound,
+        Some(403) => PortError::Forbidden,
+        _ => PortError::Unavailable,
+    }
 }
 
-/// The due time (unix seconds) of both delete jobs: now plus the plan's delay.
+/// The due time (unix seconds) of both delete jobs: now plus the plan's delay. Saturates
+/// at `i64::MAX` instead of wrapping; a clock below zero counts as zero.
 pub fn due_at_secs(delay_secs: u64, now_secs: i64) -> i64 {
-    let _ = (delay_secs, now_secs);
-    unimplemented!("FL2 RED stub")
+    let now = u64::try_from(now_secs).unwrap_or(0);
+    i64::try_from(now.saturating_add(delay_secs)).unwrap_or(i64::MAX)
 }
 
-/// A stable code for an ignore reason (shadow tally keys).
+/// A stable code for an ignore reason.
 pub fn ignore_code(reason: IgnoreReason) -> &'static str {
-    let _ = reason;
-    unimplemented!("FL2 RED stub")
+    match reason {
+        IgnoreReason::GuildMismatch => "guild_mismatch",
+        IgnoreReason::FeatureDisabled => "feature_disabled",
+        IgnoreReason::BotAuthor => "bot_author",
+        IgnoreReason::WebhookAuthor => "webhook_author",
+        IgnoreReason::InvalidAuthor => "invalid_author",
+        IgnoreReason::InvalidMessage => "invalid_message",
+        IgnoreReason::NoAttachments => "no_attachments",
+        IgnoreReason::ChannelNotConfigured => "channel_not_configured",
+        IgnoreReason::ThreadNotIncluded => "thread_not_included",
+    }
+}
+
+/// The shadow tally key of an ignore reason; `None` for the reasons that describe the
+/// ordinary message anywhere else in the server (counting those would drown the rest).
+fn shadow_ignore_key(reason: IgnoreReason) -> Option<&'static str> {
+    match reason {
+        IgnoreReason::GuildMismatch
+        | IgnoreReason::FeatureDisabled
+        | IgnoreReason::ChannelNotConfigured => None,
+        IgnoreReason::BotAuthor => Some("ignored_bot_author"),
+        IgnoreReason::WebhookAuthor => Some("ignored_webhook_author"),
+        IgnoreReason::InvalidAuthor => Some("ignored_invalid_author"),
+        IgnoreReason::InvalidMessage => Some("ignored_invalid_message"),
+        IgnoreReason::NoAttachments => Some("ignored_no_attachments"),
+        IgnoreReason::ThreadNotIncluded => Some("ignored_thread_not_included"),
+    }
 }
 
 /// Facts of a serenity message; `None` for a message outside a guild.
 pub fn facts_from_message(message: &serenity::Message) -> Option<MessageFacts> {
-    let _ = message;
-    unimplemented!("FL2 RED stub")
+    let guild = message.guild_id?;
+    Some(MessageFacts {
+        guild_id: guild.get(),
+        channel_id: message.channel_id.get(),
+        parent_channel_id: None,
+        author_id: message.author.id.get(),
+        author_is_bot: message.author.bot,
+        is_webhook: message.webhook_id.is_some(),
+        attachment_count: message.attachments.len(),
+        message_id: message.id.get(),
+    })
 }
 
 /// What shadow mode would have done for one message: counts only.
@@ -208,6 +296,17 @@ pub struct ShadowRecord {
     pub user_mentions: u32,
 }
 
+fn shadow_record(plan: &ExpirePlan) -> ShadowRecord {
+    let mentions = &plan.notice.allowed_mentions;
+    ShadowRecord {
+        notices: 1,
+        delete_jobs: 2,
+        delay_secs: plan.delay_secs,
+        role_mentions: u32::try_from(mentions.roles.len()).unwrap_or(u32::MAX),
+        user_mentions: u32::try_from(mentions.users.len()).unwrap_or(u32::MAX),
+    }
+}
+
 /// What happened to the notice of an expiring message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeStatus {
@@ -222,7 +321,7 @@ pub enum NoticeStatus {
 /// What `process` did with one message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The mode is `Off`.
+    /// The feature is not active (mode `off`, or no flash channel configured).
     Off,
     /// The policy ignored the message.
     Ignored(IgnoreReason),
@@ -250,16 +349,228 @@ pub struct FlashDeps {
     pub clock: Arc<dyn Clock>,
 }
 
+/// One job to schedule.
+struct JobSpec {
+    kind: &'static str,
+    key: String,
+    target: DeleteTarget,
+    due_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheduled {
+    Created,
+    AlreadyThere,
+}
+
+struct Inner {
+    settings: FlashSettings,
+    ports: Arc<dyn FlashPorts>,
+    alerts: Arc<dyn StaffAlerter>,
+    clock: Arc<dyn Clock>,
+    wake: Mutex<Option<JobSignal>>,
+    tally: Mutex<BTreeMap<&'static str, u64>>,
+}
+
+impl Inner {
+    fn count(&self, key: &'static str) {
+        let mut tally = self
+            .tally
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = tally.entry(key).or_insert(0);
+        *slot = slot.saturating_add(1);
+    }
+
+    fn wake_runner(&self) {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    async fn process(
+        &self,
+        mut facts: MessageFacts,
+        core_db: Option<&tokio_rusqlite::Connection>,
+    ) -> Outcome {
+        let mode = self.settings.mode();
+        if !self.settings.is_active() {
+            return Outcome::Off;
+        }
+        let cfg = self.settings.policy();
+        let mut decision = super::policy::decide(&facts, cfg);
+        // A thread is not in the channel list: ask for its parent, once, and decide again.
+        if matches!(
+            decision,
+            Decision::Ignore(IgnoreReason::ChannelNotConfigured)
+        ) && facts.parent_channel_id.is_none()
+        {
+            match self
+                .ports
+                .thread_parent(facts.guild_id, facts.channel_id)
+                .await
+            {
+                ParentLookup::NotThread => {}
+                ParentLookup::Parent(parent) => {
+                    facts.parent_channel_id = Some(parent);
+                    decision = super::policy::decide(&facts, cfg);
+                }
+                ParentLookup::Unavailable => return Outcome::ParentLookupFailed,
+            }
+        }
+        match decision {
+            Decision::Ignore(reason) => {
+                if mode == Mode::Shadow {
+                    if let Some(key) = shadow_ignore_key(reason) {
+                        self.count(key);
+                    }
+                }
+                Outcome::Ignored(reason)
+            }
+            Decision::Expire(plan) => match mode {
+                Mode::Live => self.expire(plan, core_db).await,
+                Mode::Shadow => {
+                    self.count("would_expire");
+                    Outcome::Shadow(shadow_record(&plan))
+                }
+                Mode::Off => Outcome::Off,
+            },
+        }
+    }
+
+    async fn expire(
+        &self,
+        plan: ExpirePlan,
+        core_db: Option<&tokio_rusqlite::Connection>,
+    ) -> Outcome {
+        let now = self.clock.now();
+        let due_at = due_at_secs(plan.delay_secs, now);
+        let Some(db) = core_db else {
+            self.alerts.alert(AlertCode::SourceScheduleFailed).await;
+            return Outcome::SourceNotScheduled;
+        };
+        let source = JobSpec {
+            kind: KIND_DELETE_SOURCE,
+            key: source_dedupe_key(plan.original_message_id),
+            target: DeleteTarget {
+                channel_id: plan.channel_id,
+                message_id: plan.original_message_id,
+            },
+            due_at,
+        };
+        match self.schedule(db, source, now).await {
+            Ok(Scheduled::Created) => {}
+            Ok(Scheduled::AlreadyThere) => return Outcome::DuplicateEvent,
+            Err(()) => {
+                self.alerts.alert(AlertCode::SourceScheduleFailed).await;
+                return Outcome::SourceNotScheduled;
+            }
+        }
+        let notice = NoticeRequest {
+            channel_id: plan.channel_id,
+            text: plan.notice.text.clone(),
+            mentions: plan.notice.allowed_mentions.clone(),
+        };
+        let notice_id = match self.ports.send_notice(&notice).await {
+            Ok(id) => id,
+            Err(_) => {
+                self.alerts.alert(AlertCode::NoticeSendFailed).await;
+                return Outcome::Expiring(NoticeStatus::SendFailed);
+            }
+        };
+        let notice_job = JobSpec {
+            kind: KIND_DELETE_NOTICE,
+            key: notice_dedupe_key(notice_id),
+            target: DeleteTarget {
+                channel_id: plan.channel_id,
+                message_id: notice_id,
+            },
+            due_at,
+        };
+        match self.schedule(db, notice_job, now).await {
+            Ok(_) => Outcome::Expiring(NoticeStatus::Posted),
+            Err(()) => {
+                self.alerts.alert(AlertCode::NoticeScheduleFailed).await;
+                Outcome::Expiring(NoticeStatus::PostedButDeleteNotScheduled)
+            }
+        }
+    }
+
+    /// Schedules one job and wakes the runner when a row was created.
+    async fn schedule(
+        &self,
+        db: &tokio_rusqlite::Connection,
+        spec: JobSpec,
+        now: i64,
+    ) -> Result<Scheduled, ()> {
+        let payload = delete_payload(spec.target);
+        let outcome = db
+            .call(move |conn| {
+                queue::schedule(
+                    conn,
+                    &NewJob {
+                        kind: spec.kind,
+                        dedupe_key: &spec.key,
+                        payload_json: &payload,
+                        due_at: spec.due_at,
+                    },
+                    now,
+                )
+            })
+            .await;
+        match outcome {
+            Ok(ScheduleOutcome::Created { .. }) => {
+                self.wake_runner();
+                Ok(Scheduled::Created)
+            }
+            Ok(ScheduleOutcome::Duplicate { .. }) => Ok(Scheduled::AlreadyThere),
+            Err(_) => Err(()),
+        }
+    }
+
+    async fn run_delete(&self, job: ClaimedJob) -> HandlerResult {
+        let Ok(target) = parse_delete_payload(&job.payload_json) else {
+            self.alerts.alert(AlertCode::PayloadInvalid).await;
+            return Err(HandlerError::new("payload_invalid"));
+        };
+        let result = self
+            .ports
+            .delete_message(target.channel_id, target.message_id)
+            .await;
+        match delete_verdict(result) {
+            DeleteVerdict::Done => Ok(()),
+            DeleteVerdict::Failed { alert, code } => {
+                self.alerts.alert(alert).await;
+                Err(HandlerError::new(code))
+            }
+        }
+    }
+}
+
 /// The flash-media feature. Implements the registry's `Feature` hook; it is NOT
 /// registered anywhere.
 pub struct FlashFeature {
-    _deps: FlashDeps,
+    inner: Arc<Inner>,
 }
 
 impl FlashFeature {
     /// Builds the feature.
     pub fn new(deps: FlashDeps) -> Self {
-        FlashFeature { _deps: deps }
+        FlashFeature {
+            inner: Arc::new(Inner {
+                settings: deps.settings,
+                ports: deps.ports,
+                alerts: deps.alerts,
+                clock: deps.clock,
+                wake: Mutex::new(None),
+                tally: Mutex::new(BTreeMap::new()),
+            }),
+        }
     }
 
     /// Handles one message. `core_db` is the shared database (needed in live mode).
@@ -268,25 +579,35 @@ impl FlashFeature {
         facts: MessageFacts,
         core_db: Option<&tokio_rusqlite::Connection>,
     ) -> Outcome {
-        let _ = (facts, core_db);
-        unimplemented!("FL2 RED stub")
+        self.inner.process(facts, core_db).await
     }
 
     /// Runs one delete job (both kinds share this handler).
     pub async fn run_delete(&self, job: ClaimedJob) -> HandlerResult {
-        let _ = job;
-        unimplemented!("FL2 RED stub")
+        self.inner.run_delete(job).await
     }
 
     /// Shadow-mode tally: `(code, count)` sorted by code.
     pub fn shadow_summary(&self) -> Vec<(&'static str, u64)> {
-        unimplemented!("FL2 RED stub")
+        self.inner
+            .tally
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(key, count)| (*key, *count))
+            .collect()
     }
 
-    /// Registers the two job kinds.
+    /// Registers the two job kinds with [`JOB_KINDS`]' restart policies.
     pub fn register_job_kinds(&self, registry: &mut Registry) -> Result<(), RunnerError> {
-        let _ = registry;
-        unimplemented!("FL2 RED stub")
+        for (kind, policy) in JOB_KINDS {
+            let inner = self.inner.clone();
+            registry.register(kind, policy, move |job| {
+                let inner = inner.clone();
+                async move { inner.run_delete(job).await }
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -296,30 +617,178 @@ impl<X: Sync + 'static, D: Sync + 'static> Feature<X, D> for FlashFeature {
     }
 
     fn enabled(&self) -> bool {
-        unimplemented!("FL2 RED stub")
+        self.inner.settings.is_active()
     }
 
+    /// Only `live` uses the database: `shadow` schedules nothing, so it must not open it
+    /// or register job kinds.
     fn needs_core_db(&self) -> bool {
-        unimplemented!("FL2 RED stub")
+        self.inner.settings.is_active() && self.inner.settings.mode() == Mode::Live
     }
 
     fn register_jobs(&self, registry: &mut Registry) -> Result<(), RunnerError> {
         self.register_job_kinds(registry)
     }
 
-    fn jobs_started(&self, _wake: JobSignal) {
-        unimplemented!("FL2 RED stub")
+    fn jobs_started(&self, wake: JobSignal) {
+        *self
+            .inner
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake);
     }
 
     fn handle<'a>(
         &'a self,
         _ctx: &'a X,
-        _event: &'a serenity::FullEvent,
+        event: &'a serenity::FullEvent,
         _data: &'a D,
         _guild: Option<u64>,
-        _core_db: Option<&'a tokio_rusqlite::Connection>,
+        core_db: Option<&'a tokio_rusqlite::Connection>,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async { unimplemented!("FL2 RED stub") })
+        Box::pin(async move {
+            let serenity::FullEvent::Message { new_message } = event else {
+                return;
+            };
+            let Some(facts) = facts_from_message(new_message) else {
+                return;
+            };
+            let _ = self.inner.process(facts, core_db).await;
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The serenity adapter (not run against Discord).
+// ---------------------------------------------------------------------------
+
+/// Maps a serenity error to a [`PortError`] through its HTTP status, if it has one.
+pub fn port_error_from_serenity(error: &serenity::Error) -> PortError {
+    match error {
+        serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) => {
+            port_error_from_status(Some(response.status_code.as_u16()))
+        }
+        _ => port_error_from_status(None),
+    }
+}
+
+/// The guild's cached answer for a thread parent, if the cache can tell. The guard on
+/// the cache is dropped before this returns, so nothing is held across an await.
+fn cached_thread_parent(
+    cache: &serenity::Cache,
+    guild: serenity::GuildId,
+    channel: serenity::ChannelId,
+) -> Option<ParentLookup> {
+    let guild = cache.guild(guild)?;
+    if guild.channels.contains_key(&channel) {
+        return Some(ParentLookup::NotThread);
+    }
+    guild
+        .threads
+        .iter()
+        .find(|thread| thread.id == channel)
+        .map(|thread| {
+            thread
+                .parent_id
+                .map_or(ParentLookup::Unavailable, |p| ParentLookup::Parent(p.get()))
+        })
+}
+
+/// Discord calls over serenity's HTTP client and cache.
+pub struct SerenityFlashPorts {
+    /// The serenity HTTP client.
+    pub http: Arc<serenity::Http>,
+    /// The serenity cache.
+    pub cache: Arc<serenity::Cache>,
+    /// Channel that receives staff alerts, if one is configured.
+    pub staff_alert_channel: Option<u64>,
+}
+
+#[serenity::async_trait]
+impl FlashPorts for SerenityFlashPorts {
+    async fn send_notice(&self, req: &NoticeRequest) -> Result<u64, PortError> {
+        if req.channel_id == 0 {
+            return Err(PortError::Unavailable);
+        }
+        let users: Vec<serenity::UserId> = req
+            .mentions
+            .users
+            .iter()
+            .filter(|id| **id != 0)
+            .map(|id| serenity::UserId::new(*id))
+            .collect();
+        let roles: Vec<serenity::RoleId> = req
+            .mentions
+            .roles
+            .iter()
+            .filter(|id| **id != 0)
+            .map(|id| serenity::RoleId::new(*id))
+            .collect();
+        // Only the listed users and roles; `everyone` and `replied_user` stay unset.
+        let mentions = serenity::builder::CreateAllowedMentions::new()
+            .users(users)
+            .roles(roles);
+        let message = serenity::builder::CreateMessage::new()
+            .content(req.text.clone())
+            .allowed_mentions(mentions);
+        serenity::ChannelId::new(req.channel_id)
+            .send_message(&self.http, message)
+            .await
+            .map(|sent| sent.id.get())
+            .map_err(|e| port_error_from_serenity(&e))
+    }
+
+    async fn delete_message(&self, channel_id: u64, message_id: u64) -> Result<(), PortError> {
+        if channel_id == 0 || message_id == 0 {
+            return Err(PortError::Unavailable);
+        }
+        self.http
+            .delete_message(
+                serenity::ChannelId::new(channel_id),
+                serenity::MessageId::new(message_id),
+                Some("flash expiry"),
+            )
+            .await
+            .map_err(|e| port_error_from_serenity(&e))
+    }
+
+    async fn thread_parent(&self, guild_id: u64, channel_id: u64) -> ParentLookup {
+        if guild_id == 0 || channel_id == 0 {
+            return ParentLookup::Unavailable;
+        }
+        let guild = serenity::GuildId::new(guild_id);
+        let channel = serenity::ChannelId::new(channel_id);
+        if let Some(found) = cached_thread_parent(&self.cache, guild, channel) {
+            return found;
+        }
+        match self.http.get_channel(channel).await {
+            Ok(serenity::Channel::Guild(found)) => {
+                if found.thread_metadata.is_none() {
+                    ParentLookup::NotThread
+                } else {
+                    found
+                        .parent_id
+                        .map_or(ParentLookup::Unavailable, |p| ParentLookup::Parent(p.get()))
+                }
+            }
+            _ => ParentLookup::Unavailable,
+        }
+    }
+}
+
+#[serenity::async_trait]
+impl StaffAlerter for SerenityFlashPorts {
+    async fn alert(&self, code: AlertCode) {
+        let Some(channel) = self.staff_alert_channel.filter(|id| *id != 0) else {
+            return;
+        };
+        // No mention can fire from an alert: the allowed-mentions object is empty.
+        let message = serenity::builder::CreateMessage::new()
+            .content(alert_text(code))
+            .allowed_mentions(serenity::builder::CreateAllowedMentions::new());
+        let _ = serenity::ChannelId::new(channel)
+            .send_message(&self.http, message)
+            .await;
     }
 }
 
@@ -1982,13 +2451,18 @@ mod tests {
     /// are used.
     #[tokio::test]
     async fn a_flash_message_reaches_the_feature_but_never_the_cache_or_the_logger() {
-        for (label, channel, include_threads) in [
+        for (index, (label, channel, include_threads)) in [
             ("flash channel", FLASH_CH, "true"),
             ("thread of the flash channel", THREAD_CH, "true"),
             ("thread when threads are not expired", THREAD_CH, "false"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // One database file per case: a file still held by the previous case's
+            // connection thread cannot be removed on Windows.
             let reg = registered(
-                "route",
+                &format!("route-{index}"),
                 "live",
                 &[("FLASH_INCLUDE_THREADS", include_threads)],
             )

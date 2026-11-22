@@ -7,7 +7,7 @@
 //! the value is never carried or echoed.
 
 use super::policy::{self, FlashConfig};
-use crate::settings::Mode;
+use crate::settings::{parse_duration_secs, parse_id_list, parse_mode, Mode, SettingError};
 
 /// Environment key holding the feature mode (`off`, `shadow`, `live`).
 pub const KEY_MODE: &str = "FLASH_MODE";
@@ -62,8 +62,7 @@ pub struct FlashSettings {
 impl FlashSettings {
     /// The configured mode. `Off` whenever a setting was refused.
     pub fn mode(&self) -> Mode {
-        let _ = self.mode;
-        unimplemented!("FL2 RED stub")
+        self.mode
     }
 
     /// The validated policy configuration.
@@ -74,7 +73,19 @@ impl FlashSettings {
     /// True when the feature should run at all: a mode other than `Off` and at least
     /// one flash channel.
     pub fn is_active(&self) -> bool {
-        unimplemented!("FL2 RED stub")
+        self.mode != Mode::Off && self.policy.is_enabled()
+    }
+
+    /// The settings used when nothing is configured or a value was refused.
+    fn off() -> Self {
+        FlashSettings {
+            mode: Mode::Off,
+            // An empty channel list, no role, the default delay and no guild are all
+            // valid for the policy, so this cannot fail (the `nothing_set_is_off` test
+            // runs it).
+            policy: FlashConfig::new(Vec::new(), None, policy::DEFAULT_DELAY_SECS, true, None)
+                .expect("an empty channel list and the default delay are valid"),
+        }
     }
 }
 
@@ -90,8 +101,107 @@ pub struct Loaded {
 /// Parses the flash keys from `lookup` (blank counts as unset). `guild_id` is the
 /// already-parsed `GUILD_ID` the policy scopes to.
 pub fn load(lookup: impl Fn(&str) -> Option<String>, guild_id: Option<u64>) -> Loaded {
-    let _ = (&lookup, guild_id, policy::DEFAULT_DELAY_SECS);
-    unimplemented!("FL2 RED stub")
+    match parse(&lookup, guild_id) {
+        Ok(settings) => Loaded {
+            settings,
+            error: None,
+        },
+        Err(error) => Loaded {
+            settings: FlashSettings::off(),
+            error: Some(error),
+        },
+    }
+}
+
+fn parse(
+    lookup: &impl Fn(&str) -> Option<String>,
+    guild_id: Option<u64>,
+) -> Result<FlashSettings, FlashConfigError> {
+    // `parse_mode` has no error path: anything but off/shadow/live is `Off`.
+    let mode = parse_mode(KEY_MODE, lookup(KEY_MODE).as_deref()).unwrap_or(Mode::Off);
+
+    let channels = parse_id_list(
+        policy::KEY_CHANNEL_IDS,
+        lookup(policy::KEY_CHANNEL_IDS).as_deref(),
+    )
+    .map_err(|e| refused(policy::KEY_CHANNEL_IDS, &e))?;
+
+    let role = parse_id_list(
+        policy::KEY_PING_ROLE_ID,
+        lookup(policy::KEY_PING_ROLE_ID).as_deref(),
+    )
+    .map_err(|e| refused(policy::KEY_PING_ROLE_ID, &e))?;
+    let role = match role.as_slice() {
+        [] => None,
+        [one] => Some(*one),
+        // A list of roles is not one ping role.
+        _ => {
+            return Err(FlashConfigError {
+                key: policy::KEY_PING_ROLE_ID,
+                kind: FlashConfigErrorKind::Unreadable,
+            })
+        }
+    };
+
+    let delay = match parse_duration_secs(
+        policy::KEY_DELAY_SECS,
+        lookup(policy::KEY_DELAY_SECS).as_deref(),
+        policy::MIN_DELAY_SECS,
+        policy::MAX_DELAY_SECS,
+    ) {
+        Ok(secs) => secs,
+        // Unset or blank: the default.
+        Err(SettingError::Unset(_)) => policy::DEFAULT_DELAY_SECS,
+        Err(e) => return Err(refused(policy::KEY_DELAY_SECS, &e)),
+    };
+
+    let include_threads = parse_flag(
+        policy::KEY_INCLUDE_THREADS,
+        lookup(policy::KEY_INCLUDE_THREADS).as_deref(),
+        true,
+    )?;
+
+    let policy =
+        FlashConfig::new(channels, role, delay, include_threads, guild_id).map_err(|e| {
+            FlashConfigError {
+                key: e.key(),
+                kind: FlashConfigErrorKind::OutOfRange,
+            }
+        })?;
+    Ok(FlashSettings { mode, policy })
+}
+
+/// Maps a K06 error to this module's error, keeping only the key and a stable kind.
+fn refused(key: &'static str, error: &SettingError) -> FlashConfigError {
+    let kind = match error {
+        SettingError::OutOfRange(_) => FlashConfigErrorKind::OutOfRange,
+        SettingError::Unset(_) | SettingError::InvalidValue(_) | SettingError::ParseError(_) => {
+            FlashConfigErrorKind::Unreadable
+        }
+    };
+    FlashConfigError { key, kind }
+}
+
+/// Strict boolean: blank or unset is `default`; otherwise exactly `true` or `false`
+/// (case-insensitive, trimmed). K06 has no boolean helper; anything else is refused.
+fn parse_flag(
+    key: &'static str,
+    raw: Option<&str>,
+    default: bool,
+) -> Result<bool, FlashConfigError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default);
+    };
+    if raw.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if raw.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(FlashConfigError {
+            key,
+            kind: FlashConfigErrorKind::Unreadable,
+        })
+    }
 }
 
 #[cfg(test)]
