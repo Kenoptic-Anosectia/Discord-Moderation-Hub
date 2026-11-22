@@ -97,6 +97,29 @@ macro_rules! cached_channel_permissions {
 mod tests {
     use super::*;
     #[test]
+    fn configured_commands_are_unchanged_by_the_core_settings() {
+        // None of the core settings adds or removes a command.
+        let names = |enabled: bool| -> Vec<String> {
+            configured_commands(enabled)
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect()
+        };
+        assert_eq!(names(false), vec!["age-verified", "reactionrole"]);
+        assert_eq!(
+            names(true),
+            vec![
+                "age-verified",
+                "reactionrole",
+                "ticket-panel-post",
+                "ticket-close",
+                "ticket-recover",
+                "ticket-archives"
+            ]
+        );
+    }
+
+    #[test]
     fn ticket_commands_are_registered_only_with_valid_enabled_config() {
         assert!(!configured_commands(false)
             .iter()
@@ -1984,7 +2007,14 @@ struct Route<'a, X, D, L> {
 
 /// Routes one event: feature dispatch first, then the guarded logger.
 ///
-/// STUB for the RED commit: only the sink runs.
+/// 1. `features.dispatch` runs before anything else, so a feature is never
+///    skipped because the logger's privacy guard said no. It never touches the
+///    message cache.
+/// 2. The ticket privacy guard runs next, exactly as before.
+/// 3. Inside it, the log exclusion gate: a message in an excluded channel or
+///    category (or any message while an exclusion list is unusable) never
+///    reaches `sink`, so it is never cached and never logged on edit or delete.
+///    The sink therefore runs only when both the ticket guard and the gate allow.
 async fn route_event<X, D, L, F, Fut>(route: Route<'_, X, D, L>, sink: F) -> Result<(), Error>
 where
     X: Sync + 'static,
@@ -1993,18 +2023,28 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), Error>>,
 {
-    let _ = (
-        route.features,
-        route.ctx,
-        route.data,
-        route.event,
-        route.lookup,
-        route.exclusion,
+    route
+        .features
+        .dispatch(route.ctx, route.event, route.data)
+        .await;
+    // Fail-closed private-scope guard: ALL cache insertion / log construction runs inside the
+    // sink, which is only invoked when the guard allows the event.
+    tickets::privacy::guarded(
         route.ticket_lockdown,
         route.ticket_settings,
         route.ticket_repo,
-    );
-    sink().await
+        route.event,
+        route.lookup,
+        &tickets::privacy::COUNTERS,
+        || async {
+            match features::message_gate(route.exclusion, route.event, route.lookup).await {
+                features::Gate::Allow => sink().await,
+                features::Gate::Skip(_) => Ok(()),
+            }
+        },
+    )
+    .await
+    .unwrap_or(Ok(()))
 }
 
 async fn log_event(

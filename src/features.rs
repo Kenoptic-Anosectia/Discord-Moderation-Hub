@@ -1,47 +1,157 @@
 //! Feature registry (W1, `docs/verification/WIRING-A.md`).
 //!
-//! STUB for the RED commit: every decision here is deliberately wrong or empty.
+//! One place that knows which optional features are enabled, owns the state
+//! they share (the core database and the durable job runner) and hands every
+//! gateway event to them before the logger sees it.
+//!
+//! The decisions are pure functions over plain values ([`guild_filter`],
+//! [`guild_allows`], [`plan`], [`report_counts`], [`build_facts`]); only
+//! [`event_guild`], [`message_gate`], [`Features`] and [`TokioJobStarter`]
+//! touch serenity, SQLite or tokio. The registry is generic over the context
+//! type `X` and the data type `D` that the bot passes to its handlers, so it
+//! can be tested without a Discord connection.
+//!
+//! No real feature is registered yet (`production_features` is empty): with
+//! every feature off the registry opens no database, starts no runner and
+//! `dispatch` returns at once.
 
-use crate::config::Config;
-use crate::jobs::queue::Report;
-use crate::jobs::runner::{BoxFuture, Registry, RunnerError};
-use crate::privacy_scope::Scope;
-use crate::tickets::privacy::ChannelLookup;
+use crate::config::{
+    Config, CORE_DB_PATH_KEY, GUILD_ID_KEY, LOG_EXCLUDED_CATEGORY_IDS_KEY,
+    LOG_EXCLUDED_CHANNEL_IDS_KEY,
+};
+use crate::jobs::queue::{self, ReconcileOutcome, Report};
+use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError, SystemClock};
+use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
+use crate::storage;
+use crate::tickets::privacy::{ChannelLookup, Lookup};
 use poise::serenity_prelude as serenity;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A cheap, cloneable callback (wake the job runner, stop the job runner).
 pub type JobSignal = Arc<dyn Fn() + Send + Sync>;
 
+/// How long `stop` waits beyond the runner's own shutdown grace.
+const STOP_MARGIN: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Guild filter (pure)
+// ---------------------------------------------------------------------------
+
 /// Which guilds feature dispatch serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuildFilter {
+    /// `GUILD_ID` is not set: every guild is served.
     Any,
+    /// `GUILD_ID` is set: only this guild is served.
     Only(u64),
+    /// `GUILD_ID` was set but is unusable: no event is served.
     Closed,
 }
 
 /// What an event says about the guild it belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventGuild {
+    /// The payload names this guild.
     Guild(u64),
+    /// The event kind can carry a guild id and this one does not (a DM).
     NoGuild,
+    /// The event kind has no guild by nature (gateway-level events).
     NotGuildBound,
+    /// The classifier does not know this event kind.
     Unknown,
 }
 
-pub fn guild_filter(_guild_id: Option<u64>, _invalid_keys: &[&str]) -> GuildFilter {
-    GuildFilter::Any
+/// Derives the filter from the parsed `GUILD_ID` and the list of unusable keys.
+///
+/// A `GUILD_ID` that was set but could not be read closes the filter: a typo
+/// must never widen the scope to every guild.
+pub fn guild_filter(guild_id: Option<u64>, invalid_keys: &[&str]) -> GuildFilter {
+    if invalid_keys.contains(&GUILD_ID_KEY) {
+        return GuildFilter::Closed;
+    }
+    match guild_id {
+        Some(id) => GuildFilter::Only(id),
+        None => GuildFilter::Any,
+    }
 }
 
-pub fn guild_allows(_filter: GuildFilter, _event: EventGuild) -> bool {
-    true
+/// True when a feature may see an event of this guild.
+///
+/// With a single guild configured only an event that provably belongs to it
+/// passes, plus events that have no guild by nature. An event with no guild
+/// id (a DM) or of an unclassified kind is not passed.
+pub fn guild_allows(filter: GuildFilter, event: EventGuild) -> bool {
+    match filter {
+        GuildFilter::Any => true,
+        GuildFilter::Closed => false,
+        GuildFilter::Only(wanted) => match event {
+            EventGuild::Guild(id) => id == wanted,
+            EventGuild::NotGuildBound => true,
+            EventGuild::NoGuild | EventGuild::Unknown => false,
+        },
+    }
 }
 
-pub fn event_guild(_event: &serenity::FullEvent) -> EventGuild {
-    EventGuild::Unknown
+/// Reads the guild of an event. Only the event kinds listed here are
+/// classified; every other kind is `Unknown` (and so refused by a configured
+/// filter) until a feature card that needs it adds it.
+pub fn event_guild(event: &serenity::FullEvent) -> EventGuild {
+    use serenity::FullEvent as E;
+    let maybe = |g: Option<serenity::GuildId>| {
+        g.map_or(EventGuild::NoGuild, |g| EventGuild::Guild(g.get()))
+    };
+    let some = |g: serenity::GuildId| EventGuild::Guild(g.get());
+    match event {
+        E::Message { new_message } => maybe(new_message.guild_id),
+        E::MessageUpdate { event, new, .. } => maybe(
+            event
+                .guild_id
+                .or_else(|| new.as_ref().and_then(|m| m.guild_id)),
+        ),
+        E::MessageDelete { guild_id, .. } | E::MessageDeleteBulk { guild_id, .. } => {
+            maybe(*guild_id)
+        }
+        E::ReactionAdd { add_reaction } => maybe(add_reaction.guild_id),
+        E::ReactionRemove { removed_reaction } => maybe(removed_reaction.guild_id),
+        E::VoiceStateUpdate { new, .. } => maybe(new.guild_id),
+        E::InviteCreate { data } => maybe(data.guild_id),
+        E::InviteDelete { data } => maybe(data.guild_id),
+        E::InteractionCreate { interaction } => maybe(interaction.guild_id()),
+        E::GuildMemberAddition { new_member } => some(new_member.guild_id),
+        E::GuildMemberRemoval { guild_id, .. } => some(*guild_id),
+        E::GuildMemberUpdate { event, .. } => some(event.guild_id),
+        E::GuildRoleCreate { new } => some(new.guild_id),
+        E::GuildRoleUpdate { new, .. } => some(new.guild_id),
+        E::GuildRoleDelete { guild_id, .. } => some(*guild_id),
+        E::ChannelCreate { channel } => some(channel.guild_id),
+        E::ChannelUpdate { new, .. } => some(new.guild_id),
+        E::ChannelDelete { channel, .. } => some(channel.guild_id),
+        E::CategoryCreate { category } | E::CategoryDelete { category } => some(category.guild_id),
+        E::ThreadCreate { thread } => some(thread.guild_id),
+        E::ThreadUpdate { new, .. } => some(new.guild_id),
+        E::ThreadDelete { thread, .. } => some(thread.guild_id),
+        E::GuildCreate { guild, .. } => some(guild.id),
+        E::GuildUpdate { new_data, .. } => some(new_data.id),
+        E::GuildDelete { incomplete, .. } => some(incomplete.id),
+        E::GuildBanAddition { guild_id, .. } | E::GuildBanRemoval { guild_id, .. } => {
+            some(*guild_id)
+        }
+        E::GuildAuditLogEntryCreate { guild_id, .. } => some(*guild_id),
+        E::Ready { .. }
+        | E::Resume { .. }
+        | E::CacheReady { .. }
+        | E::ShardsReady { .. }
+        | E::ShardStageUpdate { .. }
+        | E::UserUpdate { .. } => EventGuild::NotGuildBound,
+        _ => EventGuild::Unknown,
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Start-up plan and job-report counts (pure)
+// ---------------------------------------------------------------------------
 
 /// Plain facts about one registered feature, for the pure start-up plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,14 +163,17 @@ pub struct FeatureInfo {
 /// What start-up must do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
+    /// Per feature (same order as the input): keep it.
     pub keep: Vec<bool>,
+    /// True only when a kept feature needs the core database.
     pub open_core_db: bool,
 }
 
+/// Keeps the enabled features and says whether the core database is needed.
 pub fn plan(infos: &[FeatureInfo]) -> Plan {
     Plan {
-        keep: vec![true; infos.len()],
-        open_core_db: false,
+        keep: infos.iter().map(|i| i.enabled).collect(),
+        open_core_db: infos.iter().any(|i| i.enabled && i.needs_core_db),
     }
 }
 
@@ -73,21 +186,44 @@ pub struct ReportCounts {
     pub failed_max_attempts: usize,
 }
 
-pub fn report_counts(_report: &Report) -> ReportCounts {
-    ReportCounts::default()
+/// Counts the entries of a reconcile report by outcome.
+pub fn report_counts(report: &Report) -> ReportCounts {
+    let mut counts = ReportCounts::default();
+    for entry in &report.entries {
+        match entry.outcome {
+            ReconcileOutcome::Requeued => counts.requeued += 1,
+            ReconcileOutcome::AbandonedAtMostOnce => counts.abandoned_at_most_once += 1,
+            ReconcileOutcome::AbandonedUnregistered => counts.abandoned_unregistered += 1,
+            ReconcileOutcome::FailedMaxAttempts => counts.failed_max_attempts += 1,
+        }
+    }
+    counts
 }
 
 impl ReportCounts {
+    /// The start-up line: numbers only, no job id, kind or payload.
     pub fn line(&self) -> String {
-        String::new()
+        format!(
+            "Job runner started; restart reconcile: requeued={} abandoned_at_most_once={} abandoned_unregistered={} failed_max_attempts={}",
+            self.requeued,
+            self.abandoned_at_most_once,
+            self.abandoned_unregistered,
+            self.failed_max_attempts
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
 
 /// Settings the feature layer needs, taken from `Config`.
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub guild: GuildFilter,
+    /// `None` when `CORE_DB_PATH` was unusable.
     pub core_db_path: Option<String>,
+    /// Files the core database must never alias (ticket and reaction-role files).
     pub reserved_db_paths: Vec<PathBuf>,
     pub staff_alert_channel: Option<u64>,
     pub protected_role_count: usize,
@@ -96,41 +232,84 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn from_config(_config: &Config) -> Self {
+    pub fn from_config(config: &Config) -> Self {
+        let mut reserved = vec![PathBuf::from(&config.reaction_role_db_path)];
+        if let Some(tickets) = &config.tickets {
+            reserved.push(PathBuf::from(&tickets.db_path));
+        }
         Settings {
-            guild: GuildFilter::Any,
-            core_db_path: None,
-            reserved_db_paths: Vec::new(),
-            staff_alert_channel: None,
-            protected_role_count: 0,
-            log_excluded_channels: 0,
-            log_excluded_categories: 0,
+            guild: guild_filter(config.guild_id, &config.invalid_core_keys),
+            core_db_path: config.core_db_path.clone(),
+            reserved_db_paths: reserved,
+            staff_alert_channel: config.staff_alert_channel_id,
+            protected_role_count: config.protected_role_ids.len(),
+            log_excluded_channels: config.log_excluded_channel_ids.len(),
+            log_excluded_categories: config.log_excluded_category_ids.len(),
         }
     }
 
+    /// One start-up line with states and counts. It carries no id and no path.
     pub fn summary(&self) -> String {
-        String::new()
+        let guild = match self.guild {
+            GuildFilter::Any => "any",
+            GuildFilter::Only(_) => "one",
+            GuildFilter::Closed => "closed (GUILD_ID unusable)",
+        };
+        format!(
+            "Feature layer: guild filter={guild}; staff alert channel={}; protected roles={}; log exclusions={} channels, {} categories; core database path={}",
+            if self.staff_alert_channel.is_some() { "set" } else { "unset" },
+            self.protected_role_count,
+            self.log_excluded_channels,
+            self.log_excluded_categories,
+            if self.core_db_path.is_some() { "usable" } else { "unusable" },
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Log exclusions
+// ---------------------------------------------------------------------------
 
 /// What the general logger does with message events.
 #[derive(Clone, Debug)]
 pub enum LogExclusion {
+    /// Nothing is excluded: the logger is exactly as before.
     Off,
+    /// Messages of these channels and categories are never cached or logged.
     Scope(Scope),
+    /// An exclusion list was unusable: guild message events are not cached or
+    /// logged until it is fixed (the list cannot be dropped, see K05).
     BlockMessages,
 }
 
 impl LogExclusion {
-    pub fn from_config(_config: &Config) -> Self {
-        LogExclusion::Off
+    pub fn from_config(config: &Config) -> Self {
+        let unusable = config
+            .invalid_core_keys
+            .iter()
+            .any(|k| *k == LOG_EXCLUDED_CHANNEL_IDS_KEY || *k == LOG_EXCLUDED_CATEGORY_IDS_KEY);
+        if unusable {
+            return LogExclusion::BlockMessages;
+        }
+        if config.log_excluded_channel_ids.is_empty() && config.log_excluded_category_ids.is_empty()
+        {
+            return LogExclusion::Off;
+        }
+        LogExclusion::Scope(Scope::new(
+            config.log_excluded_channel_ids.clone(),
+            config.log_excluded_category_ids.clone(),
+            Vec::new(),
+        ))
     }
 }
 
 /// Why a message event may not be cached or logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateReason {
+    /// The channel is, or sits under, an excluded channel or category, or it
+    /// could not be resolved while exclusions are configured.
     Excluded,
+    /// An exclusion list is unusable.
     ConfigInvalid,
 }
 
@@ -141,25 +320,146 @@ pub enum Gate {
     Skip(GateReason),
 }
 
-pub async fn message_gate(
-    _exclusion: &LogExclusion,
-    _event: &serenity::FullEvent,
-    _lookup: &impl ChannelLookup,
-) -> Gate {
-    Gate::Allow
+/// The guild and channel of the four message events the logger caches or logs.
+fn message_channel(event: &serenity::FullEvent) -> Option<(Option<u64>, u64)> {
+    use serenity::FullEvent as E;
+    match event {
+        E::Message { new_message } => Some((
+            new_message.guild_id.map(|g| g.get()),
+            new_message.channel_id.get(),
+        )),
+        E::MessageUpdate { event, new, .. } => Some((
+            event
+                .guild_id
+                .or_else(|| new.as_ref().and_then(|m| m.guild_id))
+                .map(|g| g.get()),
+            event.channel_id.get(),
+        )),
+        E::MessageDelete {
+            channel_id,
+            guild_id,
+            ..
+        }
+        | E::MessageDeleteBulk {
+            channel_id,
+            guild_id,
+            ..
+        } => Some((guild_id.map(|g| g.get()), channel_id.get())),
+        _ => None,
+    }
 }
 
+/// What one lookup says about a channel's parent.
+fn parent_of(found: Lookup) -> ParentResolution {
+    match found {
+        // Discord ids are never 0: a 0 parent is a bad answer, not "no parent".
+        Lookup::Guild { parent: Some(0) } => ParentResolution::Unknown,
+        Lookup::Guild { parent: Some(id) } => ParentResolution::Id(id),
+        Lookup::Guild { parent: None } => ParentResolution::None,
+        // A channel an event claims to be in a guild cannot be "not a guild channel".
+        Lookup::NotGuild | Lookup::Unknown => ParentResolution::Unknown,
+    }
+}
+
+/// Builds the predicate's input for a guild message from the lookups.
+///
+/// `channel` is what the channel lookup said (its parent is the category, or
+/// the parent channel of a thread); `parent` is what the lookup of that parent
+/// said (its parent is the category of a thread's parent channel). Pass `None`
+/// for `parent` only when `channel` has no parent.
+pub fn build_facts(
+    guild: u64,
+    channel_id: u64,
+    channel: Lookup,
+    parent: Option<Lookup>,
+) -> ChannelFacts {
+    let parent_id = parent_of(channel);
+    let category_id = match (&parent_id, parent) {
+        (ParentResolution::Id(_), Some(found)) => parent_of(found),
+        (ParentResolution::Id(_), None) => ParentResolution::Unknown,
+        (other, _) => other.clone(),
+    };
+    ChannelFacts {
+        guild_id: Some(guild),
+        channel_id: Some(channel_id),
+        parent_id,
+        category_id,
+        old_parent_id: ParentResolution::None,
+        new_parent_id: ParentResolution::None,
+    }
+}
+
+async fn lookup_channel(lookup: &impl ChannelLookup, id: u64) -> Lookup {
+    if id == 0 {
+        return Lookup::Unknown;
+    }
+    lookup.lookup(serenity::ChannelId::new(id)).await
+}
+
+/// Decides whether a message event may be cached or logged.
+///
+/// Only the four message events are gated; every other event is `Allow`. A
+/// message with no guild id (a DM) is left to the DM guard. With nothing
+/// configured the answer is `Allow` before any lookup. With exclusions
+/// configured, a channel that cannot be resolved is skipped.
+pub async fn message_gate(
+    exclusion: &LogExclusion,
+    event: &serenity::FullEvent,
+    lookup: &impl ChannelLookup,
+) -> Gate {
+    let scope = match exclusion {
+        LogExclusion::Off => return Gate::Allow,
+        LogExclusion::BlockMessages => {
+            return match message_channel(event) {
+                Some((Some(_), _)) => Gate::Skip(GateReason::ConfigInvalid),
+                _ => Gate::Allow,
+            };
+        }
+        LogExclusion::Scope(scope) => scope,
+    };
+    let Some((Some(guild), channel_id)) = message_channel(event) else {
+        return Gate::Allow;
+    };
+    let channel = lookup_channel(lookup, channel_id).await;
+    let parent = match parent_of(channel) {
+        ParentResolution::Id(parent_id) => Some(lookup_channel(lookup, parent_id).await),
+        _ => None,
+    };
+    let facts = build_facts(guild, channel_id, channel, parent);
+    match privacy_scope::may_log(scope, &facts) {
+        LogDecision::Allow => Gate::Allow,
+        LogDecision::Skip(_) => Gate::Skip(GateReason::Excluded),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The registry
+// ---------------------------------------------------------------------------
+
 /// An optional feature.
+///
+/// A later card implements this for its feature and adds it to
+/// [`production_features`]. All methods have a safe default.
 pub trait Feature<X, D>: Send + Sync {
+    /// Stable name used in start-up lines.
     fn name(&self) -> &'static str;
+    /// Whether the feature is switched on (its own parsed setting).
     fn enabled(&self) -> bool;
+    /// True when the feature uses the core database. A feature that registers
+    /// job kinds must return true: `register_jobs` is only called for those.
     fn needs_core_db(&self) -> bool {
         false
     }
+    /// Registers the feature's job kinds with the shared runner.
     fn register_jobs(&self, _registry: &mut Registry) -> Result<(), RunnerError> {
         Ok(())
     }
+    /// Called once after the runner started, with a callback that wakes it.
+    /// Call it after every job you schedule.
     fn jobs_started(&self, _wake: JobSignal) {}
+    /// Called for every event the guild filter lets through, before the
+    /// logger. `guild` is the event's guild when it names one; `core_db` is
+    /// the shared database for a feature that needs it.
     fn handle<'a>(
         &'a self,
         _ctx: &'a X,
@@ -175,8 +475,11 @@ pub trait Feature<X, D>: Send + Sync {
 /// What a started job runner hands back.
 pub struct StartedJobs {
     pub counts: ReportCounts,
+    /// Wakes the runner (call after scheduling a job).
     pub wake: JobSignal,
+    /// Asks the runner to stop.
     pub shutdown: JobSignal,
+    /// Completes when the runner has stopped.
     pub finished: BoxFuture<'static, ()>,
 }
 
@@ -195,49 +498,256 @@ pub struct StartRequest<'a, X, D> {
     pub settings: &'a Settings,
 }
 
-/// The features that are registered in production. W1 registers none.
+/// The features that are registered in production. W1 registers none: each
+/// later card adds its own feature here.
 pub fn production_features<X, D>() -> Vec<Box<dyn Feature<X, D>>> {
     Vec::new()
 }
 
-/// Starts the real job runner (STUB).
-pub struct TokioJobStarter;
-
-impl JobStarter for TokioJobStarter {
-    fn start(
-        &self,
-        _db: tokio_rusqlite::Connection,
-        _registry: Registry,
-    ) -> BoxFuture<'_, Result<StartedJobs, RunnerError>> {
-        Box::pin(async { Err(RunnerError::DbClosed) })
-    }
+/// Stops the runner started by [`TokioJobStarter`].
+struct JobControl {
+    shutdown: JobSignal,
+    finished: BoxFuture<'static, ()>,
 }
 
 /// The registry of enabled features and their shared state.
 pub struct Features<X, D> {
     active: Vec<Box<dyn Feature<X, D>>>,
+    guild: GuildFilter,
+    core_db: Option<tokio_rusqlite::Connection>,
+    jobs: Mutex<Option<JobControl>>,
     lines: Vec<String>,
 }
 
+/// Opens the core database (and its job table when jobs are wanted) off the
+/// executor. The error is a stable code.
+async fn open_core_db(
+    settings: &Settings,
+    init_jobs: bool,
+) -> Result<rusqlite::Connection, &'static str> {
+    let Some(path) = settings.core_db_path.clone() else {
+        return Err("unusable_setting");
+    };
+    let reserved = settings.reserved_db_paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = storage::open(&path, &reserved).map_err(|e| e.code())?;
+        if init_jobs {
+            queue::init(&mut conn).map_err(|e| e.code())?;
+        }
+        Ok(conn)
+    })
+    .await
+    .unwrap_or(Err("open_task_failed"))
+}
+
+/// Builds the shared job registry from the features that need the database.
+/// A feature whose registration fails is dropped (named, with a code) and the
+/// registry is rebuilt without it, so no half-registered kind survives.
+fn build_registry<X, D>(
+    active: &mut Vec<Box<dyn Feature<X, D>>>,
+    lines: &mut Vec<String>,
+) -> Registry {
+    loop {
+        let mut registry = Registry::new();
+        let mut failed = None;
+        for (index, feature) in active.iter().enumerate() {
+            if !feature.needs_core_db() {
+                continue;
+            }
+            if let Err(error) = feature.register_jobs(&mut registry) {
+                failed = Some((index, error));
+                break;
+            }
+        }
+        match failed {
+            None => return registry,
+            Some((index, error)) => {
+                let feature = active.remove(index);
+                lines.push(format!(
+                    "Feature {} stays off: job registration failed ({}).",
+                    feature.name(),
+                    error.code()
+                ));
+            }
+        }
+    }
+}
+
+fn drop_database_features<X, D>(active: &mut Vec<Box<dyn Feature<X, D>>>) {
+    active.retain(|feature| !feature.needs_core_db());
+}
+
 impl<X: Sync + 'static, D: Sync + 'static> Features<X, D> {
-    pub async fn start<S: JobStarter>(req: StartRequest<'_, X, D>, _starter: &S) -> Self {
-        let _ = req.settings;
+    /// Builds the registry: keeps the enabled features, opens the core
+    /// database only when one of them needs it, and starts the job runner only
+    /// when one of them registered a job kind. Any failure turns the features
+    /// that need the database off and is reported as a stable code.
+    pub async fn start<S: JobStarter>(req: StartRequest<'_, X, D>, starter: &S) -> Self {
+        let StartRequest { features, settings } = req;
+        let infos: Vec<FeatureInfo> = features
+            .iter()
+            .map(|f| FeatureInfo {
+                enabled: f.enabled(),
+                needs_core_db: f.needs_core_db(),
+            })
+            .collect();
+        let plan = plan(&infos);
+        let mut active: Vec<Box<dyn Feature<X, D>>> = features
+            .into_iter()
+            .zip(plan.keep)
+            .filter_map(|(feature, keep)| keep.then_some(feature))
+            .collect();
+        let mut lines = Vec::new();
+        let mut core_db = None;
+        let mut jobs = None;
+
+        if plan.open_core_db {
+            let registry = build_registry(&mut active, &mut lines);
+            if active.iter().any(|f| f.needs_core_db()) {
+                match open_core_db(settings, !registry.is_empty()).await {
+                    Err(code) => {
+                        lines.push(format!(
+                            "Core database unavailable ({code}); {CORE_DB_PATH_KEY} is unusable or refused, so features that need it stay off."
+                        ));
+                        drop_database_features(&mut active);
+                    }
+                    Ok(conn) => {
+                        let conn: tokio_rusqlite::Connection = conn.into();
+                        if registry.is_empty() {
+                            core_db = Some(conn);
+                        } else {
+                            match starter.start(conn.clone(), registry).await {
+                                Ok(started) => {
+                                    lines.push(started.counts.line());
+                                    for feature in active.iter().filter(|f| f.needs_core_db()) {
+                                        feature.jobs_started(started.wake.clone());
+                                    }
+                                    jobs = Some(JobControl {
+                                        shutdown: started.shutdown,
+                                        finished: started.finished,
+                                    });
+                                    core_db = Some(conn);
+                                }
+                                Err(error) => {
+                                    lines.push(format!(
+                                        "Job runner could not start ({}); features that need the core database stay off.",
+                                        error.code()
+                                    ));
+                                    drop_database_features(&mut active);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Features {
-            active: Vec::new(),
-            lines: Vec::new(),
+            active,
+            guild: settings.guild,
+            core_db,
+            jobs: Mutex::new(jobs),
+            lines,
         }
     }
 
+    /// Start-up lines for the caller to print (states and counts, no ids).
     pub fn lines(&self) -> &[String] {
         &self.lines
     }
 
-    pub async fn dispatch(&self, _ctx: &X, _event: &serenity::FullEvent, _data: &D) -> usize {
-        let _ = &self.active;
-        0
+    /// Hands the event to every active feature, in registration order, when
+    /// the guild filter lets it through. Returns how many features saw it.
+    ///
+    /// Features are awaited one after the other, so a slow feature delays the
+    /// logger; a feature must not block. Dispatch never touches the message
+    /// cache. With no active feature this returns before looking at the event.
+    pub async fn dispatch(&self, ctx: &X, event: &serenity::FullEvent, data: &D) -> usize {
+        if self.active.is_empty() {
+            return 0;
+        }
+        let guild = event_guild(event);
+        if !guild_allows(self.guild, guild) {
+            return 0;
+        }
+        let guild_id = match guild {
+            EventGuild::Guild(id) => Some(id),
+            _ => None,
+        };
+        for feature in &self.active {
+            let core_db = if feature.needs_core_db() {
+                self.core_db.as_ref()
+            } else {
+                None
+            };
+            feature.handle(ctx, event, data, guild_id, core_db).await;
+        }
+        self.active.len()
     }
 
-    pub async fn stop(&self) {}
+    /// Stops the job runner, if one was started, and waits for it (at most
+    /// the runner's shutdown grace plus a small margin). Safe to call twice.
+    pub async fn stop(&self) {
+        let control = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(JobControl { shutdown, finished }) = control else {
+            return;
+        };
+        shutdown();
+        if tokio::time::timeout(RunnerConfig::DEFAULT.shutdown_grace + STOP_MARGIN, finished)
+            .await
+            .is_err()
+        {
+            eprintln!("Job runner did not stop in time.");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real job starter
+// ---------------------------------------------------------------------------
+
+/// Starts the real runner: reconcile once, then run on a tokio task.
+pub struct TokioJobStarter;
+
+impl JobStarter for TokioJobStarter {
+    fn start(
+        &self,
+        db: tokio_rusqlite::Connection,
+        registry: Registry,
+    ) -> BoxFuture<'_, Result<StartedJobs, RunnerError>> {
+        Box::pin(async move {
+            let runner = Runner::new(db, Arc::new(SystemClock), registry, RunnerConfig::DEFAULT)?;
+            let wake = runner.wake_handle();
+            let shutdown = runner.shutdown_handle();
+            let started = runner.start().await?;
+            let counts = report_counts(started.report());
+            let task = tokio::spawn(async move {
+                match started.run().await {
+                    Ok(summary) => println!(
+                        "Job runner stopped: claimed={} completed={} retried={} failed={} left_running={}",
+                        summary.claimed,
+                        summary.completed,
+                        summary.retried,
+                        summary.failed,
+                        summary.left_running.len()
+                    ),
+                    Err(error) => println!("Job runner stopped with an error ({}).", error.code()),
+                }
+            });
+            Ok(StartedJobs {
+                counts,
+                wake: Arc::new(move || wake.wake()),
+                shutdown: Arc::new(move || shutdown.trigger()),
+                finished: Box::pin(async move {
+                    let _ = task.await;
+                }),
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +1148,63 @@ mod tests {
     }
 
     // ---- the gate -----------------------------------------------------------
+    #[test]
+    fn build_facts_reads_parent_and_category_and_fails_closed() {
+        let guild = |parent| Lookup::Guild { parent };
+        // A top-level channel: no parent, no category.
+        let f = build_facts(GUILD, CH_PLAIN, guild(None), None);
+        assert_eq!(f.guild_id, Some(GUILD));
+        assert_eq!(f.channel_id, Some(CH_PLAIN));
+        assert_eq!(f.parent_id, ParentResolution::None);
+        assert_eq!(f.category_id, ParentResolution::None);
+        // A channel in a category; the category itself has no parent.
+        let f = build_facts(
+            GUILD,
+            CH_IN_OTHER_CATEGORY,
+            guild(Some(CAT_OTHER)),
+            Some(guild(None)),
+        );
+        assert_eq!(f.parent_id, ParentResolution::Id(CAT_OTHER));
+        assert_eq!(f.category_id, ParentResolution::None);
+        // A thread: parent is the channel, category is the grandparent.
+        let f = build_facts(
+            GUILD,
+            THREAD_UNDER_PLAIN,
+            guild(Some(CH_PLAIN)),
+            Some(guild(Some(CAT_OTHER))),
+        );
+        assert_eq!(f.parent_id, ParentResolution::Id(CH_PLAIN));
+        assert_eq!(f.category_id, ParentResolution::Id(CAT_OTHER));
+        // Anything unresolved is Unknown, never None.
+        let f = build_facts(GUILD, CH_PLAIN, Lookup::Unknown, None);
+        assert_eq!(f.parent_id, ParentResolution::Unknown);
+        assert_eq!(f.category_id, ParentResolution::Unknown);
+        let f = build_facts(GUILD, CH_PLAIN, Lookup::NotGuild, None);
+        assert_eq!(f.parent_id, ParentResolution::Unknown);
+        let f = build_facts(GUILD, CH_PLAIN, guild(Some(0)), None);
+        assert_eq!(f.parent_id, ParentResolution::Unknown);
+        // A parent that is known but whose own lookup is missing or failed.
+        let f = build_facts(GUILD, CH_PLAIN, guild(Some(CAT_OTHER)), None);
+        assert_eq!(f.category_id, ParentResolution::Unknown);
+        let f = build_facts(
+            GUILD,
+            CH_PLAIN,
+            guild(Some(CAT_OTHER)),
+            Some(Lookup::Unknown),
+        );
+        assert_eq!(f.category_id, ParentResolution::Unknown);
+        let f = build_facts(
+            GUILD,
+            CH_PLAIN,
+            guild(Some(CAT_OTHER)),
+            Some(guild(Some(0))),
+        );
+        assert_eq!(f.category_id, ParentResolution::Unknown);
+        // No move is described by a message event.
+        assert_eq!(f.old_parent_id, ParentResolution::None);
+        assert_eq!(f.new_parent_id, ParentResolution::None);
+    }
+
     struct FakeLookup {
         map: HashMap<u64, Lookup>,
         calls: AtomicUsize,
@@ -903,7 +1470,7 @@ mod tests {
     }
 
     impl TestFeature {
-        fn new(
+        fn boxed(
             name: &'static str,
             enabled: bool,
             needs_db: bool,
@@ -1037,8 +1604,8 @@ mod tests {
         let s = settings(Some(&db), GuildFilter::Any);
         let features = start(
             vec![
-                TestFeature::new("off_db", false, true, &["off_kind"], &probe),
-                TestFeature::new("off_plain", false, false, &[], &probe),
+                TestFeature::boxed("off_db", false, true, &["off_kind"], &probe),
+                TestFeature::boxed("off_plain", false, false, &[], &probe),
             ],
             &s,
             &starter,
@@ -1072,7 +1639,7 @@ mod tests {
         let starter = FakeStarter::default();
         let s = settings(Some(&db), GuildFilter::Any);
         let f = start(
-            vec![TestFeature::new("plain", true, false, &[], &probe)],
+            vec![TestFeature::boxed("plain", true, false, &[], &probe)],
             &s,
             &starter,
         )
@@ -1092,7 +1659,7 @@ mod tests {
         let starter = FakeStarter::default();
         let s = settings(Some(&db), GuildFilter::Any);
         let f = start(
-            vec![TestFeature::new("needs_db", true, true, &[], &probe)],
+            vec![TestFeature::boxed("needs_db", true, true, &[], &probe)],
             &s,
             &starter,
         )
@@ -1119,9 +1686,9 @@ mod tests {
         let s = settings(Some(&db), GuildFilter::Any);
         let f = start(
             vec![
-                TestFeature::new("alpha", true, true, &["alpha_job", "alpha_two"], &probe_a),
-                TestFeature::new("beta", true, true, &["beta_job"], &probe_b),
-                TestFeature::new("off", false, true, &["never_registered"], &probe_b),
+                TestFeature::boxed("alpha", true, true, &["alpha_job", "alpha_two"], &probe_a),
+                TestFeature::boxed("beta", true, true, &["beta_job"], &probe_b),
+                TestFeature::boxed("off", false, true, &["never_registered"], &probe_b),
             ],
             &s,
             &starter,
@@ -1166,7 +1733,13 @@ mod tests {
         let starter = FakeStarter::default();
         let s = settings(Some(&db), GuildFilter::Any);
         let _f = start(
-            vec![TestFeature::new("liar", true, false, &["liar_job"], &probe)],
+            vec![TestFeature::boxed(
+                "liar",
+                true,
+                false,
+                &["liar_job"],
+                &probe,
+            )],
             &s,
             &starter,
         )
@@ -1183,8 +1756,8 @@ mod tests {
         let s = settings(None, GuildFilter::Any);
         let f = start(
             vec![
-                TestFeature::new("needs_db", true, true, &["job_a"], &probe_db),
-                TestFeature::new("plain", true, false, &[], &probe_plain),
+                TestFeature::boxed("needs_db", true, true, &["job_a"], &probe_db),
+                TestFeature::boxed("plain", true, false, &[], &probe_plain),
             ],
             &s,
             &starter,
@@ -1207,7 +1780,13 @@ mod tests {
         let mut s = settings(Some(&reserved), GuildFilter::Any);
         s.reserved_db_paths = vec![reserved.clone()];
         let f = start(
-            vec![TestFeature::new("needs_db", true, true, &["job_a"], &probe)],
+            vec![TestFeature::boxed(
+                "needs_db",
+                true,
+                true,
+                &["job_a"],
+                &probe,
+            )],
             &s,
             &starter,
         )
@@ -1237,8 +1816,8 @@ mod tests {
         let s = settings(Some(&db), GuildFilter::Any);
         let f = start(
             vec![
-                TestFeature::new("needs_db", true, true, &["job_a"], &probe_db),
-                TestFeature::new("plain", true, false, &[], &probe_plain),
+                TestFeature::boxed("needs_db", true, true, &["job_a"], &probe_db),
+                TestFeature::boxed("plain", true, false, &[], &probe_plain),
             ],
             &s,
             &starter,
@@ -1264,8 +1843,8 @@ mod tests {
         let s = settings(Some(&db), GuildFilter::Any);
         let f = start(
             vec![
-                TestFeature::new("bad", true, true, &["good_prefix", "Bad Kind!"], &probe_bad),
-                TestFeature::new("good", true, true, &["good_job"], &probe_good),
+                TestFeature::boxed("bad", true, true, &["good_prefix", "Bad Kind!"], &probe_bad),
+                TestFeature::boxed("good", true, true, &["good_job"], &probe_good),
             ],
             &s,
             &starter,
@@ -1285,6 +1864,122 @@ mod tests {
         assert!(!text.contains("Bad Kind"), "{text}");
     }
 
+    // ---- the real runner start (TokioJobStarter) --------------------------------
+    struct CountingJobFeature {
+        ran: Arc<AtomicUsize>,
+        wake: Arc<Mutex<Option<JobSignal>>>,
+    }
+
+    impl Feature<u8, u16> for CountingJobFeature {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn needs_core_db(&self) -> bool {
+            true
+        }
+        fn register_jobs(&self, registry: &mut Registry) -> Result<(), RunnerError> {
+            let ran = self.ran.clone();
+            registry.register("w1_probe", RestartPolicy::RunAgain, move |_job| {
+                let ran = ran.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+        }
+        fn jobs_started(&self, wake: JobSignal) {
+            *self.wake.lock().unwrap() = Some(wake);
+        }
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..250 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_runner_reconciles_a_crashed_job_runs_a_new_one_and_stops() {
+        use crate::jobs::queue::{NewJob, ScheduleOutcome};
+        let dir = scratch("real-runner");
+        let db = dir.join("core.sqlite");
+        let path = db.to_string_lossy().into_owned();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        {
+            // A job a previous process left in `running`.
+            let mut c = storage::open(&path, &[]).unwrap();
+            queue::init(&mut c).unwrap();
+            let job = NewJob {
+                kind: "w1_probe",
+                dedupe_key: "crashed",
+                payload_json: "{}",
+                due_at: 0,
+            };
+            let ScheduleOutcome::Created { id } = queue::schedule(&c, &job, now).unwrap() else {
+                panic!("fresh key");
+            };
+            assert!(queue::try_claim(&c, id, now).unwrap());
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Mutex::new(None));
+        let s = settings(Some(&db), GuildFilter::Any);
+        let features: Features<u8, u16> = Features::start(
+            StartRequest {
+                features: vec![Box::new(CountingJobFeature {
+                    ran: ran.clone(),
+                    wake: wake.clone(),
+                })],
+                settings: &s,
+            },
+            &TokioJobStarter,
+        )
+        .await;
+        let text = features.lines().join("\n");
+        assert!(text.contains("requeued=1"), "{text}");
+        wait_until("the requeued job to run", || {
+            ran.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        // A job scheduled later is picked up after the wake callback.
+        {
+            let c = storage::open(&path, &[]).unwrap();
+            let job = NewJob {
+                kind: "w1_probe",
+                dedupe_key: "fresh",
+                payload_json: "{}",
+                due_at: 0,
+            };
+            assert!(matches!(
+                queue::schedule(&c, &job, now).unwrap(),
+                ScheduleOutcome::Created { .. }
+            ));
+        }
+        let wake = wake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("wake handed to the feature");
+        wake();
+        wait_until("the new job to run", || ran.load(Ordering::SeqCst) == 2).await;
+
+        tokio::time::timeout(Duration::from_secs(20), features.stop())
+            .await
+            .expect("stop returns");
+        features.stop().await; // a second stop is a no-op
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "each job ran exactly once");
+    }
+
     // ---- dispatch ------------------------------------------------------------
     #[tokio::test]
     async fn dispatch_honours_the_guild_filter() {
@@ -1292,7 +1987,7 @@ mod tests {
         let starter = FakeStarter::default();
         let only = settings(None, GuildFilter::Only(GUILD));
         let f = start(
-            vec![TestFeature::new("plain", true, false, &[], &probe)],
+            vec![TestFeature::boxed("plain", true, false, &[], &probe)],
             &only,
             &starter,
         )
@@ -1323,7 +2018,7 @@ mod tests {
         let any = settings(None, GuildFilter::Any);
         let probe_any = Probe::new();
         let f = start(
-            vec![TestFeature::new("plain", true, false, &[], &probe_any)],
+            vec![TestFeature::boxed("plain", true, false, &[], &probe_any)],
             &any,
             &starter,
         )
@@ -1337,7 +2032,7 @@ mod tests {
         let closed = settings(None, GuildFilter::Closed);
         let probe_closed = Probe::new();
         let f = start(
-            vec![TestFeature::new("plain", true, false, &[], &probe_closed)],
+            vec![TestFeature::boxed("plain", true, false, &[], &probe_closed)],
             &closed,
             &starter,
         )
@@ -1353,9 +2048,9 @@ mod tests {
         let s = settings(None, GuildFilter::Any);
         let f = start(
             vec![
-                TestFeature::new("one", true, false, &[], &probe),
-                TestFeature::new("two", false, false, &[], &probe),
-                TestFeature::new("three", true, false, &[], &probe),
+                TestFeature::boxed("one", true, false, &[], &probe),
+                TestFeature::boxed("two", false, false, &[], &probe),
+                TestFeature::boxed("three", true, false, &[], &probe),
             ],
             &s,
             &starter,

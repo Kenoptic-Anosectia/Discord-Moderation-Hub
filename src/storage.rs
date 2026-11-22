@@ -7,9 +7,6 @@
 //! Connection settings applied by [`open`]: `busy_timeout`=5000 ms, WAL journal
 //! (file databases), `foreign_keys=ON`, `synchronous=NORMAL`.
 
-// Temporary: wiring card W1 removes this once a production caller exists.
-#![allow(dead_code)]
-
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::path::{Component, Path, PathBuf};
 

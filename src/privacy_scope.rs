@@ -1,7 +1,3 @@
-// Wiring card W1 (general-logger integration) will remove this allow once a production
-// caller invokes `may_log`.  Until then the module is dead code in a binary crate.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------

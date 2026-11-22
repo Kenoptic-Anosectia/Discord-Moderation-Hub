@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::{env, ffi::OsStr};
 
+use crate::settings::parse_id_list;
 use crate::tickets::{
     policy::Settings,
     retention::{parse_retention, RetentionPolicy, RETENTION_DAYS_KEY},
@@ -335,22 +336,128 @@ pub struct CoreSettings {
 }
 
 impl CoreSettings {
-    /// Startup lines for every unusable setting.
+    /// Startup lines for every unusable setting. Each names the key and what
+    /// stays off; none carries the value.
     pub fn messages(&self) -> Vec<String> {
-        Vec::new()
+        self.invalid_keys
+            .iter()
+            .map(|key| {
+                let effect = match *key {
+                    CORE_DB_PATH_KEY => "the core database and the features that need it stay off",
+                    GUILD_ID_KEY => "optional features stay off until it is fixed",
+                    LOG_EXCLUDED_CHANNEL_IDS_KEY | LOG_EXCLUDED_CATEGORY_IDS_KEY => {
+                        "guild message caching and edit/delete logging are paused until it is fixed"
+                    }
+                    _ => "the setting is switched off",
+                };
+                format!("Setting {key} is unusable: {effect}.")
+            })
+            .collect()
+    }
+}
+
+/// How one environment value reads before it is parsed.
+enum Raw {
+    /// Not set, or only whitespace.
+    Unset,
+    Text(String),
+    /// Set, but not valid Unicode.
+    NotUnicode,
+}
+
+fn read_raw(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Raw {
+    match lookup(key) {
+        None => Raw::Unset,
+        Some(value) => match value.into_string() {
+            Ok(text) if text.trim().is_empty() => Raw::Unset,
+            Ok(text) => Raw::Text(text),
+            Err(_) => Raw::NotUnicode,
+        },
+    }
+}
+
+/// Longest accepted `CORE_DB_PATH`, in bytes.
+const MAX_CORE_DB_PATH_BYTES: usize = 1024;
+
+/// A path is usable only when it is plainly a file path: no control
+/// character, no `file:` URI, not the in-memory name, and not absurdly long.
+/// The storage layer refuses the rest (reserved, UNC, stream names) at open.
+fn plain_core_db_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_CORE_DB_PATH_BYTES
+        && !path.chars().any(char::is_control)
+        && path != ":memory:"
+        && !path.to_ascii_lowercase().starts_with("file:")
+}
+
+/// One Discord id. A list (`1,2`) is not one id, even when it dedupes to one.
+fn single_id(key: &str, text: &str) -> Option<u64> {
+    if text.contains(',') {
+        return None;
+    }
+    match parse_id_list(key, Some(text)).ok()?.as_slice() {
+        [id] => Some(*id),
+        _ => None,
     }
 }
 
 /// Parses the six core settings.
-pub fn core_settings(_lookup: impl Fn(&str) -> Option<OsString>) -> CoreSettings {
+///
+/// A blank value counts as unset. A value that cannot be used switches only
+/// that setting off and its key is listed in `invalid_keys`; the value itself
+/// is not kept anywhere.
+pub fn core_settings(lookup: impl Fn(&str) -> Option<OsString>) -> CoreSettings {
+    let mut invalid_keys: Vec<&'static str> = Vec::new();
+
+    let core_db_path = match read_raw(&lookup, CORE_DB_PATH_KEY) {
+        Raw::Unset => Some(DEFAULT_CORE_DB_PATH.to_string()),
+        Raw::Text(text) if plain_core_db_path(text.trim()) => Some(text.trim().to_string()),
+        Raw::Text(_) | Raw::NotUnicode => {
+            invalid_keys.push(CORE_DB_PATH_KEY);
+            None
+        }
+    };
+
+    let mut one_id = |key: &'static str| match read_raw(&lookup, key) {
+        Raw::Unset => None,
+        Raw::Text(text) => {
+            let id = single_id(key, text.trim());
+            if id.is_none() {
+                invalid_keys.push(key);
+            }
+            id
+        }
+        Raw::NotUnicode => {
+            invalid_keys.push(key);
+            None
+        }
+    };
+    let guild_id = one_id(GUILD_ID_KEY);
+    let staff_alert_channel_id = one_id(STAFF_ALERT_CHANNEL_ID_KEY);
+
+    let mut id_list = |key: &'static str| match read_raw(&lookup, key) {
+        Raw::Unset => Vec::new(),
+        Raw::Text(text) => parse_id_list(key, Some(&text)).unwrap_or_else(|_| {
+            invalid_keys.push(key);
+            Vec::new()
+        }),
+        Raw::NotUnicode => {
+            invalid_keys.push(key);
+            Vec::new()
+        }
+    };
+    let log_excluded_channel_ids = id_list(LOG_EXCLUDED_CHANNEL_IDS_KEY);
+    let log_excluded_category_ids = id_list(LOG_EXCLUDED_CATEGORY_IDS_KEY);
+    let protected_role_ids = id_list(PROTECTED_ROLE_IDS_KEY);
+
     CoreSettings {
-        core_db_path: Some(DEFAULT_CORE_DB_PATH.to_string()),
-        guild_id: None,
-        staff_alert_channel_id: None,
-        log_excluded_channel_ids: Vec::new(),
-        log_excluded_category_ids: Vec::new(),
-        protected_role_ids: Vec::new(),
-        invalid_keys: Vec::new(),
+        core_db_path,
+        guild_id,
+        staff_alert_channel_id,
+        log_excluded_channel_ids,
+        log_excluded_category_ids,
+        protected_role_ids,
+        invalid_keys,
     }
 }
 
@@ -899,9 +1006,6 @@ mod tests {
                 .map(|(_, v)| OsString::from(*v))
         }
     }
-
-    /// Sentinel that must never appear in any startup message.
-    const BAD_SENTINEL: &str = "S3CR3T-W1-VALUE";
 
     #[test]
     fn core_settings_all_unset_is_the_documented_default() {
