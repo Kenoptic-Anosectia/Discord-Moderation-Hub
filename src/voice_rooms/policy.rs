@@ -3022,7 +3022,10 @@ mod tests {
     /// The neighbours are `None` where the neighbour is removed by another
     /// rule rather than by the class (the whitespace rule removes U+200A,
     /// U+2029, U+202F and U+205F), so only the neighbours that must survive
-    /// are asserted.
+    /// are asserted. The neighbour below the tag range is U+DFFF and not
+    /// U+DFFFF, because U+D800..U+DFFF are the surrogates, which are not
+    /// characters at all, so U+DFFF is the nearest code point below U+E0000
+    /// that a name can hold.
     const EXPECTED_CLASS: &[(u32, u32, Option<u32>, Option<u32>)] = &[
         (0x00AD, 0x00AD, Some(0x00AC), Some(0x00AE)),
         (0x034F, 0x034F, Some(0x034E), Some(0x0350)),
