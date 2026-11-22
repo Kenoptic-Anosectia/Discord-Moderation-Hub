@@ -30,11 +30,20 @@ pub const MAX_CONCURRENCY: usize = 16;
 /// Smallest and largest accepted [`RunnerConfig::max_poll`].
 pub const MIN_POLL: Duration = Duration::from_secs(1);
 pub const MAX_POLL: Duration = Duration::from_secs(3600);
+/// Smallest and largest accepted [`RunnerConfig::shutdown_grace`]. The floor is
+/// non-zero so in-flight handlers always get a real chance to finish; the cap
+/// is the bound on how long a shutdown can take.
+pub const MIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+pub const MAX_SHUTDOWN_GRACE: Duration = Duration::from_secs(300);
+/// Smallest and largest accepted [`RunnerConfig::handler_timeout`].
+pub const MIN_HANDLER_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_HANDLER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Codes the runner itself writes as a job's `last_error_code`.
 pub const CODE_NO_HANDLER: &str = "no_handler";
 pub const CODE_PANICKED: &str = "handler_panicked";
 pub const CODE_CANCELLED: &str = "handler_cancelled";
+pub const CODE_TIMED_OUT: &str = "handler_timed_out";
 
 /// Wait before retrying after a database error (claim, acknowledge or the
 /// next-due lookup failed): the loop sleeps this long before trying again.
@@ -81,6 +90,8 @@ impl Clock for SystemClock {
 pub enum RunnerError {
     InvalidConcurrency,
     InvalidPoll,
+    InvalidShutdownGrace,
+    InvalidHandlerTimeout,
     InvalidRetryPolicy,
     InvalidKind,
     DuplicateKind,
@@ -95,6 +106,8 @@ impl RunnerError {
         match self {
             RunnerError::InvalidConcurrency => "invalid_concurrency",
             RunnerError::InvalidPoll => "invalid_poll",
+            RunnerError::InvalidShutdownGrace => "invalid_shutdown_grace",
+            RunnerError::InvalidHandlerTimeout => "invalid_handler_timeout",
             RunnerError::InvalidRetryPolicy => "invalid_retry_policy",
             RunnerError::InvalidKind => "invalid_kind",
             RunnerError::DuplicateKind => "duplicate_kind",
@@ -213,6 +226,9 @@ pub struct RunnerConfig {
     pub max_poll: Duration,
     /// How long shutdown waits for in-flight handlers before abandoning them.
     pub shutdown_grace: Duration,
+    /// Longest one handler may run before it is aborted and treated as a
+    /// cancel: [`MIN_HANDLER_TIMEOUT`]..=[`MAX_HANDLER_TIMEOUT`].
+    pub handler_timeout: Duration,
     pub retry: RetryPolicy,
 }
 
@@ -221,6 +237,7 @@ impl RunnerConfig {
         concurrency: 4,
         max_poll: Duration::from_secs(30),
         shutdown_grace: Duration::from_secs(10),
+        handler_timeout: Duration::from_secs(60),
         retry: RetryPolicy::DEFAULT,
     };
 
@@ -272,6 +289,9 @@ pub struct RunSummary {
     pub refused_at_claim: u64,
     /// Database calls that failed and were retried or dropped.
     pub db_errors: u64,
+    /// Acknowledgements the queue refused because the job was no longer
+    /// `running` (changed behind the runner's back).
+    pub refused_acks: u64,
     /// Jobs still `running` in the database at return (in-flight past the
     /// grace period, or an acknowledgement that could not be written), sorted.
     pub left_running: Vec<i64>,
@@ -783,6 +803,7 @@ mod tests {
             concurrency: n,
             max_poll: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(5),
+            handler_timeout: Duration::from_secs(600),
             retry: RetryPolicy {
                 base_secs: 30,
                 cap_secs: 600,
@@ -1052,6 +1073,96 @@ mod tests {
             }),
             Err(RunnerError::InvalidRetryPolicy)
         );
+    }
+
+    #[test]
+    fn shutdown_grace_and_handler_timeout_are_validated_with_boundaries() {
+        let base = cfg(1);
+        let check = |c: RunnerConfig| c.validate();
+        let ms = Duration::from_millis(1);
+        // shutdown_grace: non-zero floor, documented maximum, both edges.
+        let grace = |d: Duration| {
+            check(RunnerConfig {
+                shutdown_grace: d,
+                ..base
+            })
+        };
+        assert_eq!(
+            grace(Duration::ZERO),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(
+            grace(MIN_SHUTDOWN_GRACE - ms),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(grace(MIN_SHUTDOWN_GRACE), Ok(()));
+        assert_eq!(grace(MAX_SHUTDOWN_GRACE), Ok(()));
+        assert_eq!(
+            grace(MAX_SHUTDOWN_GRACE + ms),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(
+            grace(Duration::from_secs(365 * 24 * 3600)),
+            Err(RunnerError::InvalidShutdownGrace)
+        );
+        assert_eq!(grace(Duration::MAX), Err(RunnerError::InvalidShutdownGrace));
+        // handler_timeout: same shape.
+        let timeout = |d: Duration| {
+            check(RunnerConfig {
+                handler_timeout: d,
+                ..base
+            })
+        };
+        assert_eq!(
+            timeout(Duration::ZERO),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        assert_eq!(
+            timeout(MIN_HANDLER_TIMEOUT - ms),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        assert_eq!(timeout(MIN_HANDLER_TIMEOUT), Ok(()));
+        assert_eq!(timeout(MAX_HANDLER_TIMEOUT), Ok(()));
+        assert_eq!(
+            timeout(MAX_HANDLER_TIMEOUT + ms),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        assert_eq!(
+            timeout(Duration::MAX),
+            Err(RunnerError::InvalidHandlerTimeout)
+        );
+        // The shipped defaults sit inside both ranges, and the ranges are sane.
+        let d = RunnerConfig::DEFAULT;
+        assert!((MIN_SHUTDOWN_GRACE..=MAX_SHUTDOWN_GRACE).contains(&d.shutdown_grace));
+        assert!((MIN_HANDLER_TIMEOUT..=MAX_HANDLER_TIMEOUT).contains(&d.handler_timeout));
+        assert!(MIN_SHUTDOWN_GRACE > Duration::ZERO && MIN_HANDLER_TIMEOUT > Duration::ZERO);
+        assert_eq!(
+            RunnerError::InvalidShutdownGrace.code(),
+            "invalid_shutdown_grace"
+        );
+        assert_eq!(
+            RunnerError::InvalidHandlerTimeout.code(),
+            "invalid_handler_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_new_refuses_an_out_of_range_grace_or_timeout() {
+        let bad_grace = RunnerConfig {
+            shutdown_grace: Duration::ZERO,
+            ..cfg(1)
+        };
+        let bad_timeout = RunnerConfig {
+            handler_timeout: Duration::MAX,
+            ..cfg(1)
+        };
+        for (c, want) in [
+            (bad_grace, RunnerError::InvalidShutdownGrace),
+            (bad_timeout, RunnerError::InvalidHandlerTimeout),
+        ] {
+            let err = Runner::new(mem_db(), FakeClock::new(), Registry::new(), c).err();
+            assert_eq!(err, Some(want));
+        }
     }
 
     #[tokio::test]
@@ -1844,6 +1955,8 @@ mod tests {
         let all = [
             RunnerError::InvalidConcurrency,
             RunnerError::InvalidPoll,
+            RunnerError::InvalidShutdownGrace,
+            RunnerError::InvalidHandlerTimeout,
             RunnerError::InvalidRetryPolicy,
             RunnerError::InvalidKind,
             RunnerError::DuplicateKind,
@@ -1877,6 +1990,274 @@ mod tests {
         );
     }
 
+    // ---- handler timeout (a hung handler must not hold its slot forever) ----
+
+    /// Sets a flag when dropped: proves the runner aborted a handler future.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    fn timeout_cfg(n: usize, secs: u64) -> RunnerConfig {
+        RunnerConfig {
+            handler_timeout: Duration::from_secs(secs),
+            ..cfg(n)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_handler_times_out_frees_its_slot_and_is_retried_with_backoff() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        // Concurrency 1: while `hang` holds the only slot, `ok` cannot run.
+        let hang = sched(&db, "hang", "a", "{}", T0).await;
+        let ok = sched(&db, "ok", "b", "{}", T0 + 1).await;
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ok_calls = Arc::new(AtomicUsize::new(0));
+        let mut reg = Registry::new();
+        let (s, d) = (started.clone(), dropped.clone());
+        reg.register("hang", RestartPolicy::RunAgain, move |_| {
+            let (s, d) = (s.clone(), d.clone());
+            async move {
+                s.fetch_add(1, SeqCst);
+                let _flag = DropFlag(d);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .unwrap();
+        let n = ok_calls.clone();
+        reg.register("ok", RestartPolicy::RunAgain, move |_| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+        let up = boot(&db, &clock, reg, timeout_cfg(1, 60)).await;
+        let s = started.clone();
+        eventually("hang started", || s.load(SeqCst) == 1).await;
+        // Hours of idle wakes do not free the slot before the timeout...
+        clock.advance(59);
+        up.wake.wake();
+        linger().await;
+        assert_eq!(view(&db, hang).await.state, JobState::Running);
+        assert_eq!(view(&db, ok).await.state, JobState::Pending);
+        assert!(!dropped.load(SeqCst), "not aborted before its timeout");
+        // ...and the timeout does.
+        clock.advance(1);
+        wait_state(&db, ok, JobState::Done).await;
+        assert_eq!(ok_calls.load(SeqCst), 1);
+        wait_retry(&db, hang, 1).await;
+        let v = view(&db, hang).await;
+        assert_eq!(
+            (v.attempts, v.due_at, v.last_error_code.as_deref()),
+            (1, T0 + 60 + 30, Some(CODE_TIMED_OUT)),
+            "RunAgain: failed with the queue's backoff"
+        );
+        assert!(dropped.load(SeqCst), "the hung handler future was aborted");
+        assert_eq!(started.load(SeqCst), 1, "not run again before its backoff");
+        let summary = up.stop_idle().await;
+        assert_eq!((summary.completed, summary.retried), (1, 1));
+        assert!(summary.left_running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hung_at_most_once_handler_times_out_terminal_and_is_never_run_again() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let once = sched(&db, "once", "a", "{}", T0).await;
+        let ok = sched(&db, "ok", "b", "{}", T0 + 1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reg = Registry::new();
+        let n = calls.clone();
+        reg.register("once", RestartPolicy::AtMostOnce, move |_| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .unwrap();
+        reg.register("ok", RestartPolicy::RunAgain, |_| async { Ok(()) })
+            .unwrap();
+        let up = boot(&db, &clock, reg, timeout_cfg(1, 60)).await;
+        let c = calls.clone();
+        eventually("once started", || c.load(SeqCst) == 1).await;
+        clock.advance(60);
+        wait_state(&db, once, JobState::Failed).await;
+        wait_state(&db, ok, JobState::Done).await;
+        let v = view(&db, once).await;
+        assert_eq!(
+            (v.attempts, v.last_error_code.as_deref()),
+            (1, Some(CODE_TIMED_OUT))
+        );
+        clock.advance(100_000);
+        up.wake.wake();
+        linger().await;
+        assert_eq!(
+            calls.load(SeqCst),
+            1,
+            "its effect may have happened: no rerun"
+        );
+        let summary = up.stop_idle().await;
+        assert_eq!((summary.failed, summary.completed), (1, 1));
+        assert!(summary.left_running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_timeout_only_cuts_handlers_that_overrun_it() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let id = sched(&db, "slow", "a", "{}", T0).await;
+        let gate = Arc::new(Gate::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut reg = Registry::new();
+        let (g, s) = (gate.clone(), started.clone());
+        reg.register("slow", RestartPolicy::RunAgain, move |_| {
+            let (g, s) = (g.clone(), s.clone());
+            async move {
+                s.fetch_add(1, SeqCst);
+                g.wait().await;
+                Ok(())
+            }
+        })
+        .unwrap();
+        let up = boot(&db, &clock, reg, timeout_cfg(1, 60)).await;
+        let s = started.clone();
+        eventually("started", || s.load(SeqCst) == 1).await;
+        clock.advance(59);
+        linger().await;
+        gate.open(); // finishes with 1 s to spare
+        wait_state(&db, id, JobState::Done).await;
+        clock.advance(10_000);
+        up.wake.wake();
+        linger().await;
+        let v = view(&db, id).await;
+        assert_eq!(
+            (v.state, v.attempts, v.last_error_code),
+            (JobState::Done, 1, None)
+        );
+        assert_eq!(started.load(SeqCst), 1);
+        up.stop_idle().await;
+    }
+
+    // ---- no spin when a due job cannot be claimed; unknown kinds in bulk ----
+
+    #[tokio::test]
+    async fn a_due_job_whose_claim_always_loses_does_not_make_the_runner_spin() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let id = sched(&db, "t", "a", "{}", T0 - 5).await;
+        assert_eq!(id, 1);
+        // Another claimer always wins: the claim UPDATE changes nothing, so
+        // the job stays `pending` and due.
+        sql(
+            &db,
+            "CREATE TRIGGER lose_claim BEFORE UPDATE ON jobs WHEN OLD.id = 1 \
+             BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reg = Registry::new();
+        let n = calls.clone();
+        reg.register("t", RestartPolicy::RunAgain, move |_| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+        let up = boot(&db, &clock, reg, cfg(1)).await;
+        let c = clock.clone();
+        eventually("first sleep", || c.sleeps() >= 1).await;
+        // Frozen fake clock, ~80 ms of real time: a spin would make thousands
+        // of passes (each one asks the clock for a sleep).
+        linger().await;
+        linger().await;
+        assert_eq!(clock.sleeps(), 1, "one sleep, not a busy loop");
+        assert!(clock.nows() <= 4, "clock reads: {}", clock.nows());
+        assert_eq!(
+            clock.last_deadline(),
+            T0 + 1,
+            "a due job that cannot be claimed is retried a second later, not at once"
+        );
+        assert_eq!(view(&db, id).await.state, JobState::Pending);
+        // Time moving one second makes exactly one more pass.
+        clock.advance(1);
+        let c = clock.clone();
+        eventually("second sleep", || c.sleeps() == 2).await;
+        linger().await;
+        assert_eq!(clock.sleeps(), 2);
+        assert_eq!(clock.last_deadline(), T0 + 2);
+        assert_eq!(calls.load(SeqCst), 0);
+        let summary = up.stop_idle().await;
+        assert_eq!(summary, RunSummary::default());
+    }
+
+    #[tokio::test]
+    async fn many_unknown_kind_rows_are_all_failed_without_the_clock_moving() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            ids.push(sched(&db, "ghost", &format!("g{i}"), "{}", T0 - 1).await);
+        }
+        // Concurrency 2: seven rows take several claim batches. Each batch
+        // changes rows, so the loop must go straight on to the next one
+        // instead of waiting for time to pass (the clock is frozen).
+        let up = boot(&db, &clock, Registry::new(), cfg(2)).await;
+        for id in &ids {
+            wait_state(&db, *id, JobState::Failed).await;
+            let v = view(&db, *id).await;
+            assert_eq!(v.last_error_code.as_deref(), Some(CODE_NO_HANDLER));
+        }
+        assert_eq!(clock.secs(), T0, "the clock never moved");
+        let summary = up.stop_idle().await;
+        assert_eq!((summary.claimed, summary.failed), (7, 7));
+        assert!(summary.left_running.is_empty());
+    }
+
+    // ---- refused acknowledgements are counted ----
+
+    #[tokio::test]
+    async fn an_acknowledgement_the_queue_refuses_is_counted_not_hidden() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let id = sched(&db, "t", "a", "{}", T0).await;
+        let mut reg = Registry::new();
+        let db2 = db.clone();
+        reg.register("t", RestartPolicy::RunAgain, move |j| {
+            let db2 = db2.clone();
+            async move {
+                // Something else finishes the job behind the runner's back.
+                let jid = j.id;
+                db2.call(move |c| queue::complete(c, jid, T0))
+                    .await
+                    .unwrap();
+                Ok(())
+            }
+        })
+        .unwrap();
+        let up = boot(&db, &clock, reg, cfg(1)).await;
+        wait_state(&db, id, JobState::Done).await;
+        linger().await;
+        let summary = up.stop_idle().await;
+        assert_eq!(
+            summary.refused_acks, 1,
+            "the runner's own complete was refused"
+        );
+        assert_eq!(summary.completed, 0);
+        assert!(summary.left_running.is_empty());
+        assert_eq!(view(&db, id).await.state, JobState::Done);
+    }
+
     // ---- liveness ----
 
     struct Lcg(u64);
@@ -1890,11 +2271,44 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    /// Handlers of the hang kinds give up (time out) this many fake seconds
+    /// after they start.
+    const LIVE_TIMEOUT_SECS: i64 = 400;
+
     struct Model {
+        clock: Arc<FakeClock>,
         runs: Mutex<HashMap<i64, u32>>,
-        hung: Mutex<BTreeSet<i64>>,
+        /// Hung handlers that are running: job id -> fake second at which its
+        /// timeout fires.
+        hung: Mutex<BTreeMap<i64, i64>>,
         released: AtomicBool,
+    }
+
+    impl Model {
+        fn new(clock: &Arc<FakeClock>) -> Arc<Model> {
+            Arc::new(Model {
+                clock: clock.clone(),
+                runs: Mutex::default(),
+                hung: Mutex::default(),
+                released: AtomicBool::new(false),
+            })
+        }
+
+        /// Ids of hung handlers whose timeout has not fired yet at `now`.
+        fn live_hung(&self, now: i64) -> BTreeSet<i64> {
+            let hung = self.hung.lock().unwrap();
+            hung.iter()
+                .filter(|(_, deadline)| now < **deadline)
+                .map(|(id, _)| *id)
+                .collect()
+        }
+    }
+
+    fn live_cfg(slots: usize) -> RunnerConfig {
+        RunnerConfig {
+            handler_timeout: Duration::from_secs(u64::try_from(LIVE_TIMEOUT_SECS).unwrap()),
+            ..cfg(slots)
+        }
     }
 
     struct HangGuard(Arc<Model>, i64);
@@ -1930,7 +2344,8 @@ mod tests {
                         "t_fail" => Err(HandlerError::new("always_fails")),
                         "t_panic" | "o_panic" => panic!("model panic"),
                         _ => {
-                            model.hung.lock().unwrap().insert(j.id);
+                            let deadline = model.clock.secs() + LIVE_TIMEOUT_SECS;
+                            model.hung.lock().unwrap().insert(j.id, deadline);
                             let _g = HangGuard(model.clone(), j.id);
                             while !model.released.load(SeqCst) {
                                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1946,10 +2361,11 @@ mod tests {
     }
 
     /// True once the runner is quiet: no job is `running` except a handler
-    /// that is deliberately hung, and nothing due waits unless every slot is
-    /// taken by a hung handler.
+    /// that is hung and whose timeout has not fired yet, and nothing due waits
+    /// unless every slot is taken by such a hung handler. A hung job past its
+    /// timeout is NOT excused: the runner must have aborted it by then.
     async fn quiet(db: &tokio_rusqlite::Connection, model: &Model, now: i64, slots: usize) -> bool {
-        let hung = model.hung.lock().unwrap().clone();
+        let hung = model.live_hung(now);
         let hung_n = hung.len();
         db.call(move |c| -> rusqlite::Result<bool> {
             let mut st = c.prepare("SELECT id, state, due_at FROM jobs")?;
@@ -1994,8 +2410,8 @@ mod tests {
             let mut rng = Lcg(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
             let db = mem_db();
             let clock = FakeClock::new();
-            let model = Arc::new(Model::default());
-            let mut up = boot(&db, &clock, live_registry(&model), cfg(SLOTS)).await;
+            let model = Model::new(&clock);
+            let mut up = boot(&db, &clock, live_registry(&model), live_cfg(SLOTS)).await;
             let mut reported_abandoned = BTreeSet::<i64>::new();
             let mut all_ids = Vec::<(i64, &str)>::new();
             for step in 0..40u64 {
@@ -2020,7 +2436,21 @@ mod tests {
                     7 => up.wake.wake(),
                     8 => {
                         settle(&db, &model, &clock, SLOTS, seed).await;
-                        let hung_before = model.hung.lock().unwrap().clone();
+                        // A hung handler whose timeout would fire inside the
+                        // grace period would end differently from one that is
+                        // abandoned: let those time out first.
+                        while model
+                            .hung
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .any(|d| *d <= clock.secs() + 5)
+                        {
+                            clock.advance(5);
+                            settle(&db, &model, &clock, SLOTS, seed).await;
+                        }
+                        let hung_before: BTreeSet<i64> =
+                            model.hung.lock().unwrap().keys().copied().collect();
                         let summary = if hung_before.is_empty() {
                             up.stop_idle().await
                         } else {
@@ -2031,7 +2461,7 @@ mod tests {
                             left, hung_before,
                             "seed {seed}: left_running is exactly the hung jobs"
                         );
-                        up = boot(&db, &clock, live_registry(&model), cfg(SLOTS)).await;
+                        up = boot(&db, &clock, live_registry(&model), live_cfg(SLOTS)).await;
                         for e in up.report.abandoned() {
                             reported_abandoned.insert(e.id);
                         }
@@ -2040,7 +2470,7 @@ mod tests {
                 }
                 settle(&db, &model, &clock, SLOTS, seed).await;
                 // While the runner is up, whatever is `running` is a live hung handler.
-                let hung = model.hung.lock().unwrap().clone();
+                let hung: Vec<i64> = model.hung.lock().unwrap().keys().copied().collect();
                 for id in hung {
                     assert_eq!(view(&db, id).await.state, JobState::Running, "seed {seed}");
                 }
@@ -2104,9 +2534,16 @@ mod tests {
                     ("o_ok", s) => assert_eq!(s, JobState::Done),
                     ("o_hang", s) => {
                         assert!(
-                            matches!(s, JobState::Done | JobState::Abandoned),
+                            matches!(s, JobState::Done | JobState::Abandoned | JobState::Failed),
                             "seed {seed}"
                         );
+                        if s == JobState::Failed {
+                            assert_eq!(
+                                v.last_error_code.as_deref(),
+                                Some(CODE_TIMED_OUT),
+                                "seed {seed}: an at-most-once hang ends terminal only by timeout"
+                            );
+                        }
                         assert_eq!(runs, 1, "seed {seed}: at-most-once job ran twice");
                     }
                     ("t_hang", s) => assert!(
