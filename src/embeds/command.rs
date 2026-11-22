@@ -360,8 +360,13 @@ pub fn authorize(publishers: Publishers, who: &Invoker) -> Result<(), Code> {
 /// Checks that the call comes from the one home guild. Commands are registered globally,
 /// so the owner of ANY guild the bot is in could otherwise use them.
 pub fn check_guild(home_guild: Option<u64>, guild: u64) -> Result<(), Outcome> {
-    let _ = (home_guild, guild);
-    Ok(())
+    match home_guild {
+        // No home guild (or the zero id) means the wiring did not say which guild to
+        // serve: nothing is served.
+        None | Some(0) => Err(Outcome::with(Code::Denied, "no_home_guild")),
+        Some(home) if home == guild => Ok(()),
+        Some(_) => Err(Outcome::with(Code::Denied, "other_guild")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,12 +713,18 @@ struct Job<'a> {
     shadow: bool,
 }
 
-/// Mode and caller checks shared by every command.
-fn gate(env: &Env<'_>, who: &Invoker) -> Result<(), Outcome> {
+/// Mode, caller and guild checks shared by every command. The order matters: an off
+/// feature says `disabled`; a caller who is not allowed is `denied` whatever the guild;
+/// guild 0 is an invalid target; and only the home guild is served.
+fn gate(env: &Env<'_>, who: &Invoker, guild: u64) -> Result<(), Outcome> {
     if !env.config.enabled() {
         return Err(Outcome::new(Code::Disabled));
     }
-    authorize(env.config.publishers, who).map_err(Outcome::new)
+    authorize(env.config.publishers, who).map_err(Outcome::new)?;
+    if guild == 0 {
+        return Err(Outcome::new(Code::InvalidTarget));
+    }
+    check_guild(env.home_guild, guild)
 }
 
 fn refused_report(env: &Env<'_>, outcome: Outcome) -> Report {
@@ -739,7 +750,7 @@ async fn alert_failures(env: &Env<'_>, shadow: bool, outcomes: impl Iterator<Ite
 
 /// Publishes a template into a channel and records it.
 pub async fn post(env: &Env<'_>, req: &PostRequest<'_>) -> Report {
-    if let Err(outcome) = gate(env, &req.invoker) {
+    if let Err(outcome) = gate(env, &req.invoker, req.guild) {
         return refused_report(env, outcome);
     }
     let shadow = env.config.mode == Mode::Shadow;
@@ -762,14 +773,19 @@ pub async fn post(env: &Env<'_>, req: &PostRequest<'_>) -> Report {
 
 /// Re-renders recorded posts by editing their messages.
 pub async fn sync(env: &Env<'_>, req: &SyncRequest<'_>) -> Report {
-    if let Err(outcome) = gate(env, &req.invoker) {
+    if let Err(outcome) = gate(env, &req.invoker, req.guild) {
         return refused_report(env, outcome);
     }
     let shadow = env.config.mode == Mode::Shadow;
     let keys: Vec<String> = match req.key {
         Some(key) => vec![key.to_string()],
+        // Only this guild's rows are walked: another guild's key is neither read nor named.
         None => match env.store.list().await {
-            Ok(rows) => rows.into_iter().map(|row| row.record.key).collect(),
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| row.record.guild == req.guild)
+                .map(|row| row.record.key)
+                .collect(),
             Err(error) => {
                 let report = refused_report(env, Outcome::with(Code::StoreFailed, error.code()));
                 alert_failures(env, shadow, report.items.iter().map(|i| i.outcome)).await;
@@ -795,9 +811,9 @@ pub async fn sync(env: &Env<'_>, req: &SyncRequest<'_>) -> Report {
     report
 }
 
-/// Lists the recorded posts.
+/// Lists the recorded posts of the calling guild.
 pub async fn list(env: &Env<'_>, req: &ListRequest) -> ListReport {
-    if let Err(outcome) = gate(env, &req.invoker) {
+    if let Err(outcome) = gate(env, &req.invoker, req.guild) {
         return ListReport {
             outcome,
             posts: Vec::new(),
@@ -806,7 +822,10 @@ pub async fn list(env: &Env<'_>, req: &ListRequest) -> ListReport {
     match env.store.list().await {
         Ok(posts) => ListReport {
             outcome: Outcome::new(Code::Listed),
-            posts,
+            posts: posts
+                .into_iter()
+                .filter(|row| row.record.guild == req.guild)
+                .collect(),
         },
         Err(error) => {
             let outcome = Outcome::with(Code::StoreFailed, error.code());
