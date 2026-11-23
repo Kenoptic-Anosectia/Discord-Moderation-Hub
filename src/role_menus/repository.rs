@@ -416,6 +416,16 @@ pub fn set_published(
     Ok(())
 }
 
+/// Changes the mode and the maximum of a menu: RED stub.
+pub fn update_menu(
+    _conn: &Connection,
+    _menu_id: i64,
+    _mode: &str,
+    _max_select: u32,
+) -> Result<(), RepoError> {
+    Err(RepoError::MenuMissing)
+}
+
 /// Clears the recorded location of a menu.
 ///
 /// The channel, the message and the embed key are set to null, so the menu
@@ -888,5 +898,64 @@ mod tests {
             assert_eq!(format!("{error}"), code);
             assert!(!format!("{error:?}").contains("SELECT"));
         }
+    }
+
+    #[test]
+    fn update_menu_changes_mode_and_maximum_and_keeps_everything_else() {
+        let conn = mem();
+        let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+        let other = create_menu(&conn, GUILD, "other", "exclusive", 0).unwrap();
+        add_option(&conn, id, ROLE_A, "Alpha", "a").unwrap();
+        set_published(&conn, id, CHANNEL, MESSAGE, Some("main")).unwrap();
+
+        update_menu(&conn, id, "multi", 4).unwrap();
+        let menu = get_menu(&conn, GUILD, "main").unwrap().unwrap();
+        assert_eq!(menu.mode, "multi");
+        assert_eq!(menu.max_select, 4);
+        assert_eq!(menu.key, "main");
+        assert_eq!(menu.channel, Some(CHANNEL));
+        assert_eq!(menu.message, Some(MESSAGE));
+        assert_eq!(menu.embed_key.as_deref(), Some("main"));
+        assert_eq!(list_options(&conn, id).unwrap().len(), 1);
+        // Another menu is not touched.
+        let untouched = get_menu(&conn, GUILD, "other").unwrap().unwrap();
+        assert_eq!(untouched.id, other);
+        assert_eq!(
+            (untouched.mode.as_str(), untouched.max_select),
+            ("exclusive", 0)
+        );
+    }
+
+    #[test]
+    fn update_menu_refuses_an_unknown_mode_and_a_missing_menu_and_writes_nothing() {
+        let conn = mem();
+        let id = create_menu(&conn, GUILD, "main", "multi", 3).unwrap();
+        for bad in ["", "garbage", "MULTI", "multi ", "Exclusive"] {
+            assert_eq!(
+                update_menu(&conn, id, bad, 1),
+                Err(RepoError::InvalidMode),
+                "{bad:?}"
+            );
+        }
+        let menu = get_menu(&conn, GUILD, "main").unwrap().unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 3));
+        assert_eq!(
+            update_menu(&conn, 999, "multi", 1),
+            Err(RepoError::MenuMissing)
+        );
+    }
+
+    #[test]
+    fn update_menu_persists_across_a_reopen() {
+        let path = scratch("update-reopen");
+        let ps = path.to_str().unwrap();
+        {
+            let conn = open(ps);
+            let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+            update_menu(&conn, id, "multi", 2).unwrap();
+        }
+        let conn = open(ps);
+        let menu = get_menu(&conn, GUILD, "main").unwrap().unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 2));
     }
 }

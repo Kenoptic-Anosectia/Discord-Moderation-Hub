@@ -41,6 +41,9 @@ pub const MAX_ROWS_PER_MESSAGE: usize = 5;
 /// time instead of being sent and rejected by Discord.
 pub const MAX_OPTIONS_PER_MENU: usize = MAX_ROWS_PER_MESSAGE * SELECT_OPTION_LIMIT;
 
+/// The most ZWJ joins one emoji may hold (the longest family sequence has three).
+pub const MAX_ZWJ_JOINS: usize = 4;
+
 /// The modes a menu may have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuMode {
@@ -134,6 +137,8 @@ pub enum Code {
     ChannelGone,
     /// The recorded location of the menu was cleared.
     Unpublished,
+    /// The mode and/or the maximum of the menu were changed.
+    MenuUpdated,
     /// The role facts could not be looked up.
     FactsUnavailable,
     /// The stored row could not be understood.
@@ -175,6 +180,7 @@ impl Code {
             Code::MessageGone => "message_gone",
             Code::ChannelGone => "channel_gone",
             Code::Unpublished => "unpublished",
+            Code::MenuUpdated => "menu_updated",
             Code::FactsUnavailable => "facts_unavailable",
             Code::CorruptRow => "corrupt_row",
         }
@@ -324,6 +330,21 @@ pub struct PostRequest<'a> {
     pub channel: u64,
 }
 
+/// `/rolemenu edit <key> [mode] [max_select]`.
+#[derive(Debug, Clone, Copy)]
+pub struct EditRequest<'a> {
+    /// Who is calling.
+    pub invoker: Invoker,
+    /// The guild the command was used in.
+    pub guild: u64,
+    /// The menu key.
+    pub key: &'a str,
+    /// The new mode, or `None` to keep the stored one.
+    pub mode: Option<MenuMode>,
+    /// The new maximum (0 = unbounded), or `None` to keep the stored one.
+    pub max_select: Option<u32>,
+}
+
 /// `/rolemenu unpublish <key>`.
 #[derive(Debug, Clone, Copy)]
 pub struct UnpublishRequest<'a> {
@@ -407,6 +428,9 @@ pub trait MenuStore: Send + Sync {
         message: u64,
         embed_key: Option<&str>,
     ) -> Result<(), RepoError>;
+    /// Changes the mode and the maximum of a menu.
+    async fn update_menu(&self, menu_id: i64, mode: &str, max_select: u32)
+        -> Result<(), RepoError>;
     /// Clears the recorded location of a menu.
     ///
     /// Used by the reset path: a menu whose channel was deleted can only be
@@ -1122,7 +1146,16 @@ pub async fn remove_option<S: MenuStore + ?Sized>(
     }
 }
 
-/// `/rolemenu post <key>` and `/rolemenu edit <key>`.
+/// `/rolemenu edit <key>`: RED stub, replaced by the implementation commit.
+pub async fn edit<S: MenuStore + ?Sized>(
+    _store: &S,
+    _settings: &Settings,
+    _req: &EditRequest<'_>,
+) -> Outcome {
+    Outcome::new(Code::Denied)
+}
+
+/// `/rolemenu post <key>`.
 ///
 /// Posts the managed embed of the menu, or edits the message the row already
 /// names. The row is the truth: a menu that was already posted is edited, not
@@ -1366,6 +1399,8 @@ mod tests {
         fail_publish: Option<RepoError>,
         /// Set to fail only `clear_published`.
         fail_clear: Option<RepoError>,
+        /// Set to fail only `update_menu`.
+        fail_update: Option<RepoError>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1569,6 +1604,33 @@ mod tests {
             Err(RepoError::MenuMissing)
         }
 
+        async fn update_menu(
+            &self,
+            menu_id: i64,
+            mode: &str,
+            max_select: u32,
+        ) -> Result<(), RepoError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("update_menu {menu_id}"));
+            if let Some(error) = self.fail_update {
+                return Err(error);
+            }
+            if let Some(error) = self.fail {
+                return Err(error);
+            }
+            let mut menus = self.menus.lock().unwrap();
+            for menu in menus.iter_mut() {
+                if menu.id == menu_id {
+                    menu.mode = mode.to_string();
+                    menu.max_select = max_select;
+                    return Ok(());
+                }
+            }
+            Err(RepoError::MenuMissing)
+        }
+
         async fn clear_published(&self, menu_id: i64) -> Result<(), RepoError> {
             self.calls
                 .lock()
@@ -1746,6 +1808,16 @@ mod tests {
             crate::role_menus::repository::set_published(
                 &conn, menu_id, channel, message, embed_key,
             )
+        }
+
+        async fn update_menu(
+            &self,
+            menu_id: i64,
+            mode: &str,
+            max_select: u32,
+        ) -> Result<(), RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::update_menu(&conn, menu_id, mode, max_select)
         }
 
         async fn clear_published(&self, menu_id: i64) -> Result<(), RepoError> {
@@ -3763,5 +3835,556 @@ mod tests {
             "an idempotent post sends nothing"
         );
         assert_eq!(store.menu(GUILD, "main").unwrap().message, settled.message);
+    }
+
+    // -----------------------------------------------------------------------
+    // The one-emoji walker: each part of the grammar has its own test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_keycap_mark_is_allowed_only_after_a_digit_and_ends_the_emoji() {
+        for good in [
+            "1\u{20E3}",
+            "1\u{FE0F}\u{20E3}",
+            "9\u{FE0F}\u{20E3}",
+            "0\u{20E3}",
+        ] {
+            assert_eq!(validate_emoji(good), Ok(()), "{good:?}");
+        }
+        for bad in [
+            // The keycap mark after a base that is not a digit.
+            "\u{1F389}\u{20E3}",
+            "\u{00A9}\u{20E3}",
+            "\u{1F389}\u{FE0F}\u{20E3}",
+            // The mark may not be doubled or repeated.
+            "1\u{20E3}\u{20E3}",
+            "1\u{FE0F}\u{20E3}\u{FE0F}",
+            // Anything after the keycap is a second part, not one emoji.
+            "1\u{FE0F}\u{20E3}x",
+            "1\u{FE0F}\u{20E3}\u{1F389}",
+            "1\u{FE0F}\u{20E3}1\u{FE0F}\u{20E3}",
+            "1\u{FE0F}\u{20E3}\u{200D}\u{1F389}",
+            // A digit alone, or with a skin tone, is not a keycap.
+            "1",
+            "1\u{1F3FB}",
+        ] {
+            assert_eq!(validate_emoji(bad), Err(Code::InvalidEmoji), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_zwj_must_be_followed_by_a_base_and_a_joined_sequence_is_one_emoji() {
+        // Valid: the family and the skin-toned sequences.
+        for good in [
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            // person, skin tone, joiner, laptop
+            "\u{1F9D1}\u{1F3FB}\u{200D}\u{1F4BB}",
+            // woman raising hand, skin tone, joiner, female sign, variation selector
+            "\u{1F64B}\u{1F3FD}\u{200D}\u{2640}\u{FE0F}",
+            // heart on fire style: base, selector, joiner, base
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+        ] {
+            assert_eq!(validate_emoji(good), Ok(()), "{good:?}");
+        }
+        for bad in [
+            // A joiner at the end.
+            "\u{1F389}\u{200D}",
+            // A joiner followed by something that is not a base.
+            "\u{1F389}\u{200D}x",
+            "\u{1F389}\u{200D}1",
+            "\u{1F389}\u{200D}\u{1F3FB}",
+            "\u{1F389}\u{200D}\u{FE0F}",
+            "\u{1F389}\u{200D}\u{20E3}",
+            "\u{1F389}\u{200D}\u{1F1FA}",
+            // Two joiners in a row.
+            "\u{1F389}\u{200D}\u{200D}\u{1F389}",
+            // A joiner first.
+            "\u{200D}\u{1F389}",
+        ] {
+            assert_eq!(validate_emoji(bad), Err(Code::InvalidEmoji), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_number_of_zwj_joins_is_bounded() {
+        let chain = |joins: usize| {
+            let mut text = String::from("\u{1F389}");
+            for _ in 0..joins {
+                text.push('\u{200D}');
+                text.push('\u{1F389}');
+            }
+            text
+        };
+        assert_eq!(validate_emoji(&chain(MAX_ZWJ_JOINS)), Ok(()));
+        assert_eq!(
+            validate_emoji(&chain(MAX_ZWJ_JOINS + 1)),
+            Err(Code::InvalidEmoji)
+        );
+        assert_eq!(validate_emoji(&chain(8)), Err(Code::InvalidEmoji));
+    }
+
+    #[test]
+    fn a_regional_indicator_is_one_half_of_a_pair_and_nothing_else() {
+        assert_eq!(validate_emoji("\u{1F1FA}\u{1F1F8}"), Ok(()));
+        for bad in [
+            // The second half is not a regional indicator.
+            "\u{1F1FA}x",
+            "\u{1F1FA}\u{1F389}",
+            "\u{1F1FA}\u{FE0F}",
+            "\u{1F1FA}\u{200D}\u{1F1F8}",
+            "\u{1F1FA}\u{1F3FB}",
+            // The first half is not a regional indicator.
+            "\u{1F389}\u{1F1F8}",
+            "x\u{1F1F8}",
+            // A third indicator, or a second pair.
+            "\u{1F1FA}\u{1F1F8}\u{1F1FA}",
+            "\u{1F1FA}\u{1F1F8}\u{1F1FA}\u{1F1F8}",
+            // A pair with a trailing selector or joiner.
+            "\u{1F1FA}\u{1F1F8}\u{FE0F}",
+            "\u{1F1FA}\u{1F1F8}\u{200D}\u{1F389}",
+        ] {
+            assert_eq!(validate_emoji(bad), Err(Code::InvalidEmoji), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_skin_tone_follows_its_base_and_is_not_followed_by_another_base() {
+        for good in [
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F44D}\u{FE0F}\u{1F3FD}",
+            "\u{1F44D}\u{1F3FD}\u{FE0F}",
+        ] {
+            assert_eq!(validate_emoji(good), Ok(()), "{good:?}");
+        }
+        for bad in [
+            // A skin tone first.
+            "\u{1F3FD}\u{1F44D}",
+            // Another base straight after the skin tone, with no joiner.
+            "\u{1F44D}\u{1F3FD}\u{1F44D}",
+            "\u{1F64B}\u{1F3FD}\u{1F389}",
+            // Two skin tones.
+            "\u{1F44D}\u{1F3FD}\u{1F3FD}",
+            "\u{1F44D}\u{1F3FB}\u{1F3FF}",
+            // A skin tone then a plain character.
+            "\u{1F44D}\u{1F3FD}x",
+            // Two selectors around a skin tone.
+            "\u{1F44D}\u{FE0F}\u{1F3FD}\u{FE0F}",
+        ] {
+            assert_eq!(validate_emoji(bad), Err(Code::InvalidEmoji), "{bad:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // /rolemenu edit
+    // -----------------------------------------------------------------------
+
+    fn edit_req(key: &str, mode: Option<MenuMode>, max_select: Option<u32>) -> EditRequest<'_> {
+        EditRequest {
+            invoker: staff(),
+            guild: GUILD,
+            key,
+            mode,
+            max_select,
+        }
+    }
+
+    async fn seed_multi(store: &FakeStore, key: &str) {
+        let outcome = create(
+            store,
+            &settings(),
+            &CreateRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key,
+                mode: MenuMode::Multi,
+                max_select: 3,
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::Created));
+    }
+
+    #[tokio::test]
+    async fn edit_changes_the_mode_and_the_maximum_and_nothing_else() {
+        let store = FakeStore::new();
+        let discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        assert_eq!(
+            post(&store, &discord, &settings(), &post_req("main")).await,
+            Outcome::new(Code::Posted)
+        );
+        let before = store.menu(GUILD, "main").unwrap();
+
+        let outcome = edit(
+            &store,
+            &settings(),
+            &edit_req("main", Some(MenuMode::Multi), Some(2)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        let after = store.menu(GUILD, "main").unwrap();
+        assert_eq!(after.mode, "multi");
+        assert_eq!(after.max_select, 2);
+        // The key, the guild, the published location and the options stay.
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.key, before.key);
+        assert_eq!(after.guild, before.guild);
+        assert_eq!(after.channel, before.channel);
+        assert_eq!(after.message, before.message);
+        assert_eq!(after.embed_key, before.embed_key);
+        assert_eq!(store.option_count(), 1);
+        // The edit sent and edited nothing on Discord.
+        assert_eq!(discord.send_count(), 1);
+        assert_eq!(discord.edit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_what_it_is_not_given() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+
+        // Only the maximum: the mode stays.
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(5))).await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 5));
+
+        // Only the mode, to multi again: the maximum stays.
+        let outcome = edit(
+            &store,
+            &settings(),
+            &edit_req("main", Some(MenuMode::Multi), None),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 5));
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_an_exclusive_menu_with_a_maximum_and_leaves_the_row() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+
+        // Exclusive plus a maximum.
+        for (mode, max) in [
+            (Some(MenuMode::Exclusive), Some(2)),
+            // Exclusive alone, while the stored maximum is 3.
+            (Some(MenuMode::Exclusive), None),
+        ] {
+            let outcome = edit(&store, &settings(), &edit_req("main", mode, max)).await;
+            assert_eq!(outcome, Outcome::new(Code::InvalidMode), "{mode:?} {max:?}");
+            let menu = store.menu(GUILD, "main").unwrap();
+            assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 3));
+        }
+        assert!(!store.calls().iter().any(|c| c.starts_with("update_menu")));
+
+        // Exclusive with an explicit maximum of zero is the valid spelling.
+        let outcome = edit(
+            &store,
+            &settings(),
+            &edit_req("main", Some(MenuMode::Exclusive), Some(0)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("exclusive", 0));
+
+        // A maximum alone on an exclusive menu is refused too.
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::new(Code::InvalidMode));
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, 0);
+    }
+
+    #[tokio::test]
+    async fn edit_and_create_bound_the_maximum_by_what_one_message_can_hold() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        let over = u32::try_from(MAX_OPTIONS_PER_MENU).unwrap() + 1;
+        let at = u32::try_from(MAX_OPTIONS_PER_MENU).unwrap();
+
+        let outcome = edit(
+            &store,
+            &settings(),
+            &edit_req("main", Some(MenuMode::Multi), Some(over)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::InvalidMode));
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, 3);
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(u32::MAX))).await;
+        assert_eq!(outcome, Outcome::new(Code::InvalidMode));
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(at))).await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, at);
+
+        // The same bound applies to create.
+        let make = |key, max_select| CreateRequest {
+            invoker: staff(),
+            guild: GUILD,
+            key,
+            mode: MenuMode::Multi,
+            max_select,
+        };
+        assert_eq!(
+            create(&store, &settings(), &make("big", over)).await,
+            Outcome::new(Code::InvalidMode)
+        );
+        assert!(store.menu(GUILD, "big").is_none());
+        assert_eq!(
+            create(&store, &settings(), &make("fits", at)).await,
+            Outcome::new(Code::Created)
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_with_nothing_to_change_is_refused_and_writes_nothing() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        let outcome = edit(&store, &settings(), &edit_req("main", None, None)).await;
+        assert_eq!(
+            outcome,
+            Outcome::with(Code::InvalidMode, "nothing_to_change")
+        );
+        assert!(!store.calls().iter().any(|c| c.starts_with("update_menu")));
+    }
+
+    #[tokio::test]
+    async fn edit_requires_the_gate_and_a_valid_key_and_an_existing_menu() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        let change = Some(MenuMode::Multi);
+        let calls_before = store.calls().len();
+
+        // A member who is not staff.
+        let mut req = edit_req("main", change, Some(1));
+        req.invoker = member();
+        assert_eq!(
+            edit(&store, &settings(), &req).await,
+            Outcome::new(Code::Denied)
+        );
+        // The bot without Manage Roles.
+        let mut no_manage = settings();
+        no_manage.bot_has_manage_roles = false;
+        assert_eq!(
+            edit(&store, &no_manage, &edit_req("main", change, Some(1))).await,
+            Outcome::new(Code::BotMissingManageRoles)
+        );
+        // The feature off.
+        let mut off = settings();
+        off.enabled = false;
+        assert_eq!(
+            edit(&store, &off, &edit_req("main", change, Some(1))).await,
+            Outcome::new(Code::Disabled)
+        );
+        // An unset home guild fails closed.
+        let mut no_home = settings();
+        no_home.home_guild = None;
+        assert_eq!(
+            edit(&store, &no_home, &edit_req("main", change, Some(1))).await,
+            Outcome::new(Code::NoHomeGuild)
+        );
+        // A foreign guild reads and writes nothing.
+        let mut foreign = edit_req("main", change, Some(1));
+        foreign.guild = OTHER_GUILD;
+        assert_eq!(
+            edit(&store, &settings(), &foreign).await,
+            Outcome::new(Code::OtherGuild)
+        );
+        assert_eq!(
+            store.calls().len(),
+            calls_before,
+            "none of the refusals touched the store"
+        );
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, 3);
+
+        // A bad key never reaches the store.
+        for key in ["", "Main", "../x", "a b"] {
+            assert_eq!(
+                edit(&store, &settings(), &edit_req(key, change, Some(1))).await,
+                Outcome::new(Code::InvalidKey),
+                "{key:?}"
+            );
+        }
+        assert_eq!(store.calls().len(), calls_before);
+
+        // An unknown key.
+        assert_eq!(
+            edit(&store, &settings(), &edit_req("nope", change, Some(1))).await,
+            Outcome::new(Code::MenuNotFound)
+        );
+        // The guild owner may edit as well.
+        let mut by_owner = edit_req("main", change, Some(1));
+        by_owner.invoker = owner();
+        assert_eq!(
+            edit(&store, &settings(), &by_owner).await,
+            Outcome::new(Code::MenuUpdated)
+        );
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_never_reaches_a_menu_of_another_guild() {
+        let store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        // The same key in a foreign guild's namespace is not found.
+        store.menus.lock().unwrap()[0].guild = OTHER_GUILD;
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+        assert!(!store.calls().iter().any(|c| c.starts_with("update_menu")));
+    }
+
+    #[tokio::test]
+    async fn edit_reports_store_failures_and_a_corrupt_row_and_leaves_the_row() {
+        // The write fails.
+        let mut store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        store.fail_update = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::with(Code::StoreFailed, "sqlite_error"));
+        assert_eq!(store.menu(GUILD, "main").unwrap().max_select, 3);
+
+        // The menu vanished between the read and the write.
+        store.fail_update = Some(RepoError::MenuMissing);
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+
+        // The read fails.
+        store.fail_update = None;
+        store.fail = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::with(Code::StoreFailed, "sqlite_error"));
+        store.fail = None;
+
+        // A stored mode the reader cannot understand is not guessed.
+        store.menus.lock().unwrap()[0].mode = "garbage".to_string();
+        let outcome = edit(&store, &settings(), &edit_req("main", None, Some(1))).await;
+        assert_eq!(outcome, Outcome::new(Code::CorruptRow));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("garbage", 3));
+        // An explicit valid mode repairs it.
+        let outcome = edit(
+            &store,
+            &settings(),
+            &edit_req("main", Some(MenuMode::Multi), Some(1)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+        assert_eq!(store.menu(GUILD, "main").unwrap().mode, "multi");
+    }
+
+    #[tokio::test]
+    async fn an_edit_over_real_sqlite_survives_a_reopen_and_keeps_options_and_location() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rm2-coder1-tests")
+            .join("edit-reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let discord = FakeDiscord::new();
+        {
+            let store = SqlStore::open(&path);
+            seed_menu_sql(&store, "main", &[ROLE_OK]).await;
+            assert_eq!(
+                post(&store, &discord, &settings(), &post_req("main")).await,
+                Outcome::new(Code::Posted)
+            );
+            let outcome = edit(
+                &store,
+                &settings(),
+                &edit_req("main", Some(MenuMode::Multi), Some(2)),
+            )
+            .await;
+            assert_eq!(outcome, Outcome::new(Code::MenuUpdated));
+            // A refused edit does not change the row.
+            let outcome = edit(
+                &store,
+                &settings(),
+                &edit_req("main", Some(MenuMode::Exclusive), Some(2)),
+            )
+            .await;
+            assert_eq!(outcome, Outcome::new(Code::InvalidMode));
+        }
+        let store = SqlStore::open(&path);
+        let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+        assert_eq!((menu.mode.as_str(), menu.max_select), ("multi", 2));
+        assert_eq!(menu.channel, Some(CHANNEL));
+        assert!(menu.message.is_some());
+        assert_eq!(store.count_options(menu.id).await.unwrap(), 1);
+        // And the menu is still idempotently posted.
+        assert_eq!(
+            post(&store, &discord, &settings(), &post_req("main")).await,
+            Outcome::new(Code::Edited)
+        );
+        assert_eq!(discord.send_count(), 1);
+    }
+
+    #[test]
+    fn edit_has_a_stable_code_and_an_ephemeral_reply() {
+        assert_eq!(Code::MenuUpdated.as_str(), "menu_updated");
+        let reply = reply_for(Outcome::new(Code::MenuUpdated));
+        assert_eq!(reply.text(), "rolemenu menu_updated");
+        assert!(reply.ephemeral());
+    }
+
+    #[tokio::test]
+    async fn a_seeded_sequence_of_edits_and_faults_never_leaves_an_invalid_row() {
+        let mut store = FakeStore::new();
+        seed_multi(&store, "main").await;
+        let mut rng = Lcg(0xED17_5EED_0001);
+        let mut updated = 0;
+        let mut refused = 0;
+        let mut failed = 0;
+        for _ in 0..200 {
+            store.fail_update = (rng.next(4) == 0)
+                .then_some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+            let mode = match rng.next(3) {
+                0 => None,
+                1 => Some(MenuMode::Exclusive),
+                _ => Some(MenuMode::Multi),
+            };
+            let max = match rng.next(3) {
+                0 => None,
+                1 => Some(0),
+                _ => Some(u32::try_from(rng.next(6)).unwrap()),
+            };
+            let before = store.menu(GUILD, "main").unwrap();
+            let outcome = edit(&store, &settings(), &edit_req("main", mode, max)).await;
+            let after = store.menu(GUILD, "main").unwrap();
+            match outcome.code {
+                Code::MenuUpdated => {
+                    updated += 1;
+                    assert_eq!(
+                        after.mode,
+                        mode.map_or(before.mode.clone(), |m| m.as_str().to_string())
+                    );
+                    assert_eq!(after.max_select, max.unwrap_or(before.max_select));
+                }
+                Code::InvalidMode => {
+                    refused += 1;
+                    assert_eq!(
+                        (&after.mode, after.max_select),
+                        (&before.mode, before.max_select)
+                    );
+                }
+                Code::StoreFailed => {
+                    failed += 1;
+                    assert_eq!(
+                        (&after.mode, after.max_select),
+                        (&before.mode, before.max_select)
+                    );
+                }
+                other => panic!("unexpected code {other:?}"),
+            }
+            // Whatever happened, the row is one the policy can read, and an
+            // exclusive row never names a maximum.
+            assert!(to_policy_menu(&after, &[]).is_ok());
+            assert!(after.mode != "exclusive" || after.max_select == 0);
+        }
+        assert!(
+            updated > 0 && refused > 0 && failed > 0,
+            "{updated} {refused} {failed}"
+        );
     }
 }
