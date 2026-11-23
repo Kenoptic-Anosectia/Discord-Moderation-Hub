@@ -1,6 +1,16 @@
 //! SQLite persistence for role menus (RM2).
 //!
-//! RED STUB: the behaviour is not implemented yet; only the tests are.
+//! Two tables in the shared core database:
+//! `role_menus(id INTEGER PK, guild TEXT, key TEXT UNIQUE, mode TEXT,
+//! max_select INTEGER, channel TEXT, message TEXT, embed_key TEXT)` and
+//! `role_menu_options(menu_id INTEGER, role TEXT, label TEXT, emoji TEXT,
+//! position INTEGER)`.
+//!
+//! The repository creates and migrates its own tables (it does not touch
+//! `storage.rs`). It holds no Discord types, reads no clock and does no I/O
+//! outside the database: ids and `now` are passed in.
+//!
+//! Every error is a stable code that carries no SQL text, path, id or name.
 
 use std::fmt;
 
@@ -127,88 +137,284 @@ pub struct OptionRow {
 }
 
 /// Applies the migrations of the `role_menus` feature to a connection.
+///
+/// Idempotent: running it again changes nothing, and a stored version newer
+/// than the code knows is refused with no writes (the storage layer's rule).
 pub fn migrate(conn: &mut Connection) -> Result<u32, StorageError> {
     crate::storage::migrate(conn, FEATURE, &MIGRATIONS)
 }
 
-/// RED STUB: returns an empty id.
-pub fn create_menu(
-    _conn: &Connection,
-    _guild: u64,
-    _key: &str,
-    _mode: &str,
-    _max_select: u32,
-) -> Result<i64, RepoError> {
-    Err(RepoError::Storage(StorageError::Sqlite))
+fn parse_id(text: &str) -> Result<u64, RepoError> {
+    let id = text.parse::<u64>().map_err(|_| RepoError::CorruptRow)?;
+    if id == 0 {
+        return Err(RepoError::CorruptRow);
+    }
+    Ok(id)
 }
 
-/// RED STUB: finds nothing.
-pub fn get_menu(_conn: &Connection, _guild: u64, _key: &str) -> Result<Option<MenuRow>, RepoError> {
-    Ok(None)
-}
-
-/// RED STUB: lists nothing.
-pub fn list_menus(_conn: &Connection, _guild: u64) -> Result<Vec<MenuRow>, RepoError> {
-    Ok(Vec::new())
-}
-
-/// RED STUB: stores nothing.
-pub fn add_option(
-    _conn: &Connection,
-    _menu_id: i64,
-    _role: u64,
-    _label: &str,
-    _emoji: &str,
-) -> Result<i64, RepoError> {
-    Err(RepoError::Storage(StorageError::Sqlite))
-}
-
-/// RED STUB: lists nothing.
-pub fn list_options(_conn: &Connection, _menu_id: i64) -> Result<Vec<OptionRow>, RepoError> {
-    Ok(Vec::new())
-}
-
-/// RED STUB: removes nothing.
-pub fn remove_option(_conn: &Connection, _menu_id: i64, _role: u64) -> Result<bool, RepoError> {
-    Ok(false)
-}
-
-/// RED STUB: records nothing.
-pub fn set_published(
-    _conn: &Connection,
-    _menu_id: i64,
-    _channel: u64,
-    _message: u64,
-    _embed_key: Option<&str>,
-) -> Result<(), RepoError> {
-    Err(RepoError::MenuMissing)
-}
-
-/// RED STUB: deletes nothing.
-pub fn delete_menu(_conn: &Connection, _menu_id: i64) -> Result<bool, RepoError> {
-    Ok(false)
-}
-
-/// RED STUB: counts nothing.
-pub fn count_options(_conn: &Connection, _menu_id: i64) -> Result<u32, RepoError> {
-    Ok(0)
-}
-
-#[cfg(test)]
-mod unused_helpers {
-    use super::*;
-
-    #[test]
-    fn the_stub_keeps_the_optional_import_used() {
-        let conn = Connection::open_in_memory().unwrap();
-        let value: Option<i64> = conn
-            .query_row("SELECT 1", [], |r| r.get(0))
-            .optional()
-            .unwrap();
-        assert_eq!(value, Some(1));
-        assert_eq!(params!["x"].len(), 1);
+fn parse_optional_id(text: Option<String>) -> Result<Option<u64>, RepoError> {
+    match text {
+        None => Ok(None),
+        Some(text) => Ok(Some(parse_id(&text)?)),
     }
 }
+
+/// Reads one menu row.
+///
+/// A stored id that is not a positive number, or a `max_select` that is
+/// negative, is a [`RepoError::CorruptRow`]: a damaged row must not look like
+/// "no menu" or "no options".
+fn menu_from_row(row: &rusqlite::Row<'_>) -> Result<MenuRow, RepoError> {
+    let id: i64 = row.get(0).map_err(|_| RepoError::CorruptRow)?;
+    let guild_text: String = row.get(1).map_err(|_| RepoError::CorruptRow)?;
+    let key: String = row.get(2).map_err(|_| RepoError::CorruptRow)?;
+    let mode: String = row.get(3).map_err(|_| RepoError::CorruptRow)?;
+    let max_select: i64 = row.get(4).map_err(|_| RepoError::CorruptRow)?;
+    let channel: Option<String> = row.get(5).map_err(|_| RepoError::CorruptRow)?;
+    let message: Option<String> = row.get(6).map_err(|_| RepoError::CorruptRow)?;
+    let embed_key: Option<String> = row.get(7).map_err(|_| RepoError::CorruptRow)?;
+    if max_select < 0 {
+        return Err(RepoError::CorruptRow);
+    }
+    Ok(MenuRow {
+        id,
+        guild: parse_id(&guild_text)?,
+        key,
+        mode,
+        max_select: u32::try_from(max_select).map_err(|_| RepoError::CorruptRow)?,
+        channel: parse_optional_id(channel)?,
+        message: parse_optional_id(message)?,
+        embed_key,
+    })
+}
+
+/// The rusqlite-side wrapper of [`menu_from_row`].
+///
+/// A corrupt row is reported as a rusqlite error so it travels out of the
+/// query; the caller turns it into [`RepoError::CorruptRow`].
+fn menu_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MenuRow> {
+    menu_from_row(row).map_err(|_| {
+        rusqlite::Error::InvalidColumnType(
+            0,
+            "role_menus row".to_string(),
+            rusqlite::types::Type::Text,
+        )
+    })
+}
+
+/// Turns a rusqlite error into a repository error.
+///
+/// The `InvalidColumnType` marker is how [`menu_row`] reports a corrupt row;
+/// every other engine error is a plain storage failure.
+fn row_error(error: rusqlite::Error) -> RepoError {
+    match error {
+        rusqlite::Error::InvalidColumnType(_, _, _) => RepoError::CorruptRow,
+        _ => RepoError::Storage(StorageError::Sqlite),
+    }
+}
+
+/// Creates a menu row and returns its id.
+///
+/// The key is unique across the whole table: a key that is already used is
+/// refused with [`RepoError::KeyTaken`] and nothing is written.
+pub fn create_menu(
+    conn: &Connection,
+    guild: u64,
+    key: &str,
+    mode: &str,
+    max_select: u32,
+) -> Result<i64, RepoError> {
+    // A plain INSERT, not INSERT OR IGNORE: the duplicate must be reported,
+    // never silently swallowed.
+    match conn.execute(
+        "INSERT INTO role_menus (guild, key, mode, max_select) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![guild.to_string(), key, mode, i64::from(max_select)],
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            return Err(RepoError::KeyTaken);
+        }
+        Err(_) => return Err(RepoError::Storage(StorageError::Sqlite)),
+    }
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM role_menus WHERE guild = ?1 AND key = ?2",
+            params![guild.to_string(), key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or(RepoError::KeyTaken)?;
+    Ok(id)
+}
+
+/// Reads one menu by guild and key. `Ok(None)` means no such menu.
+pub fn get_menu(conn: &Connection, guild: u64, key: &str) -> Result<Option<MenuRow>, RepoError> {
+    let row = conn
+        .query_row(
+            "SELECT id, guild, key, mode, max_select, channel, message, embed_key \
+             FROM role_menus WHERE guild = ?1 AND key = ?2",
+            params![guild.to_string(), key],
+            menu_row,
+        )
+        .optional()
+        .map_err(row_error)?;
+    Ok(row)
+}
+
+/// Lists the menus of one guild, ordered by key.
+pub fn list_menus(conn: &Connection, guild: u64) -> Result<Vec<MenuRow>, RepoError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, guild, key, mode, max_select, channel, message, embed_key \
+             FROM role_menus WHERE guild = ?1 ORDER BY key ASC",
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    let rows = stmt
+        .query_map(params![guild.to_string()], menu_row)
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item.map_err(row_error)?);
+    }
+    Ok(out)
+}
+
+/// Stores one option of a menu and returns its position.
+///
+/// The role is unique inside a menu: a second option for the same role is
+/// refused with [`RepoError::OptionExists`] and the menu keeps its options.
+pub fn add_option(
+    conn: &Connection,
+    menu_id: i64,
+    role: u64,
+    label: &str,
+    emoji: &str,
+) -> Result<i64, RepoError> {
+    let next: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM role_menu_options WHERE menu_id = ?1",
+            params![menu_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    match conn.execute(
+        "INSERT INTO role_menu_options (menu_id, role, label, emoji, position) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![menu_id, role.to_string(), label, emoji, next],
+    ) {
+        Ok(_) => Ok(next),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(RepoError::OptionExists)
+        }
+        Err(_) => Err(RepoError::Storage(StorageError::Sqlite)),
+    }
+}
+
+/// Lists the options of one menu, ordered by position.
+pub fn list_options(conn: &Connection, menu_id: i64) -> Result<Vec<OptionRow>, RepoError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT menu_id, role, label, emoji, position FROM role_menu_options \
+             WHERE menu_id = ?1 ORDER BY position ASC, role ASC",
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    let rows = stmt
+        .query_map(params![menu_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    let mut out = Vec::new();
+    for item in rows {
+        let (menu_id, role, label, emoji, position) = item.map_err(|_| RepoError::CorruptRow)?;
+        let role = parse_id(&role).map_err(|_| RepoError::CorruptRow)?;
+        out.push(OptionRow {
+            menu_id,
+            role,
+            label,
+            emoji,
+            position,
+        });
+    }
+    Ok(out)
+}
+
+/// Deletes one option of a menu. Returns whether a row was deleted.
+///
+/// Deleting an option never touches member roles: this function only removes
+/// the stored row.
+pub fn remove_option(conn: &Connection, menu_id: i64, role: u64) -> Result<bool, RepoError> {
+    let n = conn
+        .execute(
+            "DELETE FROM role_menu_options WHERE menu_id = ?1 AND role = ?2",
+            params![menu_id, role.to_string()],
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    Ok(n == 1)
+}
+
+/// Records where a menu was published.
+///
+/// Only the channel, the message and the embed key are written; the menu
+/// itself is not changed.
+pub fn set_published(
+    conn: &Connection,
+    menu_id: i64,
+    channel: u64,
+    message: u64,
+    embed_key: Option<&str>,
+) -> Result<(), RepoError> {
+    let n = conn
+        .execute(
+            "UPDATE role_menus SET channel = ?1, message = ?2, embed_key = ?3 WHERE id = ?4",
+            params![channel.to_string(), message.to_string(), embed_key, menu_id],
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    if n != 1 {
+        return Err(RepoError::MenuMissing);
+    }
+    Ok(())
+}
+
+/// Deletes a menu and its options. Returns whether a row was deleted.
+///
+/// Deleting a menu never touches member roles.
+pub fn delete_menu(conn: &Connection, menu_id: i64) -> Result<bool, RepoError> {
+    conn.execute(
+        "DELETE FROM role_menu_options WHERE menu_id = ?1",
+        params![menu_id],
+    )
+    .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    let n = conn
+        .execute("DELETE FROM role_menus WHERE id = ?1", params![menu_id])
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    Ok(n == 1)
+}
+
+/// The number of options a menu holds.
+pub fn count_options(conn: &Connection, menu_id: i64) -> Result<u32, RepoError> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM role_menu_options WHERE menu_id = ?1",
+            params![menu_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

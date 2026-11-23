@@ -220,7 +220,7 @@ pub struct Invoker {
 
 /// The configuration the command needs. Every field is decided by the wiring
 /// card; this module reads them and nothing else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// The one guild these commands serve (`GUILD_ID`).
     pub home_guild: Option<u64>,
@@ -232,18 +232,6 @@ pub struct Settings {
     pub protected_role_ids: Vec<u64>,
     /// True when `PROTECTED_ROLE_IDS` could not be read: fail closed.
     pub protected_roles_invalid: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            home_guild: None,
-            staff_role_id: None,
-            bot_has_manage_roles: false,
-            protected_role_ids: Vec::new(),
-            protected_roles_invalid: false,
-        }
-    }
 }
 
 /// `/rolemenu create <key>`.
@@ -409,17 +397,9 @@ pub enum DiscordError {
 #[async_trait]
 pub trait MenuDiscord: Send + Sync {
     /// Sends a new menu message and returns its id.
-    async fn send_menu(
-        &self,
-        channel: u64,
-        chunks: &[RenderedChunk],
-    ) -> Result<u64, DiscordError>;
+    async fn send_menu(&self, channel: u64, chunks: &[RenderedChunk]) -> Result<u64, DiscordError>;
     /// Edits an existing menu message in place.
-    async fn edit_menu(
-        &self,
-        message: u64,
-        chunks: &[RenderedChunk],
-    ) -> Result<(), DiscordError>;
+    async fn edit_menu(&self, message: u64, chunks: &[RenderedChunk]) -> Result<(), DiscordError>;
 }
 
 /// Where the facts of a role come from.
@@ -432,37 +412,103 @@ pub trait RoleFactsSource: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// RED STUBS: the behaviour is not implemented yet; only the tests are.
+// Pure helpers
 // ---------------------------------------------------------------------------
 
-/// RED STUB.
-pub fn validate_key(_key: &str) -> Result<(), Code> {
+/// Checks that a menu key is usable.
+///
+/// One canonical spelling: a lowercase ASCII name that starts with a letter or
+/// a digit and continues with letters, digits, `-` or `_`, at most
+/// [`MAX_KEY_BYTES`] bytes. Every other spelling is refused, so a key can
+/// never name a path and never names two different menus.
+pub fn validate_key(key: &str) -> Result<(), Code> {
+    if key.is_empty() || key.len() > MAX_KEY_BYTES {
+        return Err(Code::InvalidKey);
+    }
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(Code::InvalidKey);
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(Code::InvalidKey);
+    }
+    if !bytes.all(|byte| {
+        byte.is_ascii_digit() || byte.is_ascii_lowercase() || matches!(byte, b'-' | b'_')
+    }) {
+        return Err(Code::InvalidKey);
+    }
     Ok(())
 }
 
-/// RED STUB.
-pub fn validate_label(_label: &str) -> Result<(), Code> {
+/// Checks that a label is usable: not empty, not too long and free of control
+/// characters other than a newline.
+pub fn validate_label(label: &str) -> Result<(), Code> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_LABEL_CHARS {
+        return Err(Code::InvalidLabel);
+    }
+    if trimmed.chars().any(|c| c.is_control() && c != '\n') {
+        return Err(Code::InvalidLabel);
+    }
     Ok(())
 }
 
-/// RED STUB.
-pub fn validate_emoji(_emoji: &str) -> Result<(), Code> {
+/// Checks that an emoji is usable: not empty, not too long and free of control
+/// characters.
+///
+/// The control-character check runs on the raw input, before trimming, so a
+/// newline or a NUL hidden at the end of the input is refused instead of being
+/// trimmed away.
+pub fn validate_emoji(emoji: &str) -> Result<(), Code> {
+    if emoji.chars().any(char::is_control) {
+        return Err(Code::InvalidEmoji);
+    }
+    let trimmed = emoji.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_EMOJI_CHARS {
+        return Err(Code::InvalidEmoji);
+    }
     Ok(())
 }
 
-/// RED STUB: returns one empty chunk.
-pub fn split_chunks(_options: &[OptionRow]) -> Vec<RenderedChunk> {
-    Vec::new()
+/// Splits the options of a menu into the chunks of one message.
+///
+/// A chunk holds at most [`SELECT_OPTION_LIMIT`] options, in the stored order,
+/// and no option is dropped: a menu with more options than fit on one message
+/// produces more chunks. The split is deterministic.
+pub fn split_chunks(options: &[OptionRow]) -> Vec<RenderedChunk> {
+    options
+        .chunks(SELECT_OPTION_LIMIT)
+        .enumerate()
+        .map(|(part, chunk)| RenderedChunk {
+            part,
+            options: chunk
+                .iter()
+                .map(|o| RenderedOption {
+                    role: o.role,
+                    label: o.label.clone(),
+                    emoji: o.emoji.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
-/// RED STUB: returns an empty policy menu.
+/// The policy menu of one stored menu, for the shared RM1 policy.
 pub fn to_policy_menu(menu: &MenuRow, options: &[OptionRow]) -> policy::Menu {
+    let mode = match MenuMode::parse(&menu.mode) {
+        Some(MenuMode::Exclusive) => GroupMode::Exclusive,
+        _ => GroupMode::Multi,
+    };
     policy::Menu {
         key: menu.key.clone(),
         groups: vec![policy::Group {
             id: menu.key.clone(),
-            mode: GroupMode::Multi,
-            max: None,
+            mode,
+            max: if menu.max_select == 0 {
+                None
+            } else {
+                Some(menu.max_select)
+            },
             options: options
                 .iter()
                 .map(|o| policy::MenuOption {
@@ -474,101 +520,325 @@ pub fn to_policy_menu(menu: &MenuRow, options: &[OptionRow]) -> policy::Menu {
     }
 }
 
-/// RED STUB.
+/// The roles a menu may grant, as a set.
 pub fn menu_roles(options: &[OptionRow]) -> BTreeSet<u64> {
     options.iter().map(|o| o.role).collect()
 }
 
-/// RED STUB: allows everybody.
-pub fn gate(
-    _settings: &Settings,
-    _invoker: &Invoker,
-    _guild: u64,
-) -> Result<(), Outcome> {
-    Ok(())
+// ---------------------------------------------------------------------------
+// The gate
+// ---------------------------------------------------------------------------
+
+/// Checks the caller and the guild.
+///
+/// The order matters: an off feature says `disabled`; a caller who is not
+/// staff is `denied` whatever the guild; a guild that is not the home guild is
+/// `other_guild`; and a bot without "Manage Roles" may not configure anything.
+pub fn gate(settings: &Settings, invoker: &Invoker, guild: u64) -> Result<(), Outcome> {
+    if !settings.bot_has_manage_roles {
+        return Err(Outcome::new(Code::BotMissingManageRoles));
+    }
+    if invoker.user == 0 {
+        return Err(Outcome::new(Code::Denied));
+    }
+    let is_owner = invoker.user == invoker.guild_owner;
+    let is_staff = match settings.staff_role_id {
+        Some(role) => invoker.is_staff && role != 0,
+        None => false,
+    };
+    if !(is_owner || is_staff) {
+        return Err(Outcome::new(Code::Denied));
+    }
+    if guild == 0 {
+        return Err(Outcome::new(Code::InvalidTarget));
+    }
+    match settings.home_guild {
+        None | Some(0) => Err(Outcome::new(Code::NoHomeGuild)),
+        Some(home) if home == guild => Ok(()),
+        Some(_) => Err(Outcome::new(Code::OtherGuild)),
+    }
 }
 
-/// RED STUB: allows every role.
+/// Checks that the role may be granted through a menu.
+///
+/// The same K03 rules as at grant time are applied at configuration time: a
+/// privileged, managed or protected role is refused with its own stable code.
 pub fn check_role(
-    _settings: &Settings,
-    _facts: &RoleFacts,
-    _bot_top_position: u16,
-    _guild: u64,
+    settings: &Settings,
+    facts: &RoleFacts,
+    bot_top_position: u16,
+    guild: u64,
 ) -> Result<(), Outcome> {
-    Ok(())
+    let request = crate::roles::eligibility::GrantRequest {
+        path: GrantPath::Menu,
+        role: *facts,
+        bot_top_position,
+        guild_id: guild,
+        protected_role_ids: &settings.protected_role_ids,
+        safeword: crate::roles::eligibility::SafewordState::Inactive,
+        safeword_restricted_role_ids: &[],
+        staff: None,
+    };
+    match decide(&request) {
+        Decision::Allow => Ok(()),
+        Decision::Deny(reason) => Err(Outcome::with(Code::Ineligible, reason.code())),
+    }
 }
 
-/// RED STUB.
+/// The code a K03 denial is reported with.
 pub fn deny_code(reason: DenyReason) -> &'static str {
     reason.code()
 }
 
-/// RED STUB.
+// ---------------------------------------------------------------------------
+// Reply builders
+// ---------------------------------------------------------------------------
+
+/// Builds the reply of a single-outcome command.
 pub fn reply_for(outcome: Outcome) -> Reply {
     Reply {
-        text: outcome.text(),
+        text: format!("rolemenu {}", outcome.text()),
     }
 }
 
-/// RED STUB.
+/// Builds the reply of `/rolemenu list`.
 pub fn list_reply(report: &ListReport) -> Reply {
-    reply_for(report.outcome)
+    if report.outcome.code != Code::Listed {
+        return reply_for(report.outcome);
+    }
+    let mut text = format!("rolemenu list: {} menus", report.menus.len());
+    for menu in &report.menus {
+        text.push_str(&format!(
+            "\n{} mode={} options={} posted={}",
+            menu.key, menu.mode, menu.options, menu.posted
+        ));
+    }
+    Reply { text }
 }
 
-/// RED STUB.
+// ---------------------------------------------------------------------------
+// The commands
+// ---------------------------------------------------------------------------
+
+/// `/rolemenu create <key>`.
+///
+/// Creates the menu row. The key is validated first, and a key that is
+/// already taken is refused.
 pub async fn create<S: MenuStore + ?Sized>(
-    _store: &S,
-    _settings: &Settings,
-    _req: &CreateRequest<'_>,
+    store: &S,
+    settings: &Settings,
+    req: &CreateRequest<'_>,
 ) -> Outcome {
-    Outcome::new(Code::Created)
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    match store
+        .create_menu(req.guild, req.key, req.mode.as_str(), req.max_select)
+        .await
+    {
+        Ok(_) => Outcome::new(Code::Created),
+        Err(RepoError::KeyTaken) => Outcome::new(Code::KeyTaken),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
 }
 
-/// RED STUB.
+/// `/rolemenu option add <key> <role> <label> <emoji>`.
+///
+/// The role is checked against the K03 rules before it is stored, so a
+/// privileged, managed or protected role never reaches the table.
 pub async fn add_option<S: MenuStore + ?Sized, F: RoleFactsSource + ?Sized>(
-    _store: &S,
-    _facts: &F,
-    _settings: &Settings,
-    _req: &AddOptionRequest<'_>,
+    store: &S,
+    facts: &F,
+    settings: &Settings,
+    req: &AddOptionRequest<'_>,
 ) -> Outcome {
-    Outcome::new(Code::OptionAdded)
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    if req.role == 0 {
+        return Outcome::new(Code::InvalidTarget);
+    }
+    if validate_label(req.label).is_err() {
+        return Outcome::new(Code::InvalidLabel);
+    }
+    if validate_emoji(req.emoji).is_err() {
+        return Outcome::new(Code::InvalidEmoji);
+    }
+    if settings.protected_roles_invalid {
+        return Outcome::new(Code::Ineligible);
+    }
+    let menu = match store.get_menu(req.guild, req.key).await {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return Outcome::new(Code::MenuNotFound),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    let Some(role_facts) = facts.role_facts(req.guild, req.role).await else {
+        return Outcome::new(Code::FactsUnavailable);
+    };
+    let Some(bot_top) = facts.bot_top_position(req.guild).await else {
+        return Outcome::new(Code::FactsUnavailable);
+    };
+    if let Err(outcome) = check_role(settings, &role_facts, bot_top, req.guild) {
+        return outcome;
+    }
+    match store
+        .add_option(menu.id, req.role, req.label.trim(), req.emoji.trim())
+        .await
+    {
+        Ok(_) => Outcome::new(Code::OptionAdded),
+        Err(RepoError::OptionExists) => Outcome::new(Code::OptionExists),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
 }
 
-/// RED STUB.
+/// `/rolemenu option remove <key> <role>`.
+///
+/// Removes the stored option. No member role is touched.
 pub async fn remove_option<S: MenuStore + ?Sized>(
-    _store: &S,
-    _settings: &Settings,
-    _req: &RemoveOptionRequest<'_>,
+    store: &S,
+    settings: &Settings,
+    req: &RemoveOptionRequest<'_>,
 ) -> Outcome {
-    Outcome::new(Code::OptionRemoved)
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    if req.role == 0 {
+        return Outcome::new(Code::InvalidTarget);
+    }
+    let menu = match store.get_menu(req.guild, req.key).await {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return Outcome::new(Code::MenuNotFound),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    match store.remove_option(menu.id, req.role).await {
+        Ok(true) => Outcome::new(Code::OptionRemoved),
+        Ok(false) => Outcome::new(Code::OptionNotFound),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
 }
 
-/// RED STUB.
+/// `/rolemenu post <key>` and `/rolemenu edit <key>`.
+///
+/// Posts the managed embed of the menu, or edits the message the row already
+/// names. The row is the truth: a menu that was already posted is edited, not
+/// posted again. A failed send leaves the row unchanged.
 pub async fn post<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
-    _store: &S,
-    _discord: &D,
-    _settings: &Settings,
-    _req: &PostRequest<'_>,
+    store: &S,
+    discord: &D,
+    settings: &Settings,
+    req: &PostRequest<'_>,
 ) -> Outcome {
-    Outcome::new(Code::Posted)
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    if req.channel == 0 {
+        return Outcome::new(Code::InvalidTarget);
+    }
+    let menu = match store.get_menu(req.guild, req.key).await {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return Outcome::new(Code::MenuNotFound),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    let options = match store.list_options(menu.id).await {
+        Ok(options) => options,
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    if options.is_empty() {
+        return Outcome::new(Code::EmptyMenu);
+    }
+    let chunks = split_chunks(&options);
+    let already_posted = menu.message.is_some() && menu.channel.is_some();
+    let outcome = if already_posted {
+        let message = menu.message.unwrap_or(0);
+        match discord.edit_menu(message, &chunks).await {
+            Ok(()) => Outcome::new(Code::Edited),
+            Err(error) => return discord_error(error),
+        }
+    } else {
+        match discord.send_menu(req.channel, &chunks).await {
+            Ok(message) => {
+                match store
+                    .set_published(menu.id, req.channel, message, Some(req.key))
+                    .await
+                {
+                    Ok(()) => Outcome::new(Code::Posted),
+                    Err(error) => {
+                        return Outcome::with(Code::StoreFailed, error.code());
+                    }
+                }
+            }
+            Err(error) => return discord_error(error),
+        }
+    };
+    outcome
 }
 
-/// RED STUB.
 fn discord_error(error: DiscordError) -> Outcome {
-    Outcome::new(Code::DiscordFailed)
+    match error {
+        DiscordError::Forbidden => Outcome::new(Code::DiscordForbidden),
+        DiscordError::Failed => Outcome::new(Code::DiscordFailed),
+    }
 }
 
-/// RED STUB.
+/// `/rolemenu list`.
+///
+/// Only the calling guild's menus are listed.
 pub async fn list<S: MenuStore + ?Sized>(
-    _store: &S,
-    _settings: &Settings,
-    _req: &ListRequest,
+    store: &S,
+    settings: &Settings,
+    req: &ListRequest,
 ) -> ListReport {
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return ListReport {
+            outcome,
+            menus: Vec::new(),
+        };
+    }
+    let menus = match store.list_menus(req.guild).await {
+        Ok(menus) => menus,
+        Err(error) => {
+            return ListReport {
+                outcome: Outcome::with(Code::StoreFailed, error.code()),
+                menus: Vec::new(),
+            }
+        }
+    };
+    let mut listed = Vec::with_capacity(menus.len());
+    for menu in menus {
+        let options = match store.list_options(menu.id).await {
+            Ok(options) => options.len(),
+            Err(error) => {
+                return ListReport {
+                    outcome: Outcome::with(Code::StoreFailed, error.code()),
+                    menus: Vec::new(),
+                }
+            }
+        };
+        listed.push(ListedMenu {
+            key: menu.key,
+            mode: menu.mode,
+            options: u32::try_from(options).unwrap_or(u32::MAX),
+            posted: menu.message.is_some(),
+        });
+    }
     ListReport {
         outcome: Outcome::new(Code::Listed),
-        menus: Vec::new(),
+        menus: listed,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,7 +917,10 @@ mod tests {
             mode: &str,
             max_select: u32,
         ) -> Result<i64, RepoError> {
-            self.calls.lock().unwrap().push(format!("create_menu {key}"));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_menu {key}"));
             if let Some(error) = self.fail {
                 return Err(error);
             }
@@ -711,7 +984,10 @@ mod tests {
                 return Err(error);
             }
             let mut options = self.options.lock().unwrap();
-            if options.iter().any(|o| o.menu_id == menu_id && o.role == role) {
+            if options
+                .iter()
+                .any(|o| o.menu_id == menu_id && o.role == role)
+            {
                 return Err(RepoError::OptionExists);
             }
             let position = options
@@ -731,7 +1007,10 @@ mod tests {
         }
 
         async fn list_options(&self, menu_id: i64) -> Result<Vec<OptionRow>, RepoError> {
-            self.calls.lock().unwrap().push(format!("list_options {menu_id}"));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("list_options {menu_id}"));
             if let Some(error) = self.fail {
                 return Err(error);
             }
@@ -860,7 +1139,13 @@ mod tests {
             let facts = FakeFacts::default();
             {
                 let mut roles = facts.roles.lock().unwrap();
-                for id in [ROLE_OK, ROLE_PRIV, ROLE_MANAGED, ROLE_PROTECTED, ROLE_ABOVE_BOT] {
+                for id in [
+                    ROLE_OK,
+                    ROLE_PRIV,
+                    ROLE_MANAGED,
+                    ROLE_PROTECTED,
+                    ROLE_ABOVE_BOT,
+                ] {
                     roles.insert(
                         id,
                         RoleFacts {
@@ -1086,10 +1371,7 @@ mod tests {
         let s = settings();
         assert_eq!(gate(&s, &staff(), GUILD), Ok(()));
         assert_eq!(gate(&s, &owner(), GUILD), Ok(()));
-        assert_eq!(
-            gate(&s, &member(), GUILD),
-            Err(Outcome::new(Code::Denied))
-        );
+        assert_eq!(gate(&s, &member(), GUILD), Err(Outcome::new(Code::Denied)));
         // A caller id of zero is never trusted.
         let zero = Invoker {
             user: 0,
@@ -1205,7 +1487,10 @@ mod tests {
             Err(Outcome::with(Code::Ineligible, "managed_role"))
         );
 
-        let protected = RoleFacts { id: ROLE_PROTECTED, ..ok };
+        let protected = RoleFacts {
+            id: ROLE_PROTECTED,
+            ..ok
+        };
         assert_eq!(
             check_role(&s, &protected, 10, GUILD),
             Err(Outcome::with(Code::Ineligible, "protected_role"))
@@ -1232,10 +1517,7 @@ mod tests {
         );
 
         // The @everyone role (its id equals the guild id) is refused.
-        let everyone = RoleFacts {
-            id: GUILD,
-            ..ok
-        };
+        let everyone = RoleFacts { id: GUILD, ..ok };
         assert_eq!(
             check_role(&s, &everyone, 10, GUILD),
             Err(Outcome::with(Code::Ineligible, "everyone_role"))
@@ -1346,7 +1628,13 @@ mod tests {
         let outcome = add_option(&store, &facts, &settings(), &add_req("main", ROLE_MANAGED)).await;
         assert_eq!(outcome, Outcome::with(Code::Ineligible, "managed_role"));
 
-        let outcome = add_option(&store, &facts, &settings(), &add_req("main", ROLE_PROTECTED)).await;
+        let outcome = add_option(
+            &store,
+            &facts,
+            &settings(),
+            &add_req("main", ROLE_PROTECTED),
+        )
+        .await;
         assert_eq!(outcome, Outcome::with(Code::Ineligible, "protected_role"));
 
         assert_eq!(store.option_count(), 0, "no refused option is stored");
@@ -1568,17 +1856,13 @@ mod tests {
         let discord = FakeDiscord::new();
         create(&store, &settings(), &create_req("big")).await;
         for index in 0..60u64 {
-            store
-                .options
-                .lock()
-                .unwrap()
-                .push(OptionRow {
-                    menu_id: store.menu(GUILD, "big").unwrap().id,
-                    role: 700_000 + index,
-                    label: format!("Label {index}"),
-                    emoji: "x".to_string(),
-                    position: index as i64,
-                });
+            store.options.lock().unwrap().push(OptionRow {
+                menu_id: store.menu(GUILD, "big").unwrap().id,
+                role: 700_000 + index,
+                label: format!("Label {index}"),
+                emoji: "x".to_string(),
+                position: index as i64,
+            });
         }
         let outcome = post(&store, &discord, &settings(), &post_req("big")).await;
         assert_eq!(outcome, Outcome::new(Code::Posted));
@@ -1644,12 +1928,20 @@ mod tests {
             message: None,
             embed_key: None,
         });
-        let report = list(&store, &settings(), &ListRequest { invoker: staff(), guild: GUILD }).await;
+        let report = list(
+            &store,
+            &settings(),
+            &ListRequest {
+                invoker: staff(),
+                guild: GUILD,
+            },
+        )
+        .await;
         assert_eq!(report.outcome, Outcome::new(Code::Listed));
         assert_eq!(report.menus.len(), 1);
         assert_eq!(report.menus[0].key, "main");
         assert_eq!(report.menus[0].options, 1);
-        assert_eq!(report.menus[0].posted, false);
+        assert!(!report.menus[0].posted);
     }
 
     #[tokio::test]
@@ -1673,7 +1965,15 @@ mod tests {
     async fn a_store_failure_is_reported_with_a_stable_code() {
         let mut store = FakeStore::new();
         store.fail = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
-        let report = list(&store, &settings(), &ListRequest { invoker: staff(), guild: GUILD }).await;
+        let report = list(
+            &store,
+            &settings(),
+            &ListRequest {
+                invoker: staff(),
+                guild: GUILD,
+            },
+        )
+        .await;
         assert_eq!(
             report.outcome,
             Outcome::with(Code::StoreFailed, "sqlite_error")
@@ -1791,10 +2091,7 @@ mod tests {
             // The role is now stored exactly once: either it was added, or it
             // was already there and the add is refused.
             assert!(
-                matches!(
-                    outcome.code,
-                    Code::OptionAdded | Code::OptionExists
-                ),
+                matches!(outcome.code, Code::OptionAdded | Code::OptionExists),
                 "{outcome:?}"
             );
             let menu = store.menu(GUILD, "main").unwrap();
