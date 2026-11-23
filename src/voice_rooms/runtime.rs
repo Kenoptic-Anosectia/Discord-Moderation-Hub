@@ -204,10 +204,6 @@ struct RawCleanup {
 /// Parses a cleanup payload strictly: exactly the four keys, JSON integers, non-zero ids, a
 /// non-negative time and an attempt counter within [`MAX_CLEANUP_ATTEMPTS`].
 pub fn parse_cleanup_payload(raw: &str) -> Result<CleanupPayload, PayloadInvalid> {
-    if true {
-        // RED stub: no payload is valid.
-        return Err(PayloadInvalid);
-    }
     // serde also reads a struct from a JSON array; only the object form is a payload.
     if !raw.trim_start().starts_with('{') {
         return Err(PayloadInvalid);
@@ -247,10 +243,6 @@ pub fn due_at(since: i64, grace_secs: i64) -> i64 {
 
 /// Seconds to wait before retrying a failed cleanup: doubles per attempt, capped.
 pub fn retry_delay_secs(attempt: u32) -> i64 {
-    if true {
-        // RED stub: retry at once.
-        return 0;
-    }
     let shift = attempt.min(20);
     RETRY_BASE_SECS
         .saturating_mul(1i64 << shift)
@@ -329,10 +321,6 @@ pub fn classify(
     home_guild: u64,
     bot_user: Option<u64>,
 ) -> Result<Moves, IgnoreCode> {
-    if true {
-        // RED stub: every event is ignored.
-        return Err(IgnoreCode::NoChannelChange);
-    }
     if home_guild == 0 || facts.guild_id != Some(home_guild) {
         return Err(IgnoreCode::WrongGuild);
     }
@@ -536,10 +524,6 @@ impl Inner {
     }
 
     async fn process(&self, facts: VoiceFacts, core_db: Option<&Db>) -> Outcome {
-        if true {
-            // RED stub: acts on nothing.
-            return Outcome::Off;
-        }
         match self.settings.readiness() {
             Readiness::Off => return Outcome::Off,
             Readiness::Misconfigured(reason) => return Outcome::NotReady(reason),
@@ -799,10 +783,6 @@ impl Inner {
     /// The cleanup job's handler. The row and the live occupancy decide; the job is only a
     /// wake-up. `Ok` means nothing more is owed by this job (including "somebody rejoined").
     async fn run_cleanup(&self, job: ClaimedJob) -> HandlerResult {
-        if true {
-            // RED stub: every wake-up is a no-op.
-            return Ok(());
-        }
         let Ok(p) = parse_cleanup_payload(&job.payload_json) else {
             self.alerts.alert(AlertCode::PayloadInvalid).await;
             return Err(HandlerError::new("payload_invalid"));
@@ -914,13 +894,6 @@ impl Inner {
     /// Restart reconcile over the rows of the home guild, and nothing else: a channel that has
     /// no row is never listed, deleted or modified.
     async fn reconcile(&self, core_db: Option<&Db>) -> ReconcileReport {
-        if true {
-            // RED stub: reconciles nothing.
-            return ReconcileReport {
-                skipped: true,
-                ..ReconcileReport::default()
-            };
-        }
         let mut report = ReconcileReport::default();
         let Some(home) = self.settings.guild_id() else {
             report.skipped = true;

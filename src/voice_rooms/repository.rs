@@ -90,14 +90,29 @@ pub fn migrate(conn: &mut Connection) -> Result<(), RepoError> {
 }
 
 /// Inserts a room. Returns `false` (and writes nothing) when the channel already has a row.
-pub fn insert(_conn: &Connection, _row: &RoomRow) -> Result<bool, RepoError> {
-    // RED stub: stores nothing.
-    Ok(false)
+pub fn insert(conn: &Connection, row: &RoomRow) -> Result<bool, RepoError> {
+    let n = conn.execute(
+        "INSERT INTO voice_rooms (channel, guild, owner, created_at, locked, user_limit) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(channel) DO NOTHING",
+        params![
+            row.channel.to_string(),
+            row.guild.to_string(),
+            row.owner.to_string(),
+            row.created_at,
+            i64::from(row.locked),
+            i64::from(row.user_limit),
+        ],
+    )?;
+    Ok(n == 1)
 }
 
 /// Deletes the row of `channel`. Returns whether a row was there.
-pub fn delete(_conn: &Connection, _channel: u64) -> Result<bool, RepoError> {
-    Ok(false)
+pub fn delete(conn: &Connection, channel: u64) -> Result<bool, RepoError> {
+    let n = conn.execute(
+        "DELETE FROM voice_rooms WHERE channel = ?1",
+        params![channel.to_string()],
+    )?;
+    Ok(n == 1)
 }
 
 type RawRow = (String, String, String, i64, i64, i64);

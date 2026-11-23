@@ -206,11 +206,16 @@ pub struct Loaded {
 
 /// Parses the `VC_*` keys from `lookup` (blank counts as unset). `guild_id` is the
 /// already-parsed `GUILD_ID` (the home guild).
-pub fn load(_lookup: impl Fn(&str) -> Option<String>, guild_id: Option<u64>) -> Loaded {
-    // RED stub: reads nothing.
-    Loaded {
-        settings: VoiceSettings::off(guild_id),
-        error: None,
+pub fn load(lookup: impl Fn(&str) -> Option<String>, guild_id: Option<u64>) -> Loaded {
+    match parse(&lookup, guild_id) {
+        Ok(settings) => Loaded {
+            settings,
+            error: None,
+        },
+        Err(error) => Loaded {
+            settings: VoiceSettings::off(guild_id),
+            error: Some(error),
+        },
     }
 }
 
