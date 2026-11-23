@@ -35,7 +35,8 @@ Mode parsing; off, unset home guild, unset staff role, foreign guild, DM and zer
 boundaries (equal and one above and below); six privileged bits; protected, managed, everyone,
 deleted; safeword matrix (active, inactive, unknown, caller's own); no-op replies; audit reason
 on retries; failure table; clamp of a huge retry hint; shadow mode; info and list; a 5,000-role
-member; a 1,170-case sweep of all four commands (reply shape, audit count); a 600-case seeded LCG liveness test against a model of the
+member; a 1,170-case sweep of all four commands (reply shape, audit count); a 600-case seeded
+LCG liveness test against a model of the
 retry policy (one reply and one audit entry each, at most 4 calls, exact sleeps, state matches
 the reply); a 200-case test that repeating a command against a flaky executor converges.
 RED evidence: commit `60a361e` (stub): 36 of 36 tests failed. Later additions: the `bound()`
