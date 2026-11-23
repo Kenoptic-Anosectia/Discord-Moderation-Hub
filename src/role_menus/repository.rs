@@ -416,14 +416,31 @@ pub fn set_published(
     Ok(())
 }
 
-/// Changes the mode and the maximum of a menu: RED stub.
+/// Changes the mode and the maximum of a menu.
+///
+/// Only those two columns are written: the key, the guild, the options and
+/// the published location are untouched. A mode that is not one of [`MODES`]
+/// is refused with [`RepoError::InvalidMode`] and nothing is written; a menu
+/// that is not stored is refused with [`RepoError::MenuMissing`].
 pub fn update_menu(
-    _conn: &Connection,
-    _menu_id: i64,
-    _mode: &str,
-    _max_select: u32,
+    conn: &Connection,
+    menu_id: i64,
+    mode: &str,
+    max_select: u32,
 ) -> Result<(), RepoError> {
-    Err(RepoError::MenuMissing)
+    if !MODES.contains(&mode) {
+        return Err(RepoError::InvalidMode);
+    }
+    let n = conn
+        .execute(
+            "UPDATE role_menus SET mode = ?1, max_select = ?2 WHERE id = ?3",
+            params![mode, i64::from(max_select), menu_id],
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    if n != 1 {
+        return Err(RepoError::MenuMissing);
+    }
+    Ok(())
 }
 
 /// Clears the recorded location of a menu.

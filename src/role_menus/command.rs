@@ -1,4 +1,4 @@
-//! `/rolemenu create | option | post | edit | list` logic (RM2).
+//! `/rolemenu create | option | post | edit | list | unpublish` logic (RM2).
 //!
 //! The functions here are plain async functions over small traits (the menu
 //! store, the embed poster, the role-facts source) so that tests inject fakes;
@@ -699,9 +699,10 @@ fn holds_markup(text: &str) -> bool {
 /// "Exactly one" is the whole rule: Discord shows one emoji next to a select
 /// option, so a string that holds two emoji (`"🎉🎉"`) or a skin tone
 /// without its base (`"🏻"`) is refused. One emoji is a base code point,
-/// optionally followed by a variation selector, a skin tone, a keycap mark,
-/// or more parts joined with the zero-width joiner; a flag is a pair of
-/// regional indicators.
+/// optionally followed by a variation selector and a skin tone, and at most
+/// [`MAX_ZWJ_JOINS`] more parts joined with the zero-width joiner; a keycap
+/// is a digit with the keycap mark; a flag is a pair of regional indicators.
+/// See [`is_single_emoji`] for the grammar and its limit.
 ///
 /// Everything else is refused, so free text, a mention, a link and a
 /// zero-width mark can never be stored as the emoji of an option.
@@ -757,69 +758,76 @@ fn validate_custom_emoji(text: &str) -> Result<(), Code> {
 
 /// True when the text is exactly one Unicode emoji.
 ///
-/// The text is walked as a sequence of emoji parts. One part is an emoji
-/// base code point, optionally followed by a variation selector, a skin
-/// tone or the keycap mark; more parts may be joined with the zero-width
-/// joiner. A regional indicator pair is one flag. The whole text must be
-/// ONE such sequence: a second base that is not joined to the first makes
-/// the string two emoji, and it is refused.
+/// The grammar, walked left to right, and nothing outside it is accepted:
+///
+/// * a flag: exactly two regional indicators,
+/// * a keycap: an ASCII digit, an optional variation selector, then the
+///   keycap mark `U+20E3` as the LAST character (the mark is not accepted
+///   after anything that is not a digit),
+/// * otherwise one or more PARTS joined by the zero-width joiner, at most
+///   [`MAX_ZWJ_JOINS`] joins. A part is a base code point, an optional
+///   variation selector, an optional skin tone (which may be followed by a
+///   variation selector if none came before it). A joiner must be followed
+///   by the next part, so it cannot be last, doubled or followed by a
+///   non-base; a skin tone is followed by a joiner or the end, never by
+///   another base.
+///
+/// Limit: "base" is a set of coarse code-point ranges ([`is_emoji_base`]),
+/// not an emoji table, so a code point inside a range that is not really an
+/// emoji, a skin tone on a base that cannot take one, and a pair of regional
+/// indicators that is not a real flag are all accepted.
 fn is_single_emoji(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
-    let mut index = 0usize;
-    // A flag: two regional indicators.
-    if index < chars.len() && is_regional_indicator(chars[index]) {
+    let Some(&first) = chars.first() else {
+        return false;
+    };
+    if is_regional_indicator(first) {
         return chars.len() == 2 && is_regional_indicator(chars[1]);
     }
-    if index >= chars.len() {
-        return false;
+    if first.is_ascii_digit() {
+        return matches!(&chars[1..], ['\u{20E3}'] | ['\u{FE0F}', '\u{20E3}']);
     }
-    // A keycap: an ASCII digit, a variation selector and the keycap mark.
-    if chars[index].is_ascii_digit() {
-        let mut cursor = index + 1;
-        if cursor < chars.len() && chars[cursor] == '\u{FE0F}' {
-            cursor += 1;
+    let mut index = 0usize;
+    let mut joins = 0usize;
+    loop {
+        let Some(end) = part_end(&chars, index) else {
+            return false;
+        };
+        index = end;
+        if index == chars.len() {
+            return true;
         }
-        return cursor < chars.len() && chars[cursor] == '\u{20E3}' && cursor + 1 == chars.len();
+        if chars[index] != '\u{200D}' {
+            return false;
+        }
+        joins += 1;
+        if joins > MAX_ZWJ_JOINS {
+            return false;
+        }
+        index += 1;
     }
-    if !is_emoji_base(chars[index]) {
-        return false;
+}
+
+/// The index just after the emoji part that starts at `start`, or `None`
+/// when no part starts there.
+fn part_end(chars: &[char], start: usize) -> Option<usize> {
+    if start >= chars.len() || !is_emoji_base(chars[start]) {
+        return None;
     }
-    index += 1;
-    // The marks that may follow the base. At most one variation selector:
-    // two of them are not one emoji.
-    let mut variation_seen = false;
-    while index < chars.len() {
-        match chars[index] {
-            '\u{FE0E}' | '\u{FE0F}' => {
-                if variation_seen {
-                    return false;
-                }
-                variation_seen = true;
-                index += 1;
-            }
-            '\u{20E3}' => {
-                index += 1;
-                // A keycap mark is the last part of this emoji.
-                break;
-            }
-            c if is_skin_tone(c) => {
-                index += 1;
-                // A skin tone is the last part of this emoji.
-                break;
-            }
-            '\u{200D}' => {
-                // A joined part: the joiner must be followed by a base.
-                index += 1;
-                if index >= chars.len() || !is_emoji_base(chars[index]) {
-                    return false;
-                }
-                index += 1;
-                variation_seen = false;
-            }
-            _ => return false,
+    let mut index = start + 1;
+    let is_selector = |c: char| matches!(c, '\u{FE0E}' | '\u{FE0F}');
+    let mut selector_seen = false;
+    if index < chars.len() && is_selector(chars[index]) {
+        selector_seen = true;
+        index += 1;
+    }
+    if index < chars.len() && is_skin_tone(chars[index]) {
+        index += 1;
+        if !selector_seen && index < chars.len() && is_selector(chars[index]) {
+            index += 1;
         }
     }
-    index == chars.len()
+    Some(index)
 }
 
 /// True for a code point that is an emoji on its own.
@@ -1024,6 +1032,17 @@ pub fn list_reply(report: &ListReport) -> Reply {
 // The commands
 // ---------------------------------------------------------------------------
 
+/// True when a mode and a maximum fit together.
+///
+/// An exclusive menu may not name a maximum, and no maximum may exceed what
+/// one message can hold ([`MAX_OPTIONS_PER_MENU`]).
+fn mode_fits(mode: MenuMode, max_select: u32) -> bool {
+    if mode == MenuMode::Exclusive && max_select > 0 {
+        return false;
+    }
+    max_select as usize <= MAX_OPTIONS_PER_MENU
+}
+
 /// `/rolemenu create <key>`.
 ///
 /// Creates the menu row. The key is validated first, and a key that is
@@ -1041,7 +1060,7 @@ pub async fn create<S: MenuStore + ?Sized>(
     if validate_key(req.key).is_err() {
         return Outcome::new(Code::InvalidKey);
     }
-    if req.mode == MenuMode::Exclusive && req.max_select > 0 {
+    if !mode_fits(req.mode, req.max_select) {
         return Outcome::new(Code::InvalidMode);
     }
     match store
@@ -1146,13 +1165,52 @@ pub async fn remove_option<S: MenuStore + ?Sized>(
     }
 }
 
-/// `/rolemenu edit <key>`: RED stub, replaced by the implementation commit.
+/// `/rolemenu edit <key> [mode] [max_select]`.
+///
+/// Changes the mode and/or the maximum of a menu. What is not given keeps its
+/// stored value, and the result must pass the same rule as `create`
+/// ([`mode_fits`]): switching a menu with a maximum to exclusive therefore
+/// needs an explicit maximum of zero. A refused or failed edit leaves the row
+/// as it was. The key, the options and the published location are not
+/// touched, and no member role is written.
 pub async fn edit<S: MenuStore + ?Sized>(
-    _store: &S,
-    _settings: &Settings,
-    _req: &EditRequest<'_>,
+    store: &S,
+    settings: &Settings,
+    req: &EditRequest<'_>,
 ) -> Outcome {
-    Outcome::new(Code::Denied)
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    if req.mode.is_none() && req.max_select.is_none() {
+        return Outcome::with(Code::InvalidMode, "nothing_to_change");
+    }
+    let menu = match store.get_menu(req.guild, req.key).await {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return Outcome::new(Code::MenuNotFound),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    // A stored mode the reader cannot understand is never guessed; naming a
+    // mode explicitly repairs it.
+    let mode = match req.mode {
+        Some(mode) => mode,
+        None => match MenuMode::parse(&menu.mode) {
+            Some(mode) => mode,
+            None => return Outcome::new(Code::CorruptRow),
+        },
+    };
+    let max_select = req.max_select.unwrap_or(menu.max_select);
+    if !mode_fits(mode, max_select) {
+        return Outcome::new(Code::InvalidMode);
+    }
+    match store.update_menu(menu.id, mode.as_str(), max_select).await {
+        Ok(()) => Outcome::new(Code::MenuUpdated),
+        Err(RepoError::MenuMissing) => Outcome::new(Code::MenuNotFound),
+        Err(RepoError::InvalidMode) => Outcome::new(Code::InvalidMode),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
 }
 
 /// `/rolemenu post <key>`.
