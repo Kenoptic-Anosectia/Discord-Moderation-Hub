@@ -1,4 +1,5 @@
-//! The `/safeword status|strike|clear` staff command logic (SW4, `docs/verification/SAFEWORD-COMMAND.md`).
+//! The `/safeword status|strike|clear` staff command logic (SW4).
+//! See `docs/verification/SAFEWORD-COMMAND.md`.
 //!
 //! Plain functions over an [`Env`] (the SW3 collaborators, the clock and the confirm book), so
 //! a test injects fakes. Registering a poise command and sending the ephemeral reply belong to
