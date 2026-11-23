@@ -6,8 +6,9 @@ full `u64` range. The segment column admits only decimal digits, minus signs and
 its parser validates the format and the ledger validates the ordered, non-overlapping stretches.
 
 Only the configured nonzero home guild is in scope. Webhooks, bots and disallowed channels
-do not count. The Feature ignores an entire voice update if its new state lacks `member`
-(including a leave), and reports `activity_voice_member_missing` without changing the ledger.
+do not count. If a voice update lacks `member`, the Feature reports
+`activity_voice_member_missing` and closes any tracked session at the update time, subject
+to the usual privacy and accounting rules. It never opens a session or enters a new channel.
 AC1 decides voice credit, including AFK, self-deafening, moves and UTC midnight splits.
 Diagnostics have stable codes, not SQL or user data.
 
@@ -57,8 +58,8 @@ RED `d31a94a`: `timeout 300 cargo test --locked --offline activity::` returned 1
 9 failed, 88 passed. Failures: config; snapshot round trip and validation; schema; exclusions
 and shutdown; heartbeat/deafening/midnight; transaction retry; corrupt-row recovery; seeded
 SQLite checkpoint/restart model. The missing-home/no-store test passed against the scaffold.
-After the migration return-type fix, all 1,551 unit tests and 52 integration tests passed
-offline. Targeted tests failed when UTC midnight splitting, snapshot overlap rejection,
+In round 3, all 1,569 unit tests and 52 integration tests passed offline.
+Targeted tests failed when UTC midnight splitting, snapshot overlap rejection,
 the persisted heartbeat cap, or the message privacy gate was deliberately broken. Each
 mutation was reverted.
 

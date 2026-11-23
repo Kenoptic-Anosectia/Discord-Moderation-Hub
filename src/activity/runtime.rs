@@ -410,26 +410,29 @@ impl ActivityFeature {
                 serenity::FullEvent::VoiceStateUpdate { old, new }
                     if new.guild_id.is_some_and(|id| id.get() == guild) =>
                 {
-                    let Some(member) = &new.member else {
-                        drop(runtime);
-                        self.ports.report("activity_voice_member_missing");
-                        return;
-                    };
-                    if member.user.bot {
+                    if new.member.as_ref().is_some_and(|member| member.user.bot) {
                         return;
                     }
-                    let old_channel = old
-                        .as_ref()
-                        .and_then(|state| state.channel_id)
-                        .map(|id| id.get());
-                    let new_channel = new.channel_id.map(|id| id.get());
+                    let user_id = new.user_id.get();
+                    let member_missing = new.member.is_none();
+                    let (old_channel, new_channel) = if member_missing {
+                        // Without a member, only close what the ledger already tracks.
+                        (runtime.ledger.open_channel(guild, user_id), None)
+                    } else {
+                        (
+                            old.as_ref()
+                                .and_then(|state| state.channel_id)
+                                .map(|id| id.get()),
+                            new.channel_id.map(|id| id.get()),
+                        )
+                    };
                     let allowed = |channel: Option<u64>| {
                         channel.is_none_or(|id| self.ports.channel_allowed(guild, id))
                     };
-                    runtime.observe(Input::Voice {
+                    let mut codes = runtime.observe(Input::Voice {
                         event: VoiceEvent {
                             guild_id: guild,
-                            user_id: new.user_id.get(),
+                            user_id,
                             old_channel,
                             new_channel,
                             self_deaf: new.self_deaf,
@@ -437,7 +440,11 @@ impl ActivityFeature {
                         },
                         old_allowed: allowed(old_channel),
                         new_allowed: allowed(new_channel),
-                    })
+                    });
+                    if member_missing {
+                        codes.push("activity_voice_member_missing");
+                    }
+                    codes
                 }
                 _ => return,
             }
