@@ -5,10 +5,11 @@ migrates only its own tables in shared `core.sqlite`. IDs are decimal strings to
 full `u64` range. The segment column admits only decimal digits, minus signs and delimiters;
 its parser validates the format and the ledger validates the ordered, non-overlapping stretches.
 
-Only the configured nonzero home guild is in scope. Webhooks (including any repeated text),
-bot messages and disallowed channels do not count. AC1 decides voice credit, including AFK,
-self-deafening, moves and UTC midnight splits. The AC1 mismatch documentation is corrected to
-match the approved leave/move behavior. Diagnostics have stable codes, not SQL or user data.
+Only the configured nonzero home guild is in scope. Webhooks, bots and disallowed channels
+do not count. The Feature ignores an entire voice update if its new state lacks `member`
+(including a leave), and reports `activity_voice_member_missing` without changing the ledger.
+AC1 decides voice credit, including AFK, self-deafening, moves and UTC midnight splits.
+Diagnostics have stable codes, not SQL or user data.
 
 The runtime batches totals and writes open snapshots at a shared 30-second flush/heartbeat
 cadence. One transaction applies the totals and replaces the guild's open rows, so a failed
@@ -44,6 +45,12 @@ The parser accepts an injected lookup. Refusals name only the key; leave the fea
 No environment read, command, registration, production migration or call from `main.rs`.
 Owner decision D13 (including privacy sign-off) is required before activation.
 
+## Limits (unchanged in round 2)
+
+- AC1 forfeits sessions requiring more than 366 records (`MAX_SESSION_RECORDS`).
+- The synchronous event-handler lock can block for the duration of a SQLite commit.
+- Changing the home guild leaves old guild checkpoint rows in place; AC2 does not read them.
+
 ## Offline evidence
 
 RED `d31a94a`: `timeout 300 cargo test --locked --offline activity::` returned 101:
@@ -54,3 +61,5 @@ After the migration return-type fix, all 1,551 unit tests and 52 integration tes
 offline. Targeted tests failed when UTC midnight splitting, snapshot overlap rejection,
 the persisted heartbeat cap, or the message privacy gate was deliberately broken. Each
 mutation was reverted.
+
+Round 2 RED `135756a`: 109 passed and 2 failed (bot and missing-member voice both opened rows).

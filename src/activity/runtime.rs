@@ -410,6 +410,14 @@ impl ActivityFeature {
                 serenity::FullEvent::VoiceStateUpdate { old, new }
                     if new.guild_id.is_some_and(|id| id.get() == guild) =>
                 {
+                    let Some(member) = &new.member else {
+                        drop(runtime);
+                        self.ports.report("activity_voice_member_missing");
+                        return;
+                    };
+                    if member.user.bot {
+                        return;
+                    }
                     let old_channel = old
                         .as_ref()
                         .and_then(|state| state.channel_id)
