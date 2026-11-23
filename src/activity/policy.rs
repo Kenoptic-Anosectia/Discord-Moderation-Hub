@@ -832,6 +832,159 @@ impl Ledger {
 }
 
 #[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_restart_matches_uninterrupted_self_deaf_stretches() {
+        let cfg = ActivityConfig::new(vec![], None, false).unwrap();
+        let mut ledger = Ledger::new();
+        for (at, old_channel, self_deaf) in
+            [(10, None, false), (20, Some(3), true), (30, Some(3), false)]
+        {
+            ledger.apply_voice(
+                &VoiceEvent {
+                    guild_id: 1,
+                    user_id: 2,
+                    old_channel,
+                    new_channel: Some(3),
+                    self_deaf,
+                    at,
+                },
+                &cfg,
+            );
+        }
+        let mut restored = Ledger::restore(ledger.snapshot_open()).unwrap();
+        let expected = ledger.note_restart(9_000, 40, &cfg);
+        assert_eq!(expected.sessions.iter().map(|s| s.seconds).sum::<u64>(), 20);
+        assert_eq!(restored.note_restart(9_000, 40, &cfg), expected);
+    }
+
+    #[test]
+    fn snapshot_restore_refuses_every_invalid_shape() {
+        let segment = SegmentSnapshot {
+            start: 0,
+            end: 1,
+            self_deaf: false,
+        };
+        let valid = OpenSnapshot {
+            guild_id: 1,
+            user_id: 2,
+            channel_id: 3,
+            segments: vec![segment],
+        };
+        let cases = [
+            (
+                vec![OpenSnapshot {
+                    guild_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    user_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    channel_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![],
+                    ..valid.clone()
+                }],
+                "snapshot_empty",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![segment; MAX_SNAPSHOT_SEGMENTS + 1],
+                    ..valid.clone()
+                }],
+                "snapshot_too_many_segments",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![SegmentSnapshot { end: -1, ..segment }],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![segment, segment],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![
+                        segment,
+                        SegmentSnapshot {
+                            start: -2,
+                            end: -1,
+                            ..segment
+                        },
+                    ],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (vec![valid.clone(), valid], "snapshot_duplicate_open"),
+        ];
+        for (snapshots, code) in cases {
+            assert_eq!(
+                Ledger::restore(snapshots).err().map(|e| e.code()),
+                Some(code)
+            );
+        }
+    }
+}
+
+pub const MAX_SNAPSHOT_SEGMENTS: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSnapshot {
+    pub start: i64,
+    pub end: i64,
+    pub self_deaf: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSnapshot {
+    pub guild_id: u64,
+    pub user_id: u64,
+    pub channel_id: u64,
+    pub segments: Vec<SegmentSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreError;
+
+impl RestoreError {
+    pub fn code(self) -> &'static str {
+        "snapshot_unimplemented"
+    }
+}
+
+impl Ledger {
+    pub fn snapshot_open(&self) -> Vec<OpenSnapshot> {
+        Vec::new()
+    }
+
+    pub fn restore(_: impl IntoIterator<Item = OpenSnapshot>) -> Result<Self, RestoreError> {
+        Ok(Self::new())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
