@@ -416,6 +416,26 @@ pub fn set_published(
     Ok(())
 }
 
+/// Clears the recorded location of a menu.
+///
+/// The channel, the message and the embed key are set to null, so the menu
+/// may be published again somewhere else. The menu row itself and its
+/// options are untouched.
+///
+/// A menu that is not stored is refused with [`RepoError::MenuMissing`].
+pub fn clear_published(conn: &Connection, menu_id: i64) -> Result<(), RepoError> {
+    let n = conn
+        .execute(
+            "UPDATE role_menus SET channel = NULL, message = NULL, embed_key = NULL WHERE id = ?1",
+            params![menu_id],
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+    if n != 1 {
+        return Err(RepoError::MenuMissing);
+    }
+    Ok(())
+}
+
 /// What a menu deletion removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deleted {
@@ -771,6 +791,29 @@ mod tests {
             set_published(&conn, 999, CHANNEL, MESSAGE, None),
             Err(RepoError::MenuMissing)
         );
+    }
+
+    #[test]
+    fn clear_published_clears_the_location_and_keeps_the_menu_and_its_options() {
+        let conn = mem();
+        let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+        add_option(&conn, id, ROLE_A, "Alpha", "a").unwrap();
+        set_published(&conn, id, CHANNEL, MESSAGE, Some("main")).unwrap();
+
+        clear_published(&conn, id).unwrap();
+        let menu = get_menu(&conn, GUILD, "main").unwrap().unwrap();
+        assert_eq!(menu.channel, None, "the channel is cleared");
+        assert_eq!(menu.message, None, "the message is cleared");
+        assert_eq!(menu.embed_key, None, "the embed key is cleared");
+        // The menu and its options are untouched.
+        assert_eq!(menu.key, "main");
+        assert_eq!(list_options(&conn, id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clear_published_on_a_missing_menu_is_refused() {
+        let conn = mem();
+        assert_eq!(clear_published(&conn, 999), Err(RepoError::MenuMissing));
     }
 
     #[test]

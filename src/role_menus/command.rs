@@ -130,6 +130,10 @@ pub enum Code {
     DiscordForbidden,
     /// The recorded message does not exist any more.
     MessageGone,
+    /// The channel the menu was posted in does not exist any more.
+    ChannelGone,
+    /// The recorded location of the menu was cleared.
+    Unpublished,
     /// The role facts could not be looked up.
     FactsUnavailable,
     /// The stored row could not be understood.
@@ -169,6 +173,8 @@ impl Code {
             Code::DiscordFailed => "discord_failed",
             Code::DiscordForbidden => "discord_forbidden",
             Code::MessageGone => "message_gone",
+            Code::ChannelGone => "channel_gone",
+            Code::Unpublished => "unpublished",
             Code::FactsUnavailable => "facts_unavailable",
             Code::CorruptRow => "corrupt_row",
         }
@@ -318,6 +324,17 @@ pub struct PostRequest<'a> {
     pub channel: u64,
 }
 
+/// `/rolemenu unpublish <key>`.
+#[derive(Debug, Clone, Copy)]
+pub struct UnpublishRequest<'a> {
+    /// Who is calling.
+    pub invoker: Invoker,
+    /// The guild the command was used in.
+    pub guild: u64,
+    /// The menu key.
+    pub key: &'a str,
+}
+
 /// `/rolemenu list`.
 #[derive(Debug, Clone, Copy)]
 pub struct ListRequest {
@@ -390,6 +407,11 @@ pub trait MenuStore: Send + Sync {
         message: u64,
         embed_key: Option<&str>,
     ) -> Result<(), RepoError>;
+    /// Clears the recorded location of a menu.
+    ///
+    /// Used by the reset path: a menu whose channel was deleted can only be
+    /// published again after its recorded channel and message were cleared.
+    async fn clear_published(&self, menu_id: i64) -> Result<(), RepoError>;
 }
 
 /// One select component of a menu, ready to be rendered.
@@ -418,7 +440,17 @@ pub enum DiscordError {
     /// The bot may not do this.
     Forbidden,
     /// The message the call named does not exist any more.
+    ///
+    /// The message is gone but the channel is still there: the caller may
+    /// send a new message in its place.
     NotFound,
+    /// The channel the call named does not exist any more.
+    ///
+    /// A deleted channel is not a deleted message: a new message cannot be
+    /// sent into it either, so the recorded location of a menu in that
+    /// channel is dead and must be cleared before the menu can be published
+    /// again.
+    ChannelGone,
     /// Anything else (transport error, missing channel, ...).
     Failed,
 }
@@ -488,6 +520,8 @@ pub fn validate_key(key: &str) -> Result<(), Code> {
 ///
 /// * no control character (the newline included),
 /// * no format character (`Cf`: zero-width and bidirectional marks),
+/// * no blank code point (see [`is_blank_char`]: the Hangul fillers, the
+///   braille blank and the rest of the default-ignorable set),
 /// * no line separator (`U+2028`) and no paragraph separator (`U+2029`),
 /// * no Discord mention markup (`<@…>`, `<#…>`, `<:…>`, `<a:…>`),
 /// * and it must hold at least one visible character, so a label that is only
@@ -498,6 +532,9 @@ pub fn validate_label(label: &str) -> Result<(), Code> {
         return Err(Code::InvalidLabel);
     }
     if trimmed.chars().any(is_forbidden_label_char) {
+        return Err(Code::InvalidLabel);
+    }
+    if trimmed.chars().any(is_blank_char) {
         return Err(Code::InvalidLabel);
     }
     if holds_markup(trimmed) {
@@ -523,6 +560,36 @@ fn is_forbidden_label_char(c: char) -> bool {
         return true;
     }
     matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// True for a character an emoji may not hold.
+///
+/// An emoji is not free text: it may not hide behind a control character, a
+/// bidirectional mark or a zero-width mark. Three code points are NOT
+/// refused: the zero-width joiner and the two variation selectors, because
+/// they are what joins the parts of one emoji (a family, a skin tone, a
+/// heart).
+fn is_forbidden_emoji_char(c: char) -> bool {
+    if c.is_control() {
+        return true;
+    }
+    if is_emoji_mark(c) {
+        return false;
+    }
+    // A bidirectional or invisible mark other than the joiner.
+    if is_format_char(c) {
+        return true;
+    }
+    // A blank code point.
+    if is_blank_char(c) {
+        return true;
+    }
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// True for the marks that join the parts of one emoji.
+fn is_emoji_mark(c: char) -> bool {
+    matches!(c, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
 }
 
 /// True for a Unicode format character (`Cf`).
@@ -556,8 +623,43 @@ fn is_format_char(c: char) -> bool {
 }
 
 /// True for a character that is shown to the reader.
+///
+/// A character shows nothing when it is whitespace, a control character, a
+/// format character or one of the blank code points (see
+/// [`is_blank_char`]).
 fn is_visible_char(c: char) -> bool {
-    !c.is_whitespace() && !c.is_control() && !is_format_char(c)
+    !c.is_whitespace() && !c.is_control() && !is_format_char(c) && !is_blank_char(c)
+}
+
+/// True for a code point that occupies space but shows the reader nothing.
+///
+/// These are the Unicode DEFAULT IGNORABLE code points that are not already
+/// format characters, plus the blank fillers: the Hangul fillers, the
+/// braille blank and the Khmer inherent vowels. A label that holds only
+/// these would look empty, so it is refused.
+///
+/// The set is a class, not a list of examples: every code point in these
+/// ranges is refused, not only the ones named here.
+fn is_blank_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' // SOFT HYPHEN
+            | '\u{034F}' // COMBINING GRAPHEME JOINER
+            | '\u{061C}' // ARABIC LETTER MARK
+            | '\u{115F}'..='\u{1160}' // HANGUL CHOSEONG/JUNGSEONG FILLER
+            | '\u{17B4}'..='\u{17B5}' // KHMER VOWEL INHERENT AQ/AA
+            | '\u{180B}'..='\u{180F}' // MONGOLIAN FREE VARIATION SELECTORS
+            | '\u{200B}'..='\u{200F}' // ZERO WIDTH SPACE AND MARKS
+            | '\u{202A}'..='\u{202E}' // BIDIRECTIONAL FORMATTING
+            | '\u{2060}'..='\u{206F}' // WORD JOINER AND DIRECTIONAL FORMATTING
+            | '\u{2800}' // BRAILLE PATTERN BLANK
+            | '\u{3164}' // HANGUL FILLER
+            | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE
+            | '\u{FFA0}' // HALFWIDTH HANGUL FILLER
+            | '\u{FFF9}'..='\u{FFFB}' // INTERLINEAR ANNOTATION
+            | '\u{E0000}'..='\u{E0FFF}' // TAGS AND VARIATION SELECTORS
+            | '\u{FE00}'..='\u{FE0F}' // VARIATION SELECTORS
+    )
 }
 
 /// True when the text holds Discord markup that would be rendered as a
@@ -578,8 +680,15 @@ fn holds_markup(text: &str) -> bool {
 /// * a custom emoji in the Discord form `<name:id>` or `<a:name:id>`, where
 ///   the name is two to thirty-two characters of letters, digits and
 ///   underscores and the id is a number that is not zero,
-/// * a plain Unicode emoji: one or more emoji code points, with no
-///   whitespace, no markup and no character that could hide it.
+/// * a plain Unicode emoji: EXACTLY ONE emoji, with no whitespace, no
+///   markup and no character that could hide it.
+///
+/// "Exactly one" is the whole rule: Discord shows one emoji next to a select
+/// option, so a string that holds two emoji (`"🎉🎉"`) or a skin tone
+/// without its base (`"🏻"`) is refused. One emoji is a base code point,
+/// optionally followed by a variation selector, a skin tone, a keycap mark,
+/// or more parts joined with the zero-width joiner; a flag is a pair of
+/// regional indicators.
 ///
 /// Everything else is refused, so free text, a mention, a link and a
 /// zero-width mark can never be stored as the emoji of an option.
@@ -591,13 +700,13 @@ pub fn validate_emoji(emoji: &str) -> Result<(), Code> {
     if trimmed.chars().any(char::is_whitespace) {
         return Err(Code::InvalidEmoji);
     }
-    if trimmed.chars().any(is_forbidden_label_char) {
+    if trimmed.chars().any(is_forbidden_emoji_char) {
         return Err(Code::InvalidEmoji);
     }
     if trimmed.starts_with('<') {
         return validate_custom_emoji(trimmed);
     }
-    if trimmed.chars().all(is_emoji_char) && trimmed.chars().any(is_emoji_base) {
+    if is_single_emoji(trimmed) {
         return Ok(());
     }
     Err(Code::InvalidEmoji)
@@ -633,20 +742,81 @@ fn validate_custom_emoji(text: &str) -> Result<(), Code> {
     Ok(())
 }
 
-/// True for a code point that may be part of a plain Unicode emoji.
+/// True when the text is exactly one Unicode emoji.
 ///
-/// The set holds the emoji blocks and the few marks that join emoji parts
-/// (the joiner, the variation selectors, the skin tones and the keycap mark).
-fn is_emoji_char(c: char) -> bool {
-    is_emoji_base(c)
-        || matches!(
-            c,
-            '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}'
-        )
+/// The text is walked as a sequence of emoji parts. One part is an emoji
+/// base code point, optionally followed by a variation selector, a skin
+/// tone or the keycap mark; more parts may be joined with the zero-width
+/// joiner. A regional indicator pair is one flag. The whole text must be
+/// ONE such sequence: a second base that is not joined to the first makes
+/// the string two emoji, and it is refused.
+fn is_single_emoji(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
+    // A flag: two regional indicators.
+    if index < chars.len() && is_regional_indicator(chars[index]) {
+        return chars.len() == 2 && is_regional_indicator(chars[1]);
+    }
+    if index >= chars.len() {
+        return false;
+    }
+    // A keycap: an ASCII digit, a variation selector and the keycap mark.
+    if chars[index].is_ascii_digit() {
+        let mut cursor = index + 1;
+        if cursor < chars.len() && chars[cursor] == '\u{FE0F}' {
+            cursor += 1;
+        }
+        return cursor < chars.len() && chars[cursor] == '\u{20E3}' && cursor + 1 == chars.len();
+    }
+    if !is_emoji_base(chars[index]) {
+        return false;
+    }
+    index += 1;
+    // The marks that may follow the base. At most one variation selector:
+    // two of them are not one emoji.
+    let mut variation_seen = false;
+    while index < chars.len() {
+        match chars[index] {
+            '\u{FE0E}' | '\u{FE0F}' => {
+                if variation_seen {
+                    return false;
+                }
+                variation_seen = true;
+                index += 1;
+            }
+            '\u{20E3}' => {
+                index += 1;
+                // A keycap mark is the last part of this emoji.
+                break;
+            }
+            c if is_skin_tone(c) => {
+                index += 1;
+                // A skin tone is the last part of this emoji.
+                break;
+            }
+            '\u{200D}' => {
+                // A joined part: the joiner must be followed by a base.
+                index += 1;
+                if index >= chars.len() || !is_emoji_base(chars[index]) {
+                    return false;
+                }
+                index += 1;
+                variation_seen = false;
+            }
+            _ => return false,
+        }
+    }
+    index == chars.len()
 }
 
 /// True for a code point that is an emoji on its own.
+///
+/// A skin-tone modifier and a regional indicator are NOT bases: they are
+/// parts that must follow a base (or another regional indicator).
 fn is_emoji_base(c: char) -> bool {
+    if is_skin_tone(c) || is_regional_indicator(c) {
+        return false;
+    }
     matches!(
         c,
         '\u{00A9}' | '\u{00AE}'
@@ -667,6 +837,16 @@ fn is_emoji_base(c: char) -> bool {
             | '\u{3299}'
             | '\u{1F000}'..='\u{1FAFF}'
     )
+}
+
+/// True for a skin-tone modifier (`U+1F3FB` to `U+1F3FF`).
+fn is_skin_tone(c: char) -> bool {
+    matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
+}
+
+/// True for a regional indicator, the half of a flag.
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
 /// Splits the options of a menu into the select components of one message.
@@ -971,6 +1151,13 @@ pub async fn remove_option<S: MenuStore + ?Sized>(
 /// When the recorded message no longer exists (a moderator deleted it), the
 /// call is not lost: a new message is sent into the recorded channel and the
 /// row records it. That is reported as [`Code::Reposted`].
+///
+/// When the recorded CHANNEL no longer exists (a moderator deleted the whole
+/// channel), the recorded location is dead: the call is refused with
+/// [`Code::ChannelGone`] and the row is left unchanged, because a message
+/// cannot be sent into a channel that is gone either. The way out is
+/// [`unpublish`], which clears the recorded location, after which the next
+/// `post` sends the menu into the channel the staff names.
 pub async fn post<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
     store: &S,
     discord: &D,
@@ -1032,6 +1219,41 @@ pub async fn post<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
     }
 }
 
+/// `/rolemenu unpublish <key>`.
+///
+/// Clears the recorded location of a menu, so it may be published again.
+///
+/// This is the way out of a dead location: when the channel a menu was
+/// posted in is deleted for good, `post` answers `channel_gone` and the
+/// recorded channel and message stay. `unpublish` clears them, and the next
+/// `post` sends the menu into the channel the staff names.
+///
+/// The menu and its options are untouched: only the recorded channel, the
+/// recorded message and the embed key are cleared. No member role is
+/// touched.
+pub async fn unpublish<S: MenuStore + ?Sized>(
+    store: &S,
+    settings: &Settings,
+    req: &UnpublishRequest<'_>,
+) -> Outcome {
+    if let Err(outcome) = gate(settings, &req.invoker, req.guild) {
+        return outcome;
+    }
+    if validate_key(req.key).is_err() {
+        return Outcome::new(Code::InvalidKey);
+    }
+    let menu = match store.get_menu(req.guild, req.key).await {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return Outcome::new(Code::MenuNotFound),
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    };
+    match store.clear_published(menu.id).await {
+        Ok(()) => Outcome::new(Code::Unpublished),
+        Err(RepoError::MenuMissing) => Outcome::new(Code::MenuNotFound),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
+}
+
 /// Sends a new message for a menu whose recorded message is gone.
 ///
 /// The row is only changed when the new message was really sent: a failed
@@ -1061,6 +1283,7 @@ fn discord_error(error: DiscordError) -> Outcome {
     match error {
         DiscordError::Forbidden => Outcome::new(Code::DiscordForbidden),
         DiscordError::NotFound => Outcome::new(Code::MessageGone),
+        DiscordError::ChannelGone => Outcome::new(Code::ChannelGone),
         DiscordError::Failed => Outcome::new(Code::DiscordFailed),
     }
 }
@@ -1354,6 +1577,26 @@ mod tests {
             }
             Err(RepoError::MenuMissing)
         }
+
+        async fn clear_published(&self, menu_id: i64) -> Result<(), RepoError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("clear_published {menu_id}"));
+            if let Some(error) = self.fail {
+                return Err(error);
+            }
+            let mut menus = self.menus.lock().unwrap();
+            for menu in menus.iter_mut() {
+                if menu.id == menu_id {
+                    menu.channel = None;
+                    menu.message = None;
+                    menu.embed_key = None;
+                    return Ok(());
+                }
+            }
+            Err(RepoError::MenuMissing)
+        }
     }
 
     /// A Discord fake that records the calls it was given.
@@ -1365,6 +1608,8 @@ mod tests {
         fail: Option<DiscordError>,
         /// When set, every edit fails with this error (a deleted message).
         fail_edit: Option<DiscordError>,
+        /// When set, every call into this channel fails with `ChannelGone`.
+        gone_channel: Option<u64>,
         next_message: Mutex<u64>,
     }
 
@@ -1393,6 +1638,9 @@ mod tests {
             chunks: &[RenderedChunk],
         ) -> Result<u64, DiscordError> {
             self.sends.lock().unwrap().push((channel, chunks.to_vec()));
+            if self.gone_channel == Some(channel) {
+                return Err(DiscordError::ChannelGone);
+            }
             if let Some(error) = self.fail {
                 return Err(error);
             }
@@ -1412,6 +1660,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((channel, message, chunks.to_vec()));
+            if self.gone_channel == Some(channel) {
+                return Err(DiscordError::ChannelGone);
+            }
             if let Some(error) = self.fail_edit {
                 return Err(error);
             }
@@ -1501,6 +1752,11 @@ mod tests {
             crate::role_menus::repository::set_published(
                 &conn, menu_id, channel, message, embed_key,
             )
+        }
+
+        async fn clear_published(&self, menu_id: i64) -> Result<(), RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::clear_published(&conn, menu_id)
         }
     }
 
@@ -1783,7 +2039,15 @@ mod tests {
             validate_emoji(&"🎉".repeat(MAX_EMOJI_CHARS + 1)),
             Err(Code::InvalidEmoji)
         );
-        assert_eq!(validate_emoji(&"🎉".repeat(MAX_EMOJI_CHARS)), Ok(()));
+        // A string of many emoji is refused as well: it is not ONE emoji.
+        assert_eq!(
+            validate_emoji(&"🎉".repeat(MAX_EMOJI_CHARS)),
+            Err(Code::InvalidEmoji)
+        );
+        // The length bound still bites on one long emoji: a ZWJ chain of
+        // bases is longer than the limit.
+        let long_chain = "👨".repeat(MAX_EMOJI_CHARS) + "‍";
+        assert_eq!(validate_emoji(&long_chain), Err(Code::InvalidEmoji));
         // A custom emoji with a bad name or id is refused.
         assert_eq!(validate_emoji("<:a:650101>"), Err(Code::InvalidEmoji));
         assert_eq!(validate_emoji("<:party:0>"), Err(Code::InvalidEmoji));
@@ -2878,12 +3142,275 @@ mod tests {
         assert_eq!(menu.channel, Some(CHANNEL));
     }
 
+    /// A seeded sequence over a channel that is deleted for good.
+    ///
+    /// The channel never comes back: every call into it reports that it is
+    /// gone. The sequence asserts that the command never pretends to have
+    /// published the menu, that the row is never changed by the failed call,
+    /// and that the reset path (`unpublish`) always brings the menu back to a
+    /// published state in a channel that exists.
+    #[tokio::test]
+    async fn a_seeded_gone_channel_sequence_always_reaches_a_published_menu() {
+        let path = scratch_db("gone-channel-liveness");
+        let store = SqlStore::open(&path);
+        let mut discord = FakeDiscord::new();
+        seed_menu_sql(&store, "main", &[ROLE_OK]).await;
+        assert_eq!(
+            post(&store, &discord, &settings(), &post_req("main")).await,
+            Outcome::new(Code::Posted)
+        );
+
+        let mut rng = Lcg(0x000A_11CE_5EED_0001);
+        let mut recovered = 0;
+        let mut published = 0;
+        for _ in 0..40 {
+            // The channel the menu currently lives in is deleted for good.
+            let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+            let live = menu.channel.unwrap();
+            discord.gone_channel = Some(live);
+
+            // The row before the call.
+            let before = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+            let before = (before.channel, before.message);
+            let mut req = post_req("main");
+            req.channel = live;
+            let outcome = post(&store, &discord, &settings(), &req).await;
+            assert_eq!(
+                outcome,
+                Outcome::new(Code::ChannelGone),
+                "a gone channel never publishes"
+            );
+            let after = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+            assert_eq!(
+                (after.channel, after.message),
+                before,
+                "the row is unchanged by the failed call"
+            );
+
+            // Every few steps the staff reset the menu and post it again in a
+            // channel that exists.
+            if rng.next(3) == 0 {
+                let outcome = unpublish(
+                    &store,
+                    &settings(),
+                    &UnpublishRequest {
+                        invoker: staff(),
+                        guild: GUILD,
+                        key: "main",
+                    },
+                )
+                .await;
+                assert_eq!(outcome, Outcome::new(Code::Unpublished));
+                discord.gone_channel = None;
+                let mut req = post_req("main");
+                req.channel = live + 1;
+                assert_eq!(
+                    post(&store, &discord, &settings(), &req).await,
+                    Outcome::new(Code::Posted)
+                );
+                let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+                assert_eq!(menu.channel, Some(live + 1));
+                assert!(menu.message.is_some(), "the menu is published again");
+                recovered += 1;
+                published += 1;
+            }
+        }
+        assert!(recovered > 0, "the sequence never exercised the reset path");
+        assert_eq!(published, recovered, "every reset published the menu");
+    }
+
     /// Creates a menu with options over a store, without the command layer.
     async fn seed_menu_sql(store: &SqlStore, key: &str, roles: &[u64]) {
         let id = store.create_menu(GUILD, key, "exclusive", 0).await.unwrap();
         for role in roles {
             store.add_option(id, *role, "Label", "🎉").await.unwrap();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A deleted channel: the way out
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_deleted_channel_is_reported_and_the_row_is_left_alone() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+        let before = store.menu(GUILD, "main").unwrap();
+
+        // A moderator deleted the whole channel the menu lived in.
+        discord.gone_channel = Some(CHANNEL);
+        for _ in 0..25 {
+            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+            assert_eq!(
+                outcome,
+                Outcome::new(Code::ChannelGone),
+                "a gone channel has its own code"
+            );
+        }
+        let after = store.menu(GUILD, "main").unwrap();
+        assert_eq!(after.channel, before.channel, "the row is unchanged");
+        assert_eq!(after.message, before.message);
+        assert_eq!(
+            discord.send_count(),
+            1,
+            "no message was sent into the gone channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpublish_clears_the_recorded_location_and_the_menu_is_posted_again() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+
+        // The channel is gone for good: `post` cannot fix the row.
+        discord.gone_channel = Some(CHANNEL);
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::ChannelGone));
+
+        // The way out: unpublish clears the recorded location.
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::Unpublished));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(menu.channel, None, "the recorded channel is cleared");
+        assert_eq!(menu.message, None);
+        assert_eq!(menu.embed_key, None);
+        // The menu and its options are untouched.
+        assert_eq!(store.option_count(), 1, "the option is kept");
+        assert_eq!(store.menu(GUILD, "main").unwrap().key, "main");
+
+        // Now the menu can be posted into a channel that still exists.
+        discord.gone_channel = None;
+        let mut req = post_req("main");
+        req.channel = CHANNEL + 1;
+        let outcome = post(&store, &discord, &settings(), &req).await;
+        assert_eq!(outcome, Outcome::new(Code::Posted));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(menu.channel, Some(CHANNEL + 1), "the new place is recorded");
+        assert!(menu.message.is_some());
+    }
+
+    #[tokio::test]
+    async fn unpublish_of_a_missing_menu_is_refused_and_writes_nothing() {
+        let store = FakeStore::new();
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "ghost",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+        assert!(
+            !store
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("clear_published")),
+            "nothing was written"
+        );
+        assert!(store.menus.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpublish_by_a_non_staff_caller_is_denied_and_writes_nothing() {
+        let store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        let before = store.calls().len();
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: member(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::Denied));
+        assert_eq!(store.calls().len(), before, "nothing was read or written");
+    }
+
+    #[tokio::test]
+    async fn unpublish_in_a_foreign_guild_does_nothing() {
+        let store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        let before = store.calls().len();
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: OTHER_GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::OtherGuild));
+        assert_eq!(store.calls().len(), before, "nothing was read or written");
+    }
+
+    #[tokio::test]
+    async fn a_gone_channel_never_leaves_the_menu_unpublishable_over_the_real_database() {
+        let path = scratch_db("gone-channel");
+        let store = SqlStore::open(&path);
+        let mut discord = FakeDiscord::new();
+        seed_menu_sql(&store, "main", &[ROLE_OK]).await;
+        assert_eq!(
+            post(&store, &discord, &settings(), &post_req("main")).await,
+            Outcome::new(Code::Posted)
+        );
+
+        // The channel is deleted for good: every call into it fails.
+        discord.gone_channel = Some(CHANNEL);
+        for _ in 0..25 {
+            assert_eq!(
+                post(&store, &discord, &settings(), &post_req("main")).await,
+                Outcome::new(Code::ChannelGone)
+            );
+        }
+
+        // The reset path works over the real database too.
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::Unpublished));
+        let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+        assert_eq!(menu.channel, None);
+        assert_eq!(menu.message, None);
+
+        // And the menu is publishable again in a channel that exists.
+        discord.gone_channel = None;
+        let mut req = post_req("main");
+        req.channel = CHANNEL + 1;
+        assert_eq!(
+            post(&store, &discord, &settings(), &req).await,
+            Outcome::new(Code::Posted)
+        );
+        let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+        assert_eq!(menu.channel, Some(CHANNEL + 1));
+        assert!(menu.message.is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -2913,12 +3440,11 @@ mod tests {
             );
         }
         // A mix of fillers is refused as well.
-        assert_eq!(
-            validate_label("\u{3164}\u{2800}"),
-            Err(Code::InvalidLabel)
-        );
-        // A label with one visible character among them is kept.
-        assert_eq!(validate_label("A\u{3164}"), Ok(()));
+        assert_eq!(validate_label("\u{3164}\u{2800}"), Err(Code::InvalidLabel));
+        // A filler inside a label is refused too: the whole class is refused.
+        assert_eq!(validate_label("A\u{3164}"), Err(Code::InvalidLabel));
+        // An ordinary label with visible characters is kept.
+        assert_eq!(validate_label("Alpha"), Ok(()));
     }
 
     // -----------------------------------------------------------------------
@@ -2966,10 +3492,7 @@ mod tests {
         // The message is sent, but the row cannot be written.
         store.fail_publish = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
         let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
-        assert_eq!(
-            outcome,
-            Outcome::with(Code::StoreFailed, "sqlite_error")
-        );
+        assert_eq!(outcome, Outcome::with(Code::StoreFailed, "sqlite_error"));
         let menu = store.menu(GUILD, "main").unwrap();
         assert_eq!(menu.message, None, "the row is unchanged");
         assert_eq!(menu.channel, None);
