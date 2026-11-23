@@ -1757,6 +1757,21 @@ mod tests {
     // ------------------------------------------------------------------ info and list
 
     #[tokio::test]
+    async fn shadow_mode_reports_noops_as_noops_not_as_would_be_changes() {
+        let mut rig = Rig::new();
+        rig.env.mode = Mode::Shadow;
+        assert_eq!(
+            rig.add(&req(CALLER, TARGET, R_TARGET_TOP)).await.code,
+            "already_held"
+        );
+        assert_eq!(
+            rig.remove(&req(CALLER, TARGET, R_OK)).await.code,
+            "not_held"
+        );
+        assert!(rig.exec.calls.is_empty());
+    }
+
+    #[tokio::test]
     async fn info_reports_role_facts_and_is_read_only() {
         let mut rig = Rig::new();
         let info = rig.info(&info_req(CALLER, R_OK)).await;
@@ -1828,7 +1843,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_caps_the_number_of_roles_and_the_text_length() {
+    async fn list_never_names_the_everyone_role_even_if_the_source_returns_it() {
+        let rig = Rig::new();
+        rig.world
+            .lock()
+            .unwrap()
+            .members
+            .get_mut(&TARGET)
+            .unwrap()
+            .push(HOME);
+        let reply = rig.list(&list_req(CALLER, Some(TARGET))).await;
+        assert_eq!(reply.code, "role_list");
+        assert!(!reply.text.contains(&HOME.to_string()), "{}", reply.text);
+        assert!(reply.text.contains("1 role:"), "{}", reply.text);
+    }
+
+    #[tokio::test]
+    async fn list_cap_applies_to_the_number_of_roles_named() {
         let rig = Rig::new();
         {
             let mut world = rig.world.lock().unwrap();
@@ -1900,6 +1931,14 @@ mod tests {
                             assert_reply_shape(&reply);
                             seen.insert(reply.code);
                         }
+                        let passes_gate =
+                            mode != Mode::Off && caller != 0 && member != 0 && role != 0;
+                        let expected_audit = if passes_gate { 2 } else { 0 };
+                        assert_eq!(
+                            rig.audit.entries.len(),
+                            expected_audit,
+                            "{mode:?} {caller} {member} {role}"
+                        );
                     }
                 }
             }
