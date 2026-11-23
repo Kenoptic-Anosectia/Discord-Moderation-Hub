@@ -51,6 +51,9 @@ pub struct RoleAdminEnv {
     /// True when `PROTECTED_ROLE_IDS` had an unusable entry; the commands then fail closed.
     pub protected_roles_invalid: bool,
     pub safeword_restricted_role_ids: Vec<u64>,
+    /// True when `SAFEWORD_RESTRICTED_ROLE_IDS` had an unusable entry (the safeword config
+    /// refuses the whole list); the commands then fail closed instead of treating it as empty.
+    pub safeword_restricted_invalid: bool,
 }
 
 /// Writes one role change to Discord. `reason` is the audit-log reason.
@@ -965,6 +968,7 @@ mod tests {
             protected_role_ids: vec![R_PROT],
             protected_roles_invalid: false,
             safeword_restricted_role_ids: vec![R_RESTRICTED],
+            safeword_restricted_invalid: false,
         }
     }
 
@@ -1244,6 +1248,35 @@ mod tests {
             "protected_roles_invalid"
         );
         assert!(rig.nothing_touched());
+    }
+
+    #[tokio::test]
+    async fn unusable_safeword_restricted_config_fails_closed() {
+        let mut rig = Rig::new();
+        // The deny-list reaches the code as empty when the config was unusable; a member with
+        // an Active safeword must still not be handed a role.
+        rig.env.safeword_restricted_role_ids = Vec::new();
+        rig.env.safeword_restricted_invalid = true;
+        rig.safeword
+            .states
+            .insert(TARGET, Some(SafewordState::Active));
+        for reply in [
+            rig.add(&req(CALLER, TARGET, R_RESTRICTED)).await,
+            rig.add(&req(CALLER, TARGET, R_OK)).await,
+            rig.remove(&req(CALLER, TARGET, R_TARGET_TOP)).await,
+            rig.info(&info_req(CALLER, R_OK)).await,
+            rig.list(&list_req(CALLER, Some(TARGET))).await,
+        ] {
+            assert_eq!(reply.code, "safeword_restricted_invalid");
+            assert_reply_shape(&reply);
+        }
+        assert!(rig.nothing_touched());
+        // Control: with a usable (empty) list the same request is not refused for this reason.
+        rig.env.safeword_restricted_invalid = false;
+        assert_ne!(
+            rig.add(&req(CALLER, TARGET, R_OK)).await.code,
+            "safeword_restricted_invalid"
+        );
     }
 
     #[tokio::test]
