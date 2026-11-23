@@ -18,5 +18,7 @@
 //! allow once the runtime calls into the module.
 #![allow(dead_code)]
 
+pub mod command;
+pub mod config;
 pub mod posts;
 pub mod template;
