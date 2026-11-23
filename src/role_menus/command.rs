@@ -4021,6 +4021,9 @@ mod tests {
             // Another base straight after the skin tone, with no joiner.
             "\u{1F44D}\u{1F3FD}\u{1F44D}",
             "\u{1F64B}\u{1F3FD}\u{1F389}",
+            // Three joiner-less parts (odd lengths): each junction must be a joiner.
+            "\u{1F389}\u{1F389}\u{1F389}",
+            "\u{1F44D}\u{1F3FD}\u{1F389}\u{1F389}",
             // Two skin tones.
             "\u{1F44D}\u{1F3FD}\u{1F3FD}",
             "\u{1F44D}\u{1F3FB}\u{1F3FF}",
