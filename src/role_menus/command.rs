@@ -33,6 +33,14 @@ pub const MAX_LABEL_CHARS: usize = 100;
 /// Longest option emoji, in characters.
 pub const MAX_EMOJI_CHARS: usize = 64;
 
+/// Discord's limit of action rows in one message.
+pub const MAX_ROWS_PER_MESSAGE: usize = 5;
+
+/// The most options one menu may hold: Discord's five action rows of twenty-five
+/// options each. A menu that would need a sixth row is refused at configuration
+/// time instead of being sent and rejected by Discord.
+pub const MAX_OPTIONS_PER_MENU: usize = MAX_ROWS_PER_MESSAGE * SELECT_OPTION_LIMIT;
+
 /// The modes a menu may have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuMode {
@@ -88,12 +96,16 @@ pub enum Code {
     OptionNotFound,
     /// The role may not be granted through a menu.
     Ineligible,
-    /// The label is empty, too long or holds a control character.
+    /// The label is empty, too long or holds a character that may not be shown.
     InvalidLabel,
-    /// The emoji is empty, too long or holds a control character.
+    /// The emoji is empty, too long or is not an emoji.
     InvalidEmoji,
     /// The menu has no options yet.
     EmptyMenu,
+    /// The menu already holds as many options as one message may carry.
+    TooManyOptions,
+    /// The mode and the max-select do not fit together.
+    InvalidMode,
     /// The menu was created.
     Created,
     /// The option was added.
@@ -104,6 +116,10 @@ pub enum Code {
     Posted,
     /// The menu embed was edited in place.
     Edited,
+    /// The recorded message was gone: a new one was posted in its place.
+    Reposted,
+    /// The menu is posted in another channel than the one that was given.
+    ChannelMismatch,
     /// The menu was listed.
     Listed,
     /// The store could not be read or written.
@@ -112,6 +128,8 @@ pub enum Code {
     DiscordFailed,
     /// Discord refused the call (the bot may not do this).
     DiscordForbidden,
+    /// The recorded message does not exist any more.
+    MessageGone,
     /// The role facts could not be looked up.
     FactsUnavailable,
     /// The stored row could not be understood.
@@ -137,15 +155,20 @@ impl Code {
             Code::InvalidLabel => "invalid_label",
             Code::InvalidEmoji => "invalid_emoji",
             Code::EmptyMenu => "empty_menu",
+            Code::TooManyOptions => "too_many_options",
+            Code::InvalidMode => "invalid_mode",
             Code::Created => "created",
             Code::OptionAdded => "option_added",
             Code::OptionRemoved => "option_removed",
             Code::Posted => "posted",
             Code::Edited => "edited",
+            Code::Reposted => "reposted",
+            Code::ChannelMismatch => "channel_mismatch",
             Code::Listed => "listed",
             Code::StoreFailed => "store_failed",
             Code::DiscordFailed => "discord_failed",
             Code::DiscordForbidden => "discord_forbidden",
+            Code::MessageGone => "message_gone",
             Code::FactsUnavailable => "facts_unavailable",
             Code::CorruptRow => "corrupt_row",
         }
@@ -222,6 +245,9 @@ pub struct Invoker {
 /// card; this module reads them and nothing else.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
+    /// True when the feature is on (`ROLE_MENUS_MODE`). While it is off every
+    /// command says `disabled` and nothing is read or written.
+    pub enabled: bool,
     /// The one guild these commands serve (`GUILD_ID`).
     pub home_guild: Option<u64>,
     /// The staff role a caller must hold (`STAFF_ROLE_ID`).
@@ -354,6 +380,8 @@ pub trait MenuStore: Send + Sync {
     async fn list_options(&self, menu_id: i64) -> Result<Vec<OptionRow>, RepoError>;
     /// Deletes one option of a menu.
     async fn remove_option(&self, menu_id: i64, role: u64) -> Result<bool, RepoError>;
+    /// The number of options a menu holds.
+    async fn count_options(&self, menu_id: i64) -> Result<u32, RepoError>;
     /// Records where a menu was published.
     async fn set_published(
         &self,
@@ -389,6 +417,8 @@ pub struct RenderedChunk {
 pub enum DiscordError {
     /// The bot may not do this.
     Forbidden,
+    /// The message the call named does not exist any more.
+    NotFound,
     /// Anything else (transport error, missing channel, ...).
     Failed,
 }
@@ -399,7 +429,17 @@ pub trait MenuDiscord: Send + Sync {
     /// Sends a new menu message and returns its id.
     async fn send_menu(&self, channel: u64, chunks: &[RenderedChunk]) -> Result<u64, DiscordError>;
     /// Edits an existing menu message in place.
-    async fn edit_menu(&self, message: u64, chunks: &[RenderedChunk]) -> Result<(), DiscordError>;
+    ///
+    /// The channel is passed as well as the message: Discord needs both to
+    /// find the message. A message that no longer exists is reported as
+    /// [`DiscordError::NotFound`], never as a plain failure, so the caller can
+    /// post a new one in its place.
+    async fn edit_menu(
+        &self,
+        channel: u64,
+        message: u64,
+        chunks: &[RenderedChunk],
+    ) -> Result<(), DiscordError>;
 }
 
 /// Where the facts of a role come from.
@@ -440,41 +480,204 @@ pub fn validate_key(key: &str) -> Result<(), Code> {
     Ok(())
 }
 
-/// Checks that a label is usable: not empty, not too long and free of control
-/// characters other than a newline.
+/// Checks that a label is usable.
+///
+/// A label is plain text that Discord shows inside a select option. It must
+/// not be empty, not be longer than [`MAX_LABEL_CHARS`] characters and must
+/// not hold a character that could hide or fake the text:
+///
+/// * no control character (the newline included),
+/// * no format character (`Cf`: zero-width and bidirectional marks),
+/// * no line separator (`U+2028`) and no paragraph separator (`U+2029`),
+/// * no Discord mention markup (`<@…>`, `<#…>`, `<:…>`, `<a:…>`),
+/// * and it must hold at least one visible character, so a label that is only
+///   spaces or only invisible marks is refused.
 pub fn validate_label(label: &str) -> Result<(), Code> {
     let trimmed = label.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_LABEL_CHARS {
         return Err(Code::InvalidLabel);
     }
-    if trimmed.chars().any(|c| c.is_control() && c != '\n') {
+    if trimmed.chars().any(is_forbidden_label_char) {
+        return Err(Code::InvalidLabel);
+    }
+    if holds_markup(trimmed) {
+        return Err(Code::InvalidLabel);
+    }
+    // At least one visible character: whitespace alone is not a label.
+    if !trimmed.chars().any(is_visible_char) {
         return Err(Code::InvalidLabel);
     }
     Ok(())
 }
 
-/// Checks that an emoji is usable: not empty, not too long and free of control
-/// characters.
+/// True for a character a label may not hold.
 ///
-/// The control-character check runs on the raw input, before trimming, so a
-/// newline or a NUL hidden at the end of the input is refused instead of being
-/// trimmed away.
-pub fn validate_emoji(emoji: &str) -> Result<(), Code> {
-    if emoji.chars().any(char::is_control) {
-        return Err(Code::InvalidEmoji);
+/// The check is on the code point, not on the spelling: every control
+/// character, every format character (`Cf`) and the two Unicode separators
+/// are refused.
+fn is_forbidden_label_char(c: char) -> bool {
+    if c.is_control() {
+        return true;
     }
+    if is_format_char(c) {
+        return true;
+    }
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// True for a Unicode format character (`Cf`).
+///
+/// These are the zero-width and bidirectional marks: they change how the text
+/// is shown or read without changing what it says.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// True for a character that is shown to the reader.
+fn is_visible_char(c: char) -> bool {
+    !c.is_whitespace() && !c.is_control() && !is_format_char(c)
+}
+
+/// True when the text holds Discord markup that would be rendered as a
+/// mention or an emoji instead of as plain text.
+fn holds_markup(text: &str) -> bool {
+    for marker in ["<@", "<#", "<:", "<a:"] {
+        if text.contains(marker) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks that an emoji is usable.
+///
+/// Two spellings are accepted and nothing else:
+///
+/// * a custom emoji in the Discord form `<name:id>` or `<a:name:id>`, where
+///   the name is two to thirty-two characters of letters, digits and
+///   underscores and the id is a number that is not zero,
+/// * a plain Unicode emoji: one or more emoji code points, with no
+///   whitespace, no markup and no character that could hide it.
+///
+/// Everything else is refused, so free text, a mention, a link and a
+/// zero-width mark can never be stored as the emoji of an option.
+pub fn validate_emoji(emoji: &str) -> Result<(), Code> {
     let trimmed = emoji.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_EMOJI_CHARS {
+        return Err(Code::InvalidEmoji);
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(Code::InvalidEmoji);
+    }
+    if trimmed.chars().any(is_forbidden_label_char) {
+        return Err(Code::InvalidEmoji);
+    }
+    if trimmed.starts_with('<') {
+        return validate_custom_emoji(trimmed);
+    }
+    if trimmed.chars().all(is_emoji_char) && trimmed.chars().any(is_emoji_base) {
+        return Ok(());
+    }
+    Err(Code::InvalidEmoji)
+}
+
+/// Checks the Discord custom-emoji form `<name:id>` or `<a:name:id>`.
+fn validate_custom_emoji(text: &str) -> Result<(), Code> {
+    let Some(rest) = text.strip_prefix('<') else {
+        return Err(Code::InvalidEmoji);
+    };
+    let Some(rest) = rest.strip_prefix("a:").or_else(|| rest.strip_prefix(':')) else {
+        return Err(Code::InvalidEmoji);
+    };
+    let Some((name, id)) = rest.split_once(':') else {
+        return Err(Code::InvalidEmoji);
+    };
+    let Some(id) = id.strip_suffix('>') else {
+        return Err(Code::InvalidEmoji);
+    };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(Code::InvalidEmoji);
+    }
+    if id.parse::<u64>().unwrap_or(0) == 0 {
+        return Err(Code::InvalidEmoji);
+    }
+    let name_length = name.chars().count();
+    if !(2..=32).contains(&name_length) {
+        return Err(Code::InvalidEmoji);
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(Code::InvalidEmoji);
     }
     Ok(())
 }
 
-/// Splits the options of a menu into the chunks of one message.
+/// True for a code point that may be part of a plain Unicode emoji.
 ///
-/// A chunk holds at most [`SELECT_OPTION_LIMIT`] options, in the stored order,
-/// and no option is dropped: a menu with more options than fit on one message
-/// produces more chunks. The split is deterministic.
+/// The set holds the emoji blocks and the few marks that join emoji parts
+/// (the joiner, the variation selectors, the skin tones and the keycap mark).
+fn is_emoji_char(c: char) -> bool {
+    is_emoji_base(c)
+        || matches!(
+            c,
+            '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}'
+        )
+}
+
+/// True for a code point that is an emoji on its own.
+fn is_emoji_base(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00A9}' | '\u{00AE}'
+            | '\u{203C}'
+            | '\u{2049}'
+            | '\u{2122}'
+            | '\u{2139}'
+            | '\u{2190}'..='\u{21FF}'
+            | '\u{2300}'..='\u{23FF}'
+            | '\u{24C2}'
+            | '\u{25AA}'..='\u{25FE}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2934}'..='\u{2935}'
+            | '\u{2B00}'..='\u{2BFF}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+            | '\u{1F000}'..='\u{1FAFF}'
+    )
+}
+
+/// Splits the options of a menu into the select components of one message.
+///
+/// A component holds at most [`SELECT_OPTION_LIMIT`] options, in the stored
+/// order, and no option is dropped: a menu with more options than fit on one
+/// component produces more components. A menu never needs more than
+/// [`MAX_ROWS_PER_MESSAGE`] components, because a menu may not hold more than
+/// [`MAX_OPTIONS_PER_MENU`] options at all.
+///
+/// The split is deterministic.
 pub fn split_chunks(options: &[OptionRow]) -> Vec<RenderedChunk> {
     options
         .chunks(SELECT_OPTION_LIMIT)
@@ -494,12 +697,17 @@ pub fn split_chunks(options: &[OptionRow]) -> Vec<RenderedChunk> {
 }
 
 /// The policy menu of one stored menu, for the shared RM1 policy.
-pub fn to_policy_menu(menu: &MenuRow, options: &[OptionRow]) -> policy::Menu {
+///
+/// A stored mode that is not one of the two known spellings is refused with
+/// [`Code::CorruptRow`]: a mode the reader cannot understand must never fall
+/// back to a mode that is more permissive.
+pub fn to_policy_menu(menu: &MenuRow, options: &[OptionRow]) -> Result<policy::Menu, Code> {
     let mode = match MenuMode::parse(&menu.mode) {
         Some(MenuMode::Exclusive) => GroupMode::Exclusive,
-        _ => GroupMode::Multi,
+        Some(MenuMode::Multi) => GroupMode::Multi,
+        None => return Err(Code::CorruptRow),
     };
-    policy::Menu {
+    Ok(policy::Menu {
         key: menu.key.clone(),
         groups: vec![policy::Group {
             id: menu.key.clone(),
@@ -517,7 +725,7 @@ pub fn to_policy_menu(menu: &MenuRow, options: &[OptionRow]) -> policy::Menu {
                 })
                 .collect(),
         }],
-    }
+    })
 }
 
 /// The roles a menu may grant, as a set.
@@ -535,6 +743,9 @@ pub fn menu_roles(options: &[OptionRow]) -> BTreeSet<u64> {
 /// staff is `denied` whatever the guild; a guild that is not the home guild is
 /// `other_guild`; and a bot without "Manage Roles" may not configure anything.
 pub fn gate(settings: &Settings, invoker: &Invoker, guild: u64) -> Result<(), Outcome> {
+    if !settings.enabled {
+        return Err(Outcome::new(Code::Disabled));
+    }
     if !settings.bot_has_manage_roles {
         return Err(Outcome::new(Code::BotMissingManageRoles));
     }
@@ -623,7 +834,9 @@ pub fn list_reply(report: &ListReport) -> Reply {
 /// `/rolemenu create <key>`.
 ///
 /// Creates the menu row. The key is validated first, and a key that is
-/// already taken is refused.
+/// already taken is refused. An exclusive menu may not name a maximum number
+/// of options: the two rules do not fit together, and a menu that holds one
+/// rule must not be read as holding the other.
 pub async fn create<S: MenuStore + ?Sized>(
     store: &S,
     settings: &Settings,
@@ -635,12 +848,16 @@ pub async fn create<S: MenuStore + ?Sized>(
     if validate_key(req.key).is_err() {
         return Outcome::new(Code::InvalidKey);
     }
+    if req.mode == MenuMode::Exclusive && req.max_select > 0 {
+        return Outcome::new(Code::InvalidMode);
+    }
     match store
         .create_menu(req.guild, req.key, req.mode.as_str(), req.max_select)
         .await
     {
         Ok(_) => Outcome::new(Code::Created),
         Err(RepoError::KeyTaken) => Outcome::new(Code::KeyTaken),
+        Err(RepoError::InvalidMode) => Outcome::new(Code::InvalidMode),
         Err(error) => Outcome::with(Code::StoreFailed, error.code()),
     }
 }
@@ -678,6 +895,16 @@ pub async fn add_option<S: MenuStore + ?Sized, F: RoleFactsSource + ?Sized>(
         Ok(None) => return Outcome::new(Code::MenuNotFound),
         Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
     };
+    // A menu may not hold more options than one message may carry: Discord
+    // allows five action rows of twenty-five options. The option is refused
+    // here, never dropped later.
+    match store.count_options(menu.id).await {
+        Ok(count) if count as usize >= MAX_OPTIONS_PER_MENU => {
+            return Outcome::new(Code::TooManyOptions);
+        }
+        Ok(_) => {}
+        Err(error) => return Outcome::with(Code::StoreFailed, error.code()),
+    }
     let Some(role_facts) = facts.role_facts(req.guild, req.role).await else {
         return Outcome::new(Code::FactsUnavailable);
     };
@@ -731,6 +958,19 @@ pub async fn remove_option<S: MenuStore + ?Sized>(
 /// Posts the managed embed of the menu, or edits the message the row already
 /// names. The row is the truth: a menu that was already posted is edited, not
 /// posted again. A failed send leaves the row unchanged.
+///
+/// Three cases the row decides:
+///
+/// * the row names no message: a new message is sent into the requested
+///   channel and the row records it,
+/// * the row names a message in the requested channel: that message is edited,
+/// * the row names a message in another channel: the call is refused with
+///   [`Code::ChannelMismatch`] and nothing is sent or edited, because moving
+///   a published menu is not this command's business.
+///
+/// When the recorded message no longer exists (a moderator deleted it), the
+/// call is not lost: a new message is sent into the recorded channel and the
+/// row records it. That is reported as [`Code::Reposted`].
 pub async fn post<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
     store: &S,
     discord: &D,
@@ -759,35 +999,68 @@ pub async fn post<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
         return Outcome::new(Code::EmptyMenu);
     }
     let chunks = split_chunks(&options);
-    let already_posted = menu.message.is_some() && menu.channel.is_some();
-    let outcome = if already_posted {
-        let message = menu.message.unwrap_or(0);
-        match discord.edit_menu(message, &chunks).await {
-            Ok(()) => Outcome::new(Code::Edited),
-            Err(error) => return discord_error(error),
+    match (menu.channel, menu.message) {
+        // The row names a message in another channel than the one that was
+        // given: refuse, and touch nothing.
+        (Some(channel), Some(_message)) if channel != req.channel => {
+            Outcome::new(Code::ChannelMismatch)
         }
-    } else {
-        match discord.send_menu(req.channel, &chunks).await {
+        (Some(channel), Some(message)) => {
+            match discord.edit_menu(channel, message, &chunks).await {
+                Ok(()) => Outcome::new(Code::Edited),
+                Err(DiscordError::NotFound) => {
+                    // The recorded message is gone: post a new one in the
+                    // recorded channel and record it.
+                    repost(store, discord, menu.id, channel, req.key, &chunks).await
+                }
+                Err(error) => discord_error(error),
+            }
+        }
+        // The row names no message: send a new one.
+        _ => match discord.send_menu(req.channel, &chunks).await {
             Ok(message) => {
                 match store
                     .set_published(menu.id, req.channel, message, Some(req.key))
                     .await
                 {
                     Ok(()) => Outcome::new(Code::Posted),
-                    Err(error) => {
-                        return Outcome::with(Code::StoreFailed, error.code());
-                    }
+                    Err(error) => Outcome::with(Code::StoreFailed, error.code()),
                 }
             }
-            Err(error) => return discord_error(error),
-        }
+            Err(error) => discord_error(error),
+        },
+    }
+}
+
+/// Sends a new message for a menu whose recorded message is gone.
+///
+/// The row is only changed when the new message was really sent: a failed
+/// send leaves the row exactly as it was.
+async fn repost<S: MenuStore + ?Sized, D: MenuDiscord + ?Sized>(
+    store: &S,
+    discord: &D,
+    menu_id: i64,
+    channel: u64,
+    key: &str,
+    chunks: &[RenderedChunk],
+) -> Outcome {
+    let message = match discord.send_menu(channel, chunks).await {
+        Ok(message) => message,
+        Err(error) => return discord_error(error),
     };
-    outcome
+    match store
+        .set_published(menu_id, channel, message, Some(key))
+        .await
+    {
+        Ok(()) => Outcome::new(Code::Reposted),
+        Err(error) => Outcome::with(Code::StoreFailed, error.code()),
+    }
 }
 
 fn discord_error(error: DiscordError) -> Outcome {
     match error {
         DiscordError::Forbidden => Outcome::new(Code::DiscordForbidden),
+        DiscordError::NotFound => Outcome::new(Code::MessageGone),
         DiscordError::Failed => Outcome::new(Code::DiscordFailed),
     }
 }
@@ -1040,6 +1313,19 @@ mod tests {
             Ok(options.len() != before)
         }
 
+        async fn count_options(&self, menu_id: i64) -> Result<u32, RepoError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("count_options {menu_id}"));
+            if let Some(error) = self.fail {
+                return Err(error);
+            }
+            let options = self.options.lock().unwrap();
+            let count = options.iter().filter(|o| o.menu_id == menu_id).count();
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        }
+
         async fn set_published(
             &self,
             menu_id: i64,
@@ -1074,9 +1360,11 @@ mod tests {
     #[derive(Default)]
     struct FakeDiscord {
         sends: Mutex<Vec<(u64, Vec<RenderedChunk>)>>,
-        edits: Mutex<Vec<(u64, Vec<RenderedChunk>)>>,
+        edits: Mutex<Vec<(u64, u64, Vec<RenderedChunk>)>>,
         /// When set, every call fails with this error.
         fail: Option<DiscordError>,
+        /// When set, every edit fails with this error (a deleted message).
+        fail_edit: Option<DiscordError>,
         next_message: Mutex<u64>,
     }
 
@@ -1116,14 +1404,103 @@ mod tests {
 
         async fn edit_menu(
             &self,
+            channel: u64,
             message: u64,
             chunks: &[RenderedChunk],
         ) -> Result<(), DiscordError> {
-            self.edits.lock().unwrap().push((message, chunks.to_vec()));
+            self.edits
+                .lock()
+                .unwrap()
+                .push((channel, message, chunks.to_vec()));
+            if let Some(error) = self.fail_edit {
+                return Err(error);
+            }
             match self.fail {
                 Some(error) => Err(error),
                 None => Ok(()),
             }
+        }
+    }
+
+    /// A menu store over a real SQLite database.
+    ///
+    /// The commands are exercised over the real tables here, not over a fake:
+    /// the point of this store is that a row survives a restart and that the
+    /// foreign key and the unique key really refuse a write.
+    struct SqlStore {
+        conn: Mutex<rusqlite::Connection>,
+    }
+
+    impl SqlStore {
+        fn open(path: &std::path::Path) -> SqlStore {
+            let mut conn = crate::storage::open(path.to_str().unwrap(), &[]).unwrap();
+            crate::role_menus::repository::migrate(&mut conn).unwrap();
+            SqlStore {
+                conn: Mutex::new(conn),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MenuStore for SqlStore {
+        async fn create_menu(
+            &self,
+            guild: u64,
+            key: &str,
+            mode: &str,
+            max_select: u32,
+        ) -> Result<i64, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::create_menu(&conn, guild, key, mode, max_select)
+        }
+
+        async fn get_menu(&self, guild: u64, key: &str) -> Result<Option<MenuRow>, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::get_menu(&conn, guild, key)
+        }
+
+        async fn list_menus(&self, guild: u64) -> Result<Vec<MenuRow>, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::list_menus(&conn, guild)
+        }
+
+        async fn add_option(
+            &self,
+            menu_id: i64,
+            role: u64,
+            label: &str,
+            emoji: &str,
+        ) -> Result<i64, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::add_option(&conn, menu_id, role, label, emoji)
+        }
+
+        async fn list_options(&self, menu_id: i64) -> Result<Vec<OptionRow>, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::list_options(&conn, menu_id)
+        }
+
+        async fn remove_option(&self, menu_id: i64, role: u64) -> Result<bool, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::remove_option(&conn, menu_id, role)
+        }
+
+        async fn count_options(&self, menu_id: i64) -> Result<u32, RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::count_options(&conn, menu_id)
+        }
+
+        async fn set_published(
+            &self,
+            menu_id: i64,
+            channel: u64,
+            message: u64,
+            embed_key: Option<&str>,
+        ) -> Result<(), RepoError> {
+            let conn = self.conn.lock().unwrap();
+            crate::role_menus::repository::set_published(
+                &conn, menu_id, channel, message, embed_key,
+            )
         }
     }
 
@@ -1192,6 +1569,7 @@ mod tests {
 
     fn settings() -> Settings {
         Settings {
+            enabled: true,
             home_guild: Some(GUILD),
             staff_role_id: Some(STAFF_ROLE),
             bot_has_manage_roles: true,
@@ -1241,7 +1619,7 @@ mod tests {
             key,
             role,
             label: "Label",
-            emoji: "x",
+            emoji: "🎉",
         }
     }
 
@@ -1288,7 +1666,7 @@ mod tests {
                     key,
                     role: *role,
                     label: &label,
-                    emoji: "x",
+                    emoji: "🎉",
                 },
             )
             .await;
@@ -1331,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn a_label_must_be_non_empty_bounded_and_free_of_control_characters() {
+    fn a_label_must_be_non_empty_bounded_and_free_of_hidden_characters() {
         assert_eq!(validate_label("Alpha"), Ok(()));
         assert_eq!(validate_label("  Alpha  "), Ok(()));
         assert_eq!(validate_label(""), Err(Code::InvalidLabel));
@@ -1341,25 +1719,84 @@ mod tests {
             Err(Code::InvalidLabel)
         );
         assert_eq!(validate_label(&"a".repeat(MAX_LABEL_CHARS)), Ok(()));
+        // A control character is refused.
         assert_eq!(validate_label("Alpha\u{0}"), Err(Code::InvalidLabel));
         assert_eq!(validate_label("Alpha\u{7}"), Err(Code::InvalidLabel));
-        // A newline is allowed in a label.
-        assert_eq!(validate_label("Alpha\nBeta"), Ok(()));
+        // A newline is refused: a label is one line of plain text.
+        assert_eq!(validate_label("Alpha\nBeta"), Err(Code::InvalidLabel));
+        // The line and paragraph separators are refused.
+        assert_eq!(validate_label("Alpha\u{2028}Beta"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("Alpha\u{2029}Beta"), Err(Code::InvalidLabel));
+        // A format character is refused: zero-width and bidirectional marks.
+        assert_eq!(validate_label("Alpha\u{200B}"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("Alpha\u{FEFF}"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("Alpha\u{202E}evil"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("Alpha\u{200E}"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("Alpha\u{2060}"), Err(Code::InvalidLabel));
+        // A label that is only invisible is refused.
+        assert_eq!(validate_label("\u{200B}"), Err(Code::InvalidLabel));
+        // Mention markup is refused.
+        assert_eq!(validate_label("<@&650101>"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("<@650101>"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("<#650010>"), Err(Code::InvalidLabel));
+        assert_eq!(validate_label("<:party:650101>"), Err(Code::InvalidLabel));
+        // A plain angle bracket is not markup and stays allowed.
+        assert_eq!(validate_label("Level < 5"), Ok(()));
     }
 
     #[test]
-    fn an_emoji_must_be_non_empty_bounded_and_free_of_control_characters() {
-        assert_eq!(validate_emoji("x"), Ok(()));
-        assert_eq!(validate_emoji("\u{1F980}"), Ok(()));
-        assert_eq!(validate_emoji(""), Err(Code::InvalidEmoji));
-        assert_eq!(validate_emoji("   "), Err(Code::InvalidEmoji));
+    fn an_emoji_must_be_a_custom_emoji_or_a_unicode_emoji() {
+        // Plain Unicode emoji are accepted.
+        assert_eq!(validate_emoji("🎉"), Ok(()));
+        assert_eq!(validate_emoji("👍"), Ok(()));
+        assert_eq!(validate_emoji("🎉\u{FE0F}"), Ok(()));
+        assert_eq!(validate_emoji("👍🏽"), Ok(()));
+        // The Discord custom-emoji forms are accepted.
+        assert_eq!(validate_emoji("<:party:650101>"), Ok(()));
+        assert_eq!(validate_emoji("<a:party:650101>"), Ok(()));
+        assert_eq!(validate_emoji("<:two_words:650101>"), Ok(()));
+        // Free text is refused.
         assert_eq!(
-            validate_emoji(&"x".repeat(MAX_EMOJI_CHARS + 1)),
+            validate_emoji("not an emoji at all"),
             Err(Code::InvalidEmoji)
         );
-        assert_eq!(validate_emoji(&"x".repeat(MAX_EMOJI_CHARS)), Ok(()));
+        assert_eq!(validate_emoji("x"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji(""), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("   "), Err(Code::InvalidEmoji));
+        // A mention is refused.
+        assert_eq!(validate_emoji("@everyone"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("<@&650101>"), Err(Code::InvalidEmoji));
+        // A link is refused.
+        assert_eq!(
+            validate_emoji("https://example.com/x"),
+            Err(Code::InvalidEmoji)
+        );
+        // An invisible or a hiding mark is refused.
+        assert_eq!(validate_emoji("\u{200B}"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("\u{FEFF}"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("\u{202E}x"), Err(Code::InvalidEmoji));
+        // A control character is refused.
         assert_eq!(validate_emoji("x\u{0}"), Err(Code::InvalidEmoji));
         assert_eq!(validate_emoji("x\n"), Err(Code::InvalidEmoji));
+        // A too long emoji is refused.
+        assert_eq!(
+            validate_emoji(&"🎉".repeat(MAX_EMOJI_CHARS + 1)),
+            Err(Code::InvalidEmoji)
+        );
+        assert_eq!(validate_emoji(&"🎉".repeat(MAX_EMOJI_CHARS)), Ok(()));
+        // A custom emoji with a bad name or id is refused.
+        assert_eq!(validate_emoji("<:a:650101>"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("<:party:0>"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("<:party:abc>"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("<:party:650101"), Err(Code::InvalidEmoji));
+        assert_eq!(
+            validate_emoji("<:bad name:650101>"),
+            Err(Code::InvalidEmoji)
+        );
+        assert_eq!(
+            validate_emoji("<:party:650101> trailing"),
+            Err(Code::InvalidEmoji)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1774,7 +2211,8 @@ mod tests {
         assert_eq!(outcome, Outcome::new(Code::Edited));
         assert_eq!(discord.send_count(), 1, "no second message");
         assert_eq!(discord.edit_count(), 1);
-        let edited = discord.edits.lock().unwrap()[0].0;
+        let (channel, edited, _) = discord.edits.lock().unwrap()[0].clone();
+        assert_eq!(channel, CHANNEL, "the stored channel is passed to the edit");
         assert_eq!(Some(edited), first, "the recorded message is edited");
         assert_eq!(store.menu(GUILD, "main").unwrap().message, first);
     }
@@ -1860,7 +2298,7 @@ mod tests {
                 menu_id: store.menu(GUILD, "big").unwrap().id,
                 role: 700_000 + index,
                 label: format!("Label {index}"),
-                emoji: "x".to_string(),
+                emoji: "🎉".to_string(),
                 position: index as i64,
             });
         }
@@ -1887,7 +2325,7 @@ mod tests {
                 menu_id: 1,
                 role: 800_000 + i,
                 label: format!("L{i}"),
-                emoji: "x".to_string(),
+                emoji: "🎉".to_string(),
                 position: i as i64,
             })
             .collect();
@@ -2106,5 +2544,375 @@ mod tests {
         roles.sort_unstable();
         roles.dedup();
         assert_eq!(roles.len(), 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // A deleted message
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_deleted_message_is_reposted_and_the_row_names_the_new_message() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+        let first = store.menu(GUILD, "main").unwrap().message.unwrap();
+
+        // The message was deleted: every edit reports that it is gone.
+        discord.fail_edit = Some(DiscordError::NotFound);
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::Reposted));
+        let second = store.menu(GUILD, "main").unwrap().message.unwrap();
+        assert_ne!(second, first, "a new message was sent");
+        assert_eq!(discord.send_count(), 2, "one new message was sent");
+        assert_eq!(store.menu(GUILD, "main").unwrap().channel, Some(CHANNEL));
+    }
+
+    #[tokio::test]
+    async fn a_failed_repost_leaves_the_row_unchanged() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+        let first = store.menu(GUILD, "main").unwrap().message;
+
+        // The message is gone and the new send fails too.
+        discord.fail_edit = Some(DiscordError::NotFound);
+        discord.fail = Some(DiscordError::Failed);
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::DiscordFailed));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(menu.message, first, "the row still names the old message");
+        assert_eq!(menu.channel, Some(CHANNEL));
+    }
+
+    #[tokio::test]
+    async fn a_persistent_deleted_message_always_reaches_a_published_menu() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        // The edit always reports that the message is gone: the recovery must
+        // still reach a published menu, not give up.
+        discord.fail_edit = Some(DiscordError::NotFound);
+
+        let mut rng = Lcg(0xC0FF_EE00_1234);
+        let mut last = None;
+        for _ in 0..60 {
+            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+            match outcome.code {
+                Code::Posted | Code::Reposted => {
+                    // The row always names the message that was really sent.
+                    let menu = store.menu(GUILD, "main").unwrap();
+                    let sent = discord.sends.lock().unwrap().last().unwrap().0;
+                    assert_eq!(menu.channel, Some(sent));
+                    assert!(menu.message.is_some());
+                    last = menu.message;
+                }
+                other => panic!("unexpected code {other:?}"),
+            }
+            let _ = rng.next(4);
+        }
+        assert!(last.is_some(), "the menu was never published");
+        assert_eq!(discord.send_count(), 60, "one message per attempt");
+    }
+
+    // -----------------------------------------------------------------------
+    // The channel of a published menu
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn posting_to_another_channel_is_refused_and_nothing_is_sent() {
+        let store = FakeStore::new();
+        let discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+        let sends = discord.send_count();
+
+        let mut req = post_req("main");
+        req.channel = CHANNEL + 1;
+        let outcome = post(&store, &discord, &settings(), &req).await;
+        assert_eq!(outcome, Outcome::new(Code::ChannelMismatch));
+        assert_eq!(discord.send_count(), sends, "no message was sent");
+        assert_eq!(discord.edit_count(), 0, "the old message was not edited");
+        assert_eq!(
+            store.menu(GUILD, "main").unwrap().channel,
+            Some(CHANNEL),
+            "the row still names the old channel"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The number of options
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_menu_may_not_hold_more_options_than_one_message_may_carry() {
+        let store = FakeStore::new();
+        let facts = FakeFacts::new();
+        seed_menu(&store, "big", &[]).await;
+        let menu_id = store.menu(GUILD, "big").unwrap().id;
+        // Fill the menu right up to the limit.
+        for index in 0..MAX_OPTIONS_PER_MENU as u64 {
+            store.options.lock().unwrap().push(OptionRow {
+                menu_id,
+                role: 950_000 + index,
+                label: format!("Label {index}"),
+                emoji: "🎉".to_string(),
+                position: index as i64,
+            });
+        }
+        let count = store.count_options(menu_id).await.unwrap();
+        assert_eq!(count as usize, MAX_OPTIONS_PER_MENU);
+
+        // The next option is refused: the menu may not need a sixth row.
+        let outcome = add_option(&store, &facts, &settings(), &add_req("big", 960_000)).await;
+        assert_eq!(outcome, Outcome::new(Code::TooManyOptions));
+        assert_eq!(
+            store.count_options(menu_id).await.unwrap() as usize,
+            MAX_OPTIONS_PER_MENU,
+            "the refused option was not stored"
+        );
+
+        // The menu still fits into one message: five components.
+        let options = store.list_options(menu_id).await.unwrap();
+        let chunks = split_chunks(&options);
+        assert_eq!(chunks.len(), MAX_ROWS_PER_MESSAGE);
+        assert!(chunks
+            .iter()
+            .all(|c| c.options.len() <= SELECT_OPTION_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn a_menu_below_the_limit_still_takes_an_option() {
+        let store = FakeStore::new();
+        let facts = FakeFacts::new();
+        facts.set(
+            960_000,
+            RoleFacts {
+                id: 960_000,
+                position: 5,
+                managed: false,
+                permissions: 0,
+                exists: true,
+            },
+        );
+        seed_menu(&store, "big", &[]).await;
+        let menu_id = store.menu(GUILD, "big").unwrap().id;
+        for index in 0..(MAX_OPTIONS_PER_MENU as u64 - 1) {
+            store.options.lock().unwrap().push(OptionRow {
+                menu_id,
+                role: 950_000 + index,
+                label: format!("Label {index}"),
+                emoji: "🎉".to_string(),
+                position: index as i64,
+            });
+        }
+        let outcome = add_option(&store, &facts, &settings(), &add_req("big", 960_000)).await;
+        assert_eq!(outcome, Outcome::new(Code::OptionAdded));
+        assert_eq!(
+            store.count_options(menu_id).await.unwrap() as usize,
+            MAX_OPTIONS_PER_MENU
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // What a stored row says
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_maximum_number_of_options_is_stored_and_read_back() {
+        let store = FakeStore::new();
+        let outcome = create(
+            &store,
+            &settings(),
+            &CreateRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "multi",
+                mode: MenuMode::Multi,
+                max_select: 3,
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::Created));
+        let menu = store.menu(GUILD, "multi").unwrap();
+        assert_eq!(menu.max_select, 3, "the maximum is stored");
+        // The policy menu carries the maximum as well.
+        let policy_menu = to_policy_menu(&menu, &[]).unwrap();
+        assert_eq!(policy_menu.groups[0].max, Some(3));
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_menu_may_not_name_a_maximum() {
+        let store = FakeStore::new();
+        let outcome = create(
+            &store,
+            &settings(),
+            &CreateRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+                mode: MenuMode::Exclusive,
+                max_select: 2,
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::InvalidMode));
+        assert!(store.menus.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_stored_mode_is_refused_instead_of_guessed() {
+        let store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        store.menus.lock().unwrap()[0].mode = "garbage".to_string();
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(to_policy_menu(&menu, &[]), Err(Code::CorruptRow));
+    }
+
+    #[tokio::test]
+    async fn a_label_and_an_emoji_are_stored_trimmed() {
+        let store = FakeStore::new();
+        let facts = FakeFacts::new();
+        seed_menu(&store, "main", &[]).await;
+        let mut req = add_req("main", ROLE_OK);
+        req.label = "  Alpha  ";
+        req.emoji = "  🎉  ";
+        let outcome = add_option(&store, &facts, &settings(), &req).await;
+        assert_eq!(outcome, Outcome::new(Code::OptionAdded));
+        let menu = store.menu(GUILD, "main").unwrap();
+        let options = store.list_options(menu.id).await.unwrap();
+        assert_eq!(options[0].label, "Alpha");
+        assert_eq!(options[0].emoji, "🎉");
+    }
+
+    #[tokio::test]
+    async fn a_posted_menu_is_listed_as_posted() {
+        let store = FakeStore::new();
+        let discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        post(&store, &discord, &settings(), &post_req("main")).await;
+        let report = list(
+            &store,
+            &settings(),
+            &ListRequest {
+                invoker: staff(),
+                guild: GUILD,
+            },
+        )
+        .await;
+        assert_eq!(report.outcome, Outcome::new(Code::Listed));
+        assert_eq!(report.menus.len(), 1);
+        assert!(report.menus[0].posted, "the menu was posted");
+        assert_eq!(report.menus[0].options, 1);
+    }
+
+    #[tokio::test]
+    async fn an_off_feature_serves_nothing() {
+        let store = FakeStore::new();
+        let mut s = settings();
+        s.enabled = false;
+        assert_eq!(gate(&s, &staff(), GUILD), Err(Outcome::new(Code::Disabled)));
+        let outcome = create(&store, &s, &create_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::Disabled));
+        assert!(store.calls().is_empty(), "nothing was read or written");
+    }
+
+    // -----------------------------------------------------------------------
+    // The real database
+    // -----------------------------------------------------------------------
+
+    fn scratch_db(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rm2-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("core.sqlite")
+    }
+
+    #[tokio::test]
+    async fn the_commands_work_over_a_real_database() {
+        let path = scratch_db("real");
+        let store = SqlStore::open(&path);
+        let facts = FakeFacts::new();
+        let outcome = create(&store, &settings(), &create_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::Created));
+        let outcome = add_option(&store, &facts, &settings(), &add_req("main", ROLE_OK)).await;
+        assert_eq!(outcome, Outcome::new(Code::OptionAdded));
+
+        // The same key is refused by the real unique key.
+        let outcome = create(&store, &settings(), &create_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::KeyTaken));
+
+        // The row survives a restart.
+        drop(store);
+        let store = SqlStore::open(&path);
+        let report = list(
+            &store,
+            &settings(),
+            &ListRequest {
+                invoker: staff(),
+                guild: GUILD,
+            },
+        )
+        .await;
+        assert_eq!(report.outcome, Outcome::new(Code::Listed));
+        assert_eq!(report.menus.len(), 1);
+        assert_eq!(report.menus[0].options, 1);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_sequence_over_the_real_database_always_settles() {
+        let path = scratch_db("real-liveness");
+        let store = SqlStore::open(&path);
+        let mut discord = FakeDiscord::new();
+        seed_menu_sql(&store, "main", &[ROLE_OK]).await;
+
+        // A message that is deleted for good: every edit reports it as gone.
+        discord.fail_edit = Some(DiscordError::NotFound);
+        let mut rng = Lcg(0xDEAD_BEEF_2024);
+        let mut published = false;
+        let mut row_before: Option<(Option<u64>, Option<u64>)> = None;
+        for _ in 0..80 {
+            // The send fails on some steps: the row must not change then.
+            discord.fail = if rng.next(4) == 0 {
+                Some(DiscordError::Failed)
+            } else {
+                None
+            };
+            let before = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+            let before = (before.channel, before.message);
+            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+            match outcome.code {
+                Code::Posted | Code::Reposted => {
+                    published = true;
+                    let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+                    assert!(menu.message.is_some(), "the row names a message");
+                    assert_eq!(menu.channel, Some(CHANNEL));
+                    row_before = Some((menu.channel, menu.message));
+                }
+                Code::DiscordFailed => {
+                    // A failed send never changes the row.
+                    let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+                    assert_eq!((menu.channel, menu.message), before, "the row is unchanged");
+                    assert_eq!(row_before, Some(before), "the row never moved");
+                }
+                other => panic!("unexpected code {other:?}"),
+            }
+        }
+        assert!(published, "the menu was never published");
+        let menu = store.get_menu(GUILD, "main").await.unwrap().unwrap();
+        assert!(menu.message.is_some(), "the menu ends published");
+        assert_eq!(menu.channel, Some(CHANNEL));
+    }
+
+    /// Creates a menu with options over a store, without the command layer.
+    async fn seed_menu_sql(store: &SqlStore, key: &str, roles: &[u64]) {
+        let id = store.create_menu(GUILD, key, "exclusive", 0).await.unwrap();
+        for role in roles {
+            store.add_option(id, *role, "Label", "🎉").await.unwrap();
+        }
     }
 }

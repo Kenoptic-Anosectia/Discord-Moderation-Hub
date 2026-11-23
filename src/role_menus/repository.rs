@@ -62,6 +62,8 @@ pub enum RepoError {
     OptionMissing,
     /// The menu is not stored.
     MenuMissing,
+    /// The mode is not one of the two known spellings.
+    InvalidMode,
     /// Underlying storage failure (code from the storage layer).
     Storage(StorageError),
 }
@@ -75,10 +77,22 @@ impl RepoError {
             RepoError::OptionExists => "option_exists",
             RepoError::OptionMissing => "option_missing",
             RepoError::MenuMissing => "menu_missing",
+            RepoError::InvalidMode => "invalid_mode",
             RepoError::Storage(e) => e.code(),
         }
     }
 }
+
+/// The two mode spellings the table may hold.
+pub const MODES: [&str; 2] = ["exclusive", "multi"];
+
+/// The extended SQLite result codes this module reads.
+///
+/// They are the documented SQLite values for `SQLITE_CONSTRAINT_*` and do not
+/// change between SQLite versions.
+const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = 787;
+const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 1555;
+const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
 
 impl fmt::Display for RepoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -216,7 +230,9 @@ fn row_error(error: rusqlite::Error) -> RepoError {
 /// Creates a menu row and returns its id.
 ///
 /// The key is unique across the whole table: a key that is already used is
-/// refused with [`RepoError::KeyTaken`] and nothing is written.
+/// refused with [`RepoError::KeyTaken`] and nothing is written. A mode that is
+/// not one of [`MODES`] is refused with [`RepoError::InvalidMode`]: a row must
+/// never hold a mode the reader cannot understand.
 pub fn create_menu(
     conn: &Connection,
     guild: u64,
@@ -224,6 +240,9 @@ pub fn create_menu(
     mode: &str,
     max_select: u32,
 ) -> Result<i64, RepoError> {
+    if !MODES.contains(&mode) {
+        return Err(RepoError::InvalidMode);
+    }
     // A plain INSERT, not INSERT OR IGNORE: the duplicate must be reported,
     // never silently swallowed.
     match conn.execute(
@@ -232,10 +251,11 @@ pub fn create_menu(
         params![guild.to_string(), key, mode, i64::from(max_select)],
     ) {
         Ok(_) => {}
-        Err(rusqlite::Error::SqliteFailure(error, _))
-            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            return Err(RepoError::KeyTaken);
+        Err(rusqlite::Error::SqliteFailure(error, _)) => {
+            return Err(match error.extended_code {
+                SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY => RepoError::KeyTaken,
+                code => constraint_error(code),
+            });
         }
         Err(_) => return Err(RepoError::Storage(StorageError::Sqlite)),
     }
@@ -286,6 +306,10 @@ pub fn list_menus(conn: &Connection, guild: u64) -> Result<Vec<MenuRow>, RepoErr
 ///
 /// The role is unique inside a menu: a second option for the same role is
 /// refused with [`RepoError::OptionExists`] and the menu keeps its options.
+/// An option for a menu that does not exist is refused with
+/// [`RepoError::MenuMissing`]: the two constraint kinds are told apart by
+/// their extended SQLite code, so a missing menu never looks like a
+/// duplicate option.
 pub fn add_option(
     conn: &Connection,
     menu_id: i64,
@@ -307,12 +331,17 @@ pub fn add_option(
         params![menu_id, role.to_string(), label, emoji, next],
     ) {
         Ok(_) => Ok(next),
-        Err(rusqlite::Error::SqliteFailure(error, _))
-            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            Err(RepoError::OptionExists)
-        }
+        Err(rusqlite::Error::SqliteFailure(error, _)) => Err(constraint_error(error.extended_code)),
         Err(_) => Err(RepoError::Storage(StorageError::Sqlite)),
+    }
+}
+
+/// Turns a constraint violation into the error the caller must see.
+fn constraint_error(extended_code: i32) -> RepoError {
+    match extended_code {
+        SQLITE_CONSTRAINT_FOREIGNKEY => RepoError::MenuMissing,
+        SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE => RepoError::OptionExists,
+        _ => RepoError::Storage(StorageError::Sqlite),
     }
 }
 
@@ -387,19 +416,36 @@ pub fn set_published(
     Ok(())
 }
 
-/// Deletes a menu and its options. Returns whether a row was deleted.
+/// What a menu deletion removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deleted {
+    /// True when a menu row was deleted.
+    pub menu: bool,
+    /// The number of option rows the delete removed.
+    pub options: u32,
+}
+
+/// Deletes a menu and its options.
+///
+/// The options are deleted by this function, not only by the foreign key
+/// cascade, and the number of removed options is reported so the caller can
+/// see that the delete really happened.
 ///
 /// Deleting a menu never touches member roles.
-pub fn delete_menu(conn: &Connection, menu_id: i64) -> Result<bool, RepoError> {
-    conn.execute(
-        "DELETE FROM role_menu_options WHERE menu_id = ?1",
-        params![menu_id],
-    )
-    .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
+pub fn delete_menu(conn: &Connection, menu_id: i64) -> Result<Deleted, RepoError> {
+    let options = conn
+        .execute(
+            "DELETE FROM role_menu_options WHERE menu_id = ?1",
+            params![menu_id],
+        )
+        .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
     let n = conn
         .execute("DELETE FROM role_menus WHERE id = ?1", params![menu_id])
         .map_err(|_| RepoError::Storage(StorageError::Sqlite))?;
-    Ok(n == 1)
+    Ok(Deleted {
+        menu: n == 1,
+        options: u32::try_from(options).unwrap_or(u32::MAX),
+    })
 }
 
 /// The number of options a menu holds.
@@ -631,10 +677,80 @@ mod tests {
         let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
         add_option(&conn, id, ROLE_A, "Alpha", "a").unwrap();
         add_option(&conn, id, ROLE_B, "Beta", "b").unwrap();
-        assert!(delete_menu(&conn, id).unwrap());
+        let deleted = delete_menu(&conn, id).unwrap();
+        assert!(deleted.menu, "the menu row is gone");
+        assert_eq!(deleted.options, 2, "both option rows were deleted");
         assert_eq!(list_options(&conn, id).unwrap().len(), 0);
         assert_eq!(get_menu(&conn, GUILD, "main").unwrap(), None);
-        assert!(!delete_menu(&conn, id).unwrap());
+        let again = delete_menu(&conn, id).unwrap();
+        assert!(!again.menu, "there is no menu left to delete");
+        assert_eq!(again.options, 0);
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused_and_nothing_is_written() {
+        let conn = mem();
+        assert_eq!(
+            create_menu(&conn, GUILD, "main", "garbage", 0),
+            Err(RepoError::InvalidMode)
+        );
+        assert_eq!(list_menus(&conn, GUILD).unwrap().len(), 0);
+        // The two known spellings are accepted.
+        create_menu(&conn, GUILD, "one", "exclusive", 0).unwrap();
+        create_menu(&conn, GUILD, "two", "multi", 2).unwrap();
+        assert_eq!(list_menus(&conn, GUILD).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_option_for_a_missing_menu_is_refused_as_a_missing_menu() {
+        let path = scratch("fk");
+        let ps = path.to_str().unwrap();
+        let conn = open(ps);
+        // The foreign key is on in a real database: the violation must not be
+        // reported as a duplicate option.
+        assert_eq!(
+            add_option(&conn, 4242, ROLE_A, "Alpha", "a"),
+            Err(RepoError::MenuMissing)
+        );
+        // A duplicate option of a menu that exists is still a duplicate.
+        let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+        add_option(&conn, id, ROLE_A, "Alpha", "a").unwrap();
+        assert_eq!(
+            add_option(&conn, id, ROLE_A, "Other", "b"),
+            Err(RepoError::OptionExists)
+        );
+    }
+
+    #[test]
+    fn a_stored_id_of_zero_is_a_corrupt_row() {
+        let path = scratch("zero");
+        let ps = path.to_str().unwrap();
+        {
+            let conn = open(ps);
+            create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE role_menus SET channel = '0' WHERE key = 'main'", [])
+            .unwrap();
+        let conn = open(ps);
+        assert_eq!(
+            get_menu(&conn, GUILD, "main").unwrap_err(),
+            RepoError::CorruptRow
+        );
+    }
+
+    #[test]
+    fn a_stored_role_of_zero_is_a_corrupt_row() {
+        let conn = mem();
+        let id = create_menu(&conn, GUILD, "main", "exclusive", 0).unwrap();
+        add_option(&conn, id, ROLE_A, "Alpha", "a").unwrap();
+        conn.execute(
+            "UPDATE role_menu_options SET role = '0' WHERE menu_id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(list_options(&conn, id).unwrap_err(), RepoError::CorruptRow);
     }
 
     #[test]
@@ -721,6 +837,7 @@ mod tests {
             (RepoError::OptionExists, "option_exists"),
             (RepoError::OptionMissing, "option_missing"),
             (RepoError::MenuMissing, "menu_missing"),
+            (RepoError::InvalidMode, "invalid_mode"),
             (RepoError::Storage(StorageError::Sqlite), "sqlite_error"),
         ];
         for (error, code) in cases {
