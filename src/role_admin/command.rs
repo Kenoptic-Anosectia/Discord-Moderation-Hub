@@ -162,6 +162,7 @@ enum Refusal {
     ForeignGuild,
     InvalidId,
     ProtectedConfigInvalid,
+    SafewordConfigInvalid,
     NotStaff,
     FactsUnavailable,
     Policy(DenyReason),
@@ -178,6 +179,7 @@ impl Refusal {
             Refusal::ForeignGuild => "foreign_guild",
             Refusal::InvalidId => "invalid_id",
             Refusal::ProtectedConfigInvalid => "protected_roles_invalid",
+            Refusal::SafewordConfigInvalid => "safeword_restricted_invalid",
             Refusal::NotStaff => "not_staff",
             Refusal::FactsUnavailable => runtime::CODE_FACTS_UNAVAILABLE,
             Refusal::Policy(reason) => reason.code(),
@@ -198,6 +200,7 @@ impl Refusal {
             Refusal::ForeignGuild => "This command only works in the home server.",
             Refusal::InvalidId => "A required id was missing or zero.",
             Refusal::ProtectedConfigInvalid => "The protected role setting is unusable.",
+            Refusal::SafewordConfigInvalid => "The safeword restricted role setting is unusable.",
             Refusal::NotStaff => "Only staff may use this command.",
             Refusal::FactsUnavailable => "Role or member data could not be read.",
             Refusal::Policy(reason) => match reason {
@@ -283,6 +286,9 @@ fn gate(env: &RoleAdminEnv, guild_id: Option<u64>, ids: &[u64]) -> Result<(u64, 
     }
     if env.protected_roles_invalid {
         return Err(Refusal::ProtectedConfigInvalid);
+    }
+    if env.safeword_restricted_invalid {
+        return Err(Refusal::SafewordConfigInvalid);
     }
     Ok((home, staff))
 }
