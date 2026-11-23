@@ -466,6 +466,10 @@ impl<X, D> Feature<X, D> for ActivityFeature {
 }
 
 #[cfg(test)]
+#[path = "feature_tests.rs"]
+mod feature_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::activity::{config, policy as p};
@@ -537,6 +541,182 @@ mod tests {
 
     fn tick(rt: &mut Runtime, now: i64, conn: &mut Connection) -> Vec<&'static str> {
         rt.tick(now, &mut Repository::new(conn)).unwrap()
+    }
+
+    #[test]
+    fn ac2_private_new_voice_never_opens() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(scoped_voice(1, None, Some(6), true, false));
+        tick(&mut rt, 30, &mut conn);
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+        rt.shutdown(31, &mut Repository::new(&mut conn)).unwrap();
+        assert_eq!(totals(&conn), (0, 0));
+    }
+
+    #[test]
+    fn ac2_private_old_voice_cannot_close_unrelated_public_session() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(voice(1, None, Some(3), false));
+        // The gateway's old channel disagrees with the ledger and is private.
+        // It must not be treated as evidence that the tracked session ended.
+        rt.observe(scoped_voice(10, Some(6), Some(7), false, true));
+        tick(&mut rt, 30, &mut conn);
+        let rows = Repository::new(&mut conn).load(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_ref().unwrap().snapshot.channel_id, 3);
+        assert_eq!(totals(&conn), (0, 0));
+    }
+
+    #[test]
+    fn ac2_voice_move_discards_tracked_channel_that_became_private() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(voice(1, None, Some(6), false));
+        rt.observe(scoped_voice(10, Some(6), Some(3), false, true));
+        rt.shutdown(30, &mut Repository::new(&mut conn)).unwrap();
+        assert_eq!(totals(&conn), (0, 20));
+        assert_eq!(
+            conn.query_row("SELECT channel FROM activity_daily", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "3"
+        );
+    }
+
+    fn scoped_voice(
+        at: i64,
+        old: Option<u64>,
+        new: Option<u64>,
+        old_allowed: bool,
+        new_allowed: bool,
+    ) -> Input {
+        let Input::Voice { event, .. } = voice(at, old, new, false) else {
+            unreachable!()
+        };
+        Input::Voice {
+            event,
+            old_allowed,
+            new_allowed,
+        }
+    }
+
+    #[test]
+    fn ac2_checkpoint_removes_open_row_when_scope_changes() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(voice(1, None, Some(6), false));
+        tick(&mut rt, 30, &mut conn);
+        assert_eq!(Repository::new(&mut conn).load(1).unwrap().len(), 1);
+        let codes = rt
+            .drive(60, &mut Repository::new(&mut conn), false, |_, ch| ch != 6)
+            .unwrap();
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+        assert_eq!(codes, ["snapshot_out_of_scope"]);
+        rt.shutdown(61, &mut Repository::new(&mut conn)).unwrap();
+        assert_eq!(totals(&conn), (0, 0));
+    }
+
+    #[test]
+    fn ac2_restart_rechecks_scope_of_persisted_rows() {
+        let mut conn = db();
+        conn.execute_batch(
+            "INSERT INTO voice_sessions VALUES
+             ('1','2','6',0,10,'0:0:0'), ('1','3','3',0,10,'0:0:0');",
+        )
+        .unwrap();
+        let codes = runtime(Some(1))
+            .drive(10, &mut Repository::new(&mut conn), false, |_, ch| ch != 6)
+            .unwrap();
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+        assert_eq!(totals(&conn), (0, 10));
+        assert_eq!(codes, ["snapshot_out_of_scope", "restart_gap"]);
+    }
+
+    #[test]
+    fn ac2_oversize_session_does_not_stall_guild_flushes() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(voice(0, None, Some(3), false));
+        for at in 1..=MAX_SNAPSHOT_SEGMENTS as i64 {
+            rt.observe(voice(at, Some(3), Some(3), at % 2 != 0));
+        }
+        for now in [1_050, 1_080] {
+            rt.observe(message(1, 3, false, false, true));
+            let codes = tick(&mut rt, now, &mut conn);
+            assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+            assert_eq!(codes, ["snapshot_too_many_segments"]);
+        }
+        assert_eq!(totals(&conn), (2, 0));
+    }
+
+    #[test]
+    fn ac2_future_ended_segment_does_not_stall_guild_flush() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.observe(voice(1, None, Some(3), false));
+        rt.observe(voice(40, Some(3), Some(3), true));
+        rt.observe(message(1, 3, false, false, true));
+        let codes = tick(&mut rt, 30, &mut conn);
+        assert_eq!(totals(&conn), (1, 0));
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+        assert_eq!(codes, ["activity_clock_regression"]);
+        tick(&mut rt, 60, &mut conn);
+        assert_eq!(Repository::new(&mut conn).load(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ac2_restart_and_shutdown_clamp_earlier_segments_after_clock_step() {
+        for restart in [true, false] {
+            let mut conn = db();
+            let mut rt = runtime(Some(1));
+            tick(&mut rt, 0, &mut conn);
+            rt.observe(voice(0, None, Some(3), false));
+            rt.observe(voice(100, Some(3), Some(3), true));
+            rt.observe(voice(110, Some(3), Some(3), false));
+            tick(&mut rt, 120, &mut conn);
+            if restart {
+                tick(&mut runtime(Some(1)), 50, &mut conn);
+            } else {
+                rt.shutdown(50, &mut Repository::new(&mut conn)).unwrap();
+            }
+            assert_eq!(totals(&conn), (0, 50), "restart={restart}");
+            assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn ac2_successful_shutdown_stops_event_ingestion_and_writes() {
+        let mut conn = db();
+        let mut rt = runtime(Some(1));
+        tick(&mut rt, 0, &mut conn);
+        rt.shutdown(30, &mut Repository::new(&mut conn)).unwrap();
+        rt.observe(message(1, 3, false, false, true));
+        rt.observe(voice(31, None, Some(3), false));
+        tick(&mut rt, 60, &mut conn);
+        assert_eq!(totals(&conn), (0, 0));
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ac2_corrupt_multi_segment_row_cannot_credit_past_heartbeat() {
+        let mut conn = db();
+        conn.execute_batch(
+            "INSERT INTO voice_sessions VALUES
+             ('1','2','3',0,10,'0:100:0;100:101:0'), ('1','3','3',0,10,'0:0:0');",
+        )
+        .unwrap();
+        let codes = tick(&mut runtime(Some(1)), 50, &mut conn);
+        assert_eq!(totals(&conn), (0, 10));
+        assert_eq!(codes, ["snapshot_malformed", "restart_gap"]);
+        assert!(Repository::new(&mut conn).load(1).unwrap().is_empty());
     }
 
     #[test]

@@ -71,6 +71,8 @@ mod tests {
         let defaults = parse(|_| None, Some(1)).unwrap();
         assert_eq!(defaults.mode, Mode::Off);
         assert!(!defaults.policy.count_self_deafened());
+        let no_home = parse(|key| (key == KEY_MODE).then(|| "live".into()), None).unwrap();
+        assert_eq!(no_home.mode(), Mode::Off);
         assert_eq!(
             parse(|_| Some("typo".into()), None).unwrap().mode,
             Mode::Off
