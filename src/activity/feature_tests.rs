@@ -1,4 +1,4 @@
-use super::{serenity, ActivityFeature, Feature, Ports};
+use super::{serenity, ActivityFeature, Feature, Ports, CHECKPOINT_SECS};
 use crate::activity::{config, policy::KEY_MODE};
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -160,4 +160,82 @@ async fn assert_ignored_voice(bot: Option<bool>, codes: &[&str]) {
     feature.shutdown(Some(&db)).await.unwrap();
     assert_eq!(totals(&db).await, (0, 0));
     assert_eq!(&*ports.codes.lock().unwrap(), codes);
+}
+
+#[tokio::test]
+async fn ac2_feature_memberless_leave_credits_ten_seconds_at_shutdown() {
+    assert_memberless_close(false, false).await;
+}
+
+#[tokio::test]
+async fn ac2_feature_memberless_leave_credits_ten_seconds_after_restart() {
+    assert_memberless_close(true, false).await;
+}
+
+#[tokio::test]
+async fn ac2_feature_memberless_move_closes_without_opening_destination() {
+    assert_memberless_close(false, true).await;
+}
+
+async fn assert_memberless_close(restart: bool, move_channel: bool) {
+    let ports = TestPorts::default();
+    let activity = feature("live", &ports);
+    let db = Connection::open_in_memory().await.unwrap();
+    activity.tick(Some(&db)).await.unwrap();
+    dispatch(&activity, voice(1, 2, 3, true, Some(false)), 1).await;
+    ports.clock.store(10, Ordering::Relaxed);
+    let serenity::FullEvent::VoiceStateUpdate { new, .. } = voice(1, 2, 4, move_channel, None)
+    else {
+        unreachable!();
+    };
+    // The gateway cache need not provide the previous state either.
+    dispatch(
+        &activity,
+        serenity::FullEvent::VoiceStateUpdate { old: None, new },
+        1,
+    )
+    .await;
+    assert_eq!(
+        &*ports.codes.lock().unwrap(),
+        &["activity_voice_member_missing"]
+    );
+    for tick in 1..=3600 / CHECKPOINT_SECS {
+        ports.clock.store(tick * CHECKPOINT_SECS, Ordering::Relaxed);
+        activity.tick(Some(&db)).await.unwrap();
+    }
+    if restart {
+        // Lose the runtime without flushing it; the replacement sees only SQLite state.
+        drop(activity);
+        ports.clock.store(7200, Ordering::Relaxed);
+        feature("live", &ports).tick(Some(&db)).await.unwrap();
+    } else {
+        activity.shutdown(Some(&db)).await.unwrap();
+    }
+    assert_eq!(totals(&db).await, (0, 10));
+}
+
+#[tokio::test]
+async fn ac2_feature_bot_join_then_memberless_leave_credits_nothing() {
+    let ports = TestPorts::default();
+    let activity = feature("live", &ports);
+    let db = Connection::open_in_memory().await.unwrap();
+    activity.tick(Some(&db)).await.unwrap();
+    dispatch(&activity, voice(1, 2, 3, true, Some(true)), 1).await;
+    ports.clock.store(10, Ordering::Relaxed);
+    dispatch(&activity, voice(1, 2, 3, false, None), 1).await;
+    ports.clock.store(30, Ordering::Relaxed);
+    activity.tick(Some(&db)).await.unwrap();
+    activity.shutdown(Some(&db)).await.unwrap();
+    assert_eq!(totals(&db).await, (0, 0));
+    let rows: i64 = db
+        .call(|conn| {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM activity_daily) + (SELECT count(*) FROM voice_sessions)",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
 }
