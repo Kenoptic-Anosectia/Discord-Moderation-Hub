@@ -2586,36 +2586,6 @@ mod tests {
         assert_eq!(menu.channel, Some(CHANNEL));
     }
 
-    #[tokio::test]
-    async fn a_persistent_deleted_message_always_reaches_a_published_menu() {
-        let store = FakeStore::new();
-        let mut discord = FakeDiscord::new();
-        seed_menu(&store, "main", &[ROLE_OK]).await;
-        // The edit always reports that the message is gone: the recovery must
-        // still reach a published menu, not give up.
-        discord.fail_edit = Some(DiscordError::NotFound);
-
-        let mut rng = Lcg(0xC0FF_EE00_1234);
-        let mut last = None;
-        for _ in 0..60 {
-            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
-            match outcome.code {
-                Code::Posted | Code::Reposted => {
-                    // The row always names the message that was really sent.
-                    let menu = store.menu(GUILD, "main").unwrap();
-                    let sent = discord.sends.lock().unwrap().last().unwrap().0;
-                    assert_eq!(menu.channel, Some(sent));
-                    assert!(menu.message.is_some());
-                    last = menu.message;
-                }
-                other => panic!("unexpected code {other:?}"),
-            }
-            let _ = rng.next(4);
-        }
-        assert!(last.is_some(), "the menu was never published");
-        assert_eq!(discord.send_count(), 60, "one message per attempt");
-    }
-
     // -----------------------------------------------------------------------
     // The channel of a published menu
     // -----------------------------------------------------------------------
@@ -2914,5 +2884,159 @@ mod tests {
         for role in roles {
             store.add_option(id, *role, "Label", "🎉").await.unwrap();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A label may not look empty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_label_made_only_of_invisible_characters_is_refused() {
+        // The blank fillers and the default-ignorable marks: a label made
+        // only of them shows the reader nothing.
+        for invisible in [
+            "\u{3164}", // HANGUL FILLER
+            "\u{115F}", // HANGUL CHOSEONG FILLER
+            "\u{1160}", // HANGUL JUNGSEONG FILLER
+            "\u{2800}", // BRAILLE PATTERN BLANK
+            "\u{034F}", // COMBINING GRAPHEME JOINER
+            "\u{FFA0}", // HALFWIDTH HANGUL FILLER
+            "\u{17B4}", // KHMER VOWEL INHERENT AQ
+            "\u{17B5}", // KHMER VOWEL INHERENT AA
+            "\u{180B}", // MONGOLIAN FREE VARIATION SELECTOR ONE
+            "\u{FE0F}", // VARIATION SELECTOR-16
+        ] {
+            assert_eq!(
+                validate_label(invisible),
+                Err(Code::InvalidLabel),
+                "{invisible:?}"
+            );
+        }
+        // A mix of fillers is refused as well.
+        assert_eq!(
+            validate_label("\u{3164}\u{2800}"),
+            Err(Code::InvalidLabel)
+        );
+        // A label with one visible character among them is kept.
+        assert_eq!(validate_label("A\u{3164}"), Ok(()));
+    }
+
+    // -----------------------------------------------------------------------
+    // An emoji is exactly one emoji
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_emoji_must_be_exactly_one_emoji() {
+        // One emoji is accepted.
+        assert_eq!(validate_emoji("🎉"), Ok(()));
+        assert_eq!(validate_emoji("🎉\u{FE0F}"), Ok(()));
+        assert_eq!(validate_emoji("👍🏽"), Ok(()));
+        assert_eq!(validate_emoji("👨‍👩‍👧"), Ok(()));
+        assert_eq!(validate_emoji("🇺🇸"), Ok(()));
+        assert_eq!(validate_emoji("1️⃣"), Ok(()));
+        // Two emoji in one string are refused.
+        assert_eq!(validate_emoji("🎉🎉"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("⬛⬛"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("🎉🎉🎉🎉"), Err(Code::InvalidEmoji));
+        // A skin tone without a base is refused.
+        assert_eq!(validate_emoji("🏻🎉"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("🏻"), Err(Code::InvalidEmoji));
+        // An emoji with no base at all is refused.
+        assert_eq!(validate_emoji("\u{FE0F}"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("\u{20E3}"), Err(Code::InvalidEmoji));
+        // A lone regional indicator is refused: a flag is a pair.
+        assert_eq!(validate_emoji("\u{1F1FA}"), Err(Code::InvalidEmoji));
+        // Several variation selectors after one base are refused.
+        assert_eq!(
+            validate_emoji("🎉\u{FE0F}\u{FE0F}"),
+            Err(Code::InvalidEmoji)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The record write may fail
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_failed_record_write_leaves_the_row_unchanged_and_the_next_post_publishes() {
+        let mut store = FakeStore::new();
+        let discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+
+        // The message is sent, but the row cannot be written.
+        store.fail_publish = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(
+            outcome,
+            Outcome::with(Code::StoreFailed, "sqlite_error")
+        );
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(menu.message, None, "the row is unchanged");
+        assert_eq!(menu.channel, None);
+        assert_eq!(menu.embed_key, None);
+        assert_eq!(discord.send_count(), 1, "the message was sent");
+
+        // The store works again: the next post publishes the menu.
+        store.fail_publish = None;
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::Posted));
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert!(menu.message.is_some(), "the row names the new message");
+        assert_eq!(menu.channel, Some(CHANNEL));
+        assert_eq!(
+            discord.send_count(),
+            2,
+            "the first message was orphaned by the failed write"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The seeded sequence drives its faults from the random values
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_persistent_deleted_message_always_reaches_a_published_menu() {
+        let store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        // The edit always reports that the message is gone: the recovery must
+        // still reach a published menu, not give up.
+        discord.fail_edit = Some(DiscordError::NotFound);
+
+        let mut rng = Lcg(0xC0FF_EE00_1234);
+        let mut published = false;
+        let mut last_published = (None, None);
+        for _ in 0..60 {
+            // The send itself fails on some steps: the row must not change then.
+            discord.fail = if rng.next(4) == 0 {
+                Some(DiscordError::Failed)
+            } else {
+                None
+            };
+            let before = store.menu(GUILD, "main").unwrap();
+            let before = (before.channel, before.message);
+            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+            match outcome.code {
+                Code::Posted | Code::Reposted => {
+                    published = true;
+                    let menu = store.menu(GUILD, "main").unwrap();
+                    let sent = discord.sends.lock().unwrap().last().unwrap().0;
+                    assert_eq!(menu.channel, Some(sent));
+                    assert!(menu.message.is_some());
+                    last_published = (menu.channel, menu.message);
+                }
+                Code::DiscordFailed => {
+                    // A failed send never changes the row.
+                    let menu = store.menu(GUILD, "main").unwrap();
+                    assert_eq!((menu.channel, menu.message), before, "the row is unchanged");
+                    assert_eq!(last_published, before, "the row never moved");
+                }
+                other => panic!("unexpected code {other:?}"),
+            }
+        }
+        assert!(published, "the menu was never published");
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert!(menu.message.is_some(), "the menu ends published");
+        assert_eq!(menu.channel, Some(CHANNEL));
     }
 }
