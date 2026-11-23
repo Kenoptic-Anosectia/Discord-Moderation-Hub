@@ -1364,6 +1364,8 @@ mod tests {
         fail: Option<RepoError>,
         /// Set to fail only `set_published`.
         fail_publish: Option<RepoError>,
+        /// Set to fail only `clear_published`.
+        fail_clear: Option<RepoError>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1572,6 +1574,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("clear_published {menu_id}"));
+            if let Some(error) = self.fail_clear {
+                return Err(error);
+            }
             if let Some(error) = self.fail {
                 return Err(error);
             }
@@ -3411,6 +3416,39 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_the_clear_itself_is_reported_with_a_stable_code() {
+        let mut store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        // The row was read, but the clear itself fails.
+        store.fail_clear = Some(RepoError::MenuMissing);
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+
+        // A storage failure is reported with the storage code.
+        store.fail_clear = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::with(Code::StoreFailed, "sqlite_error"));
     }
 
     #[tokio::test]
