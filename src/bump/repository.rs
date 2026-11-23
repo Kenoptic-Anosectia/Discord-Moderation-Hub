@@ -1,8 +1,9 @@
 //! SQLite persistence for the bump reminder cycle (BU2).
 //!
 //! One row per guild in `bump_state` inside the shared core database. The columns are
-//! the ones the plan names: `guild TEXT PRIMARY KEY, last_bump_at INTEGER,
-//! last_bumper TEXT, next_due_at INTEGER, cycle INTEGER, reminded INTEGER`.
+//! the ones the plan names plus `wake_gen`: `guild TEXT PRIMARY KEY, last_bump_at
+//! INTEGER, last_bumper TEXT, next_due_at INTEGER, cycle INTEGER, reminded INTEGER,
+//! wake_gen INTEGER NOT NULL DEFAULT 0`.
 //!
 //! Holds no Discord types and reads no clock: the caller passes ids and `now`.
 //!
@@ -22,17 +23,23 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Feature name used with `storage::migrate`.
 pub const FEATURE: &str = "bump";
 
-/// The plan's table shape.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: "CREATE TABLE bump_state (\
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: "CREATE TABLE bump_state (\
           guild TEXT NOT NULL PRIMARY KEY, \
           last_bump_at INTEGER, \
           last_bumper TEXT, \
           next_due_at INTEGER, \
           cycle INTEGER NOT NULL DEFAULT 0 CHECK (cycle >= 0), \
           reminded INTEGER NOT NULL DEFAULT 0 CHECK (reminded IN (0,1)));",
-}];
+    },
+    Migration {
+        version: 2,
+        sql: "ALTER TABLE bump_state ADD COLUMN \
+              wake_gen INTEGER NOT NULL DEFAULT 0 CHECK (wake_gen >= 0);",
+    },
+];
 
 /// Stable error codes. Never carries SQL text, a path or an id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +97,8 @@ pub struct BumpState {
     pub cycle: i64,
     /// True once the reminder for this cycle has been marked as sent.
     pub reminded: bool,
+    /// The wake-up generation counter for this cycle (`wake_gen`).
+    pub wake_gen: i64,
 }
 
 impl BumpState {
@@ -102,6 +111,7 @@ impl BumpState {
             next_due_at: None,
             cycle: 0,
             reminded: false,
+            wake_gen: 0,
         }
     }
 
@@ -123,6 +133,7 @@ impl BumpState {
             next_due_at,
             cycle,
             reminded: state.reminded_for_cycle,
+            wake_gen: 0,
         }
     }
 }
@@ -153,7 +164,7 @@ impl Repository {
         let raw = self
             .conn
             .query_row(
-                "SELECT last_bump_at, last_bumper, next_due_at, cycle, reminded \
+                "SELECT last_bump_at, last_bumper, next_due_at, cycle, reminded, wake_gen \
                  FROM bump_state WHERE guild = ?1",
                 params![guild.to_string()],
                 |r| {
@@ -163,11 +174,12 @@ impl Repository {
                         r.get::<_, Option<i64>>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((last_bump_at, last_bumper, next_due_at, cycle, reminded)) = raw else {
+        let Some((last_bump_at, last_bumper, next_due_at, cycle, reminded, wake_gen)) = raw else {
             return Ok(None);
         };
         let last_bumper = match last_bumper {
@@ -179,7 +191,7 @@ impl Repository {
             1 => true,
             _ => return Err(RepoError::CorruptRow),
         };
-        if cycle < 0 {
+        if cycle < 0 || wake_gen < 0 {
             return Err(RepoError::CorruptRow);
         }
         Ok(Some(BumpState {
@@ -189,20 +201,22 @@ impl Repository {
             next_due_at,
             cycle,
             reminded,
+            wake_gen,
         }))
     }
 
     /// Writes the row for its guild, replacing any row already there.
     pub fn save(&mut self, state: &BumpState) -> Result<(), RepoError> {
         self.conn.execute(
-            "INSERT INTO bump_state (guild, last_bump_at, last_bumper, next_due_at, cycle, reminded) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO bump_state (guild, last_bump_at, last_bumper, next_due_at, cycle, reminded, wake_gen) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(guild) DO UPDATE SET \
                last_bump_at = excluded.last_bump_at, \
                last_bumper = excluded.last_bumper, \
                next_due_at = excluded.next_due_at, \
                cycle = excluded.cycle, \
-               reminded = excluded.reminded",
+               reminded = excluded.reminded, \
+               wake_gen = excluded.wake_gen",
             params![
                 state.guild.to_string(),
                 state.last_bump_at,
@@ -210,20 +224,24 @@ impl Repository {
                 state.next_due_at,
                 state.cycle,
                 i64::from(state.reminded),
+                state.wake_gen,
             ],
         )?;
         Ok(())
     }
 
-    /// Mark the cycle as reminded, but only if the stored row is still that cycle.
-    ///
-    /// The write is conditional on the cycle number, so a handler that read an
-    /// older cycle cannot mark a newer one: it finds `false` and must not post.
-    /// Returns `true` when the row was changed.
-    pub fn mark_reminded(&mut self, guild: u64, cycle: i64) -> Result<bool, RepoError> {
+    /// Atomically claim the send attempt for this guild, cycle and stored due time.
+    /// A different cycle/due or an already marked row returns `false`: do not post.
+    pub fn mark_reminded(
+        &mut self,
+        guild: u64,
+        cycle: i64,
+        due_at: i64,
+    ) -> Result<bool, RepoError> {
         let n = self.conn.execute(
-            "UPDATE bump_state SET reminded = 1 WHERE guild = ?1 AND cycle = ?2",
-            params![guild.to_string(), cycle],
+            "UPDATE bump_state SET reminded = 1 \
+             WHERE guild = ?1 AND cycle = ?2 AND next_due_at = ?3 AND reminded = 0",
+            params![guild.to_string(), cycle, due_at],
         )?;
         Ok(n == 1)
     }
@@ -265,6 +283,7 @@ mod tests {
             next_due_at: Some(1_700_007_200),
             cycle: 3,
             reminded: false,
+            wake_gen: 0,
         }
     }
 
@@ -288,9 +307,51 @@ mod tests {
                 "last_bumper",
                 "next_due_at",
                 "cycle",
-                "reminded"
+                "reminded",
+                "wake_gen"
             ]
         );
+    }
+
+    #[test]
+    fn wake_gen_defaults_to_zero_and_round_trips() {
+        let mut repo = mem();
+        let mut s = state();
+        s.wake_gen = 4;
+        repo.save(&s).unwrap();
+        assert_eq!(repo.load(GUILD).unwrap().unwrap().wake_gen, 4);
+    }
+
+    #[test]
+    fn round3_upgrades_a_v1_row_without_losing_its_reminder_mark() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        storage::migrate(
+            &mut conn,
+            FEATURE,
+            &[Migration {
+                version: 1,
+                sql: "CREATE TABLE bump_state (guild TEXT NOT NULL PRIMARY KEY, \
+                  last_bump_at INTEGER, last_bumper TEXT, next_due_at INTEGER, \
+                  cycle INTEGER NOT NULL DEFAULT 0 CHECK (cycle >= 0), \
+                  reminded INTEGER NOT NULL DEFAULT 0 CHECK (reminded IN (0,1)));",
+            }],
+        )
+        .unwrap();
+        let mut expected = state();
+        expected.reminded = true;
+        conn.execute(
+            "INSERT INTO bump_state VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                GUILD.to_string(),
+                expected.last_bump_at,
+                expected.last_bumper.unwrap().to_string(),
+                expected.next_due_at,
+                expected.cycle
+            ],
+        )
+        .unwrap();
+        let repo = Repository::new(conn).unwrap();
+        assert_eq!(repo.load(GUILD), Ok(Some(expected)));
     }
 
     #[test]
@@ -402,8 +463,9 @@ mod tests {
     fn the_mark_of_the_reminder_is_conditional_on_the_cycle() {
         let mut repo = mem();
         repo.save(&state()).unwrap();
+        let due = state().next_due_at.unwrap();
         // The stored cycle is 3: the mark lands.
-        assert!(repo.mark_reminded(GUILD, 3).unwrap());
+        assert!(repo.mark_reminded(GUILD, 3, due).unwrap());
         assert!(repo.load(GUILD).unwrap().unwrap().reminded);
         // A stale handler that read an older cycle must not mark a newer one.
         let mut newer = state();
@@ -411,22 +473,35 @@ mod tests {
         newer.reminded = false;
         repo.save(&newer).unwrap();
         assert!(
-            !repo.mark_reminded(GUILD, 3).unwrap(),
+            !repo.mark_reminded(GUILD, 3, due).unwrap(),
             "a stale cycle marked the row"
         );
         let stored = repo.load(GUILD).unwrap().unwrap();
         assert_eq!(stored.cycle, 4);
         assert!(!stored.reminded, "the newer cycle was marked as reminded");
+        assert!(!repo.mark_reminded(GUILD, 4, due - 1).unwrap());
         // The right cycle marks it.
-        assert!(repo.mark_reminded(GUILD, 4).unwrap());
+        assert!(repo.mark_reminded(GUILD, 4, due).unwrap());
         assert!(repo.load(GUILD).unwrap().unwrap().reminded);
+    }
+
+    #[test]
+    fn round3_the_same_row_cannot_be_marked_twice() {
+        let mut repo = mem();
+        let initial = state();
+        repo.save(&initial).unwrap();
+        let due = initial.next_due_at.unwrap();
+        assert!(repo.mark_reminded(GUILD, initial.cycle, due).unwrap());
+        assert!(!repo.mark_reminded(GUILD, initial.cycle, due).unwrap());
     }
 
     #[test]
     fn a_mark_for_another_guild_changes_nothing() {
         let mut repo = mem();
         repo.save(&state()).unwrap();
-        assert!(!repo.mark_reminded(OTHER_GUILD, 3).unwrap());
+        assert!(!repo
+            .mark_reminded(OTHER_GUILD, 3, state().next_due_at.unwrap())
+            .unwrap());
         assert!(!repo.load(GUILD).unwrap().unwrap().reminded);
     }
 

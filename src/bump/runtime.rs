@@ -8,9 +8,8 @@
 //!    own: the message must come from the configured bump channel.
 //! 2. **Persist.** A confirmed bump is written to the `bump_state` row (see
 //!    [`super::repository`]) and the cycle number grows by one.
-//! 3. **Schedule.** Exactly one reminder job per cycle and due time is scheduled
-//!    through the job queue. The dedupe key names the guild, the cycle and the due
-//!    time, so the queue's UNIQUE key refuses a repeat of the same cycle and due time.
+//! 3. **Schedule.** The row owns the reminder; queue jobs are disposable wake-ups.
+//!    The queue deduplicates by guild, cycle, due time and persisted wake generation.
 //! 4. **Command logic.** `/bump status` and the staff-only `/bump reset` are plain
 //!    async functions plus pure reply builders; the poise registration is the wiring
 //!    card's job (W3).
@@ -25,6 +24,7 @@
 use super::config::BumpSettings;
 use super::policy::{self, BumpConfig, Decision, IgnoreReason, MessageFacts, ReminderStatus};
 use super::repository::{BumpState, RepoError, Repository};
+use crate::jobs::queue::JobState;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -142,9 +142,9 @@ pub trait ReminderChannel: Send + Sync {
 pub struct JobRequest {
     /// The job kind. Always [`KIND_REMINDER`] here.
     pub kind: &'static str,
-    /// The dedupe key. It names the cycle, so one cycle gets one job.
+    /// The dedupe key for this guild, cycle, due time and wake generation.
     pub dedupe_key: String,
-    /// The JSON payload. It holds the guild id and the cycle number, nothing else.
+    /// The JSON payload: guild id, cycle and due time.
     pub payload_json: String,
     /// When the job becomes due (unix seconds).
     pub due_at: i64,
@@ -156,7 +156,7 @@ pub enum ScheduleOutcome {
     /// A new job row was created.
     Created,
     /// The dedupe key already existed; nothing was written.
-    Duplicate,
+    Duplicate { state: JobState },
 }
 
 /// One reminder job, as the queue hands it out.
@@ -354,7 +354,7 @@ pub enum RearmOutcome {
     /// Nothing to do: the feature is off or in shadow, there is no cycle, or the
     /// cycle is already reminded.
     NothingToDo,
-    /// The job for the current cycle and due time already existed.
+    /// A pending or running wake-up for the current cycle and due time already existed.
     AlreadyScheduled,
     /// A new job was scheduled for the current cycle and due time.
     Scheduled,
@@ -392,6 +392,11 @@ pub enum CommandOutcome {
 
 /// The runtime's view of the world: the configuration, the stored state and the two
 /// outbound traits.
+///
+/// Use one serialized owner per guild for observe, reset, rearm and job handling.
+/// The mutable repository borrow enforces this for a shared instance, not for
+/// independently opened connections. Do not hold a SQLite write transaction while
+/// scheduling on the queue's connection to the shared core database.
 pub struct Runtime<'a> {
     /// The parsed settings.
     pub settings: &'a BumpSettings,
@@ -405,14 +410,9 @@ pub struct Runtime<'a> {
     pub channel: &'a dyn ReminderChannel,
 }
 
-/// The dedupe key of the reminder job for one cycle and due time.
-///
-/// The due time is part of the key, so a re-arm that moves the due time of a
-/// cycle schedules a NEW job instead of colliding with the old one. The old job
-/// stays harmless: it carries a due time that no longer matches the cycle, so it
-/// is stale and does nothing.
-pub fn dedupe_key(guild: u64, cycle: i64, due_at: i64) -> String {
-    format!("bump:{guild}:{cycle}:{due_at}")
+/// Key for a wake-up at this due time. A new generation bypasses a terminal key.
+pub fn dedupe_key(guild: u64, cycle: i64, due_at: i64, wake_gen: i64) -> String {
+    format!("bump:{guild}:{cycle}:{due_at}:{wake_gen}")
 }
 
 /// The payload of the reminder job for one cycle and due time. It holds the guild
@@ -577,8 +577,7 @@ impl Runtime<'_> {
             Some(confirmation.next_due),
         );
         self.repo.save(&next)?;
-        let due_at = next.next_due_at.unwrap_or(confirmation.next_due);
-        self.schedule_for(next.guild, cycle, due_at)?;
+        self.schedule_for(&next, confirmation.next_due)?;
         Ok(Observation::Confirmed {
             message_id: confirmation.message_id,
             next_due: confirmation.next_due,
@@ -589,8 +588,8 @@ impl Runtime<'_> {
     /// Re-run the schedule of the current cycle.
     ///
     /// It is the repair for a cycle whose schedule was refused: the dedupe key
-    /// makes the call idempotent, so a job that already exists is left alone and
-    /// a missing one is created. It returns `None` when there is nothing to
+    /// makes the call idempotent: an active job is left alone; a missing or
+    /// terminal one is replaced. It returns `None` when there is nothing to
     /// repair (no cycle, the cycle is already reminded, or the feature is in
     /// shadow mode).
     fn repair_schedule(
@@ -606,45 +605,65 @@ impl Runtime<'_> {
         let Some(due_at) = current.next_due_at else {
             return Ok(None);
         };
-        match self.schedule_for(current.guild, current.cycle, due_at)? {
-            ScheduleOutcome::Created => Ok(Some(Observation::Repaired {
+        let outcome = self.schedule_for(current, due_at)?;
+        Ok(
+            (outcome == RearmOutcome::Scheduled).then_some(Observation::Repaired {
                 cycle: current.cycle,
-            })),
-            ScheduleOutcome::Duplicate => Ok(None),
+            }),
+        )
+    }
+
+    /// Ensure a wake-up exists for an already persisted, unmarked cycle.
+    fn schedule_for(
+        &mut self,
+        state: &BumpState,
+        due_at: i64,
+    ) -> Result<RearmOutcome, RuntimeError> {
+        match self.schedule_wake(state, due_at)? {
+            ScheduleOutcome::Created => return Ok(RearmOutcome::Scheduled),
+            ScheduleOutcome::Duplicate { state } if !state.is_terminal() => {
+                return Ok(RearmOutcome::AlreadyScheduled);
+            }
+            ScheduleOutcome::Duplicate { .. } => {}
+        }
+
+        // Commit the next generation before a single retry. If the queue refuses,
+        // a later rearm can retry from the persisted row without losing the debt.
+        let mut next = state.clone();
+        next.wake_gen = next
+            .wake_gen
+            .checked_add(1)
+            .ok_or(RuntimeError::CorruptState)?;
+        self.repo.save(&next)?;
+        match self.schedule_wake(&next, due_at)? {
+            ScheduleOutcome::Created => Ok(RearmOutcome::Scheduled),
+            ScheduleOutcome::Duplicate { state } if !state.is_terminal() => {
+                Ok(RearmOutcome::AlreadyScheduled)
+            }
+            ScheduleOutcome::Duplicate { .. } => Err(RuntimeError::QueueRefused),
         }
     }
 
-    /// Schedule the reminder job for one cycle and due time.
-    ///
-    /// The dedupe key names the guild, the cycle and the due time, so a second call
-    /// for the same cycle and due time creates nothing, while a later due time (the
-    /// interval changed) gets a job of its own.
-    fn schedule_for(
+    fn schedule_wake(
         &self,
-        guild: u64,
-        cycle: i64,
+        state: &BumpState,
         due_at: i64,
     ) -> Result<ScheduleOutcome, RuntimeError> {
-        if cycle <= 0 {
-            return Ok(ScheduleOutcome::Duplicate);
-        }
         let request = JobRequest {
             kind: KIND_REMINDER,
-            dedupe_key: dedupe_key(guild, cycle, due_at),
-            payload_json: payload_json(guild, cycle, due_at),
+            dedupe_key: dedupe_key(state.guild, state.cycle, due_at, state.wake_gen),
+            payload_json: payload_json(state.guild, state.cycle, due_at),
             due_at,
         };
         self.queue.schedule(&request)
     }
 
-    /// Re-arm the reminder after a restart.
+    /// Re-arm after queue reconciliation and before workers claim on startup.
     ///
     /// The stored due time may be stale (the interval was changed at the
     /// restart). The policy decides what is due now; the row is updated and a job
-    /// is scheduled for that moment. The dedupe key carries the due time, so a
-    /// moved due time gets a NEW job instead of colliding with the old one, and
-    /// the old job stays harmless: it carries a due time that no longer matches
-    /// the cycle, so it is stale and does nothing.
+    /// scheduled for that moment. Old jobs for a different due time do nothing.
+    /// A terminal duplicate at the current due time needs a fresh generation.
     ///
     /// The result tells the truth: [`RearmOutcome::NothingToDo`] when there is
     /// nothing to do, [`RearmOutcome::AlreadyScheduled`] when the job was already
@@ -653,7 +672,7 @@ impl Runtime<'_> {
         if !self.is_enabled() || self.is_shadow() {
             return Ok(RearmOutcome::NothingToDo);
         }
-        let state = self.load_state()?;
+        let mut state = self.load_state()?;
         if state.cycle <= 0 || state.reminded {
             return Ok(RearmOutcome::NothingToDo);
         }
@@ -662,13 +681,11 @@ impl Runtime<'_> {
             ReminderStatus::NotYet { due_at } | ReminderStatus::Due { due_at } => due_at,
             _ => return Ok(RearmOutcome::NothingToDo),
         };
-        let mut fresh = state.clone();
-        fresh.next_due_at = Some(due_at);
-        self.repo.save(&fresh)?;
-        match self.schedule_for(fresh.guild, fresh.cycle, due_at)? {
-            ScheduleOutcome::Created => Ok(RearmOutcome::Scheduled),
-            ScheduleOutcome::Duplicate => Ok(RearmOutcome::AlreadyScheduled),
+        if state.next_due_at != Some(due_at) {
+            state.next_due_at = Some(due_at);
+            self.repo.save(&state)?;
         }
+        self.schedule_for(&state, due_at)
     }
 
     /// The outcome of the reminder job for one cycle.
@@ -677,19 +694,20 @@ impl Runtime<'_> {
     /// reminder is owed. A cycle that was already reminded owes nothing, and a
     /// cycle that is not due yet owes nothing.
     pub fn reminder_due(&self, state: &BumpState, now: i64) -> bool {
-        policy::due(&state.to_policy(), &self.config, now)
+        matches!(
+            stored_reminder_status(state, now),
+            ReminderStatus::Due { .. }
+        )
     }
 
     /// Run the reminder of one job the queue handed out.
     ///
-    /// The governing rule: a reminder job only ACTS when the due time it carries
-    /// equals the cycle's stored `next_due_at`. A job whose due time no longer
-    /// matches is STALE and is a no-op: it writes nothing and posts nothing, so
-    /// it can never consume the reminder of the cycle that is really running.
+    /// A wake-up only acts for the configured guild and the stored cycle and due
+    /// time. The row alone determines whether a reminder is owed.
     ///
     /// The cycle is marked as reminded BEFORE the post, so a crash between the mark
     /// and the post cannot produce a second reminder. The mark is conditional on
-    /// the cycle number, so a stale handler cannot mark a newer cycle. If the post
+    /// guild, cycle, due time and the row not already being marked. If the post
     /// fails, the failure is reported to the caller by code; the cycle stays
     /// marked, because a repeated post would be a duplicate.
     ///
@@ -699,29 +717,21 @@ impl Runtime<'_> {
         now: i64,
         job: &ReminderJob,
     ) -> Result<bool, RuntimeError> {
-        if !self.is_enabled() || self.is_shadow() {
+        if !self.is_enabled() || self.is_shadow() || job.kind != KIND_REMINDER {
             return Ok(false);
         }
         let payload = parse_reminder_payload(&job.payload_json)?;
+        if payload.guild != self.config.guild_id() {
+            return Ok(false);
+        }
         let state = self.load_state()?;
-        if state.cycle <= 0 {
+        let ReminderStatus::Due { due_at } = stored_reminder_status(&state, now) else {
+            return Ok(false);
+        };
+        if state.cycle != payload.cycle || due_at != payload.due_at {
             return Ok(false);
         }
-        // The governing rule: the job acts only for the cycle and the due time it
-        // carries. Anything else is stale and does nothing at all.
-        if state.cycle != payload.cycle || state.next_due_at != Some(payload.due_at) {
-            return Ok(false);
-        }
-        if state.reminded {
-            return Ok(false);
-        }
-        if now < payload.due_at {
-            return Ok(false);
-        }
-        // Mark first: at most once, even across a restart. The mark is conditional
-        // on the cycle, so a handler that read an older cycle cannot mark the
-        // newer one.
-        if !self.repo.mark_reminded(state.guild, state.cycle)? {
+        if !self.repo.mark_reminded(state.guild, state.cycle, due_at)? {
             return Ok(false);
         }
         let reminder = build_reminder(self.settings, state.cycle);
@@ -763,7 +773,7 @@ impl Runtime<'_> {
             });
         }
         let state = self.load_state()?;
-        let status = policy::reminder_status(&state.to_policy(), &self.config, now);
+        let status = stored_reminder_status(&state, now);
         Ok(CommandOutcome::Done {
             reply: status_reply(&state, status, now),
         })
@@ -816,7 +826,7 @@ impl Runtime<'_> {
             });
         }
         self.repo.save(&next)?;
-        self.schedule_for(next.guild, cycle, next_due)?;
+        self.schedule_for(&next, next_due)?;
         Ok(CommandOutcome::Done {
             reply: reset_reply_done(&next),
         })
@@ -850,6 +860,21 @@ impl Runtime<'_> {
         // The shadow record says what would happen; nothing is written or sent.
         let _ = (confirmation, next_state, cycle);
         Ok(record)
+    }
+}
+
+fn stored_reminder_status(state: &BumpState, now: i64) -> ReminderStatus {
+    match state.next_due_at {
+        Some(due_at) if state.cycle > 0 => {
+            if state.reminded {
+                ReminderStatus::AlreadyReminded { due_at }
+            } else if now >= due_at {
+                ReminderStatus::Due { due_at }
+            } else {
+                ReminderStatus::NotYet { due_at }
+            }
+        }
+        _ => ReminderStatus::NoCycle,
     }
 }
 
@@ -970,20 +995,6 @@ mod tests {
                 .cloned()
                 .collect()
         }
-        /// True when a job for this cycle and due time can still be claimed.
-        fn has_pending_job(&self, cycle: i64, due_at: i64) -> bool {
-            self.state
-                .lock()
-                .unwrap()
-                .jobs
-                .iter()
-                .filter(|j| !j.claimed && j.due_at == due_at)
-                .any(|j| {
-                    parse_reminder_payload(&j.payload_json)
-                        .map(|p| p.cycle == cycle)
-                        .unwrap_or(false)
-                })
-        }
     }
 
     impl JobQueue for FakeQueue {
@@ -993,12 +1004,18 @@ mod tests {
                 return Err(RuntimeError::QueueRefused);
             }
             state.requests.push(request.clone());
-            if state
+            if let Some(job) = state
                 .jobs
                 .iter()
-                .any(|j| j.dedupe_key == request.dedupe_key)
+                .find(|j| j.dedupe_key == request.dedupe_key)
             {
-                return Ok(ScheduleOutcome::Duplicate);
+                return Ok(ScheduleOutcome::Duplicate {
+                    state: if job.claimed {
+                        JobState::Running
+                    } else {
+                        JobState::Pending
+                    },
+                });
             }
             state.next_id += 1;
             let id = state.next_id;
@@ -1042,10 +1059,33 @@ mod tests {
     /// `Sync`; the queue's own CAS is what serialises the real callers.
     struct RealQueue {
         conn: Mutex<Connection>,
+        unavailable: std::sync::atomic::AtomicBool,
+    }
+
+    impl RealQueue {
+        fn new(conn: Connection) -> Self {
+            Self {
+                conn: Mutex::new(conn),
+                unavailable: false.into(),
+            }
+        }
+
+        fn set_available(&self, available: bool) {
+            self.unavailable
+                .store(!available, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn check_available(&self) -> Result<(), RuntimeError> {
+            if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(RuntimeError::QueueRefused);
+            }
+            Ok(())
+        }
     }
 
     impl JobQueue for RealQueue {
         fn schedule(&self, request: &JobRequest) -> Result<ScheduleOutcome, RuntimeError> {
+            self.check_available()?;
             let job = NewJob {
                 kind: request.kind,
                 dedupe_key: &request.dedupe_key,
@@ -1055,11 +1095,12 @@ mod tests {
             let conn = self.conn.lock().unwrap();
             match queue::schedule(&conn, &job, NOW).map_err(|_| RuntimeError::QueueRefused)? {
                 QueueOutcome::Created { .. } => Ok(ScheduleOutcome::Created),
-                QueueOutcome::Duplicate { .. } => Ok(ScheduleOutcome::Duplicate),
+                QueueOutcome::Duplicate { state, .. } => Ok(ScheduleOutcome::Duplicate { state }),
             }
         }
 
         fn claim_due(&self, now: i64, limit: u32) -> Result<Vec<ReminderJob>, RuntimeError> {
+            self.check_available()?;
             let conn = self.conn.lock().unwrap();
             let batch =
                 queue::claim_due(&conn, now, limit).map_err(|_| RuntimeError::QueueRefused)?;
@@ -1134,11 +1175,6 @@ mod tests {
             }
         }
 
-        /// The reminder interval in force.
-        fn interval(&self) -> u64 {
-            self.config.interval_secs()
-        }
-
         /// Change the reminder interval, as a restart with a new setting would.
         fn set_interval(&mut self, secs: u64) {
             let mut s = self.settings.clone();
@@ -1178,11 +1214,13 @@ mod tests {
                 settings,
                 config,
                 repo: repo(),
-                queue: RealQueue {
-                    conn: Mutex::new(conn),
-                },
+                queue: RealQueue::new(conn),
                 channel: FakeChannel::default(),
             }
+        }
+
+        fn interval(&self) -> u64 {
+            self.config.interval_secs()
         }
 
         fn set_interval(&mut self, secs: u64) {
@@ -1204,11 +1242,7 @@ mod tests {
 
         /// Claim every job that is due and run it through the runtime.
         async fn drive(&mut self, now: i64) {
-            let claimed = self.queue.claim_due(now, 32).unwrap();
-            for job in claimed {
-                let mut rt = self.runtime();
-                let _ = rt.run_reminder(now, &job).await;
-            }
+            drive_queue(self, now).await.unwrap();
         }
     }
 
@@ -2074,6 +2108,7 @@ mod tests {
             next_due_at: Some(NOW + INTERVAL as i64),
             cycle: 1,
             reminded: false,
+            wake_gen: 0,
         };
         // The stored row is written directly, so the cycle really is due.
         h.repo.save(&state).unwrap();
@@ -2312,6 +2347,146 @@ mod tests {
 
     // ---- the real queue --------------------------------------------------------------
 
+    // Reopen the same synthetic core database with a fresh runtime and queue connection.
+    fn disk_harness(path: &std::path::Path, interval: u64, channel: FakeChannel) -> RealHarness {
+        let mut h = RealHarness::new("live", interval);
+        h.repo = Repository::open(path.to_str().unwrap(), &[]).unwrap();
+        let mut conn = Connection::open(path).unwrap();
+        queue::init(&mut conn).unwrap();
+        h.queue.conn = Mutex::new(conn);
+        h.channel = channel;
+        h
+    }
+
+    fn runtime_db(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/bu2-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("core.sqlite")
+    }
+
+    fn reconcile(h: &RealHarness, now: i64) -> queue::Report {
+        queue::reconcile_after_restart(
+            &h.queue.conn.lock().unwrap(),
+            now,
+            KIND_TABLE,
+            &queue::RetryPolicy::DEFAULT,
+        )
+        .unwrap()
+    }
+
+    async fn interval_a_b_a_replaces_the_completed_stale_wake() {
+        let path = runtime_db("round3-interval");
+        let mut a = disk_harness(&path, 7_200, FakeChannel::default());
+        a.runtime().observe(&success(100), NOW).unwrap();
+        drop(a);
+
+        let mut b = disk_harness(&path, 9_000, FakeChannel::default());
+        assert!(reconcile(&b, NOW + 1).entries.is_empty());
+        assert_eq!(b.runtime().rearm(NOW + 1), Ok(RearmOutcome::Scheduled));
+        let early_due = NOW + 7_200;
+        let early = b.queue.claim_due(early_due, 32).unwrap();
+        assert_eq!(early.len(), 1);
+        let before = b.repo.load(GUILD).unwrap().unwrap();
+        assert!(!b
+            .runtime()
+            .run_reminder(early_due, &early[0])
+            .await
+            .unwrap());
+        assert_eq!(b.repo.load(GUILD).unwrap(), Some(before));
+        assert!(b.channel.sent().is_empty());
+        queue::complete(&b.queue.conn.lock().unwrap(), early[0].id, early_due).unwrap();
+        drop(b);
+
+        let mut a = disk_harness(&path, 7_200, FakeChannel::default());
+        assert!(reconcile(&a, early_due + 1).entries.is_empty());
+        assert_eq!(
+            a.runtime().rearm(early_due + 1),
+            Ok(RearmOutcome::Scheduled),
+            "a completed stale wake cannot satisfy the newly owed reminder"
+        );
+        assert_eq!(a.repo.load(GUILD).unwrap().unwrap().wake_gen, 1);
+        a.drive(early_due + 1).await;
+        assert!(a.repo.load(GUILD).unwrap().unwrap().reminded);
+        a.drive(NOW + 9_000).await;
+        assert_eq!(a.channel.sent().len(), 1);
+    }
+
+    async fn claim_crash_reconcile_rearms_the_owed_reminder() {
+        let path = runtime_db("round3-crash");
+        let mut h = disk_harness(&path, INTERVAL, FakeChannel::default());
+        h.runtime().observe(&success(100), NOW).unwrap();
+        let due = NOW + INTERVAL as i64;
+        let claimed = h.queue.claim_due(due, 32).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(h.runtime().rearm(due), Ok(RearmOutcome::AlreadyScheduled));
+        assert!(!h.repo.load(GUILD).unwrap().unwrap().reminded);
+        drop(h); // Crashed after claim, before the handler marked the row.
+
+        let mut h = disk_harness(&path, INTERVAL, FakeChannel::default());
+        let report = reconcile(&h, due);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].id, claimed[0].id);
+        assert_eq!(
+            report.entries[0].outcome,
+            queue::ReconcileOutcome::AbandonedAtMostOnce
+        );
+        assert_eq!(h.runtime().rearm(due), Ok(RearmOutcome::Scheduled));
+        assert_eq!(h.repo.load(GUILD).unwrap().unwrap().wake_gen, 1);
+        assert_eq!(h.runtime().rearm(due), Ok(RearmOutcome::AlreadyScheduled));
+        a_wait_for_one_delivery(&mut h, due).await;
+        drop(h);
+
+        let mut h = disk_harness(&path, INTERVAL, FakeChannel::default());
+        assert_eq!(h.runtime().rearm(due), Ok(RearmOutcome::NothingToDo));
+        h.drive(due).await;
+        assert!(h.channel.sent().is_empty());
+    }
+
+    async fn a_wait_for_one_delivery(h: &mut RealHarness, due: i64) {
+        h.drive(due).await;
+        assert!(h.repo.load(GUILD).unwrap().unwrap().reminded);
+        assert_eq!(h.channel.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn round3_foreign_guild_wake_cannot_consume_the_home_reminder() {
+        let mut h = RealHarness::new("live", INTERVAL);
+        let due = NOW + INTERVAL as i64;
+        let foreign = JobRequest {
+            kind: KIND_REMINDER,
+            dedupe_key: format!("foreign:{OTHER_GUILD}"),
+            payload_json: payload_json(OTHER_GUILD, 1, due),
+            due_at: due,
+        };
+        assert_eq!(h.queue.schedule(&foreign), Ok(ScheduleOutcome::Created));
+        h.runtime().observe(&success(100), NOW).unwrap();
+        let before = h.repo.load(GUILD).unwrap();
+        let claimed = h.queue.claim_due(due, 1).unwrap();
+        assert_eq!(claimed[0].payload_json, foreign.payload_json);
+        assert!(!h.runtime().run_reminder(due, &claimed[0]).await.unwrap());
+        assert_eq!(h.repo.load(GUILD).unwrap(), before);
+        assert!(h.channel.sent().is_empty());
+        a_wait_for_one_delivery(&mut h, due).await;
+    }
+
+    #[test]
+    fn round3_status_reports_the_row_due_not_the_unapplied_config() {
+        let mut h = RealHarness::new("live", 7_200);
+        h.runtime().observe(&success(100), NOW).unwrap();
+        h.set_interval(9_000);
+        let now = NOW + 7_200;
+        let CommandOutcome::Done { reply } = h.runtime().status(Some(GUILD), now).unwrap() else {
+            panic!("home-guild status was denied");
+        };
+        assert!(
+            reply.contains(&format!("due now (was due at {now})")),
+            "{reply}"
+        );
+    }
+
     #[test]
     fn the_real_queue_refuses_a_second_job_for_the_same_cycle() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -2319,15 +2494,18 @@ mod tests {
         let due = NOW + INTERVAL as i64;
         let request = JobRequest {
             kind: KIND_REMINDER,
-            dedupe_key: dedupe_key(GUILD, 1, due),
+            dedupe_key: dedupe_key(GUILD, 1, due, 0),
             payload_json: payload_json(GUILD, 1, due),
             due_at: due,
         };
-        let real = RealQueue {
-            conn: Mutex::new(conn),
-        };
+        let real = RealQueue::new(conn);
         assert_eq!(real.schedule(&request), Ok(ScheduleOutcome::Created));
-        assert_eq!(real.schedule(&request), Ok(ScheduleOutcome::Duplicate));
+        assert_eq!(
+            real.schedule(&request),
+            Ok(ScheduleOutcome::Duplicate {
+                state: JobState::Pending
+            })
+        );
         let count: i64 = {
             let conn = real.conn.lock().unwrap();
             conn.query_row(
@@ -2431,52 +2609,46 @@ mod tests {
         *seed >> 33
     }
 
-    /// Claim every job that is due and run it through the runtime.
-    ///
-    /// Returns how many jobs the runtime acted on and how many reminders it posted.
-    /// A reminder can only come from a job the queue handed out. A queue that
-    /// refuses hands out nothing, so nothing is attempted that step.
-    async fn drive_queue(h: &mut Harness, now: i64) -> (usize, usize) {
-        let Ok(claimed) = h.queue.claim_due(now, 32) else {
-            return (0, 0);
-        };
+    /// Return attempted sends and successful posts, settling each claimed wake-up.
+    async fn drive_queue(h: &mut RealHarness, now: i64) -> Result<(usize, usize), RuntimeError> {
         let mut attempted = 0usize;
         let mut posted = 0usize;
-        for job in claimed {
-            let result = {
-                let mut rt = h.runtime();
-                rt.run_reminder(now, &job).await
-            };
-            match result {
-                Ok(true) => {
-                    attempted += 1;
-                    posted += 1;
+        loop {
+            let claimed = h.queue.claim_due(now, 32)?;
+            if claimed.is_empty() {
+                return Ok((attempted, posted));
+            }
+            for job in claimed {
+                match h.runtime().run_reminder(now, &job).await {
+                    Ok(true) => {
+                        attempted += 1;
+                        posted += 1;
+                    }
+                    Err(RuntimeError::SendFailed) => attempted += 1, // Marked; don't retry post.
+                    Ok(false) => {}
+                    Err(other) => return Err(other),
                 }
-                Err(RuntimeError::SendFailed) => {
-                    // The cycle was marked, but the post did not happen.
-                    attempted += 1;
-                }
-                Ok(false) => {}
-                Err(_) => {}
+                queue::complete(&h.queue.conn.lock().unwrap(), job.id, now).unwrap();
             }
         }
-        (attempted, posted)
     }
 
     /// The liveness sweep.
     ///
     /// The model fires reminders ONLY from jobs the queue holds and claims: the
     /// sweep drives the queue, and every reminder the runtime posts must come from
-    /// a claimed job. The sweep includes queue failures and an interval change at a
-    /// restart. It ends with the liveness rule: every overdue, unreminded cycle has
-    /// a claimable job.
+    /// a claimed job. Reopen the actual database in both restart regressions, then
+    /// sweep with failures. Every owed reminder must be attempted when the queue
+    /// recovers, not merely when the queue happens to have a matching job.
     #[tokio::test]
     async fn seeded_sequences_fire_reminders_only_from_claimed_jobs() {
+        interval_a_b_a_replaces_the_completed_stale_wake().await;
+        claim_crash_reconcile_rearms_the_owed_reminder().await;
         for seed0 in 0..40u64 {
             let mut seed = seed0 + 1;
             let mut now = NOW;
             let mut next_id = 1_000u64;
-            let mut h = Harness::new("live");
+            let mut h = RealHarness::new("live", INTERVAL);
             // The model of the cycle.
             let mut model_cycle = 0i64;
             let mut model_last_at = 0i64;
@@ -2489,11 +2661,7 @@ mod tests {
                 // The queue's state is decided once per step: a queue that refuses
                 // hands out nothing, so no reminder can go out that step.
                 let queue_up = !lcg(&mut seed).is_multiple_of(5);
-                if queue_up {
-                    h.queue.work();
-                } else {
-                    h.queue.fail();
-                }
+                h.queue.set_available(queue_up);
                 match lcg(&mut seed) % 8 {
                     0 => {
                         // A real bump.
@@ -2630,63 +2798,49 @@ mod tests {
                     None => assert_eq!(model_cycle, 0, "seed {seed0}: a row is missing"),
                 }
 
-                // The queue is the ground truth for what is claimable: a queue
-                // that refuses to schedule does not remove a job it already holds.
-                let armed = model_cycle > 0 && h.queue.has_pending_job(model_cycle, model_due);
-
-                // Drive the queue: the only source of a reminder.
-                let (attempted, posted) = drive_queue(&mut h, now).await;
-                let owed = model_cycle > 0 && !model_reminded && armed && now >= model_due;
-                if owed && queue_up {
+                // W3's repair tick retries before claiming as soon as the queue recovers.
+                if !queue_up {
+                    assert_eq!(
+                        drive_queue(&mut h, now).await,
+                        Err(RuntimeError::QueueRefused)
+                    );
+                    assert_eq!(
+                        h.channel.sent().len(),
+                        model_posts,
+                        "seed {seed0}: queue down"
+                    );
+                    continue;
+                }
+                h.runtime().rearm(now).unwrap();
+                let (attempted, posted) = drive_queue(&mut h, now).await.unwrap();
+                let owed = model_cycle > 0 && !model_reminded && now >= model_due;
+                if owed {
                     assert_eq!(attempted, 1, "seed {seed0}: the owed reminder was not sent");
                     model_reminded = true;
                     model_posts += posted;
-                } else if owed {
-                    // The queue is down: it hands out nothing, so the reminder
-                    // stays owed and is sent when the queue works again.
-                    assert_eq!(
-                        attempted, 0,
-                        "seed {seed0}: a reminder was sent while the queue was down"
-                    );
                 } else {
                     assert_eq!(
                         attempted, 0,
                         "seed {seed0}: a reminder was not owed (cycle {model_cycle}, \
-                         due {model_due}, now {now}, armed {armed}, \
-                         reminded {model_reminded}, queue_up {queue_up})"
+                         due {model_due}, now {now}, reminded {model_reminded})"
                     );
                 }
             }
 
-            // Drain: the queue works again, the re-arm repairs a missing job and the
-            // queue is driven until nothing is left to do.
-            h.queue.work();
+            // Drain all debt with a healthy queue and channel, even on the last tick.
+            h.queue.set_available(true);
             h.channel.work();
-            for _ in 0..8 {
-                now += h.interval() as i64 + 1;
-                {
-                    let mut rt = h.runtime();
-                    let _ = rt.rearm(now);
-                }
-                let (attempted, posted) = drive_queue(&mut h, now).await;
-                if attempted > 0 {
-                    // The cycle was reminded in the drain; the model only needs the
-                    // count of the reminders that really went out.
-                    model_posts += posted;
-                }
-            }
-
-            // The liveness rule: every overdue, unreminded cycle has a claimable job.
+            now = now.max(model_due);
+            h.runtime().rearm(now).unwrap();
+            let (attempted, posted) = drive_queue(&mut h, now).await.unwrap();
+            let owed = usize::from(model_cycle > 0 && !model_reminded);
+            assert_eq!((attempted, posted), (owed, owed), "seed {seed0}: drain");
+            model_posts += posted;
             let stored = h.repo.load(GUILD).unwrap().unwrap();
-            if stored.cycle > 0 && !stored.reminded {
-                let due = stored.next_due_at.unwrap();
-                if now >= due {
-                    assert!(
-                        h.queue.has_pending_job(stored.cycle, due),
-                        "seed {seed0}: the overdue cycle {stored:?} has no claimable job"
-                    );
-                }
-            }
+            assert!(
+                stored.reminded,
+                "seed {seed0}: overdue cycle not marked: {stored:?}"
+            );
             assert_eq!(
                 h.channel.sent().len(),
                 model_posts,

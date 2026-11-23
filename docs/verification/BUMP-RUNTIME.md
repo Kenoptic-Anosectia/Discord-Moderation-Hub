@@ -1,24 +1,60 @@
 # BUMP-RUNTIME - bump reminder runtime (BU2)
 
-`src/bump/{config,repository,runtime}.rs`: the runtime around the pure BU1 policy. Config parses the `BUMP_*` keys, the repository keeps the `bump_state` row, the runtime detects a bump, persists the cycle, schedules one reminder per cycle and due time and holds the `/bump status` and staff-only `/bump reset` logic. Discord and the job queue sit behind the `ReminderChannel` and `JobQueue` traits, so the tests inject fakes.
+## Authority and delivery
 
-## Rules the code enforces (each has a test)
-1. A message is a bump only when the policy says so (not a webhook, the configured guild, the configured listing bot, a bot account, a real id newer than the last one, the success marker in the text or embed) AND it comes from the configured **bump channel** (`BUMP_CHANNEL_ID`); a message from any other channel is ignored with the code `wrong_channel`, and a runtime without a configured channel trusts no message at all. A user, a webhook or a cooldown reply never counts and never changes the stored cycle.
-2. A confirmed bump starts a cycle: the row is written (`cycle` grows by one, `reminded` cleared) and the reminder job for that cycle and due time is scheduled.
-3. One job per cycle and due time: the dedupe key is `bump:<guild>:<cycle>:<due>`, so the queue's UNIQUE key refuses every repeat. The kind `bump_reminder` is `AtMostOnce`.
-4. The reminder is posted once per cycle, and only from a job the queue handed out: the cycle is marked `reminded` BEFORE the post, and the mark is conditional on the cycle number, so a stale handler cannot mark a newer cycle. A failed post is reported by code (`send_failed`) and the cycle stays marked.
-5. A job acts ONLY when the due time it carries equals the cycle's stored `next_due_at`; a job whose due time no longer matches is STALE and does nothing at all. A re-arm that moves the due time schedules a NEW job (the due time is in the key), so raising or lowering the interval across a restart still produces exactly one reminder, and an unchanged interval produces no duplicate. `rearm` reports the truth: `NothingToDo`, `AlreadyScheduled` or `Scheduled`.
-6. A refused schedule leaves a cycle with no job. Two paths repair it: a redelivered confirmation re-runs the idempotent schedule, and `rearm` schedules the job at startup. A refused schedule still needs an alert on `queue_refused` and a retry: the wiring card W3 must do both.
-7. Only the bump role may be mentioned (`<@&id>`); the text is fixed wording, never a body.
-8. `/bump reset` is staff-only; a non-staff caller changes nothing. A staff reset starts a new cycle from now, keeps the last confirmed message id (a replay cannot undo it) and gets its own job. In shadow mode the reply says nothing was changed.
-9. The commands are registered globally, so they are **home-guild only**: a command invoked in another guild is denied and changes nothing, and with the mode on but no home guild set the check fails closed. The reply never names the home guild.
-10. `shadow` writes nothing, sends nothing and schedules nothing; `would_do` returns counts and stable codes only. `off` does nothing. A refused config value names the KEY, never the value, and the feature stays off.
+- BU1 detection still requires a trusted listing-bot confirmation in the configured bump channel.
+  `/bump status` and staff-only `/bump reset` fail closed outside the configured home guild and do
+  not name it. A reset preserves the last confirmation ID. Shadow never writes, schedules or sends;
+  its reset reply explicitly says nothing changed. Off is inert.
+- The SQLite `bump_state` row is authoritative for the cycle, `next_due_at`, and `reminded`.
+  A confirmation or reset opens a new cycle. Rearm persists any due-time change before scheduling;
+  status and dispatch use the stored due time, not a fresh calculation. `last_bumper` stores the
+  confirmation message ID, not a member ID.
+- Jobs are disposable wake-ups. A job for another guild, another cycle or a different due time is
+  a no-op. The handler checks that the row is due, then atomically marks it for the matching guild,
+  cycle and due time only if unmarked. The mark commits before sending. Send failure or a crash
+  after the mark may lose delivery, but does not authorize another attempt. The text is fixed and
+  only the configured bump role may be mentioned.
+- Wake keys are `bump:<guild>:<cycle>:<due>:<wake_gen>`. Migration v2 defaults existing rows to
+  generation zero. The adapter must preserve the queue's duplicate state: pending/running means
+  `AlreadyScheduled`; done/failed/abandoned does not. For a terminal duplicate, persist the next
+  generation and retry scheduling once. Only a new job reports `Scheduled`; another terminal
+  collision or a refused write reports `queue_refused`. No cycle or a marked cycle needs no wake.
 
-## Tested (86 new unit tests: 15 config, 15 repository, 56 runtime)
-Detection and hostile shapes; the channel restriction; the cooldown reply; the stored row; one job per cycle and due time (also against the real queue's UNIQUE key); the stale job; raising, lowering and keeping the interval across a restart against the real queue; the repair paths; the home-guild rule; the mentions; the staff-only reset; a replay after a reset; shadow and off; the config parse and its safe failures; the schema and a corrupt row; a seeded LCG liveness sweep (40 seeds x 200 steps) that drives the QUEUE, includes queue failures and interval changes at restarts, and ends by asserting every overdue unreminded cycle has a claimable job. RED evidence: commit `97460ae` (new API shape and tests, behaviour stubbed) ran the runtime tests: 16 failed, 39 passed - one per defect. Mutations tried (10, all killed): the dedupe key without the due time (3 tests); the job that ignores the due time it carries (2); the job that ignores the cycle it carries (1); the channel check that always passes (4); the redelivery that does not re-run the schedule (2); the re-arm that schedules no job of its own (5); the shadow reset that claims a reset (1); the reminded mark that is not conditional on the cycle (1); the home-guild check that lets every guild through (5); and the mutant the card names - `schedule_for` returns Ok(Created) without calling the queue - which the liveness test ALONE catches (1).
+## Wiring contract (W3)
 
-## Config keys (READ by the wiring card W3, not by this module)
-`BUMP_MODE` (default `off`; unset or unknown -> off, an unknown value names the key) | `BUMP_CHANNEL_ID`, `BUMP_ROLE_ID`, `BUMP_BOT_ID` (default unset; unset, zero or not exactly one id -> the key is named and the feature is off) | `BUMP_INTERVAL_SECS` (default `7200`; not digits or outside 600..=86400 -> the key is named) | `BUMP_SUCCESS_MARKER` (default `Bump done`; blank, over 200 bytes or a control char -> the key is named). The home guild is NOT a `BUMP_*` key: the wiring card passes it as the guild id it already holds.
+1. Serialize bump observe, reset, rearm and reminder dispatch per guild through one owner or a
+   shared lock. The mutable repository borrow guards one instance, not independent connections.
+   Commit row writes before queue operations; do not hold a SQLite write transaction across a queue
+   write on a separate connection to the same database or across a Discord send.
+2. At startup, reconcile the queue with `KIND_TABLE`, then run bump `rearm` before any worker claims.
+   Reconciliation abandons interrupted `AtMostOnce` jobs; rearm replaces an abandoned wake only if
+   the current row is still unmarked. Applying new intervals before claims prevents old wakes from
+   acting on a superseded due time.
+3. On `queue_refused`, raise a staff/operational alert using the stable code and retry rearm with
+   backoff. Don't rely on redelivery or a later process restart. The row retains the owed reminder
+   and any advanced generation. Redelivered confirmations can also repair the missing wake.
 
-## NOT done
-No poise command, no feature registered, not called from `main.rs`, no `.env.example` entry, no Discord call in production, no staff-alert post, no serenity implementation of `ReminderChannel`/`JobQueue` (the wiring card writes them), and `bump_state` is created only when the wiring card opens the core database. `last_bumper` holds the confirming message id: the plan names the column but not its meaning, and the runtime cannot know which member bumped (the reply comes from the listing bot). The reminder has never been posted to Discord and no job has been handed to the real runner (only to the real queue's schedule and claim, which is tested).
+W3 owns production adapters, command registration, workers, alerts and retry integration. BU2 has
+not launched the bot, posted to Discord, or run a production migration.
+
+W3 supplies the home guild separately and reads `BUMP_MODE`, `BUMP_CHANNEL_ID`, `BUMP_ROLE_ID`,
+`BUMP_BOT_ID`, `BUMP_INTERVAL_SECS` and `BUMP_SUCCESS_MARKER`. Mode defaults to off, interval to
+7200 seconds (allowed 600–86400), and marker to `Bump done`. Invalid values name keys, not values.
+
+## Offline verification
+
+Round 3 RED: `cargo test --locked --offline round3_` exited 101, 0 passed and 6 failed before the
+runtime fixes. Both restart cases reported `AlreadyScheduled` for terminal wakes; a foreign job
+sent the home reminder; status used the unapplied interval; a v1 row failed to load; a second
+mark incorrectly succeeded. The two restart cases now run at the start of the real-queue liveness
+sweep (40 seeds x 200 steps). They reopen the same SQLite file, and the sweep requires each owed
+reminder to be attempted on a healthy tick and all remaining debt to drain. The expectation does
+not depend on pre-checking whether a wake-up is pending. Synthetic channels only.
+
+Round 3 GREEN: fmt check, locked/offline all-targets check, full test suite (1310 passed), and
+locked/offline all-targets Clippy with warnings, deprecations, `result_large_err` and
+`type_complexity` denied. Cargo build jobs were limited to two.
+
+Round 2 evidence is retained in the history of this file; the channel/home-guild guards, truthful
+shadow replies and conditional mark remain covered by their existing tests.
