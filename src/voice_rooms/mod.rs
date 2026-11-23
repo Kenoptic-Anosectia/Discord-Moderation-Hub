@@ -15,4 +15,7 @@
 //! allow once the runtime calls into the policy.
 #![allow(dead_code)]
 
+pub mod config;
 pub mod policy;
+pub mod repository;
+pub mod runtime;
