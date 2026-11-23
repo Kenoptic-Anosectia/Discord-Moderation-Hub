@@ -3354,6 +3354,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpublish_refuses_a_hostile_key_and_writes_nothing() {
+        let store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        let before = store.calls().len();
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "Main Menu",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::InvalidKey));
+        assert_eq!(store.calls().len(), before, "nothing was read or written");
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_during_unpublish_is_reported_with_a_stable_code() {
+        let mut store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        store.fail = Some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::with(Code::StoreFailed, "sqlite_error"));
+        // The row still names the old place: the clear did not happen.
+        let menu = store.menu(GUILD, "main").unwrap();
+        assert_eq!(menu.channel, None);
+        assert_eq!(menu.message, None);
+    }
+
+    #[tokio::test]
+    async fn a_menu_that_vanished_during_unpublish_is_reported_as_missing() {
+        let mut store = FakeStore::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+        // The row disappears between the read and the clear.
+        store.menus.lock().unwrap().clear();
+        let outcome = unpublish(
+            &store,
+            &settings(),
+            &UnpublishRequest {
+                invoker: staff(),
+                guild: GUILD,
+                key: "main",
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::new(Code::MenuNotFound));
+    }
+
+    #[tokio::test]
     async fn a_gone_channel_never_leaves_the_menu_unpublishable_over_the_real_database() {
         let path = scratch_db("gone-channel");
         let store = SqlStore::open(&path);
