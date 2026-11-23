@@ -9,6 +9,7 @@ mod flash;
 mod jobs;
 mod preflight;
 mod privacy_scope;
+mod role_admin;
 mod role_menus;
 mod roles;
 mod safeword;
