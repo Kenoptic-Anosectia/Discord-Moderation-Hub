@@ -1931,6 +1931,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn long_reply_text_is_cut_to_the_character_limit_on_a_char_boundary() {
+        assert_eq!(bound("x".repeat(5_000)).chars().count(), MAX_REPLY_CHARS);
+        let multi = bound("\u{00e9}".repeat(5_000));
+        assert_eq!(multi.chars().count(), MAX_REPLY_CHARS);
+        let exact = "y".repeat(MAX_REPLY_CHARS);
+        assert_eq!(bound(exact.clone()), exact);
+        assert_eq!(bound(String::new()), "");
+        let reply = reply("added", "z".repeat(MAX_REPLY_CHARS + 1));
+        assert!(reply.ephemeral);
+        assert_eq!(reply.text.chars().count(), MAX_REPLY_CHARS);
+    }
+
     // ------------------------------------------------------------------ liveness
 
     struct Lcg(u64);
@@ -1974,7 +1987,7 @@ mod tests {
     async fn seeded_liveness_every_request_ends_with_one_reply_and_one_audit_entry() {
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
         for case in 0..600 {
-            let add = rng.next() % 2 == 0;
+            let add = rng.next().is_multiple_of(2);
             let mut rig = Rig::new();
             if !add {
                 rig.world
@@ -2070,7 +2083,7 @@ mod tests {
                 assert!(attempts <= 60, "case {case}: removal made no progress");
                 rig.exec.script = (0..4)
                     .map(|_| {
-                        if rng.next() % 3 == 0 {
+                        if rng.next().is_multiple_of(3) {
                             Ok(())
                         } else {
                             Err(err(500, None, None))
