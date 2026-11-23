@@ -11,13 +11,12 @@ use std::collections::VecDeque;
 use crate::roles::eligibility::{
     decide_removal, Decision, GrantPath, GrantRequest, RoleFacts, SafewordState,
 };
-use crate::roles::grant::{
-    self as k04, FailCode, GrantItem, RoleOutcome, RoleWriter, Sleeper, WriteError,
-};
+use crate::roles::grant::{self as k04, GrantItem, RoleOutcome, RoleWriter, Sleeper, WriteError};
 use crate::roles::runtime::{
     self as roles_facts, decide_from_facts, DecisionInputs, RuntimeDecision,
 };
 use crate::safeword::config::SafewordConfig;
+use crate::safeword::repository::RepoError;
 use crate::safeword::runtime::{
     MemberRoles, Ops, WriteCode, CODE_BOT_TOP_UNKNOWN, CODE_DM_FAILED, CODE_FACTS_UNAVAILABLE,
     CODE_PARTIAL_ROLE_FAILURE, CODE_ROLE_WRITE_FAILED, CODE_STATE_FAILED,
@@ -334,14 +333,48 @@ impl ConfirmBook {
     }
 
     /// Record a confirmation, replacing the same caller's pending one for the same member.
+    ///
+    /// Entries outside the window (relative to `now`) are dropped first; if the book is still
+    /// full, the oldest entry is dropped, so the book never holds more than [`MAX_ARMED`].
     pub fn arm(&mut self, armed: Armed, now: i64) {
-        let _ = (armed, now);
+        self.entries.retain(|e| {
+            let same_key =
+                e.guild == armed.guild && e.caller == armed.caller && e.member == armed.member;
+            !same_key && within_window(e.armed_at, now)
+        });
+        while self.entries.len() >= MAX_ARMED {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.armed_at)
+                .map(|(i, _)| i);
+            match oldest {
+                Some(index) => {
+                    self.entries.remove(index);
+                }
+                None => break,
+            }
+        }
+        self.entries.push(armed);
     }
 
     /// Remove and return the caller's pending confirmation for the member, if any.
     pub fn take(&mut self, guild: u64, caller: u64, member: u64) -> Option<Armed> {
-        let _ = (guild, caller, member);
-        None
+        let index = self
+            .entries
+            .iter()
+            .position(|e| e.guild == guild && e.caller == caller && e.member == member)?;
+        Some(self.entries.remove(index))
+    }
+}
+
+/// True when `now` is inside the confirmation window that started at `armed_at`. A clock that
+/// went backwards is outside it.
+fn within_window(armed_at: i64, now: i64) -> bool {
+    match now.checked_sub(armed_at) {
+        Some(age) => (0..=CONFIRM_WINDOW_SECS).contains(&age),
+        None => false,
     }
 }
 
@@ -349,22 +382,600 @@ impl ConfirmBook {
 // The commands
 // ---------------------------------------------------------------------------
 
-/// `status <member>`.
+/// Who may do what, decided from the configuration and the caller alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Staff,
+    Member,
+}
+
+/// The checks every subcommand starts with, before anything is read or written: the mode, the
+/// home guild (commands are registered globally, so any guild can call), the caller and the
+/// staff role. A refusal here touches nothing.
+fn gate(cfg: &CommandConfig, who: &Invoker) -> Result<Access, Reply> {
+    if cfg.safeword.mode == Mode::Off {
+        return Err(Reply::new(Code::Disabled));
+    }
+    match cfg.home_guild {
+        None | Some(0) => return Err(Reply::with_detail(Code::Denied, "no_home_guild")),
+        Some(home) if home != who.guild => {
+            return Err(Reply::with_detail(Code::Denied, "other_guild"))
+        }
+        Some(_) => {}
+    }
+    if who.user == 0 {
+        return Err(Reply::with_detail(Code::Denied, "no_caller"));
+    }
+    let is_staff = match cfg.staff_role_id {
+        None | Some(0) => false,
+        Some(role) => who.role_ids.contains(&role),
+    };
+    Ok(if is_staff {
+        Access::Staff
+    } else {
+        Access::Member
+    })
+}
+
+/// The gate for the subcommands that change something: staff only, and not in shadow mode.
+fn gate_staff_write(cfg: &CommandConfig, who: &Invoker) -> Result<(), Reply> {
+    if gate(cfg, who)? != Access::Staff {
+        return Err(Reply::with_detail(Code::Denied, "not_staff"));
+    }
+    if cfg.safeword.mode == Mode::Shadow {
+        return Err(Reply::new(Code::ShadowMode));
+    }
+    Ok(())
+}
+
+/// The reply for a failed store call. A lost compare-and-swap is `busy`; the rest is a
+/// failure. The code is the store's own stable code.
+fn store_reply(code: &'static str) -> Reply {
+    if code == RepoError::Stale.code() {
+        Reply::with_detail(Code::Busy, code)
+    } else {
+        Reply::with_detail(Code::StoreFailed, code)
+    }
+}
+
+/// The reply for a failed store call that also tells staff (a stale write is not an alert).
+fn store_failure(env: &mut dyn Env, code: &'static str) -> Reply {
+    if code != RepoError::Stale.code() {
+        env.ops().alerter.alert(code);
+    }
+    store_reply(code)
+}
+
+fn state_code(state: &State) -> StateCode {
+    match state {
+        State::Inactive => StateCode::Idle,
+        State::Activating(_) => StateCode::Activating,
+        State::Active(_) => StateCode::Active,
+        State::Releasing(_) => StateCode::Releasing,
+    }
+}
+
+/// Load a member's state and version. No row is `Inactive` at version 0; an unreadable row is
+/// an error, never a guess.
+fn load(env: &mut dyn Env, guild: u64, member: u64) -> Result<(State, u64), &'static str> {
+    match env.ops().store.load(guild, member)? {
+        Some(pair) => Ok(pair),
+        None => Ok((State::Inactive, 0)),
+    }
+}
+
+/// The state machine's context. Strike and release read no member roles, so none are passed.
+fn machine_context(env: &mut dyn Env) -> Context {
+    let cfg = env.config().safeword.clone();
+    Context {
+        safeword_role: cfg.role_id,
+        restricted_roles: cfg.restricted_role_ids,
+        protected_roles: env.ops().protected_role_ids.clone(),
+        held_roles: Vec::new(),
+        filter_restore: true,
+        defer_grants: cfg.defer_grants,
+    }
+}
+
+/// `status <member>`. Staff may look at any member and see how many roles the snapshot holds;
+/// anyone else may look only at their own state, and never sees the count.
 pub fn status(env: &mut dyn Env, who: &Invoker, member: u64) -> Reply {
-    let _ = (env, who, member);
-    Reply::new(Code::Disabled)
+    let access = match gate(env.config(), who) {
+        Ok(access) => access,
+        Err(reply) => return reply,
+    };
+    if access != Access::Staff && member != who.user {
+        return Reply::with_detail(Code::Denied, "not_staff");
+    }
+    if member == 0 {
+        return Reply::new(Code::InvalidTarget);
+    }
+    match load(env, who.guild, member) {
+        Err(code) => store_reply(code),
+        Ok((state, _)) => {
+            let mut reply = Reply::new(Code::Status);
+            reply.state = Some(state_code(&state));
+            if access == Access::Staff {
+                reply.held_roles = state.snapshot().map(|s| s.saved_roles.len());
+            }
+            reply
+        }
+    }
 }
 
-/// `strike <member> <role>`.
+/// `strike <member> <role>`: take a role out of an Active member's restore snapshot.
+///
+/// Only a role in the snapshot is accepted. The change is one SW1 `Strike` event and one
+/// compare-and-swap store of the machine's own state; if the store fails nothing changed.
 pub fn strike(env: &mut dyn Env, who: &Invoker, req: &StrikeRequest) -> Reply {
-    let _ = (env, who, req);
-    Reply::new(Code::Disabled)
+    if let Err(reply) = gate_staff_write(env.config(), who) {
+        return reply;
+    }
+    if req.member == 0 {
+        return Reply::new(Code::InvalidTarget);
+    }
+    if req.role == 0 {
+        return Reply::new(Code::InvalidRole);
+    }
+    let (state, version) = match load(env, who.guild, req.member) {
+        Ok(pair) => pair,
+        Err(code) => return store_failure(env, code),
+    };
+    let snapshot = match &state {
+        State::Inactive => return Reply::new(Code::NotActive),
+        State::Activating(_) => return Reply::with_detail(Code::WrongState, "activating"),
+        State::Releasing(_) => return Reply::with_detail(Code::WrongState, "releasing"),
+        State::Active(snapshot) => snapshot,
+    };
+    if !snapshot.saved_roles.contains(&req.role) {
+        return Reply::new(Code::RoleNotInSnapshot);
+    }
+    let ctx = machine_context(env);
+    let (struck, _) = step(&state, Event::Strike(req.role), &ctx);
+    if struck == state {
+        return Reply::new(Code::RoleNotInSnapshot);
+    }
+    // The store write IS the machine's `SaveSnapshot` action: acknowledge it, then persist the
+    // acknowledged state in one write. If the write fails the stored row is untouched.
+    let (saved_state, _) = step(&struck, Event::ActionDone(ActionId::SaveSnapshot), &ctx);
+    let now = env.now();
+    match env
+        .ops()
+        .store
+        .store(who.guild, req.member, &saved_state, version, now)
+    {
+        Ok(_) => {
+            let mut reply = Reply::new(Code::Struck);
+            reply.held_roles = saved_state.snapshot().map(|s| s.saved_roles.len());
+            reply
+        }
+        Err(code) => store_failure(env, code),
+    }
 }
 
-/// `clear <member> [confirm]`.
+/// `clear <member> [confirm]`: end the member's safeword and give the snapshot back.
+///
+/// Two calls are needed. The first (`confirm` false) only records a confirmation; the second
+/// (`confirm` true) by the same caller for the same member, while the stored row is still the
+/// same version and inside [`CONFIRM_WINDOW_SECS`], does the release.
 pub fn clear(env: &mut dyn Env, who: &Invoker, req: &ClearRequest) -> Reply {
-    let _ = (env, who, req);
-    Reply::new(Code::Disabled)
+    if let Err(reply) = gate_staff_write(env.config(), who) {
+        return reply;
+    }
+    if req.member == 0 {
+        return Reply::new(Code::InvalidTarget);
+    }
+    let (state, version) = match load(env, who.guild, req.member) {
+        Ok(pair) => pair,
+        Err(code) => return store_failure(env, code),
+    };
+    match &state {
+        // Already cleared (or never on safeword): nothing to confirm, nothing to write.
+        State::Inactive => return Reply::new(Code::AlreadyClear),
+        State::Activating(_) => return Reply::with_detail(Code::WrongState, "activating"),
+        State::Active(_) | State::Releasing(_) => {}
+    }
+    let now = env.now();
+    if !req.confirm {
+        let armed = Armed {
+            guild: who.guild,
+            caller: who.user,
+            member: req.member,
+            version,
+            armed_at: now,
+        };
+        env.confirms().arm(armed, now);
+        let mut reply = Reply::new(Code::ConfirmRequired);
+        reply.state = Some(state_code(&state));
+        return reply;
+    }
+    // The confirmation is used up by this attempt, whatever its outcome.
+    let Some(armed) = env.confirms().take(who.guild, who.user, req.member) else {
+        return Reply::new(Code::ConfirmMismatch);
+    };
+    if armed.version != version {
+        return Reply::new(Code::ConfirmMismatch);
+    }
+    if !within_window(armed.armed_at, now) {
+        return Reply::new(Code::ConfirmExpired);
+    }
+    let run = Run {
+        guild: who.guild,
+        member: req.member,
+        now,
+    };
+    release(env, &run, &state, version)
+}
+
+// ---------------------------------------------------------------------------
+// The release
+// ---------------------------------------------------------------------------
+
+/// One release of one member.
+struct Run {
+    guild: u64,
+    member: u64,
+    now: i64,
+}
+
+/// A step of the release went one of three ways.
+enum Step {
+    Done,
+    /// A direct message that could not be delivered. Acknowledged to the machine, as SW3 does,
+    /// so no member is held in `Releasing` by a DM they cannot receive.
+    DmUndelivered,
+    Failed(Vec<&'static str>),
+}
+
+/// The most actions one release executes.
+const MAX_STEPS: usize = 64;
+
+fn push_code(codes: &mut Vec<&'static str>, code: &'static str) {
+    if !codes.contains(&code) {
+        codes.push(code);
+    }
+}
+
+/// The next action: a pending `RestoreRoles` always goes first, so nothing is removed or
+/// cleared before the roles are back.
+fn next_action(pending: &mut VecDeque<Action>) -> Option<Action> {
+    let restore = pending
+        .iter()
+        .position(|a| matches!(a, Action::RestoreRoles(_)));
+    match restore {
+        Some(index) => pending.remove(index),
+        None => pending.pop_front(),
+    }
+}
+
+/// Feed the SW1 machine one release event and run what it emits.
+///
+/// The restore runs first. If it fails, the machine's new state is thrown away: the stored row
+/// stays what it was (Active), nothing else was done, and a retry derives the same plan from the
+/// same snapshot. If it succeeds, the remaining steps run in the machine's order, but
+/// `ClearSnapshot` and the DM run only while every earlier step of this run succeeded; a step
+/// that is held back is reported to the machine as failed, so the next retry re-emits it. The
+/// machine's end state is then stored (Releasing) or, when it is Inactive, the row is cleared.
+fn release(env: &mut dyn Env, run: &Run, state: &State, version: u64) -> Reply {
+    let ctx = machine_context(env);
+    let (mut machine, emitted) = step(state, Event::ReactionRemoved, &ctx);
+    let mut pending: VecDeque<Action> = emitted.into();
+    let mut version = version;
+    let mut codes: Vec<&'static str> = Vec::new();
+    let mut blocked = false;
+    let mut cleared_in_run = false;
+    let mut executed = 0usize;
+
+    while let Some(action) = next_action(&mut pending) {
+        executed += 1;
+        if executed > MAX_STEPS {
+            env.ops().alerter.alert(CODE_STATE_FAILED);
+            push_code(&mut codes, CODE_STATE_FAILED);
+            break;
+        }
+        let held_back = blocked && matches!(action, Action::ClearSnapshot | Action::SendDm(_));
+        let outcome = if held_back {
+            Step::Failed(Vec::new())
+        } else {
+            perform(env, run, &action, &mut version, &mut cleared_in_run)
+        };
+        let id = action.id();
+        let event = match outcome {
+            Step::Done => Event::ActionDone(id),
+            Step::DmUndelivered => {
+                push_code(&mut codes, CODE_DM_FAILED);
+                Event::ActionDone(id)
+            }
+            Step::Failed(failed) => {
+                if executed == 1 && matches!(action, Action::RestoreRoles(_)) {
+                    // Nothing else has been done: keep the member Active, store nothing.
+                    let mut reply = Reply::new(Code::RestoreFailed);
+                    reply.codes = failed;
+                    return reply;
+                }
+                for code in failed {
+                    push_code(&mut codes, code);
+                }
+                blocked = true;
+                Event::ActionFailed(id, FailureCode::TransientHttp)
+            }
+        };
+        let (next, more) = step(&machine, event, &ctx);
+        machine = next;
+        pending.extend(more);
+    }
+
+    if matches!(machine, State::Inactive) {
+        if !cleared_in_run {
+            // The machine ended Inactive without a `ClearSnapshot` in this run (it was
+            // acknowledged by an earlier run): the row is cleared here.
+            match env
+                .ops()
+                .store
+                .clear(run.guild, run.member, version, run.now)
+            {
+                Ok(_) => {}
+                Err(code) => {
+                    let mut reply = store_failure(env, code);
+                    reply.codes = codes;
+                    return reply;
+                }
+            }
+        }
+        let mut reply = Reply::new(Code::Cleared);
+        reply.codes = codes;
+        return reply;
+    }
+    // Not finished: store the machine's own state (never a half-cleared guess) and say so.
+    match env
+        .ops()
+        .store
+        .store(run.guild, run.member, &machine, version, run.now)
+    {
+        Ok(_) => {
+            let mut reply = Reply::new(Code::ReleaseIncomplete);
+            reply.state = Some(state_code(&machine));
+            reply.codes = codes;
+            reply
+        }
+        Err(code) => {
+            let mut reply = store_failure(env, code);
+            reply.codes = codes;
+            reply
+        }
+    }
+}
+
+/// Execute one release action.
+fn perform(
+    env: &mut dyn Env,
+    run: &Run,
+    action: &Action,
+    version: &mut u64,
+    cleared_in_run: &mut bool,
+) -> Step {
+    match action {
+        Action::RestoreRoles(roles) => match restore_roles(env, run, roles) {
+            Ok(()) => Step::Done,
+            Err(codes) => Step::Failed(codes),
+        },
+        Action::RemoveSafewordRole => remove_safeword_role(env, run),
+        Action::ClearSnapshot => {
+            match env
+                .ops()
+                .store
+                .clear(run.guild, run.member, *version, run.now)
+            {
+                Ok(new_version) => {
+                    *version = new_version;
+                    *cleared_in_run = true;
+                    Step::Done
+                }
+                Err(code) => {
+                    env.ops().alerter.alert(code);
+                    Step::Failed(vec![code])
+                }
+            }
+        }
+        Action::SendDm(kind) => {
+            if !env.config().safeword.dm {
+                return Step::Done;
+            }
+            match env.ops().dms.send_dm(run.member, kind.text()) {
+                Ok(()) => Step::Done,
+                Err(_) => {
+                    env.ops().alerter.alert(CODE_DM_FAILED);
+                    Step::DmUndelivered
+                }
+            }
+        }
+        // A release never emits these; a machine that did would have a bug, and doing nothing
+        // is the safe answer.
+        Action::SaveSnapshot | Action::RemoveRoles(_) | Action::AddSafewordRole => {
+            env.ops().alerter.alert(CODE_STATE_FAILED);
+            Step::Failed(vec![CODE_STATE_FAILED])
+        }
+    }
+}
+
+/// Remove the safeword role, after the K03 removal decision.
+fn remove_safeword_role(env: &mut dyn Env, run: &Run) -> Step {
+    let role = env.config().safeword.role_id;
+    let ops = env.ops();
+    if let Some(code) = removal_decision(run.guild, role, ops) {
+        ops.alerter.alert(code);
+        return Step::Failed(vec![code]);
+    }
+    match ops.members.remove_role(run.member, role) {
+        Ok(()) => Step::Done,
+        Err(_) => {
+            ops.alerter.alert(CODE_ROLE_WRITE_FAILED);
+            Step::Failed(vec![CODE_ROLE_WRITE_FAILED])
+        }
+    }
+}
+
+/// Give the planned roles back: every role gets a K03 decision on the `SafewordRestore` path
+/// (the member is still on safeword, so any other path would be denied), and the K04 executor
+/// writes only what K03 allowed and the member does not hold, retrying a 429 with its backoff.
+/// Any role that is not written is a failure: a partial restore is never a success.
+fn restore_roles(env: &mut dyn Env, run: &Run, roles: &[RoleId]) -> Result<(), Vec<&'static str>> {
+    let restricted = env.config().safeword.restricted_role_ids.clone();
+    let ops = env.ops();
+    // A failed lookup means "assume nothing is held": every role is written (a repeat is
+    // harmless), none is skipped.
+    let held_now = ops.members.member_roles(run.member).unwrap_or_default();
+    let mut items: Vec<GrantItem> = Vec::with_capacity(roles.len());
+    let mut failed: Vec<&'static str> = Vec::new();
+    for role_id in roles {
+        match grant_decision(run.guild, *role_id, &restricted, ops) {
+            Ok(decision) => items.push(GrantItem {
+                role_id: *role_id,
+                decision,
+                already_held: held_now.contains(role_id),
+            }),
+            Err(code) => {
+                // Left out of the request, so the executor can never write it.
+                ops.alerter.alert(code);
+                push_code(&mut failed, code);
+            }
+        }
+    }
+    let report = {
+        let mut writer = MemberWriter {
+            members: &mut *ops.members,
+        };
+        let mut sleeper = SleepAdapter {
+            sleeper: &mut *ops.sleeper,
+        };
+        k04::apply(
+            &mut writer,
+            &mut sleeper,
+            &k04::GrantRequest {
+                member_id: run.member,
+                items: &items,
+            },
+        )
+    };
+    let mut written = 0usize;
+    for result in &report.results {
+        match result.outcome {
+            RoleOutcome::Done | RoleOutcome::NoOp => written += 1,
+            RoleOutcome::Denied(reason) => {
+                ops.alerter.alert(reason.code());
+                push_code(&mut failed, reason.code());
+            }
+            RoleOutcome::Failed(_) => {
+                ops.alerter.alert(CODE_ROLE_WRITE_FAILED);
+                push_code(&mut failed, CODE_ROLE_WRITE_FAILED);
+            }
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    if written > 0 {
+        ops.alerter.alert(CODE_PARTIAL_ROLE_FAILURE);
+        push_code(&mut failed, CODE_PARTIAL_ROLE_FAILURE);
+    }
+    Err(failed)
+}
+
+/// The K03 grant decision for a restored role, or the stable code of a failed lookup.
+fn grant_decision(
+    guild: u64,
+    role_id: RoleId,
+    restricted: &[u64],
+    ops: &mut Ops,
+) -> Result<Decision, &'static str> {
+    let Some(bot_top) = ops.facts.bot_top_position() else {
+        return Err(CODE_BOT_TOP_UNKNOWN);
+    };
+    let facts = ops.facts.role_facts(role_id);
+    let inputs = DecisionInputs {
+        path: GrantPath::SafewordRestore,
+        bot_top_position: bot_top,
+        guild_id: guild,
+        protected_role_ids: &ops.protected_role_ids,
+        safeword: SafewordState::Active,
+        safeword_restricted_role_ids: restricted,
+        staff: None,
+    };
+    match decide_from_facts(facts, role_id, &inputs) {
+        RuntimeDecision::Decided(decision) => Ok(decision),
+        RuntimeDecision::Unavailable => Err(CODE_FACTS_UNAVAILABLE),
+    }
+}
+
+/// The K03 removal decision for the safeword role: `Some(code)` when it may not be removed.
+fn removal_decision(guild: u64, role_id: RoleId, ops: &mut Ops) -> Option<&'static str> {
+    let Some(bot_top) = ops.facts.bot_top_position() else {
+        return Some(CODE_BOT_TOP_UNKNOWN);
+    };
+    let role = match ops.facts.role_facts(role_id) {
+        roles_facts::FactsOutcome::Found(facts) => facts,
+        roles_facts::FactsOutcome::Missing => RoleFacts {
+            id: role_id,
+            position: 0,
+            managed: false,
+            permissions: 0,
+            exists: false,
+        },
+        roles_facts::FactsOutcome::Unavailable => return Some(CODE_FACTS_UNAVAILABLE),
+    };
+    let request = GrantRequest {
+        path: GrantPath::SafewordRestore,
+        role,
+        bot_top_position: bot_top,
+        guild_id: guild,
+        protected_role_ids: &[],
+        safeword: SafewordState::Inactive,
+        safeword_restricted_role_ids: &[],
+        staff: None,
+    };
+    match decide_removal(&request) {
+        Decision::Allow => None,
+        Decision::Deny(reason) => Some(reason.code()),
+    }
+}
+
+/// Adapts the member-role trait to the K04 executor's writer trait: the stable write code
+/// becomes the numbers the executor maps back to the same code.
+struct MemberWriter<'a> {
+    members: &'a mut dyn MemberRoles,
+}
+
+impl RoleWriter for MemberWriter<'_> {
+    fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        self.members
+            .add_role(member_id, role_id)
+            .map_err(|code| match code {
+                WriteCode::Forbidden => write_error(403, None),
+                WriteCode::UnknownRole => write_error(404, Some(k04::API_CODE_UNKNOWN_ROLE)),
+                WriteCode::UnknownMember => write_error(404, Some(k04::API_CODE_UNKNOWN_MEMBER)),
+                WriteCode::RateLimited => write_error(429, None),
+                WriteCode::Other => write_error(500, None),
+            })
+    }
+}
+
+fn write_error(status: u16, api_code: Option<u32>) -> WriteError {
+    WriteError {
+        status,
+        api_code,
+        retry_after_ms: None,
+    }
+}
+
+/// Adapts the boxed sleeper to the executor's generic parameter.
+struct SleepAdapter<'a> {
+    sleeper: &'a mut dyn Sleeper,
+}
+
+impl Sleeper for SleepAdapter<'_> {
+    fn sleep_ms(&mut self, ms: u64) {
+        self.sleeper.sleep_ms(ms);
+    }
 }
 
 #[cfg(test)]
@@ -616,10 +1227,12 @@ mod tests {
         }
     }
 
+    type Rows = Rc<RefCell<BTreeMap<(u64, u64), (State, u64)>>>;
+
     /// Where the rows live: a compare-and-swap map, or the real SW2 repository on SQLite.
     #[derive(Clone)]
     enum Backing {
-        Map(Rc<RefCell<BTreeMap<(u64, u64), (State, u64)>>>),
+        Map(Rows),
         Sql(Rc<RefCell<Repository>>),
     }
 
@@ -1801,6 +2414,7 @@ mod tests {
     fn liveness_clear_always_reaches_cleared_under_random_failures_and_restarts() {
         let all = [R1, R2, R3];
         let mut ended_cleared = 0;
+        let mut seen: BTreeMap<&'static str, u32> = BTreeMap::new();
         for seed in 0..250u64 {
             let mut rng = seed + 9;
             let mut w = World::sql(seed);
@@ -1833,22 +2447,34 @@ mod tests {
                 }
                 w.now.set(w.now.get() + (lcg(&mut rng) % 90) as i64);
                 // Sometimes staff strikes a role first; sometimes the process restarts.
-                if lcg(&mut rng) % 8 == 0 && cleared_at.is_none() {
+                if lcg(&mut rng).is_multiple_of(8) && cleared_at.is_none() {
                     let role = all[(lcg(&mut rng) % 3) as usize];
-                    if w.run_strike(&staff, MEMBER, role).code == Code::Struck {
+                    // Known limit: a strike cannot take back a role an earlier partial restore
+                    // already wrote, so only a role not yet held counts as "kept off".
+                    let held_already = w.held(MEMBER).contains(&role);
+                    if w.run_strike(&staff, MEMBER, role).code == Code::Struck && !held_already {
                         struck.push(role);
                     }
                 }
-                if lcg(&mut rng) % 6 == 0 {
+                if lcg(&mut rng).is_multiple_of(6) {
                     w.book = ConfirmBook::new();
                 }
                 let first = w.run_clear(&staff, MEMBER, false);
-                let second = if lcg(&mut rng) % 10 == 0 {
+                // Before the heal the second call may come late (past the window) or after a
+                // restart (the book is empty); after the heal it comes at once.
+                if round < heal_round {
+                    w.now.set(w.now.get() + (lcg(&mut rng) % 120) as i64);
+                    if lcg(&mut rng).is_multiple_of(6) {
+                        w.book = ConfirmBook::new();
+                    }
+                }
+                let second = if lcg(&mut rng).is_multiple_of(10) {
                     first.clone()
                 } else {
                     w.run_clear(&staff, MEMBER, true)
                 };
                 for reply in [&first, &second] {
+                    *seen.entry(reply.code.as_str()).or_insert(0) += 1;
                     assert!(
                         matches!(
                             reply.code,
@@ -1926,6 +2552,38 @@ mod tests {
             assert_eq!((log.adds.len(), log.removes.len(), log.dms.len()), writes);
         }
         assert_eq!(ended_cleared, 250);
+        // The run is not vacuous: every interesting path was taken many times.
+        for code in [
+            Code::Cleared,
+            Code::RestoreFailed,
+            Code::ReleaseIncomplete,
+            Code::StoreFailed,
+            Code::ConfirmExpired,
+            Code::ConfirmMismatch,
+            Code::AlreadyClear,
+        ] {
+            assert!(
+                seen.get(code.as_str()).copied().unwrap_or(0) >= 5,
+                "{} seen {:?} times: {seen:?}",
+                code.as_str(),
+                seen.get(code.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn known_limit_a_strike_cannot_take_back_a_role_a_partial_restore_already_wrote() {
+        let mut w = World::new();
+        w.seed_active(HOME, MEMBER, &[R1, R2]);
+        w.chaos.borrow_mut().fail_add_roles.insert(R2);
+        let staff = w.staff();
+        assert_eq!(w.clear_twice(&staff, MEMBER).code, Code::RestoreFailed);
+        // R1 was written before R2 failed; the row still says Active with both in the snapshot.
+        assert!(w.held(MEMBER).contains(&R1));
+        assert_eq!(w.run_strike(&staff, MEMBER, R1).code, Code::Struck);
+        // The strike keeps R1 out of any later restore but does not remove it from the member.
+        assert!(w.held(MEMBER).contains(&R1));
+        assert!(w.log.borrow().removes.is_empty());
     }
 
     #[test]
