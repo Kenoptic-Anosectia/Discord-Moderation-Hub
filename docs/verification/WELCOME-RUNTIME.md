@@ -33,14 +33,14 @@ join: three roles failing for the same reason raise one alert. Cross-join flood 
 is a W3 alerter precondition.
 
 ## Config: absent vs invalid keys
-`parse` reads through `RawValue`: `Unset` (absent), `Text` (valid Unicode),
-`NotUnicode` (present but invalid). `NotUnicode` is an INVALID key, never unset: the key
-is named in `WelcomeConfig::invalid_keys` and the feature is switched off. Value is never
-kept or echoed. On Windows, `OsString::into_string()` coerces invalid bytes to a string
-rejected by `parse_id_list`, so the key IS named invalid; on Unix, `RawValue::NotUnicode`
-is explicit.
+`parse` reads each key through `classify`, which uses `OsString::to_str()` on every platform
+and returns `RawValue`: `Unset` (absent), `Text` (valid Unicode), `NotUnicode` (present, not
+Unicode). `NotUnicode` is an INVALID key, never unset: it is named in
+`WelcomeConfig::invalid_keys`, the feature stays off, and the value is never kept or echoed.
+The tests build the value per platform (`cfg(windows)` unpaired surrogate, `cfg(unix)` bytes);
+only the Windows build was run, the Unix test path was NOT executed.
 
-## Tested (48 unit tests: 14 in `config.rs`, 34 in `runtime.rs`)
+## Tested (18 unit tests in `config.rs`, 47 in `runtime.rs`)
 The four keys parsed, the join list deduped and sorted, shadow and an unknown mode, a
 blank value as unset; a bad channel, template path or join list switching the feature
 off and naming the key; the escaping path spellings refused; no value in the summary
