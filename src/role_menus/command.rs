@@ -3401,7 +3401,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_menu_that_vanished_during_unpublish_is_reported_as_missing() {
-        let mut store = FakeStore::new();
+        let store = FakeStore::new();
         seed_menu(&store, "main", &[ROLE_OK]).await;
         // The row disappears between the read and the clear.
         store.menus.lock().unwrap().clear();
@@ -3567,6 +3567,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Known limits of the one-emoji check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_emoji_check_names_its_limits_by_refusing_rather_than_guessing() {
+        // Plain `#` and `*` keycaps and tag-sequence flags are not accepted:
+        // the doc names these as limits, and they fail closed.
+        assert_eq!(validate_emoji("#\u{FE0F}\u{20E3}"), Err(Code::InvalidEmoji));
+        assert_eq!(validate_emoji("*\u{FE0F}\u{20E3}"), Err(Code::InvalidEmoji));
+        assert_eq!(
+            validate_emoji("\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}"),
+            Err(Code::InvalidEmoji)
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // The record write may fail
     // -----------------------------------------------------------------------
 
@@ -3648,5 +3664,104 @@ mod tests {
         let menu = store.menu(GUILD, "main").unwrap();
         assert!(menu.message.is_some(), "the menu ends published");
         assert_eq!(menu.channel, Some(CHANNEL));
+    }
+
+    #[tokio::test]
+    async fn a_seeded_sequence_with_send_edit_and_record_faults_always_settles() {
+        let mut store = FakeStore::new();
+        let mut discord = FakeDiscord::new();
+        seed_menu(&store, "main", &[ROLE_OK]).await;
+
+        let mut rng = Lcg(0x5EED_0000_FA17);
+        let mut record_failures = 0;
+        let mut send_failures = 0;
+        let mut published = 0;
+        for _ in 0..120 {
+            // Now and then the staff reset the menu, so the plain send path
+            // (not only the edit and repost paths) meets the record fault.
+            if rng.next(5) == 0 {
+                let reset = UnpublishRequest {
+                    invoker: staff(),
+                    guild: GUILD,
+                    key: "main",
+                };
+                store.fail_publish = None;
+                assert_eq!(
+                    unpublish(&store, &settings(), &reset).await,
+                    Outcome::new(Code::Unpublished)
+                );
+            }
+            // Each step draws its own faults: a failed send, a deleted message
+            // (the edit says NotFound) and a record write that fails after a
+            // good send.
+            discord.fail = (rng.next(4) == 0).then_some(DiscordError::Failed);
+            discord.fail_edit = (rng.next(3) == 0).then_some(DiscordError::NotFound);
+            store.fail_publish = (rng.next(4) == 0)
+                .then_some(RepoError::Storage(crate::storage::StorageError::Sqlite));
+            let before = store.menu(GUILD, "main").unwrap();
+            let before = (before.channel, before.message);
+            let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+            let after = store.menu(GUILD, "main").unwrap();
+            let after = (after.channel, after.message);
+            match outcome.code {
+                Code::StoreFailed => {
+                    record_failures += 1;
+                    assert_eq!(
+                        after, before,
+                        "a failed record write leaves the row as it was"
+                    );
+                }
+                Code::DiscordFailed => {
+                    send_failures += 1;
+                    assert_eq!(
+                        after, before,
+                        "a failed Discord call leaves the row as it was"
+                    );
+                }
+                Code::Posted | Code::Reposted => {
+                    published += 1;
+                    assert_eq!(after.0, Some(CHANNEL));
+                    assert!(after.1.is_some(), "a published menu names its message");
+                    assert_ne!(after.1, before.1, "a send is recorded as the new message");
+                }
+                Code::Edited => {
+                    published += 1;
+                    assert_eq!(after, before, "an edit keeps the same message");
+                    assert!(after.1.is_some());
+                }
+                other => panic!("unexpected code {other:?}"),
+            }
+        }
+        assert!(
+            record_failures > 0,
+            "the sequence never failed a record write"
+        );
+        assert!(
+            send_failures > 0,
+            "the sequence never failed a Discord call"
+        );
+        assert!(published > 0, "the sequence never published");
+
+        // Once the faults stop, the very next post reaches a published menu and
+        // the one after that edits the same message instead of sending another.
+        discord.fail = None;
+        discord.fail_edit = None;
+        store.fail_publish = None;
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert!(
+            matches!(outcome.code, Code::Posted | Code::Reposted | Code::Edited),
+            "{outcome:?}"
+        );
+        let settled = store.menu(GUILD, "main").unwrap();
+        assert!(settled.message.is_some());
+        let sends = discord.send_count();
+        let outcome = post(&store, &discord, &settings(), &post_req("main")).await;
+        assert_eq!(outcome, Outcome::new(Code::Edited));
+        assert_eq!(
+            discord.send_count(),
+            sends,
+            "an idempotent post sends nothing"
+        );
+        assert_eq!(store.menu(GUILD, "main").unwrap().message, settled.message);
     }
 }
