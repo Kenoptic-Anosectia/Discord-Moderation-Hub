@@ -1636,4 +1636,104 @@ mod tests {
             assert!(writer.remove_calls.len() <= 8);
         }
     }
+
+    fn rate_limited(retry_after_ms: Option<u64>) -> Result<(), WriteError> {
+        Err(WriteError {
+            status: 429,
+            api_code: None,
+            retry_after_ms,
+        })
+    }
+
+    async fn run_removal_of_ok_a(
+        writer: &mut FakeWriter,
+        sleeper: &mut FakeSleeper,
+        reporter: &mut MemoryReporter,
+    ) -> ReactionRemoveOutcome {
+        let conn = db();
+        let source = FakeSource::standard().with_member_roles(MEMBER, vec![ROLE_OK_A]);
+        let e = env();
+        add_binding(&conn, &source, &e, &add_req(ROLE_OK_A, "🦀"))
+            .await
+            .unwrap();
+        handle_reaction_remove(
+            &conn,
+            &e,
+            &ReactionRemoveEvent {
+                guild_id: Some(HOME_GUILD),
+                channel_id: CHANNEL,
+                message_id: MESSAGE,
+                user_id: Some(MEMBER),
+                user_is_bot: Some(false),
+                emoji_key: "🦀".to_string(),
+                safeword: SafewordState::Inactive,
+            },
+            RemovePorts {
+                source: &source,
+                remover: writer,
+                sleeper,
+                reporter,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn removal_rate_limited_then_ok_is_retried_and_removed_with_recorded_wait() {
+        let mut writer =
+            FakeWriter::default().fail_role(ROLE_OK_A, vec![rate_limited(Some(250)), Ok(())]);
+        let mut sleeper = FakeSleeper::default();
+        let mut reporter = MemoryReporter::default();
+
+        let out = run_removal_of_ok_a(&mut writer, &mut sleeper, &mut reporter).await;
+
+        assert_eq!(
+            out,
+            ReactionRemoveOutcome::Evaluated(vec![(ROLE_OK_A, RemovalRoleOutcome::Removed)])
+        );
+        assert_eq!(
+            writer.remove_calls,
+            vec![(MEMBER, ROLE_OK_A), (MEMBER, ROLE_OK_A)]
+        );
+        assert_eq!(sleeper.slept, vec![250]);
+        assert!(reporter.lines.is_empty(), "{:?}", reporter.lines);
+    }
+
+    #[tokio::test]
+    async fn removal_persistent_rate_limit_fails_after_exactly_max_retries_plus_one_calls() {
+        let attempts = usize::from(grant::MAX_RATE_LIMIT_RETRIES) + 1;
+        // One extra scripted Ok proves no retry happens beyond the bound: if the code made
+        // another call it would consume it and report Removed instead of RateLimited.
+        let mut script: Vec<Result<(), WriteError>> =
+            (0..attempts).map(|_| rate_limited(None)).collect();
+        script.push(Ok(()));
+        let mut writer = FakeWriter::default().fail_role(ROLE_OK_A, script);
+        let mut sleeper = FakeSleeper::default();
+        let mut reporter = MemoryReporter::default();
+
+        let out = run_removal_of_ok_a(&mut writer, &mut sleeper, &mut reporter).await;
+
+        assert_eq!(
+            out,
+            ReactionRemoveOutcome::Evaluated(vec![(
+                ROLE_OK_A,
+                RemovalRoleOutcome::Failed(FailCode::RateLimited)
+            )])
+        );
+        assert_eq!(writer.remove_calls.len(), attempts);
+        assert_eq!(
+            sleeper.slept,
+            vec![
+                grant::DEFAULT_BACKOFF_MS,
+                2 * grant::DEFAULT_BACKOFF_MS,
+                3 * grant::DEFAULT_BACKOFF_MS
+            ]
+        );
+        assert_eq!(reporter.lines.len(), 1);
+        assert!(
+            reporter.lines[0].contains("failed:rate_limited"),
+            "{}",
+            reporter.lines[0]
+        );
+    }
 }
