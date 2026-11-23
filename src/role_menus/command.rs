@@ -523,9 +523,11 @@ pub fn validate_key(key: &str) -> Result<(), Code> {
 /// * no blank code point (see [`is_blank_char`]: the Hangul fillers, the
 ///   braille blank and the rest of the default-ignorable set),
 /// * no line separator (`U+2028`) and no paragraph separator (`U+2029`),
-/// * no Discord mention markup (`<@…>`, `<#…>`, `<:…>`, `<a:…>`),
-/// * and it must hold at least one visible character, so a label that is only
-///   spaces or only invisible marks is refused.
+/// * no Discord mention markup (`<@…>`, `<#…>`, `<:…>`, `<a:…>`).
+///
+/// Every one of those classes is refused wherever it appears in the label,
+/// so a label that shows the reader nothing (only fillers, only spaces) is
+/// refused too: an empty label is not a label.
 pub fn validate_label(label: &str) -> Result<(), Code> {
     let trimmed = label.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_LABEL_CHARS {
@@ -538,10 +540,6 @@ pub fn validate_label(label: &str) -> Result<(), Code> {
         return Err(Code::InvalidLabel);
     }
     if holds_markup(trimmed) {
-        return Err(Code::InvalidLabel);
-    }
-    // At least one visible character: whitespace alone is not a label.
-    if !trimmed.chars().any(is_visible_char) {
         return Err(Code::InvalidLabel);
     }
     Ok(())
@@ -620,15 +618,6 @@ fn is_format_char(c: char) -> bool {
             | '\u{E0001}'
             | '\u{E0020}'..='\u{E007F}'
     )
-}
-
-/// True for a character that is shown to the reader.
-///
-/// A character shows nothing when it is whitespace, a control character, a
-/// format character or one of the blank code points (see
-/// [`is_blank_char`]).
-fn is_visible_char(c: char) -> bool {
-    !c.is_whitespace() && !c.is_control() && !is_format_char(c) && !is_blank_char(c)
 }
 
 /// True for a code point that occupies space but shows the reader nothing.
