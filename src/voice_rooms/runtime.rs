@@ -2828,7 +2828,8 @@ mod tests {
         let room = h.room_for(U1).await;
         h.net.add_channel(UNTRACKED_A, CAT, "Voice Room");
         h.net.clear_calls();
-        // No row: the channel exists and is empty, and is left alone.
+        // Long past any grace: only the missing row (or the other guild) stands in the way.
+        h.clock.advance(600);
         assert_eq!(h.feat.run_cleanup(payload(UNTRACKED_A, T0)).await, Ok(()));
         // A payload for another guild.
         let other = ClaimedJob {
@@ -2846,6 +2847,17 @@ mod tests {
         add_row(&h.db, UNTRACKED_B, OTHER_GUILD, U2, T0).await;
         h.net.add_channel(UNTRACKED_B, CAT, "Other");
         assert_eq!(h.feat.run_cleanup(payload(UNTRACKED_B, T0)).await, Ok(()));
+        // A consistent row and payload of another guild: not the home guild's business.
+        let foreign = ClaimedJob {
+            payload_json: cleanup_payload(&CleanupPayload {
+                guild: OTHER_GUILD,
+                channel: UNTRACKED_B,
+                since: T0,
+                attempt: 0,
+            }),
+            ..payload(UNTRACKED_B, T0)
+        };
+        assert_eq!(h.feat.run_cleanup(foreign).await, Ok(()));
         assert!(h.net.calls().is_empty(), "{:?}", h.net.calls());
         assert!(h.net.exists(UNTRACKED_A) && h.net.exists(UNTRACKED_B) && h.net.exists(room));
         assert_eq!(all_rows(&h.db).await, 2);
