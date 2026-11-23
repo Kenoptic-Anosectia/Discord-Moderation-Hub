@@ -948,6 +948,7 @@ mod snapshot_tests {
     }
 }
 
+/// Persistence limit per open session; does not change live AC1 accounting.
 pub const MAX_SNAPSHOT_SEGMENTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -966,21 +967,106 @@ pub struct OpenSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RestoreError;
+pub enum RestoreError {
+    InvalidId,
+    Empty,
+    TooManySegments,
+    SegmentOrder,
+    DuplicateOpen,
+}
 
 impl RestoreError {
     pub fn code(self) -> &'static str {
-        "snapshot_unimplemented"
+        match self {
+            Self::InvalidId => "snapshot_invalid_id",
+            Self::Empty => "snapshot_empty",
+            Self::TooManySegments => "snapshot_too_many_segments",
+            Self::SegmentOrder => "snapshot_segment_order",
+            Self::DuplicateOpen => "snapshot_duplicate_open",
+        }
     }
 }
 
 impl Ledger {
+    /// Copies open sessions only, without changing the live accounting state.
     pub fn snapshot_open(&self) -> Vec<OpenSnapshot> {
-        Vec::new()
+        self.open
+            .iter()
+            .map(|(&(guild_id, user_id), session)| OpenSnapshot {
+                guild_id,
+                user_id,
+                channel_id: session.channel_id,
+                segments: session
+                    .segments
+                    .iter()
+                    .map(|segment| SegmentSnapshot {
+                        start: segment.start,
+                        end: segment.end,
+                        self_deaf: segment.self_deaf,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
-    pub fn restore(_: impl IntoIterator<Item = OpenSnapshot>) -> Result<Self, RestoreError> {
-        Ok(Self::new())
+    /// Drops open presence without credit when its channel is no longer in scope.
+    pub(super) fn discard_open(&mut self, guild_id: u64, user_id: u64) {
+        self.open.remove(&(guild_id, user_id));
+    }
+
+    /// If the wall clock moved backwards, even previously closed stretches in a
+    /// checkpoint must not extend beyond the restart. Keep at least the first
+    /// stretch so AC1 can still report the restart and close it for zero seconds.
+    pub(super) fn clamp_open_for_restart(&mut self, cutoff: i64) {
+        for session in self.open.values_mut() {
+            let count = session.segments.partition_point(|s| s.start <= cutoff);
+            session.segments.truncate(count.max(1));
+        }
+    }
+
+    /// Restores open sessions for restart reconciliation. Policy settings are applied
+    /// by `note_restart`, not by validation. Closed members are not snapshotted.
+    pub fn restore(
+        snapshots: impl IntoIterator<Item = OpenSnapshot>,
+    ) -> Result<Self, RestoreError> {
+        let mut ledger = Self::new();
+        for OpenSnapshot {
+            guild_id,
+            user_id,
+            channel_id,
+            segments,
+        } in snapshots
+        {
+            if guild_id == 0 || user_id == 0 || channel_id == 0 {
+                return Err(RestoreError::InvalidId);
+            }
+            let last = segments.last().ok_or(RestoreError::Empty)?;
+            if segments.len() > MAX_SNAPSHOT_SEGMENTS {
+                return Err(RestoreError::TooManySegments);
+            }
+            if segments.iter().any(|s| s.start > s.end)
+                || segments.windows(2).any(|w| w[0].end > w[1].start)
+            {
+                return Err(RestoreError::SegmentOrder);
+            }
+            let key = (guild_id, user_id);
+            let Entry::Vacant(slot) = ledger.open.entry(key) else {
+                return Err(RestoreError::DuplicateOpen);
+            };
+            ledger.last_seen.insert(key, last.end);
+            slot.insert(OpenSession {
+                channel_id,
+                segments: segments
+                    .into_iter()
+                    .map(|s| Segment {
+                        start: s.start,
+                        end: s.end,
+                        self_deaf: s.self_deaf,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(ledger)
     }
 }
 

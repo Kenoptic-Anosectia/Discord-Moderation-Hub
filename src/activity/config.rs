@@ -1,6 +1,8 @@
 //! Activity settings parsed from the wiring lane's lookup, not the environment.
-use super::policy::ActivityConfig;
-use crate::settings::{Mode, SettingError};
+use super::policy::{
+    ActivityConfig, KEY_AFK_CHANNEL_ID, KEY_COUNT_SELF_DEAFENED, KEY_EXCLUDED_CHANNEL_IDS, KEY_MODE,
+};
+use crate::settings::{parse_id_list, parse_mode, Mode, SettingError};
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -9,18 +11,60 @@ pub struct Settings {
     pub(super) policy: ActivityConfig,
 }
 
-pub fn parse(_: impl Fn(&str) -> Option<String>, _: Option<u64>) -> Result<Settings, SettingError> {
+impl Settings {
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn home_guild(&self) -> Option<u64> {
+        self.home
+    }
+}
+
+/// A refused key returns no settings; the caller must leave activity off.
+pub fn parse(
+    lookup: impl Fn(&str) -> Option<String>,
+    home: Option<u64>,
+) -> Result<Settings, SettingError> {
+    let invalid = |key: &str| SettingError::InvalidValue(key.into());
+    let mode = parse_mode(KEY_MODE, lookup(KEY_MODE).as_deref())?;
+    let home = home.filter(|id| *id != 0);
+    if mode == Mode::Off && home.is_none() {
+        return Ok(Settings {
+            mode,
+            home,
+            policy: ActivityConfig::new(vec![], None, false).map_err(|e| invalid(e.key()))?,
+        });
+    }
+    let excluded = parse_id_list(
+        KEY_EXCLUDED_CHANNEL_IDS,
+        lookup(KEY_EXCLUDED_CHANNEL_IDS).as_deref(),
+    )
+    .map_err(|_| invalid(KEY_EXCLUDED_CHANNEL_IDS))?;
+    let afk = lookup(KEY_AFK_CHANNEL_ID);
+    if afk.as_deref().is_some_and(|s| s.contains(',')) {
+        return Err(invalid(KEY_AFK_CHANNEL_ID));
+    }
+    let afk = parse_id_list(KEY_AFK_CHANNEL_ID, afk.as_deref())
+        .map_err(|_| invalid(KEY_AFK_CHANNEL_ID))?
+        .first()
+        .copied();
+    let deafened = lookup(KEY_COUNT_SELF_DEAFENED);
+    let count = match deafened.as_deref().map(str::trim).unwrap_or("") {
+        "" | "false" => false,
+        "true" => true,
+        _ => return Err(invalid(KEY_COUNT_SELF_DEAFENED)),
+    };
     Ok(Settings {
-        mode: Mode::Off,
-        home: None,
-        policy: ActivityConfig::new(vec![], None, false).unwrap(),
+        mode: if home.is_some() { mode } else { Mode::Off },
+        home,
+        policy: ActivityConfig::new(excluded, afk, count).map_err(|e| invalid(e.key()))?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::policy::*;
 
     #[test]
     fn ac2_config_parses_and_fails_closed() {
