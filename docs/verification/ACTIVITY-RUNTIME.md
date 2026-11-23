@@ -17,12 +17,13 @@ On restart, AC2 consumes the saved rows in a transaction with the recovered tota
 invalid rows and closes valid ones no later than each row's `last_seen_at` or restart time.
 One shared cadence keeps a closed session's totals and removal from the open set atomic.
 
-With a healthy clock, on-time ticks and successful writes, a crash can lose up to one
-flush/heartbeat interval of unflushed counts and segment detail. Restart credits no more
-than the persisted heartbeat allows, not the outage. Scheduler stalls or repeated write
-failures can lengthen the loss window. If a session exceeds 1,024 segments, the checkpoint
-omits and reports it rather than storing a partial history that could miscredit time; the
-live ledger is unchanged. Shadow does not persist activity.
+With a healthy clock, on-time ticks and successful writes, a crash can lose up to 30 seconds
+(one flush/heartbeat interval) of pending counts and segment detail for sessions that can be
+checkpointed. Restart does not credit time after the persisted heartbeat. Scheduler stalls
+or write failures can lengthen the loss window. A checkpoint omits and reports a session
+over 1,024 segments rather than storing a partial history that could miscredit time. The
+live ledger retains it, but if the process crashes while the session is omitted, restart
+cannot recover that session. Shadow does not persist activity.
 
 ## Wiring contract and config
 
@@ -49,4 +50,7 @@ RED `d31a94a`: `timeout 300 cargo test --locked --offline activity::` returned 1
 9 failed, 88 passed. Failures: config; snapshot round trip and validation; schema; exclusions
 and shutdown; heartbeat/deafening/midnight; transaction retry; corrupt-row recovery; seeded
 SQLite checkpoint/restart model. The missing-home/no-store test passed against the scaffold.
-The implementation commit was written after RED but was not runtime-verified in this turn.
+After the migration return-type fix, all 1,551 unit tests and 52 integration tests passed
+offline. Targeted tests failed when UTC midnight splitting, snapshot overlap rejection,
+the persisted heartbeat cap, or the message privacy gate was deliberately broken. Each
+mutation was reverted.

@@ -106,7 +106,9 @@ impl<'a> Repository<'a> {
     }
 
     pub fn migrate(&mut self) -> Result<(), RepoError> {
-        storage::migrate(self.0, "activity", MIGRATIONS).map_err(RepoError::Migration)
+        storage::migrate(self.0, "activity", MIGRATIONS)
+            .map(|_| ())
+            .map_err(RepoError::Migration)
     }
 }
 
