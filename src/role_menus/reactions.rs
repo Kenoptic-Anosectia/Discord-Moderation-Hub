@@ -12,9 +12,7 @@ use crate::roles::eligibility::{self, Decision, DenyReason, GrantPath, SafewordS
 use crate::roles::grant::{
     self, FailCode, GrantReport, RoleOutcome, RoleWriter, Sleeper, WriteError,
 };
-use crate::roles::runtime::{
-    self, DecisionInputs, FactsOutcome, RoleEntry, RoleSource, RuntimeDecision,
-};
+use crate::roles::runtime::{self, DecisionInputs, FactsOutcome, RoleSource, RuntimeDecision};
 use crate::text_helpers::{normalize_reaction_type, parse_emoji_input};
 use poise::serenity_prelude as s;
 use rusqlite::{params, Connection};
@@ -39,8 +37,8 @@ CREATE TABLE IF NOT EXISTS reaction_roles (
 
 /// Initializes the `reaction_roles` table if it does not exist.
 pub fn init_schema(conn: &Connection) -> Result<(), StorageCode> {
-    let _ = conn;
-    Ok(())
+    conn.execute_batch(SCHEMA_SQL)
+        .map_err(|_| StorageCode::Sqlite)
 }
 
 /// Stable error codes for `reaction_roles` SQLite operations.
@@ -160,6 +158,27 @@ pub struct ListBindingsRequest {
     pub message_id: u64,
 }
 
+fn check_home_guild(env: &ReactionEnv, guild_id: u64) -> Result<u64, CommandDeny> {
+    let Some(home) = env.home_guild_id else {
+        return Err(CommandDeny::HomeGuildUnset);
+    };
+    if home == 0 || guild_id == 0 {
+        return Err(CommandDeny::InvalidId);
+    }
+    if guild_id != home {
+        return Err(CommandDeny::ForeignGuild);
+    }
+    Ok(home)
+}
+
+fn parse_positive_id(raw: &str) -> Result<u64, StorageCode> {
+    let parsed = raw.parse::<u64>().map_err(|_| StorageCode::CorruptId)?;
+    if parsed == 0 {
+        return Err(StorageCode::CorruptId);
+    }
+    Ok(parsed)
+}
+
 /// Validates home guild, role eligibility via K03 (`GrantPath::Reaction`), and stores the binding.
 pub async fn add_binding<S: RoleSource + ?Sized>(
     conn: &Connection,
@@ -167,8 +186,54 @@ pub async fn add_binding<S: RoleSource + ?Sized>(
     env: &ReactionEnv,
     req: &AddBindingRequest,
 ) -> Result<String, CommandDeny> {
-    let _ = (conn, source, env, req, params![1]);
-    Err(CommandDeny::HomeGuildUnset)
+    let guild_id = check_home_guild(env, req.guild_id)?;
+    if req.channel_id == 0
+        || req.message_id == 0
+        || req.role_id == 0
+        || req.created_by == 0
+        || env.bot_user_id == 0
+    {
+        return Err(CommandDeny::InvalidId);
+    }
+    if env.protected_roles_invalid {
+        return Err(CommandDeny::ProtectedConfigInvalid);
+    }
+    let emoji_key = parse_emoji_input(&req.emoji_input);
+    if emoji_key.trim().is_empty() {
+        return Err(CommandDeny::EmptyEmoji);
+    }
+
+    let inputs = DecisionInputs {
+        path: GrantPath::Reaction,
+        bot_top_position: 0,
+        guild_id,
+        protected_role_ids: &env.protected_role_ids,
+        safeword: SafewordState::Inactive,
+        safeword_restricted_role_ids: &env.safeword_restricted_role_ids,
+        staff: None,
+    };
+    match runtime::decide_role(source, guild_id, req.role_id, env.bot_user_id, &inputs).await {
+        RuntimeDecision::Decided(Decision::Allow) => {}
+        RuntimeDecision::Decided(Decision::Deny(reason)) => {
+            return Err(CommandDeny::Ineligible(reason));
+        }
+        RuntimeDecision::Unavailable => return Err(CommandDeny::FactsUnavailable),
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO reaction_roles\n         (guild_id, channel_id, message_id, emoji_key, role_id, created_by, created_at)\n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))",
+        params![
+            guild_id.to_string(),
+            req.channel_id.to_string(),
+            req.message_id.to_string(),
+            emoji_key,
+            req.role_id.to_string(),
+            req.created_by.to_string(),
+        ],
+    )
+    .map_err(|_| CommandDeny::Storage(StorageCode::Sqlite))?;
+
+    Ok(emoji_key)
 }
 
 /// Validates home guild and deletes matching `(message_id, role_id)` bindings.
@@ -177,8 +242,15 @@ pub fn remove_binding(
     env: &ReactionEnv,
     req: &RemoveBindingRequest,
 ) -> Result<usize, CommandDeny> {
-    let _ = (conn, env, req);
-    Err(CommandDeny::HomeGuildUnset)
+    let _guild_id = check_home_guild(env, req.guild_id)?;
+    if req.message_id == 0 || req.role_id == 0 {
+        return Err(CommandDeny::InvalidId);
+    }
+    conn.execute(
+        "DELETE FROM reaction_roles WHERE message_id = ?1 AND role_id = ?2",
+        params![req.message_id.to_string(), req.role_id.to_string()],
+    )
+    .map_err(|_| CommandDeny::Storage(StorageCode::Sqlite))
 }
 
 /// Validates home guild and lists bindings for `message_id` ordered by `emoji_key ASC`.
@@ -187,8 +259,39 @@ pub fn list_bindings(
     env: &ReactionEnv,
     req: &ListBindingsRequest,
 ) -> Result<Vec<BindingRow>, CommandDeny> {
-    let _ = (conn, env, req);
-    Err(CommandDeny::HomeGuildUnset)
+    let _guild_id = check_home_guild(env, req.guild_id)?;
+    if req.message_id == 0 {
+        return Err(CommandDeny::InvalidId);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT guild_id, channel_id, message_id, emoji_key, role_id\n             FROM reaction_roles\n             WHERE message_id = ?1\n             ORDER BY emoji_key ASC, role_id ASC",
+        )
+        .map_err(|_| CommandDeny::Storage(StorageCode::Sqlite))?;
+    let rows = stmt
+        .query_map(params![req.message_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|_| CommandDeny::Storage(StorageCode::Sqlite))?;
+    let mut out = Vec::new();
+    for item in rows {
+        let (g, c, m, emoji_key, r) =
+            item.map_err(|_| CommandDeny::Storage(StorageCode::Sqlite))?;
+        out.push(BindingRow {
+            guild_id: parse_positive_id(&g).map_err(CommandDeny::Storage)?,
+            channel_id: parse_positive_id(&c).map_err(CommandDeny::Storage)?,
+            message_id: parse_positive_id(&m).map_err(CommandDeny::Storage)?,
+            emoji_key,
+            role_id: parse_positive_id(&r).map_err(CommandDeny::Storage)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Queries bound role IDs for `(message_id, emoji_key)` in deterministic row order.
@@ -197,8 +300,22 @@ pub fn lookup_roles_for_message_emoji(
     message_id: u64,
     emoji_key: &str,
 ) -> Result<Vec<u64>, StorageCode> {
-    let _ = (conn, message_id, emoji_key);
-    Ok(Vec::new())
+    let mut stmt = conn
+        .prepare(
+            "SELECT role_id\n             FROM reaction_roles\n             WHERE message_id = ?1 AND emoji_key = ?2\n             ORDER BY rowid ASC",
+        )
+        .map_err(|_| StorageCode::Sqlite)?;
+    let rows = stmt
+        .query_map(params![message_id.to_string(), emoji_key], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| StorageCode::Sqlite)?;
+    let mut out = Vec::new();
+    for item in rows {
+        let raw = item.map_err(|_| StorageCode::Sqlite)?;
+        out.push(parse_positive_id(&raw)?);
+    }
+    Ok(out)
 }
 
 /// Synchronous role remover port mirroring `grant::RoleWriter` so removals are offline-testable.
@@ -319,6 +436,54 @@ pub struct RemovePorts<'a, S: RoleSource + ?Sized, M: RoleRemover, L: Sleeper, R
     pub reporter: &'a mut R,
 }
 
+fn precheck_event(
+    env: &ReactionEnv,
+    guild_id: Option<u64>,
+    user_id: Option<u64>,
+    user_is_bot: Option<bool>,
+) -> Result<(u64, u64), SkipReason> {
+    let Some(gid) = guild_id.filter(|&g| g != 0) else {
+        return Err(SkipReason::NoGuild);
+    };
+    match env.home_guild_id {
+        Some(home) if home == gid => {}
+        _ => return Err(SkipReason::ForeignGuild),
+    }
+    let Some(uid) = user_id.filter(|&u| u != 0) else {
+        return Err(SkipReason::NoUser);
+    };
+    if uid == env.bot_user_id || user_is_bot == Some(true) {
+        return Err(SkipReason::BotReactor);
+    }
+    Ok((gid, uid))
+}
+
+fn remove_with_retry<M: RoleRemover, L: Sleeper>(
+    remover: &mut M,
+    sleeper: &mut L,
+    member_id: u64,
+    role_id: u64,
+) -> RemovalRoleOutcome {
+    let mut retries: u8 = 0;
+    loop {
+        let error = match remover.remove_role(member_id, role_id) {
+            Ok(()) => return RemovalRoleOutcome::Removed,
+            Err(err) => err,
+        };
+        let code = grant::classify(&error);
+        if code == FailCode::RateLimited && retries < grant::MAX_RATE_LIMIT_RETRIES {
+            retries += 1;
+            let wait = error
+                .retry_after_ms
+                .unwrap_or(grant::DEFAULT_BACKOFF_MS * u64::from(retries))
+                .min(grant::MAX_SLEEP_MS);
+            sleeper.sleep_ms(wait);
+            continue;
+        }
+        return RemovalRoleOutcome::Failed(code);
+    }
+}
+
 /// Handles a reaction-add event: filters bots/foreign guilds, resolves bound roles, evaluates
 /// K03 eligibility (including active safeword restrictions), applies grants via K04, and reports
 /// any denials or write failures through `ports.reporter` using stable codes only.
@@ -334,40 +499,101 @@ where
     L: Sleeper,
     R: FailureReporter,
 {
-    let _ = (
-        conn,
-        env,
-        event,
-        ports.source,
+    let (guild_id, member_id) =
+        match precheck_event(env, event.guild_id, event.user_id, event.user_is_bot) {
+            Ok(ids) => ids,
+            Err(reason) => return ReactionAddOutcome::Skipped(reason),
+        };
+
+    let role_ids = match lookup_roles_for_message_emoji(conn, event.message_id, &event.emoji_key) {
+        Ok(ids) => ids,
+        Err(err) => {
+            let code = err.code();
+            ports.reporter.report(&format!(
+                "reaction_add guild={guild_id} message={} member={member_id} error={code}",
+                event.message_id
+            ));
+            return ReactionAddOutcome::Aborted(code);
+        }
+    };
+    if role_ids.is_empty() {
+        return ReactionAddOutcome::Skipped(SkipReason::NoBindings);
+    }
+    if env.protected_roles_invalid {
+        let code = CommandDeny::ProtectedConfigInvalid.code();
+        ports.reporter.report(&format!(
+            "reaction_add guild={guild_id} message={} member={member_id} error={code}",
+            event.message_id
+        ));
+        return ReactionAddOutcome::Aborted(code);
+    }
+
+    let member_roles = match ports.source.member_roles(guild_id, member_id).await {
+        Ok(roles) => roles,
+        Err(_) => {
+            let code = runtime::CODE_FACTS_UNAVAILABLE;
+            ports.reporter.report(&format!(
+                "reaction_add guild={guild_id} message={} member={member_id} error={code}",
+                event.message_id
+            ));
+            return ReactionAddOutcome::Aborted(code);
+        }
+    };
+
+    let base_inputs = DecisionInputs {
+        path: GrantPath::Reaction,
+        bot_top_position: 0,
+        guild_id,
+        protected_role_ids: &env.protected_role_ids,
+        safeword: event.safeword,
+        safeword_restricted_role_ids: &env.safeword_restricted_role_ids,
+        staff: None,
+    };
+    let mut decisions: Vec<(u64, RuntimeDecision)> = Vec::with_capacity(role_ids.len());
+    let mut unavailable_roles: Vec<u64> = Vec::new();
+    for &role_id in &role_ids {
+        let dec = runtime::decide_role(
+            ports.source,
+            guild_id,
+            role_id,
+            env.bot_user_id,
+            &base_inputs,
+        )
+        .await;
+        if dec == RuntimeDecision::Unavailable {
+            unavailable_roles.push(role_id);
+        }
+        decisions.push((role_id, dec));
+    }
+
+    let items = runtime::grant_items(&decisions, &member_roles);
+    let report = grant::apply(
         ports.writer,
         ports.sleeper,
-        ports.reporter,
-        Decision::Allow,
-        GrantPath::Reaction,
-        RoleOutcome::Done,
-        DecisionInputs {
-            path: GrantPath::Reaction,
-            bot_top_position: 0,
-            guild_id: 0,
-            protected_role_ids: &[],
-            safeword: SafewordState::Inactive,
-            safeword_restricted_role_ids: &[],
-            staff: None,
+        &grant::GrantRequest {
+            member_id,
+            items: &items,
         },
-        FactsOutcome::Missing,
-        RuntimeDecision::Unavailable,
-        RoleEntry {
-            id: 0,
-            position: 0,
-            managed: false,
-            permissions: 0,
-        },
-        grant::apply::<W, L>,
-        eligibility::decide_removal,
-        parse_emoji_input,
-        normalize_reaction_type,
     );
-    ReactionAddOutcome::Skipped(SkipReason::NoBindings)
+
+    let has_non_ok = report
+        .results
+        .iter()
+        .any(|r| matches!(r.outcome, RoleOutcome::Denied(_) | RoleOutcome::Failed(_)));
+    if has_non_ok || !unavailable_roles.is_empty() {
+        ports.reporter.report(&report.summary_line());
+    }
+    for &role_id in &unavailable_roles {
+        ports.reporter.report(&format!(
+            "reaction_add guild={guild_id} member={member_id} role={role_id}:denied:{}",
+            runtime::CODE_FACTS_UNAVAILABLE
+        ));
+    }
+
+    ReactionAddOutcome::Evaluated {
+        report,
+        unavailable_roles,
+    }
 }
 
 /// Handles a reaction-remove event: filters bots/foreign guilds, resolves bound roles, checks
@@ -386,16 +612,81 @@ where
     L: Sleeper,
     R: FailureReporter,
 {
-    let _ = (
-        conn,
-        env,
-        event,
-        ports.source,
-        ports.remover,
-        ports.sleeper,
-        ports.reporter,
-    );
-    ReactionRemoveOutcome::Skipped(SkipReason::NoBindings)
+    let (guild_id, member_id) =
+        match precheck_event(env, event.guild_id, event.user_id, event.user_is_bot) {
+            Ok(ids) => ids,
+            Err(reason) => return ReactionRemoveOutcome::Skipped(reason),
+        };
+
+    let role_ids = match lookup_roles_for_message_emoji(conn, event.message_id, &event.emoji_key) {
+        Ok(ids) => ids,
+        Err(err) => {
+            let code = err.code();
+            ports.reporter.report(&format!(
+                "reaction_remove guild={guild_id} message={} member={member_id} error={code}",
+                event.message_id
+            ));
+            return ReactionRemoveOutcome::Aborted(code);
+        }
+    };
+    if role_ids.is_empty() {
+        return ReactionRemoveOutcome::Skipped(SkipReason::NoBindings);
+    }
+
+    let mut outcomes: Vec<(u64, RemovalRoleOutcome)> = Vec::with_capacity(role_ids.len());
+    for &role_id in &role_ids {
+        let (facts, bot_top) =
+            runtime::lookup_facts(ports.source, guild_id, role_id, env.bot_user_id).await;
+        let role_facts = match facts {
+            FactsOutcome::Found(f) => f,
+            FactsOutcome::Missing => eligibility::RoleFacts {
+                id: role_id,
+                position: 0,
+                managed: false,
+                permissions: 0,
+                exists: false,
+            },
+            FactsOutcome::Unavailable => {
+                ports.reporter.report(&format!(
+                    "reaction_remove guild={guild_id} member={member_id} role={role_id}:denied:{}",
+                    runtime::CODE_FACTS_UNAVAILABLE
+                ));
+                outcomes.push((role_id, RemovalRoleOutcome::Unavailable));
+                continue;
+            }
+        };
+        let req = eligibility::GrantRequest {
+            path: GrantPath::Reaction,
+            role: role_facts,
+            bot_top_position: bot_top,
+            guild_id,
+            protected_role_ids: &env.protected_role_ids,
+            safeword: event.safeword,
+            safeword_restricted_role_ids: &env.safeword_restricted_role_ids,
+            staff: None,
+        };
+        match eligibility::decide_removal(&req) {
+            Decision::Allow => {
+                let out = remove_with_retry(ports.remover, ports.sleeper, member_id, role_id);
+                if let RemovalRoleOutcome::Failed(code) = out {
+                    ports.reporter.report(&format!(
+                        "reaction_remove guild={guild_id} member={member_id} role={role_id}:failed:{}",
+                        code.code()
+                    ));
+                }
+                outcomes.push((role_id, out));
+            }
+            Decision::Deny(reason) => {
+                ports.reporter.report(&format!(
+                    "reaction_remove guild={guild_id} member={member_id} role={role_id}:denied:{}",
+                    reason.code()
+                ));
+                outcomes.push((role_id, RemovalRoleOutcome::Denied(reason)));
+            }
+        }
+    }
+
+    ReactionRemoveOutcome::Evaluated(outcomes)
 }
 
 /// Extracts an emoji key from a serenity `ReactionType` using the existing normalization rule.
@@ -453,6 +744,7 @@ mod tests {
     use crate::roles::eligibility::{
         ADMINISTRATOR, BAN_MEMBERS, KICK_MEMBERS, MANAGE_GUILD, MANAGE_ROLES, MODERATE_MEMBERS,
     };
+    use crate::roles::runtime::RoleEntry;
     use std::collections::{HashMap, VecDeque};
 
     const HOME_GUILD: u64 = 710_001;
@@ -1231,5 +1523,117 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("failed:forbidden")));
+    }
+
+    #[tokio::test]
+    async fn seeded_liveness_retry_loop_for_add_and_remove_always_terminates_bounded() {
+        let conn = db();
+        let source = FakeSource::standard();
+        let e = env();
+        add_binding(&conn, &source, &e, &add_req(ROLE_OK_A, "🦀"))
+            .await
+            .unwrap();
+        add_binding(&conn, &source, &e, &add_req(ROLE_OK_B, "🦀"))
+            .await
+            .unwrap();
+
+        let mut lcg: u64 = 0x5EED_CAFE_1234_5678;
+        let mut next_u32 = || -> u32 {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (lcg >> 32) as u32
+        };
+
+        for _step in 0..32 {
+            let mut writer = FakeWriter::default();
+            for role_id in [ROLE_OK_A, ROLE_OK_B] {
+                let n_attempts = (next_u32() % 6) as usize;
+                let mut seq = Vec::with_capacity(n_attempts);
+                for _ in 0..n_attempts {
+                    let kind = next_u32() % 4;
+                    let res = match kind {
+                        0 => Ok(()),
+                        1 => Err(WriteError {
+                            status: 429,
+                            api_code: None,
+                            retry_after_ms: Some(250),
+                        }),
+                        2 => Err(WriteError {
+                            status: 429,
+                            api_code: None,
+                            retry_after_ms: None,
+                        }),
+                        _ => Err(WriteError {
+                            status: 403,
+                            api_code: None,
+                            retry_after_ms: None,
+                        }),
+                    };
+                    seq.push(res);
+                }
+                writer = writer.fail_role(role_id, seq);
+            }
+            let mut sleeper = FakeSleeper::default();
+            let mut reporter = MemoryReporter::default();
+            let out_add = handle_reaction_add(
+                &conn,
+                &e,
+                &ReactionAddEvent {
+                    guild_id: Some(HOME_GUILD),
+                    channel_id: CHANNEL,
+                    message_id: MESSAGE,
+                    user_id: Some(MEMBER),
+                    user_is_bot: Some(false),
+                    emoji_key: "🦀".to_string(),
+                    safeword: SafewordState::Inactive,
+                },
+                AddPorts {
+                    source: &source,
+                    writer: &mut writer,
+                    sleeper: &mut sleeper,
+                    reporter: &mut reporter,
+                },
+            )
+            .await;
+            match out_add {
+                ReactionAddOutcome::Evaluated { report, .. } => {
+                    assert_eq!(report.results.len(), 2);
+                    for r in &report.results {
+                        assert!(r.writer_calls >= 1 && r.writer_calls <= 4);
+                    }
+                }
+                other => panic!("unexpected add outcome: {other:?}"),
+            }
+            assert!(writer.add_calls.len() <= 8);
+
+            let mut rem_sleeper = FakeSleeper::default();
+            let mut rem_reporter = MemoryReporter::default();
+            let out_rem = handle_reaction_remove(
+                &conn,
+                &e,
+                &ReactionRemoveEvent {
+                    guild_id: Some(HOME_GUILD),
+                    channel_id: CHANNEL,
+                    message_id: MESSAGE,
+                    user_id: Some(MEMBER),
+                    user_is_bot: Some(false),
+                    emoji_key: "🦀".to_string(),
+                    safeword: SafewordState::Inactive,
+                },
+                RemovePorts {
+                    source: &source,
+                    remover: &mut writer,
+                    sleeper: &mut rem_sleeper,
+                    reporter: &mut rem_reporter,
+                },
+            )
+            .await;
+            match out_rem {
+                ReactionRemoveOutcome::Evaluated(items) => {
+                    assert_eq!(items.len(), 2);
+                }
+                other => panic!("unexpected remove outcome: {other:?}"),
+            }
+            assert!(writer.remove_calls.len() <= 8);
+        }
     }
 }
