@@ -943,7 +943,7 @@ mod tests {
     #[derive(Default)]
     struct FakeWriter {
         calls: Vec<(u64, u64)>,
-        fail: Option<(u64, crate::roles::grant::WriteError)>,
+        fail: Vec<(u64, crate::roles::grant::WriteError)>,
     }
 
     impl FakeWriter {
@@ -956,15 +956,54 @@ mod tests {
         fn failing_with(role_id: u64, status: u16, api_code: Option<u32>) -> Self {
             FakeWriter {
                 calls: Vec::new(),
-                fail: Some((
+                fail: vec![(
                     role_id,
                     crate::roles::grant::WriteError {
                         status,
                         api_code,
                         retry_after_ms: None,
                     },
-                )),
+                )],
             }
+        }
+
+        /// A writer that fails several roles with the SAME error, so the same
+        /// code comes up more than once in one join.
+        fn failing_all(status: u16) -> Self {
+            FakeWriter {
+                calls: Vec::new(),
+                fail: Vec::new(),
+            }
+            .with_failure_for_every_role(status)
+        }
+
+        /// Fails every role with the same status.
+        fn with_failure_for_every_role(mut self, status: u16) -> Self {
+            self.fail.push((
+                ROLE_LOW,
+                crate::roles::grant::WriteError {
+                    status,
+                    api_code: None,
+                    retry_after_ms: None,
+                },
+            ));
+            self.fail.push((
+                ROLE_MID,
+                crate::roles::grant::WriteError {
+                    status,
+                    api_code: None,
+                    retry_after_ms: None,
+                },
+            ));
+            self.fail.push((
+                ROLE_HIGH,
+                crate::roles::grant::WriteError {
+                    status,
+                    api_code: None,
+                    retry_after_ms: None,
+                },
+            ));
+            self
         }
     }
 
@@ -975,9 +1014,9 @@ mod tests {
             role_id: u64,
         ) -> Result<(), crate::roles::grant::WriteError> {
             self.calls.push((member_id, role_id));
-            match &self.fail {
-                Some((failing, error)) if *failing == role_id => Err(*error),
-                _ => Ok(()),
+            match self.fail.iter().find(|(failing, _)| *failing == role_id) {
+                Some((_, error)) => Err(*error),
+                None => Ok(()),
             }
         }
     }
@@ -1506,7 +1545,7 @@ mod tests {
             Mode::Live,
             &[ROLE_LOW, ROLE_MID, ROLE_HIGH],
             FakeSource::with_roles(guild_roles()),
-            FakeWriter::failing(ROLE_LOW, 403),
+            FakeWriter::failing_all(403),
             FakeSender::ok(),
         );
         let outcome = rt.handle_join(&facts(false)).await;
@@ -1515,9 +1554,35 @@ mod tests {
             3,
             "every requested role has its own result"
         );
+        assert!(
+            outcome
+                .role_results
+                .iter()
+                .all(|r| r.outcome == RoleOutcome::Failed(crate::roles::grant::FailCode::Forbidden)),
+            "every role failed"
+        );
         assert_eq!(
             alerted(&rt),
             vec!["forbidden".to_string()],
+            "one alert per distinct code per join"
+        );
+        assert_eq!(outcome.alerts, vec!["forbidden"]);
+    }
+
+    #[tokio::test]
+    async fn the_same_denial_code_is_alerted_once_per_join() {
+        // Three roles the policy refuses for the same reason.
+        let mut rt = runtime(
+            Mode::Live,
+            &[ROLE_PRIVILEGED, ROLE_PRIVILEGED, ROLE_PRIVILEGED],
+            FakeSource::with_roles(guild_roles()),
+            FakeWriter::default(),
+            FakeSender::ok(),
+        );
+        rt.handle_join(&facts(false)).await;
+        assert_eq!(
+            alerted(&rt),
+            vec!["privileged_permission".to_string()],
             "one alert per distinct code per join"
         );
     }
