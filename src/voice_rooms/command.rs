@@ -1755,7 +1755,7 @@ impl VcCommandHandler {
                 counts.failed += 1;
                 continue;
             }
-            match Ok::<(), RefusalCode>(()) {
+            match self.check_permit_eligibility(home_guild, user).await {
                 Ok(()) => to_add.push(user),
                 Err(
                     RefusalCode::TargetIsBot
@@ -5343,6 +5343,12 @@ mod tests {
         #[tokio::test]
         async fn shadow_refresh_counts_skipped_members_and_an_old_permit_is_left_alone() {
             let h = make_harness(settings_with("shadow", Some(HOME_GUILD)));
+            h.ports
+                .state
+                .lock()
+                .unwrap()
+                .room_members
+                .insert(ROOM_CH, vec![OWNER]);
             add_user(&h, SAFEWORD_USER, vec![ROLE_NORMAL], true, true);
             add_user(&h, MEMBER_B, vec![ROLE_NORMAL], true, true);
             h.safeword.active.lock().unwrap().insert(SAFEWORD_USER);
@@ -5363,6 +5369,12 @@ mod tests {
             // A connected member who is ineligible now but already holds a permit keeps it:
             // refresh withholds new permits, it does not revoke on eligibility.
             let h = make_harness(live_settings());
+            h.ports
+                .state
+                .lock()
+                .unwrap()
+                .room_members
+                .insert(ROOM_CH, vec![OWNER]);
             add_user(&h, SAFEWORD_USER, vec![ROLE_NORMAL], true, true);
             h.safeword.active.lock().unwrap().insert(SAFEWORD_USER);
             h.ports.state.lock().unwrap().live = vec![
