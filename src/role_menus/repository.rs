@@ -284,6 +284,25 @@ pub fn get_menu(conn: &Connection, guild: u64, key: &str) -> Result<Option<MenuR
     Ok(row)
 }
 
+/// Reads one menu by its row id. `Ok(None)` means no such menu.
+///
+/// A component id names a menu by its row id, so the reader needs a lookup by
+/// id and not only by guild and key. The guild is not part of the lookup: the
+/// caller checks the returned row's guild against the guild the interaction
+/// came from.
+pub fn get_menu_by_id(conn: &Connection, menu_id: i64) -> Result<Option<MenuRow>, RepoError> {
+    let row = conn
+        .query_row(
+            "SELECT id, guild, key, mode, max_select, channel, message, embed_key \
+             FROM role_menus WHERE id = ?1",
+            params![menu_id],
+            menu_row,
+        )
+        .optional()
+        .map_err(row_error)?;
+    Ok(row)
+}
+
 /// Lists the menus of one guild, ordered by key.
 pub fn list_menus(conn: &Connection, guild: u64) -> Result<Vec<MenuRow>, RepoError> {
     let mut stmt = conn

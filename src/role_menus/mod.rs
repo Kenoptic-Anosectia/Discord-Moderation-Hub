@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod command;
+pub mod interactions;
 pub mod policy;
 pub mod reactions;
 pub mod repository;
