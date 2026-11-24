@@ -3753,4 +3753,118 @@ mod tests {
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
     }
+
+    fn exclusive_reselection_harness(held: &[u64]) -> Harness<FakeStore> {
+        Harness::new(
+            exclusive_menu(),
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, held),
+        )
+    }
+
+    #[test]
+    fn exclusive_reselection_live_repairs_an_extra_option_for_button_and_select() {
+        for press in [press_option(1, ROLE_A), press_select(1, &[ROLE_A])] {
+            let mut harness = exclusive_reselection_harness(&[ROLE_A, ROLE_B]);
+            let result = harness.run(&settings(), &press);
+            assert_eq!(
+                result.outcome,
+                Outcome::with(Code::Partial, "already_selected")
+            );
+            assert_eq!(result.removed, vec![ROLE_B]);
+            assert!(result.added.is_empty());
+            assert_eq!(harness.roles.removed(), vec![ROLE_B]);
+            assert!(harness.roles.added().is_empty());
+            assert_eq!(harness.roles.held[&MEMBER], vec![ROLE_A]);
+            assert_eq!(
+                harness.responder.follow_ups(),
+                ["partial (already_selected)"]
+            );
+
+            let repeated = harness.run(&settings(), &press);
+            assert_eq!(repeated.outcome, Outcome::new(Code::AlreadySelected));
+            assert!(repeated.removed.is_empty());
+            assert_eq!(harness.roles.removed(), vec![ROLE_B]);
+            assert!(harness.roles.added().is_empty());
+        }
+    }
+
+    #[test]
+    fn exclusive_reselection_shadow_reports_cleanup_without_writing() {
+        let mut harness = exclusive_reselection_harness(&[ROLE_A, ROLE_B]);
+        let mut settings = settings();
+        settings.mode = Mode::Shadow;
+        let result = harness.run(&settings, &press_select(1, &[ROLE_A]));
+        assert_eq!(
+            result.outcome,
+            Outcome::with(Code::Partial, "already_selected")
+        );
+        assert!(result.shadow);
+        assert_eq!(result.removed, vec![ROLE_B]);
+        assert!(result.added.is_empty());
+        assert!(harness.roles.removed().is_empty());
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.held[&MEMBER], vec![ROLE_A, ROLE_B]);
+    }
+
+    #[test]
+    fn exclusive_reselection_reports_a_failed_cleanup_write() {
+        let mut harness = exclusive_reselection_harness(&[ROLE_A, ROLE_B]);
+        harness
+            .roles
+            .remove_failures
+            .insert(ROLE_B, vec![forbidden()]);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(
+            result.outcome,
+            Outcome::with(Code::WriteFailed, "forbidden")
+        );
+        assert!(result.removed.is_empty());
+        assert!(result.added.is_empty());
+        assert_eq!(harness.roles.removed(), vec![ROLE_B]);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.held[&MEMBER], vec![ROLE_A, ROLE_B]);
+    }
+
+    #[test]
+    fn exclusive_reselection_reports_a_denied_removal_without_writing() {
+        let mut harness = exclusive_reselection_harness(&[ROLE_A, ROLE_B]);
+        harness
+            .facts
+            .facts
+            .get_mut(&ROLE_B)
+            .expect("facts")
+            .position = BOT_TOP;
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(
+            result.outcome,
+            Outcome::with(Code::Ineligible, "at_or_above_bot")
+        );
+        assert!(result.removed.is_empty());
+        assert!(result.added.is_empty());
+        assert!(harness.roles.removed().is_empty());
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.held[&MEMBER], vec![ROLE_A, ROLE_B]);
+    }
+
+    #[test]
+    fn exclusive_reselection_removes_allowed_extras_even_when_another_is_denied() {
+        let mut harness = exclusive_reselection_harness(&[ROLE_A, ROLE_B, ROLE_C]);
+        harness
+            .facts
+            .facts
+            .get_mut(&ROLE_B)
+            .expect("facts")
+            .position = BOT_TOP;
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A]));
+        assert_eq!(
+            result.outcome,
+            Outcome::with(Code::Partial, "at_or_above_bot")
+        );
+        assert_eq!(result.removed, vec![ROLE_C]);
+        assert!(result.added.is_empty());
+        assert_eq!(harness.roles.removed(), vec![ROLE_C]);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.held[&MEMBER], vec![ROLE_A, ROLE_B]);
+    }
 }
