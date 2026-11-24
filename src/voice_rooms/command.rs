@@ -149,8 +149,12 @@ pub struct RefreshCounts {
     pub removed: u32,
     /// Missing permit overwrites created for the owner, deputies and connected members.
     pub added: u32,
-    /// Writes that failed or were not attempted (rate limit, overwrites past the cap).
+    /// Writes or eligibility reads that failed or were not attempted (rate limit, overwrites
+    /// past the cap).
     pub failed: u32,
+    /// Keep-set members given no permit because `permit` would refuse them (bot account,
+    /// protected, restricted or privileged role, active safeword, category not visible).
+    pub skipped: u32,
 }
 
 /// Discord operations needed by the `/vc` subcommands.
@@ -417,12 +421,12 @@ impl SuccessCode {
     fn reply_string(self) -> String {
         match self {
             Self::Refreshed(c) => format!(
-                "Voice room approvals refreshed: removed {}, added {}. [vc_refreshed]",
-                c.removed, c.added
+                "Voice room approvals refreshed: removed {}, added {}, skipped {}. [vc_refreshed]",
+                c.removed, c.added, c.skipped
             ),
             Self::ShadowRefresh(c) => format!(
-                "Shadow mode: refresh would remove {} and add {}; nothing was changed. [vc_shadow_refresh]",
-                c.removed, c.added
+                "Shadow mode: refresh would remove {}, add {} and skip {}; nothing was changed. [vc_shadow_refresh]",
+                c.removed, c.added, c.skipped
             ),
             other => other.reply_text().to_string(),
         }
@@ -603,8 +607,8 @@ impl RefusalCode {
     fn reply_string(self) -> String {
         match self {
             Self::RefreshPartial(c) => format!(
-                "Refresh finished only in part: removed {}, added {}, failed {}. [vc_refresh_partial]",
-                c.removed, c.added, c.failed
+                "Refresh finished only in part: removed {}, added {}, failed {}, skipped {}. [vc_refresh_partial]",
+                c.removed, c.added, c.failed, c.skipped
             ),
             other => other.reply_text().to_string(),
         }
@@ -1727,16 +1731,45 @@ impl VcCommandHandler {
             .map(|o| o.user_id)
             .filter(|u| *u != bot && !keep.contains(u))
             .collect();
-        let mut to_add: Vec<u64> = keep
+        let mut wanted_adds: Vec<u64> = keep
             .iter()
             .copied()
             .filter(|u| !permitted.contains(u) && !banned.contains(u))
             .collect();
-        to_add.sort_unstable();
+        wanted_adds.sort_unstable();
         let mut counts = RefreshCounts {
             failed: count_of(listed.len() - examined),
             ..RefreshCounts::default()
         };
+        // A permit is only created for whom `permit` would accept (the owner needs no check).
+        // Ineligible members are skipped; a member who cannot be judged gets no permit and
+        // counts as failed. A 429 on a read stops all further reads and writes.
+        let mut rate_limited = false;
+        let mut to_add: Vec<u64> = Vec::new();
+        for user in wanted_adds {
+            if user == row.owner {
+                to_add.push(user);
+                continue;
+            }
+            if rate_limited {
+                counts.failed += 1;
+                continue;
+            }
+            match Ok::<(), RefusalCode>(()) {
+                Ok(()) => to_add.push(user),
+                Err(
+                    RefusalCode::TargetIsBot
+                    | RefusalCode::TargetProtectedOrRestricted
+                    | RefusalCode::TargetSafewordActive
+                    | RefusalCode::CategoryNotVisible,
+                ) => counts.skipped += 1,
+                Err(code) => {
+                    rate_limited =
+                        code == RefusalCode::DiscordFailed(CommandPortError::RateLimited);
+                    counts.failed += 1;
+                }
+            }
+        }
         if mode == Mode::Shadow {
             counts.removed = count_of(to_remove.len());
             counts.added = count_of(to_add.len());
@@ -1745,7 +1778,6 @@ impl VcCommandHandler {
 
         // Approvals are added before any are removed, so a member who stays never loses access
         // half way. A 429 stops the run: nothing after it is attempted and it counts as failed.
-        let mut rate_limited = false;
         for user in to_add {
             if rate_limited {
                 counts.failed += 1;
@@ -4903,6 +4935,7 @@ mod tests {
             removed: 3,
             added: 2,
             failed: 0,
+            skipped: 0,
         };
 
         #[tokio::test]
@@ -4967,7 +5000,8 @@ mod tests {
                 applied(SuccessCode::Refreshed(RefreshCounts {
                     removed: 1,
                     added: 1,
-                    failed: 0
+                    failed: 0,
+                    skipped: 0,
                 }))
             );
             assert_eq!(
@@ -5028,6 +5062,7 @@ mod tests {
                 removed: 2,
                 added: 2,
                 failed: 1,
+                skipped: 0,
             };
             assert_eq!(out, refused(RefusalCode::RefreshPartial(counts)));
             let reply = out.reply().unwrap();
@@ -5055,7 +5090,8 @@ mod tests {
                 refused(RefusalCode::RefreshPartial(RefreshCounts {
                     removed: 3,
                     added: 1,
-                    failed: 1
+                    failed: 1,
+                    skipped: 0,
                 }))
             );
             h.ports.state.lock().unwrap().fail_set_users.clear();
@@ -5080,7 +5116,8 @@ mod tests {
                 refused(RefusalCode::RefreshPartial(RefreshCounts {
                     removed: 0,
                     added: 2,
-                    failed: 3
+                    failed: 3,
+                    skipped: 0,
                 }))
             );
             assert_eq!(
@@ -5095,7 +5132,8 @@ mod tests {
                 refused(RefusalCode::RefreshPartial(RefreshCounts {
                     removed: 0,
                     added: 0,
-                    failed: 5
+                    failed: 5,
+                    skipped: 0,
                 }))
             );
             assert_eq!(h.ports.state.lock().unwrap().write_attempts, 1);
@@ -5110,7 +5148,8 @@ mod tests {
                 applied(SuccessCode::Refreshed(RefreshCounts {
                     removed: 0,
                     added: 2,
-                    failed: 0
+                    failed: 0,
+                    skipped: 0,
                 })),
                 "the three deletes found nothing to delete: not counted as removed, not as failed"
             );
@@ -5182,11 +5221,159 @@ mod tests {
                 refused(RefusalCode::RefreshPartial(RefreshCounts {
                     removed: 99,
                     added: 0,
-                    failed: 31
+                    failed: 31,
+                    skipped: 0,
                 })),
                 "100 examined (the owner and 99 stale), 31 not examined and reported as failed"
             );
             assert_eq!(h.ports.state.lock().unwrap().write_attempts, 99);
+        }
+
+        /// Connected: owner, `MEMBER_B` (fine) and one member of every kind `permit` refuses. The
+        /// deputies are `MEMBER_A` (fine), a safeword-active one and a privileged one.
+        fn ineligible_refresh_fixture() -> Harness {
+            let h = make_harness(live_settings());
+            h.ports
+                .state
+                .lock()
+                .unwrap()
+                .room_members
+                .insert(ROOM_CH, vec![OWNER, MEMBER_B, OTHER_BOT, STAFF_USER]);
+            add_user(&h, RESTRICTED_USER, vec![ROLE_RESTRICTED], true, true);
+            add_user(&h, PRIVILEGED_USER, vec![ROLE_PRIVILEGED], true, true);
+            add_user(&h, SAFEWORD_USER, vec![ROLE_NORMAL], true, true);
+            add_user(&h, NO_VIEW_USER, vec![ROLE_NORMAL], false, true);
+            add_user(&h, MEMBER_D, vec![ROLE_NORMAL], true, false);
+            h.safeword.active.lock().unwrap().insert(SAFEWORD_USER);
+            h.safeword.active.lock().unwrap().insert(MEMBER_D);
+            for deputy in [MEMBER_A, MEMBER_D, PRIVILEGED_USER] {
+                seed_deputy(&h, deputy);
+            }
+            h.ports.state.lock().unwrap().live = vec![VcCommandHandler::owner_overwrite(OWNER)];
+            h
+        }
+
+        #[tokio::test]
+        async fn refresh_gives_no_permit_to_members_that_permit_refuses() {
+            for actor in [OWNER, MEMBER_A] {
+                let h = ineligible_refresh_fixture();
+                // `permit` refuses every one of these ...
+                for (target, code) in [
+                    (OTHER_BOT, RefusalCode::TargetIsBot),
+                    (STAFF_USER, RefusalCode::TargetProtectedOrRestricted),
+                    (RESTRICTED_USER, RefusalCode::TargetProtectedOrRestricted),
+                    (PRIVILEGED_USER, RefusalCode::TargetProtectedOrRestricted),
+                    (SAFEWORD_USER, RefusalCode::TargetSafewordActive),
+                    (NO_VIEW_USER, RefusalCode::CategoryNotVisible),
+                    (MEMBER_D, RefusalCode::TargetSafewordActive),
+                ] {
+                    assert_eq!(
+                        run(&h, OWNER, VcSubcommand::Permit { target_id: target }).await,
+                        refused(code),
+                        "target {target}"
+                    );
+                }
+                assert_eq!(h.ports.state.lock().unwrap().write_attempts, 0);
+                // ... so `refresh` must not create their permits either, deputies included.
+                assert_eq!(
+                    run(&h, actor, VcSubcommand::Refresh).await,
+                    applied(SuccessCode::Refreshed(RefreshCounts {
+                        removed: 0,
+                        added: 2,
+                        failed: 0,
+                        skipped: 7,
+                    })),
+                    "actor {actor}"
+                );
+                assert_eq!(
+                    permit_set(&live(&h)),
+                    BTreeSet::from([OWNER, MEMBER_A, MEMBER_B]),
+                    "actor {actor}: only the owner and the two eligible members hold a permit"
+                );
+                assert_eq!(h.ports.state.lock().unwrap().write_attempts, 2);
+                // The skipped ones are still deputies / connected: refresh only withholds the permit.
+                assert_eq!(deputies_of(&h).len(), 3);
+            }
+        }
+
+        #[tokio::test]
+        async fn refresh_creates_no_permit_for_a_member_it_cannot_judge() {
+            let h = make_harness(live_settings());
+            {
+                let mut s = h.ports.state.lock().unwrap();
+                s.room_members.insert(ROOM_CH, vec![OWNER, MEMBER_B]);
+                s.live = vec![permit(STALE_1)];
+                s.fail_profile = Some(CommandPortError::Unavailable);
+            }
+            seed_deputy(&h, MEMBER_A);
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Refresh).await,
+                refused(RefusalCode::RefreshPartial(RefreshCounts {
+                    removed: 1,
+                    added: 1,
+                    failed: 2,
+                    skipped: 0,
+                })),
+                "the owner needs no check; the deputy and the connected member could not be judged"
+            );
+            assert_eq!(permit_set(&live(&h)), BTreeSet::from([OWNER]));
+
+            // A 429 on a read stops everything after it, reads and writes alike.
+            let h = make_harness(live_settings());
+            {
+                let mut s = h.ports.state.lock().unwrap();
+                s.room_members.insert(ROOM_CH, vec![OWNER, MEMBER_B]);
+                s.live = vec![permit(STALE_1)];
+                s.fail_profile = Some(CommandPortError::RateLimited);
+            }
+            seed_deputy(&h, MEMBER_A);
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Refresh).await,
+                refused(RefusalCode::RefreshPartial(RefreshCounts {
+                    removed: 0,
+                    added: 0,
+                    failed: 4,
+                    skipped: 0,
+                }))
+            );
+            assert_eq!(h.ports.state.lock().unwrap().write_attempts, 0);
+            assert!(permit_set(&live(&h)).contains(&STALE_1));
+        }
+
+        #[tokio::test]
+        async fn shadow_refresh_counts_skipped_members_and_an_old_permit_is_left_alone() {
+            let h = make_harness(settings_with("shadow", Some(HOME_GUILD)));
+            add_user(&h, SAFEWORD_USER, vec![ROLE_NORMAL], true, true);
+            add_user(&h, MEMBER_B, vec![ROLE_NORMAL], true, true);
+            h.safeword.active.lock().unwrap().insert(SAFEWORD_USER);
+            let before = vec![VcCommandHandler::owner_overwrite(OWNER)];
+            h.ports.state.lock().unwrap().live = before.clone();
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Refresh).await,
+                applied(SuccessCode::ShadowRefresh(RefreshCounts {
+                    removed: 0,
+                    added: 1,
+                    failed: 0,
+                    skipped: 1,
+                }))
+            );
+            assert_eq!(live(&h), before);
+            assert_eq!(h.ports.state.lock().unwrap().write_attempts, 0);
+
+            // A connected member who is ineligible now but already holds a permit keeps it:
+            // refresh withholds new permits, it does not revoke on eligibility.
+            let h = make_harness(live_settings());
+            add_user(&h, SAFEWORD_USER, vec![ROLE_NORMAL], true, true);
+            h.safeword.active.lock().unwrap().insert(SAFEWORD_USER);
+            h.ports.state.lock().unwrap().live = vec![
+                VcCommandHandler::owner_overwrite(OWNER),
+                permit(SAFEWORD_USER),
+            ];
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Refresh).await,
+                applied(SuccessCode::Refreshed(RefreshCounts::default()))
+            );
+            assert!(permit_set(&live(&h)).contains(&SAFEWORD_USER));
         }
 
         #[tokio::test]
