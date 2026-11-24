@@ -66,4 +66,5 @@ can both send; `unpublish` does not delete the old Discord message. The emoji "b
 of coarse code-point ranges, not an emoji table: non-emoji symbols in them, a skin tone on a
 base that takes none and a pair of regional indicators that is no real flag are accepted, and
 Discord would then fail the whole menu's `post` (`discord_failed`) without naming the option.
-`#`/`*` keycaps and tag flags are refused.
+`#`/`*` keycaps and tag flags are refused. Menu deletion is out of scope: there is no delete
+command (`repository::delete_menu` has no command caller); a menu is changed with `edit`.

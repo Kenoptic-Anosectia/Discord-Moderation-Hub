@@ -3914,6 +3914,12 @@ mod tests {
             "\u{1F389}\u{20E3}",
             "\u{00A9}\u{20E3}",
             "\u{1F389}\u{FE0F}\u{20E3}",
+            // The mark only follows a digit: not a letter or #, with or without a selector.
+            "a\u{20E3}",
+            "a\u{FE0F}\u{20E3}",
+            "A\u{20E3}",
+            "#\u{20E3}",
+            "*\u{20E3}",
             // The mark may not be doubled or repeated.
             "1\u{20E3}\u{20E3}",
             "1\u{FE0F}\u{20E3}\u{FE0F}",
@@ -3966,20 +3972,25 @@ mod tests {
 
     #[test]
     fn the_number_of_zwj_joins_is_bounded() {
-        let chain = |joins: usize| {
-            let mut text = String::from("\u{1F389}");
-            for _ in 0..joins {
-                text.push('\u{200D}');
-                text.push('\u{1F389}');
-            }
-            text
-        };
-        assert_eq!(validate_emoji(&chain(MAX_ZWJ_JOINS)), Ok(()));
+        // Raw literals, not built from MAX_ZWJ_JOINS, so moving the bound fails here.
+        let party = "\u{1F389}";
+        let zwj = "\u{200D}";
+        let four = [party, party, party, party, party].join(zwj);
+        let five = [party, party, party, party, party, party].join(zwj);
+        assert_eq!(four.matches(zwj).count(), 4);
+        assert_eq!(five.matches(zwj).count(), 5);
+        assert_eq!(validate_emoji(&four), Ok(()));
+        assert_eq!(validate_emoji(&five), Err(Code::InvalidEmoji));
         assert_eq!(
-            validate_emoji(&chain(MAX_ZWJ_JOINS + 1)),
+            validate_emoji(&[party; 9].join(zwj)),
             Err(Code::InvalidEmoji)
         );
-        assert_eq!(validate_emoji(&chain(8)), Err(Code::InvalidEmoji));
+        // Real sequences with 3 joins stay accepted.
+        assert_eq!(
+            validate_emoji("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"),
+            Ok(())
+        );
+        assert_eq!(validate_emoji("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"), Ok(()));
     }
 
     #[test]
