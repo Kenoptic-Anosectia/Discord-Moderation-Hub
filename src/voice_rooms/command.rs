@@ -369,6 +369,8 @@ pub enum RefusalCode {
     OwnerStillPresent,
     /// `claim` was called before the owner's absence grace period elapsed.
     OwnerGraceNotElapsed,
+    /// `claim` found no continuous owner absence recorded by `note_owner_absent`.
+    OwnerAbsenceNotRecorded,
     /// `transfer` target is not currently connected to the room.
     TargetNotInRoom,
     /// `permit`, `reject` or `transfer` targeted the current room owner.
@@ -418,6 +420,7 @@ impl RefusalCode {
             Self::CallerNotInRoom => "vc_caller_not_in_room",
             Self::OwnerStillPresent => "vc_owner_still_present",
             Self::OwnerGraceNotElapsed => "vc_owner_grace_not_elapsed",
+            Self::OwnerAbsenceNotRecorded => "vc_owner_absence_not_recorded",
             Self::TargetNotInRoom => "vc_target_not_in_room",
             Self::TargetIsOwner => "vc_target_is_owner",
             Self::TargetIsSelfBot => "vc_target_is_self_bot",
@@ -451,6 +454,7 @@ impl RefusalCode {
             Self::CallerNotInRoom => "You must be inside the voice room to claim it. [vc_caller_not_in_room]",
             Self::OwnerStillPresent => "The room owner is currently in the room. [vc_owner_still_present]",
             Self::OwnerGraceNotElapsed => "The owner absence grace period has not elapsed. [vc_owner_grace_not_elapsed]",
+            Self::OwnerAbsenceNotRecorded => "No continuous owner absence has been recorded yet. [vc_owner_absence_not_recorded]",
             Self::TargetNotInRoom => "The target member must be inside the voice room. [vc_target_not_in_room]",
             Self::TargetIsOwner => "That command cannot target the room owner. [vc_target_is_owner]",
             Self::TargetIsSelfBot => "That command cannot target the bot. [vc_target_is_self_bot]",
@@ -565,6 +569,10 @@ pub struct VcCommandDeps {
     pub alerter: Arc<dyn CommandAlerter>,
     /// Clock.
     pub clock: Arc<dyn Clock>,
+    /// Seconds a room's owner must have been continuously absent before `claim` may take the room.
+    /// Wiring passes the VR1 value (`VOICE_ROOM_EMPTY_GRACE_SECS`, default
+    /// [`policy::DEFAULT_EMPTY_GRACE_SECS`]); this is deliberately not the VR2 cleanup grace.
+    pub claim_grace_secs: i64,
 }
 
 /// In-memory per-room state tracked alongside the `voice_rooms` table.
@@ -1922,7 +1930,8 @@ mod tests {
                 crate::voice_rooms::config::KEY_MODE => Some(mode.to_string()),
                 crate::voice_rooms::config::KEY_HUB_CHANNEL_IDS => Some(hub_str.clone()),
                 crate::voice_rooms::config::KEY_CATEGORY_ID => Some(cat_str.clone()),
-                crate::voice_rooms::config::KEY_EMPTY_GRACE_SECS => Some("60".to_string()),
+                // VR2's cleanup grace is deliberately different from the claim grace.
+                crate::voice_rooms::config::KEY_EMPTY_GRACE_SECS => Some("10".to_string()),
                 _ => None,
             },
             home_guild,
@@ -1973,6 +1982,7 @@ mod tests {
             safeword: Arc::clone(&safeword) as Arc<dyn SafewordLookup>,
             alerter: Arc::clone(&alerter) as Arc<dyn CommandAlerter>,
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            claim_grace_secs: policy::DEFAULT_EMPTY_GRACE_SECS,
         });
         Harness {
             handler,
@@ -2781,6 +2791,7 @@ mod tests {
             seed
         };
 
+        let mut applied_total = 0_u32;
         for step in 0..80_i64 {
             h.clock.set(2_000 + step * 35);
             let r = next_u64();
@@ -2842,6 +2853,9 @@ mod tests {
             let reply = out.reply().expect("home guild live command must reply");
             assert!(reply.ephemeral);
             assert!(!reply.text.contains(&format!("Room {step}")));
+            if matches!(out, CommandOutcome::Applied { .. }) {
+                applied_total += 1;
+            }
 
             let row = repository::get(&h.db.lock().unwrap(), ROOM_CH)
                 .unwrap()
@@ -2849,6 +2863,11 @@ mod tests {
             assert!(row.owner == OWNER || row.owner == MEMBER_A);
             assert!(row.user_limit <= MAX_USER_LIMIT);
         }
+        // Progress floor: a run that refused everything would otherwise pass.
+        assert!(
+            applied_total >= 15,
+            "only {applied_total} of 80 commands applied"
+        );
     }
 
     const VIEW_CHANNEL: u64 = 1 << 10;
@@ -3174,50 +3193,114 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn claim_never_trusts_an_unrecorded_absence_and_a_return_restarts_the_grace() {
-        let h = make_harness(live_settings());
-        let claim = VcSubcommand::Claim;
-        assert_eq!(
-            run(&h, OWNER, claim.clone()).await,
-            refused(RefusalCode::AlreadyRoomOwner)
-        );
-        // Owner is outside the room but nothing recorded when: the grace starts now.
+    /// Puts the owner outside the room and `MEMBER_A` inside it.
+    fn owner_outside(h: &Harness) {
         h.ports
             .state
             .lock()
             .unwrap()
             .room_members
             .insert(ROOM_CH, vec![MEMBER_A]);
-        h.clock.set(5_000);
-        assert_eq!(
-            run(&h, MEMBER_A, claim.clone()).await,
-            refused(RefusalCode::OwnerGraceNotElapsed)
-        );
-        // The owner comes back and a claim sees them: the recorded absence is forgotten.
+    }
+
+    /// Puts the owner and `MEMBER_A` inside the room.
+    fn owner_inside(h: &Harness) {
         h.ports
             .state
             .lock()
             .unwrap()
             .room_members
             .insert(ROOM_CH, vec![OWNER, MEMBER_A]);
+    }
+
+    #[tokio::test]
+    async fn claim_with_no_recorded_absence_is_refused_however_long_it_waits() {
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        assert_eq!(
+            run(&h, OWNER, claim.clone()).await,
+            refused(RefusalCode::AlreadyRoomOwner)
+        );
+        owner_outside(&h);
+        // Nobody recorded when the owner left: a claim must not guess, now or much later.
+        for t in [5_000, 5_060, 9_000, 90_000] {
+            h.clock.set(t);
+            assert_eq!(
+                run(&h, MEMBER_A, claim.clone()).await,
+                refused(RefusalCode::OwnerAbsenceNotRecorded),
+                "t={t}"
+            );
+        }
+        assert_eq!(row_of(&h).owner, OWNER);
+        assert!(h.ports.state.lock().unwrap().overwrites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_the_unobserved_return_sequence_5000_5030_5100_5110() {
+        // qa-2 probe: owner seen absent at 5000, back at 5030, gone again at 5100, claim at 5110.
+        // Nothing recorded the return or the second absence, so the claim must be refused.
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        owner_outside(&h);
+        h.clock.set(5_000);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerAbsenceNotRecorded)
+        );
+        owner_inside(&h); // 5030: the owner returns, unobserved by the handler
         h.clock.set(5_030);
-        assert_eq!(
-            run(&h, MEMBER_A, claim.clone()).await,
-            refused(RefusalCode::OwnerStillPresent)
-        );
-        // Owner leaves again at 5_100: 59 s later still refused, 60 s later accepted.
-        h.ports
-            .state
-            .lock()
-            .unwrap()
-            .room_members
-            .insert(ROOM_CH, vec![MEMBER_A]);
+        owner_outside(&h); // 5100: leaves again, still unobserved
         h.clock.set(5_100);
+        h.clock.set(5_110);
+        assert_eq!(
+            run(&h, MEMBER_A, claim).await,
+            refused(RefusalCode::OwnerAbsenceNotRecorded)
+        );
+        assert_eq!(row_of(&h).owner, OWNER);
+        assert!(h.ports.state.lock().unwrap().overwrites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_grace_is_the_vr1_claim_value_and_runs_from_the_recorded_absence() {
+        // The harness gives VR2's cleanup grace 10 s and the claim grace the VR1 60 s.
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        owner_outside(&h);
+        h.handler.note_owner_absent(ROOM_CH, 5_000);
+        // A repeated note for the same continuous absence must not move the start.
+        h.handler.note_owner_absent(ROOM_CH, 5_040);
+        for t in [5_000, 5_010, 5_011, 5_059] {
+            h.clock.set(t);
+            assert_eq!(
+                run(&h, MEMBER_A, claim.clone()).await,
+                refused(RefusalCode::OwnerGraceNotElapsed),
+                "t={t}"
+            );
+        }
+        assert_eq!(row_of(&h).owner, OWNER);
+        h.clock.set(5_060);
+        assert_eq!(
+            run(&h, MEMBER_A, claim).await,
+            applied(SuccessCode::Claimed)
+        );
+        assert_eq!(row_of(&h).owner, MEMBER_A);
+    }
+
+    #[tokio::test]
+    async fn an_observed_return_clears_the_absence_and_the_grace_restarts() {
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        owner_outside(&h);
+        h.handler.note_owner_absent(ROOM_CH, 5_000);
+        // The wiring sees the owner rejoin at 5_030 and leave again at 5_100.
+        h.handler.note_owner_present(ROOM_CH);
+        h.clock.set(5_100);
+        // Absence after the return was never recorded: refused even though 100 s have passed.
         assert_eq!(
             run(&h, MEMBER_A, claim.clone()).await,
-            refused(RefusalCode::OwnerGraceNotElapsed)
+            refused(RefusalCode::OwnerAbsenceNotRecorded)
         );
+        h.handler.note_owner_absent(ROOM_CH, 5_100);
         h.clock.set(5_159);
         assert_eq!(
             run(&h, MEMBER_A, claim.clone()).await,
@@ -3229,6 +3312,28 @@ mod tests {
             applied(SuccessCode::Claimed)
         );
         assert_eq!(row_of(&h).owner, MEMBER_A);
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_sees_the_owner_present_clears_the_recorded_absence() {
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        owner_outside(&h);
+        h.handler.note_owner_absent(ROOM_CH, 5_000);
+        owner_inside(&h);
+        h.clock.set(5_030);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerStillPresent)
+        );
+        // The owner leaves again without anyone recording it: the old record must be gone.
+        owner_outside(&h);
+        h.clock.set(5_100);
+        assert_eq!(
+            run(&h, MEMBER_A, claim).await,
+            refused(RefusalCode::OwnerAbsenceNotRecorded)
+        );
+        assert_eq!(row_of(&h).owner, OWNER);
     }
 
     #[tokio::test]
