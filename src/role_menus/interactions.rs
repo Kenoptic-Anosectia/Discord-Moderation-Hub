@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use crate::roles::eligibility::{RoleFacts, SafewordState};
 use crate::roles::grant::{self, FailCode, GrantItem, RoleOutcome, WriteError};
 
-use super::command::to_policy_menu;
+use super::command::{self, to_policy_menu};
 use super::policy;
 use super::repository::{MenuRow, OptionRow, RepoError};
 
@@ -111,6 +111,12 @@ pub enum Code {
     SwapPartial,
     /// An exclusive swap removed the old option but could not add the new one.
     SwapPartialRemoved,
+    /// Some of the planned role writes went through and some did not.
+    ///
+    /// This is the code for a press that was not an exclusive swap: a multi
+    /// group, or a press that only added or only removed. The detail carries
+    /// the K04 fail code.
+    PartialWrite,
     /// A role write failed (the detail carries the K04 fail code).
     WriteFailed,
     /// Some of the submitted values were applied and some were refused.
@@ -148,6 +154,7 @@ impl Code {
             Code::SwapBlocked => "swap_blocked",
             Code::SwapPartial => "swap_partial",
             Code::SwapPartialRemoved => "swap_partial_removed",
+            Code::PartialWrite => "partial_write",
             Code::WriteFailed => "write_failed",
             Code::Partial => "partial",
             Code::NoChange => "no_change",
@@ -200,8 +207,13 @@ pub enum Selector {
     /// option row per role, so a button keeps naming the same option even
     /// after another option of the menu is removed.
     Option(u64),
-    /// A select component of the menu. The submitted values name the roles.
-    Select,
+    /// A select component of the menu, named by its part.
+    ///
+    /// The part is the zero-based chunk number of RM2's `split_chunks`: a
+    /// menu with more than 25 options is rendered as several select
+    /// components in one message, and each of them needs its own component
+    /// id. The submitted values name the roles.
+    Select(usize),
 }
 
 /// The menu and component a custom id names.
@@ -257,16 +269,22 @@ fn parse_canonical<T: std::str::FromStr>(digits: &str) -> Result<T, ParseError> 
     digits.parse::<T>().map_err(|_| ParseError::BadNumber)
 }
 
+/// The most select components one message may hold: Discord's five action
+/// rows. A menu may not hold more than `MAX_ROWS_PER_MESSAGE` components, so
+/// a part number at or above this can never name a real component.
+pub const MAX_SELECT_PARTS: usize = command::MAX_ROWS_PER_MESSAGE;
+
 /// Parse a component id of a role menu.
 ///
 /// The id is `rolemenu:v1:m<menu id>:r<role id>` for a button or
-/// `rolemenu:v1:m<menu id>:s` for a select component. Every part must be
-/// there and must be ASCII digits only: a letter, a sign, a space, a
+/// `rolemenu:v1:m<menu id>:s<part>` for a select component. Every part must
+/// be there and must be ASCII digits only: a letter, a sign, a space, a
 /// separator of its own or any other character makes the whole id malformed,
 /// so a hostile spelling of the class is refused and not guessed.
 ///
-/// A menu id of zero, a role id of zero and a number that does not fit are
-/// refused: none of them can name a stored row.
+/// A menu id of zero, a role id of zero, a part at or above
+/// [`MAX_SELECT_PARTS`] and a number that does not fit are refused: none of
+/// them can name a stored row or a real component.
 pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
     if raw.len() > MAX_CUSTOM_ID_LEN {
         return Err(ParseError::TooLong);
@@ -288,8 +306,14 @@ pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
     if menu_id <= 0 {
         return Err(ParseError::BadNumber);
     }
-    let selector = if kind_part == "s" {
-        Selector::Select
+    let selector = if let Some(part_digits) = kind_part.strip_prefix('s') {
+        // A select component always names its part: a bare `s` cannot say
+        // which of a menu's select components was pressed.
+        let part: usize = parse_canonical(part_digits)?;
+        if part >= MAX_SELECT_PARTS {
+            return Err(ParseError::BadNumber);
+        }
+        Selector::Select(part)
     } else {
         let Some(role_digits) = kind_part.strip_prefix('r') else {
             return Err(ParseError::Malformed);
@@ -318,15 +342,25 @@ pub fn custom_id_for_option(menu_id: i64, role_id: u64) -> Result<String, ParseE
     Ok(raw)
 }
 
-/// Build the component id of the select component of a menu.
+/// Build the component id of one select component of a menu.
+///
+/// The part is the zero-based chunk number of RM2's `split_chunks`: a menu
+/// with more than 25 options is rendered as several select components in one
+/// message, and each of them needs its own component id, because Discord
+/// wants the custom ids of one message to be different from each other.
 ///
 /// The result is always shorter than [`MAX_CUSTOM_ID_LEN`]; a menu id that
-/// could not fit is refused instead of being cut.
-pub fn custom_id_for_select(menu_id: i64) -> Result<String, ParseError> {
+/// could not fit is refused instead of being cut, and a part at or above
+/// [`MAX_SELECT_PARTS`] is refused because no message holds that many
+/// components.
+pub fn custom_id_for_select(menu_id: i64, part: usize) -> Result<String, ParseError> {
     if menu_id <= 0 {
         return Err(ParseError::BadNumber);
     }
-    let raw = format!("{CUSTOM_ID_PREFIX}m{menu_id}:s");
+    if part >= MAX_SELECT_PARTS {
+        return Err(ParseError::BadNumber);
+    }
+    let raw = format!("{CUSTOM_ID_PREFIX}m{menu_id}:s{part}");
     if raw.len() > MAX_CUSTOM_ID_LEN {
         return Err(ParseError::TooLong);
     }
@@ -1020,11 +1054,25 @@ where
     result
 }
 
+/// The options one select component of a menu holds.
+///
+/// The part is the zero-based chunk number of RM2's `split_chunks`: a
+/// component holds at most `policy::SELECT_OPTION_LIMIT` options, in the
+/// stored order, and a menu with more options produces more components.
+pub fn options_of_part(options: &[OptionRow], part: usize) -> &[OptionRow] {
+    let start = part.saturating_mul(policy::SELECT_OPTION_LIMIT);
+    if start >= options.len() {
+        return &[];
+    }
+    let end = start.saturating_add(policy::SELECT_OPTION_LIMIT).min(options.len());
+    &options[start..end]
+}
+
 /// The roles one press names.
 ///
 /// A button names one option by its role id. A select names its options by
 /// the values it submitted: every value must be a role id that is still a
-/// stored option of this menu.
+/// stored option of the part the component id names.
 fn collect_targets(
     press: &Press,
     selector: Selector,
@@ -1037,20 +1085,23 @@ fn collect_targets(
             }
             Ok(vec![role_id])
         }
-        Selector::Select => {
+        Selector::Select(part) => {
             if press.values.is_empty() {
                 return Ok(Vec::new());
             }
             if press.values.len() > policy::SELECT_OPTION_LIMIT {
                 return Err(Outcome::new(Code::TooManySelected));
             }
+            // Only the options of this part may be named: a value of another
+            // part of the same menu is not an option of this component.
+            let part_options = options_of_part(options, part);
             let mut targets = Vec::with_capacity(press.values.len());
             for value in &press.values {
                 let role_id = match parse_value(value) {
                     Ok(role_id) => role_id,
                     Err(_) => return Err(Outcome::new(Code::InvalidValue)),
                 };
-                if !options.iter().any(|option| option.role == role_id) {
+                if !part_options.iter().any(|option| option.role == role_id) {
                     return Err(Outcome::new(Code::OptionNotFound));
                 }
                 if targets.contains(&role_id) {
@@ -1493,7 +1544,12 @@ mod tests {
 
     /// A press of the select component of a menu, with the given values.
     fn press_select(menu_id: i64, values: &[u64]) -> Press {
-        let mut press = press(&custom_id_for_select(menu_id).expect("custom id"));
+        press_select_part(menu_id, 0, values)
+    }
+
+    /// A press of the select component of one part of a menu.
+    fn press_select_part(menu_id: i64, part: usize, values: &[u64]) -> Press {
+        let mut press = press(&custom_id_for_select(menu_id, part).expect("custom id"));
         press.values = values.iter().map(|role| role.to_string()).collect();
         press
     }
@@ -1570,10 +1626,13 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_select_id_names_a_menu_and_no_role() {
-        let parsed = parse_custom_id("rolemenu:v1:m12:s").expect("parsed");
+    fn a_well_formed_select_id_names_a_menu_and_a_part() {
+        let parsed = parse_custom_id("rolemenu:v1:m12:s0").expect("parsed");
         assert_eq!(parsed.menu_id, 12);
-        assert_eq!(parsed.selector, Selector::Select);
+        assert_eq!(parsed.selector, Selector::Select(0));
+        let parsed = parse_custom_id("rolemenu:v1:m12:s3").expect("parsed");
+        assert_eq!(parsed.menu_id, 12);
+        assert_eq!(parsed.selector, Selector::Select(3));
     }
 
     #[test]
@@ -1587,11 +1646,16 @@ mod tests {
 
     #[test]
     fn the_select_custom_id_round_trips() {
-        let raw = custom_id_for_select(42).expect("built");
-        assert_eq!(raw, "rolemenu:v1:m42:s");
+        let raw = custom_id_for_select(42, 0).expect("built");
+        assert_eq!(raw, "rolemenu:v1:m42:s0");
         let parsed = parse_custom_id(&raw).expect("parsed");
         assert_eq!(parsed.menu_id, 42);
-        assert_eq!(parsed.selector, Selector::Select);
+        assert_eq!(parsed.selector, Selector::Select(0));
+        let raw = custom_id_for_select(42, 4).expect("built");
+        assert_eq!(raw, "rolemenu:v1:m42:s4");
+        let parsed = parse_custom_id(&raw).expect("parsed");
+        assert_eq!(parsed.menu_id, 42);
+        assert_eq!(parsed.selector, Selector::Select(4));
     }
 
     #[test]
@@ -1650,6 +1714,28 @@ mod tests {
         ] {
             assert!(parse_custom_id(raw).is_err(), "{raw:?} must not parse");
         }
+    }
+
+    #[test]
+    fn a_select_id_without_a_part_is_refused() {
+        // A bare `s` cannot say which of a menu's select components was
+        // pressed, so it names no component at all.
+        assert!(parse_custom_id("rolemenu:v1:m1:s").is_err());
+        assert!(parse_custom_id("rolemenu:v1:m1:s:0").is_err());
+        assert!(parse_custom_id("rolemenu:v1:m1:s-1").is_err());
+        assert!(parse_custom_id("rolemenu:v1:m1:s 1").is_err());
+    }
+
+    #[test]
+    fn a_select_id_with_a_part_that_no_message_can_hold_is_refused() {
+        // Discord's message holds five action rows, so a part at or above
+        // five names no component of any menu.
+        assert!(parse_custom_id("rolemenu:v1:m1:s5").is_err());
+        assert!(parse_custom_id("rolemenu:v1:m1:s99").is_err());
+        assert_eq!(
+            custom_id_for_select(1, MAX_SELECT_PARTS),
+            Err(ParseError::BadNumber)
+        );
     }
 
     #[test]
@@ -1728,7 +1814,7 @@ mod tests {
     fn a_custom_id_for_a_zero_id_is_refused() {
         assert_eq!(custom_id_for_option(0, ROLE_A), Err(ParseError::BadNumber));
         assert_eq!(custom_id_for_option(1, 0), Err(ParseError::BadNumber));
-        assert_eq!(custom_id_for_select(0), Err(ParseError::BadNumber));
+        assert_eq!(custom_id_for_select(0, 0), Err(ParseError::BadNumber));
     }
 
     // ---------------------------------------------------------------------
@@ -3364,5 +3450,253 @@ mod tests {
             Outcome::with(Code::Ineligible, "protected_role").text(),
             "ineligible (protected_role)"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Round 3: the select part, the refusal code and the partial codes
+    // ---------------------------------------------------------------------
+
+    /// A menu with more options than one select component may hold.
+    ///
+    /// The options are numbered from `ROLE_A` upward, so the first option of
+    /// the second part is the one after the first 25 options.
+    fn big_menu(option_count: usize) -> FakeStore {
+        let options: Vec<OptionRow> = (0..option_count)
+            .map(|i| option_row(1, ROLE_A + i as u64, i as i64))
+            .collect();
+        FakeStore::with_menu(menu_row(1, HOME, Some(MESSAGE)), options)
+    }
+
+    #[test]
+    fn two_parts_of_one_menu_have_two_different_component_ids() {
+        let first = custom_id_for_select(7, 0).expect("built");
+        let second = custom_id_for_select(7, 1).expect("built");
+        assert_ne!(first, second, "Discord wants different ids in one message");
+        assert_eq!(first, "rolemenu:v1:m7:s0");
+        assert_eq!(second, "rolemenu:v1:m7:s1");
+    }
+
+    #[test]
+    fn every_part_of_a_menu_with_more_than_twenty_five_options_parses() {
+        // 30 options: two select components in one message.
+        let store = big_menu(30);
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_A + 25, ROLE_A + 29]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let mut ids = Vec::new();
+        for part in 0..2 {
+            let id = custom_id_for_select(1, part).expect("built");
+            let parsed = parse_custom_id(&id).expect("parsed");
+            assert_eq!(parsed.menu_id, 1);
+            assert_eq!(parsed.selector, Selector::Select(part));
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        // The first option of the second part belongs to the second part.
+        let mut press = press_select_part(1, 1, &[ROLE_A + 25]);
+        press.values = vec![(ROLE_A + 25).to_string()];
+        let result = harness.run(&settings(), &press);
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(result.added, vec![ROLE_A + 25]);
+    }
+
+    #[test]
+    fn a_value_of_another_part_is_refused_and_writes_nothing() {
+        // ROLE_A is in the first part; part 1 holds the options from
+        // ROLE_A + 25 on. A value of another part names no option of this
+        // component.
+        let store = big_menu(30);
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_A + 29]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let mut press = press_select_part(1, 1, &[ROLE_A]);
+        press.values = vec![ROLE_A.to_string()];
+        let result = harness.run(&settings(), &press);
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_options_of_a_part_are_the_ones_of_that_chunk() {
+        let store = big_menu(30);
+        let options = store.options.get(&1).expect("options");
+        assert_eq!(options_of_part(options, 0).len(), policy::SELECT_OPTION_LIMIT);
+        assert_eq!(options_of_part(options, 1).len(), 5);
+        assert!(options_of_part(options, 2).is_empty());
+        assert!(options_of_part(options, 9_999).is_empty());
+    }
+
+    #[test]
+    fn a_refused_select_value_keeps_its_own_code() {
+        // The member holds ROLE_A and the group allows two options. A select
+        // of ROLE_B and ROLE_C adds ROLE_B and then hits the limit on
+        // ROLE_C: the answer says which refusal it was.
+        let mut store = multi_menu();
+        store.menus.get_mut(&1).expect("menu").max_select = 2;
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[ROLE_A]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_B, ROLE_C]));
+        assert_eq!(result.outcome.code, Code::Partial);
+        assert_eq!(result.outcome.detail, Some("max_reached"));
+        assert_eq!(result.added, vec![ROLE_B]);
+    }
+
+    #[test]
+    fn a_refused_select_value_keeps_its_own_code_in_shadow_mode() {
+        let mut store = multi_menu();
+        store.menus.get_mut(&1).expect("menu").max_select = 2;
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[ROLE_A]),
+        );
+        let mut settings = settings();
+        settings.mode = Mode::Shadow;
+        let result = harness.run(&settings, &press_select(1, &[ROLE_B, ROLE_C]));
+        assert_eq!(result.outcome.code, Code::Partial);
+        assert_eq!(result.outcome.detail, Some("max_reached"));
+        assert!(result.shadow);
+        assert!(harness.roles.added().is_empty());
+    }
+
+    #[test]
+    fn the_first_refusal_is_the_one_that_is_reported() {
+        // Two values, both refused: the first refusal is the one the member
+        // is told about, so the answer names one stable reason and not a
+        // blend of two.
+        let store = multi_menu();
+        let mut settings = settings();
+        settings.safeword_restricted_role_ids = vec![ROLE_A, ROLE_B];
+        let mut blocked = press_select(1, &[ROLE_A, ROLE_B]);
+        blocked.safeword = SafewordState::Active;
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings, &blocked);
+        // Nothing was applied, so this is not a partial press: the refusal
+        // itself is the answer.
+        assert_eq!(result.outcome.code, Code::Ineligible);
+        assert_eq!(result.outcome.detail, Some("safeword_restricted"));
+        assert!(result.added.is_empty());
+        assert!(result.removed.is_empty());
+    }
+
+    #[test]
+    fn the_first_refusal_is_the_one_that_is_reported_when_something_was_applied() {
+        // The first value is refused (safeword) and the second one is
+        // applied. The answer names the first refusal, not the last one.
+        let store = multi_menu();
+        let mut settings = settings();
+        settings.safeword_restricted_role_ids = vec![ROLE_A];
+        let mut blocked = press_select(1, &[ROLE_A, ROLE_B]);
+        blocked.safeword = SafewordState::Active;
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings, &blocked);
+        assert_eq!(result.outcome.code, Code::Partial);
+        assert_eq!(result.outcome.detail, Some("safeword_restricted"));
+        assert_eq!(result.added, vec![ROLE_B]);
+    }
+
+    #[test]
+    fn a_multi_select_whose_addition_fails_is_not_reported_as_a_swap() {
+        // A multi group: ROLE_A is held and removed, ROLE_B is added but the
+        // write fails. No swap was planned, so the answer must not claim one.
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
+        roles.add_failures.insert(ROLE_B, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A, ROLE_B]));
+        assert_eq!(result.outcome.code, Code::PartialWrite);
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert_eq!(result.removed, vec![ROLE_A]);
+        assert!(result.added.is_empty());
+    }
+
+    #[test]
+    fn a_multi_select_whose_removal_fails_is_not_reported_as_a_swap() {
+        // Both values are held, so both are removals and no swap was
+        // planned. ROLE_B's removal fails.
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A, ROLE_B]);
+        roles.remove_failures.insert(ROLE_B, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A, ROLE_B]));
+        assert_eq!(result.outcome.code, Code::PartialWrite);
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert_eq!(result.removed, vec![ROLE_A]);
+        assert!(result.added.is_empty());
+    }
+
+    #[test]
+    fn a_swap_whose_removal_fails_says_the_member_may_hold_both() {
+        // The member holds ROLE_A and ROLE_B of an exclusive group and
+        // presses ROLE_C. ROLE_A is removed, ROLE_B's removal fails and
+        // ROLE_C cannot be added. The answer must not claim that the member
+        // holds neither: ROLE_B is still there.
+        let store = exclusive_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A, ROLE_B]);
+        roles.remove_failures.insert(ROLE_B, vec![forbidden()]);
+        roles.add_failures.insert(ROLE_C, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_C));
+        assert_eq!(result.outcome.code, Code::PartialWrite);
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert_eq!(result.removed, vec![ROLE_A]);
+        assert!(result.added.is_empty());
+        // The member really still holds ROLE_B.
+        assert!(harness
+            .roles
+            .held
+            .get(&MEMBER)
+            .expect("held")
+            .contains(&ROLE_B));
+    }
+
+    #[test]
+    fn a_write_that_fails_entirely_is_reported_as_a_write_failure() {
+        // Nothing succeeded: the answer is a plain write failure, not a
+        // partial one.
+        let store = exclusive_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
+        roles.remove_failures.insert(ROLE_A, vec![forbidden()]);
+        roles.add_failures.insert(ROLE_B, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
+        assert_eq!(result.outcome.code, Code::WriteFailed);
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert!(result.added.is_empty());
+        assert!(result.removed.is_empty());
+    }
+
+    #[test]
+    fn an_empty_select_reads_no_member_data() {
+        // A select with no value is a no-op: it must not read the member's
+        // roles or the role facts.
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[]));
+        assert_eq!(result.outcome.code, Code::NoChange);
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.facts.reads.load(Ordering::SeqCst), 0);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
     }
 }
