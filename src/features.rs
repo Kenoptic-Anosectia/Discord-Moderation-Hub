@@ -820,6 +820,28 @@ pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
     built
 }
 
+/// The start-up decisions that depend on which planned features really started. Production
+/// `setup` and `main` take these values from [`wire`] and from nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wiring {
+    /// The new reaction-role feature owns the reaction events (the legacy arms stand down).
+    pub reaction_roles_owned: bool,
+    /// The `/safeword` command has a running feature behind it.
+    pub safeword_active: bool,
+    /// Channel ids the logger must never record (flash).
+    pub flash_log_excluded: Vec<u64>,
+}
+
+/// Decides [`Wiring`] from the plan and from which features survived start-up. Pure.
+pub fn wire(plan: &FeaturePlan, is_active: &dyn Fn(&str) -> bool) -> Wiring {
+    let _ = (plan, is_active);
+    Wiring {
+        reaction_roles_owned: false,
+        safeword_active: false,
+        flash_log_excluded: Vec::new(),
+    }
+}
+
 /// Stops the runner started by [`TokioJobStarter`].
 struct JobControl {
     shutdown: JobSignal,
@@ -3186,5 +3208,127 @@ mod wiring_tests {
         let mut c = config();
         c.staff_alert_channel_id = None;
         assert_eq!(plan_for(&flash_keys("live"), &c).staff_alert_channel, None);
+    }
+
+    // ---- reaction roles and the safeword (fail closed) --------------------------
+    #[tokio::test]
+    async fn a_refused_safeword_refuses_reaction_roles_instead_of_reading_everyone_as_idle() {
+        // The safeword is requested but cannot start (SAFEWORD_ROLE_ID missing, a flag the
+        // parser refuses, an unusable protected list). Its restricted list is still valid, so
+        // before the fix reaction roles started with that list and an empty safeword lookup:
+        // a member under safeword read as idle and was granted a restricted role.
+        let mut protected_bad = config();
+        protected_bad.invalid_core_keys = vec!["PROTECTED_ROLE_IDS"];
+        let mut missing = safeword_keys("live");
+        missing.retain(|(k, _)| *k != "SAFEWORD_ROLE_ID");
+        let mut bad_flag = safeword_keys("shadow");
+        bad_flag.push(("SAFEWORD_DM", "perhaps"));
+        let cases: Vec<Case> = vec![
+            (missing, config(), "SAFEWORD_ROLE_ID"),
+            (bad_flag, config(), "SAFEWORD_DM"),
+            (
+                safeword_keys("live"),
+                protected_bad,
+                "protected_roles_invalid",
+            ),
+        ];
+        for (mut pairs, c, why) in cases {
+            pairs.push(("REACTION_ROLES_MODE", "live"));
+            let plan = plan_for(&pairs, &c);
+            assert!(plan.safeword.is_none(), "{why}: the safeword did not start");
+            assert!(
+                plan.reaction_roles.is_none(),
+                "{why}: reaction roles must refuse"
+            );
+            assert!(
+                !plan.reaction_roles_owned(),
+                "{why}: the legacy arms keep working"
+            );
+            let text = lines_text(&plan);
+            assert!(text.contains("safeword_unavailable"), "{why}: {text}");
+            // Built from the real plan, nothing handles a reaction: no role is granted.
+            let recorder = Arc::new(Recorder::default());
+            assert!(build(&plan, &recorder).is_empty(), "{why}");
+            assert!(recorder.log.lock().unwrap().is_empty(), "{why}");
+        }
+    }
+
+    #[test]
+    fn reaction_roles_still_start_when_the_safeword_is_off_or_running() {
+        let plan = plan_for(&[("REACTION_ROLES_MODE", "live")], &config());
+        assert!(
+            plan.reaction_roles.is_some(),
+            "safeword off: nothing to deny"
+        );
+        let mut pairs = vec![("REACTION_ROLES_MODE", "live")];
+        pairs.extend(safeword_keys("live"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.safeword.is_some() && plan.reaction_roles.is_some());
+        // A safeword whose mode is a typo is off, as everywhere else.
+        let plan = plan_for(
+            &[("REACTION_ROLES_MODE", "live"), ("SAFEWORD_MODE", "lvie")],
+            &config(),
+        );
+        assert!(plan.reaction_roles.is_some());
+    }
+
+    // ---- the pure start-up wiring ------------------------------------------------
+    fn on(names: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |name| names.contains(&name)
+    }
+
+    #[test]
+    fn wiring_from_an_empty_environment_changes_nothing() {
+        let plan = plan_for(&[], &config());
+        // Even if every feature name were reported as running, nothing was planned.
+        let wiring = wire(&plan, &|_| true);
+        assert_eq!(
+            wiring,
+            Wiring {
+                reaction_roles_owned: false,
+                safeword_active: false,
+                flash_log_excluded: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn the_legacy_arms_stand_down_only_for_a_planned_and_running_reaction_feature() {
+        let planned = plan_for(&[("REACTION_ROLES_MODE", "live")], &config());
+        assert!(wire(&planned, &on(&["reaction_roles"])).reaction_roles_owned);
+        // Planned, but dropped at start-up: the old arms keep working.
+        assert!(!wire(&planned, &on(&[])).reaction_roles_owned);
+        assert!(!wire(&planned, &on(&["flash", "safeword"])).reaction_roles_owned);
+        // Running under that name but never planned (mode off): not owned either.
+        let off = plan_for(&[], &config());
+        assert!(!wire(&off, &on(&["reaction_roles"])).reaction_roles_owned);
+    }
+
+    #[test]
+    fn the_safeword_command_needs_a_planned_and_running_feature() {
+        let planned = plan_for(&safeword_keys("live"), &config());
+        assert!(wire(&planned, &on(&["safeword"])).safeword_active);
+        assert!(
+            !wire(&planned, &on(&[])).safeword_active,
+            "dropped at start-up"
+        );
+        let off = plan_for(&[], &config());
+        assert!(!wire(&off, &on(&["safeword"])).safeword_active);
+    }
+
+    #[test]
+    fn flash_ids_reach_the_log_exclusion_only_when_flash_is_planned() {
+        let planned = plan_for(&flash_keys("live"), &config());
+        assert_eq!(
+            wire(&planned, &on(&[])).flash_log_excluded,
+            vec![FLASH_A, FLASH_B]
+        );
+        // Flash that is only requested but refused (no channels) excludes nothing.
+        let refused = plan_for(&[("FLASH_MODE", "live")], &config());
+        assert!(wire(&refused, &on(&["flash"]))
+            .flash_log_excluded
+            .is_empty());
+        let off = plan_for(&[], &config());
+        assert!(wire(&off, &on(&["flash"])).flash_log_excluded.is_empty());
     }
 }

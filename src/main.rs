@@ -1110,8 +1110,10 @@ mod tests {
                 rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
                 tickets: None,
                 features: Arc::new(features),
-                flash_log_excluded: vec![],
-                wired: WiredFeatures::default(),
+                wiring: AppWiring {
+                    flash_log_excluded: vec![],
+                    wired: WiredFeatures::default(),
+                },
             },
         )
     }
@@ -1169,10 +1171,12 @@ mod tests {
                 rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
                 tickets: None,
                 features: Arc::new(features),
-                flash_log_excluded: flash,
-                wired: WiredFeatures {
-                    reaction_roles_owned: owned,
-                    ..Default::default()
+                wiring: AppWiring {
+                    flash_log_excluded: flash,
+                    wired: WiredFeatures {
+                        reaction_roles_owned: owned,
+                        ..Default::default()
+                    },
                 },
             },
         )
@@ -1221,6 +1225,155 @@ mod tests {
             !legacy_reaction_roles_active(&on),
             "on: the new path owns them"
         );
+    }
+
+    // ---- the production wiring functions `main` and `setup` call ------------------
+    const W2_GUILD: u64 = 770_900;
+    const W2_FLASH: u64 = 770_001;
+
+    fn w2_plan(pairs: &[(&str, &str)]) -> features::FeaturePlan {
+        let mut config = w1b_config(vec![], vec![], vec![]);
+        config.guild_id = Some(W2_GUILD);
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        features::plan_features(
+            &|key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+            &config,
+        )
+    }
+
+    fn w2_runtime(plan: &features::FeaturePlan) -> Option<Arc<safeword::discord::SafewordRuntime>> {
+        features::safeword_runtime(
+            plan,
+            features::SafewordParts {
+                http: Arc::new(serenity::Http::new("synthetic-token")),
+                cache: Arc::new(serenity::Cache::new()),
+                bot_user_id: 770_002,
+                store: safeword::discord::StoreSpec {
+                    path: None,
+                    reserved: vec![],
+                },
+                protected_role_ids: vec![],
+            },
+        )
+    }
+
+    const W2_SAFEWORD: [(&str, &str); 6] = [
+        ("SAFEWORD_MODE", "live"),
+        ("SAFEWORD_ROLE_ID", "770201"),
+        ("SAFEWORD_CHANNEL_ID", "770202"),
+        ("SAFEWORD_MESSAGE_ID", "770203"),
+        ("SAFEWORD_EMOJI_ID", "770204"),
+        ("SAFEWORD_RESTRICTED_ROLE_IDS", "770205"),
+    ];
+
+    /// `Data` built by the production `build_data` from the production `app_wiring`.
+    async fn w2_wired_data(plan: &features::FeaturePlan, running: &'static [&'static str]) -> Data {
+        let settings = w1_settings(features::GuildFilter::Any);
+        let features = features::Features::<serenity::Context, Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &settings,
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        build_data(
+            Arc::new(w1b_config(vec![], vec![], vec![])),
+            DataParts {
+                rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
+                tickets: None,
+                features: Arc::new(features),
+                wiring: app_wiring(plan, &|name| running.contains(&name), w2_runtime(plan)),
+            },
+        )
+    }
+
+    #[test]
+    fn framework_commands_from_an_empty_environment_are_todays_list() {
+        let plan = w2_plan(&[]);
+        for tickets in [false, true] {
+            assert_eq!(
+                command_names(&framework_commands(tickets, &plan)),
+                command_names(&configured_commands(tickets)),
+                "tickets={tickets}"
+            );
+        }
+        // Another feature on does not add the /safeword command either.
+        let flash = w2_plan(&[("FLASH_MODE", "live"), ("FLASH_CHANNEL_IDS", "770001")]);
+        assert!(!command_names(&framework_commands(false, &flash))
+            .iter()
+            .any(|name| name == "safeword"));
+    }
+
+    #[test]
+    fn framework_commands_list_safeword_only_when_the_plan_has_it() {
+        let plan = w2_plan(&W2_SAFEWORD);
+        let mut expected = command_names(&configured_commands(false));
+        expected.push("safeword".to_string());
+        assert_eq!(command_names(&framework_commands(false, &plan)), expected);
+        // A safeword that was requested but refused (a key is missing) is not listed.
+        let refused = w2_plan(&[("SAFEWORD_MODE", "live")]);
+        assert_eq!(
+            command_names(&framework_commands(false, &refused)),
+            command_names(&configured_commands(false))
+        );
+    }
+
+    #[test]
+    fn app_wiring_from_an_empty_plan_is_all_off_even_if_every_feature_name_reports_running() {
+        let plan = w2_plan(&[]);
+        let wiring = app_wiring(&plan, &|_| true, None);
+        assert!(wiring.flash_log_excluded.is_empty());
+        assert!(!wiring.wired.reaction_roles_owned);
+        assert!(wiring.wired.safeword.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_legacy_arms_stand_down_only_for_a_reaction_feature_that_planned_and_started() {
+        let plan = w2_plan(&[("REACTION_ROLES_MODE", "live")]);
+        let started = w2_wired_data(&plan, &["reaction_roles"]).await;
+        assert!(
+            !legacy_reaction_roles_active(&started),
+            "owned by the new path"
+        );
+        let dropped = w2_wired_data(&plan, &[]).await;
+        assert!(
+            legacy_reaction_roles_active(&dropped),
+            "planned but dropped at start-up: the old arms keep working"
+        );
+        let off = w2_wired_data(&w2_plan(&[]), &["reaction_roles"]).await;
+        assert!(
+            legacy_reaction_roles_active(&off),
+            "mode off: the old arms act"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_safeword_runtime_is_kept_only_while_the_feature_runs() {
+        let plan = w2_plan(&W2_SAFEWORD);
+        assert!(w2_wired_data(&plan, &["safeword"])
+            .await
+            .wired
+            .safeword
+            .is_some());
+        assert!(w2_wired_data(&plan, &[]).await.wired.safeword.is_none());
+    }
+
+    #[tokio::test]
+    async fn flash_channels_are_excluded_from_the_logger_exactly_when_flash_is_planned() {
+        let flash = w2_plan(&[("FLASH_MODE", "live"), ("FLASH_CHANNEL_IDS", "770001")]);
+        let on = w2_wired_data(&flash, &["flash"]).await;
+        assert_eq!(
+            w1b_gate(&on, W2_FLASH).await,
+            features::Gate::Skip(features::GateReason::Excluded)
+        );
+        assert_eq!(w1b_gate(&on, W1_PLAIN).await, features::Gate::Allow);
+        let off = w2_wired_data(&w2_plan(&[]), &["flash"]).await;
+        assert!(matches!(off.log_exclusion, features::LogExclusion::Off));
+        assert_eq!(w1b_gate(&off, W2_FLASH).await, features::Gate::Allow);
     }
 
     #[tokio::test]
@@ -2257,20 +2410,56 @@ struct DataParts {
     rr_db: Arc<Connection>,
     tickets: Option<tickets::repository::Repository>,
     features: Arc<AppFeatures>,
+    /// What the start-up wiring decided (see [`app_wiring`]).
+    wiring: AppWiring,
+}
+
+/// The start-up decisions `setup` hands to [`build_data`]. Only [`app_wiring`] builds one in
+/// production.
+struct AppWiring {
     /// Flash channel ids the logger must not record (empty unless flash is on).
     flash_log_excluded: Vec<u64>,
     /// See [`Data::wired`].
     wired: WiredFeatures,
 }
 
+/// Turns the plan and the registry's view of what really started into the values `Data` keeps.
+/// `setup` calls this and nothing else to decide them; it is pure, so a test can run it from an
+/// empty plan (all-off parity) and from planned-but-dropped features.
+fn app_wiring(
+    plan: &features::FeaturePlan,
+    is_active: &dyn Fn(&str) -> bool,
+    safeword: Option<Arc<safeword::discord::SafewordRuntime>>,
+) -> AppWiring {
+    let _ = (plan, is_active, safeword);
+    AppWiring {
+        flash_log_excluded: Vec::new(),
+        wired: WiredFeatures::default(),
+    }
+}
+
+/// The slash commands the framework is built with: today's list, plus `/safeword` only when
+/// the plan has the safeword. `main` calls this and nothing else to decide the list.
+fn framework_commands(
+    tickets_enabled: bool,
+    plan: &features::FeaturePlan,
+) -> Vec<poise::Command<Data, Error>> {
+    let _ = plan;
+    configured_commands(tickets_enabled)
+}
+
 /// Builds the shared bot state. `setup` is the only production caller, so the
 /// log exclusion the event handler later reads is derived from `config` here.
 fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
+    let AppWiring {
+        flash_log_excluded,
+        wired,
+    } = parts.wiring;
     // With no flash channel the exclusion is exactly the configured one, as before W2.
-    let log_exclusion = if parts.flash_log_excluded.is_empty() {
+    let log_exclusion = if flash_log_excluded.is_empty() {
         features::LogExclusion::from_config(&config)
     } else {
-        features::LogExclusion::from_config_with_flash(&config, &parts.flash_log_excluded)
+        features::LogExclusion::from_config_with_flash(&config, &flash_log_excluded)
     };
     Data {
         log_exclusion,
@@ -2279,7 +2468,7 @@ fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
         rr_db: parts.rr_db,
         tickets: parts.tickets,
         features: parts.features,
-        wired: parts.wired,
+        wired,
     }
 }
 
@@ -3795,10 +3984,7 @@ async fn main() -> Result<(), Error> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: with_optional_commands(
-                configured_commands(config.tickets.is_some()),
-                plan.safeword_command(),
-            ),
+            commands: framework_commands(config.tickets.is_some(), &plan),
             // poise 0.7 passes (framework, event); the serenity context and our Data live inside the
             // framework context, so adapt here and keep `event_handler` itself unchanged.
             event_handler: |framework, event| {
@@ -3890,13 +4076,11 @@ async fn main() -> Result<(), Error> {
                         println!("{line}");
                     }
                     let _ = features_slot.set(features.clone());
-                    let wired = WiredFeatures {
-                        // Owned only if the feature really started: a dropped feature must
-                        // leave the legacy arms in charge.
-                        reaction_roles_owned: plan.reaction_roles_owned()
-                            && features.is_active(role_menus::reactions::FEATURE_NAME),
-                        safeword: safeword.filter(|_| features.is_active("safeword")),
-                    };
+                    let wiring = app_wiring(
+                        &plan,
+                        &|name| features.is_active(name),
+                        safeword,
+                    );
 
                     Ok(build_data(
                         config,
@@ -3904,8 +4088,7 @@ async fn main() -> Result<(), Error> {
                             rr_db,
                             tickets,
                             features,
-                            flash_log_excluded: plan.log_excluded_channels(),
-                            wired,
+                            wiring,
                         },
                     ))
                 })
