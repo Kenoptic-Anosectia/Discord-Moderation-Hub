@@ -16,8 +16,9 @@ reaction-role path own reactions. Everything defaults OFF. NOT run against Disco
    `protected_roles_invalid` (safeword), `restricted_roles_invalid`, `shadow_unsupported`.
 4. Reaction roles: while `REACTION_ROLES_MODE` is off the old `ReactionAdd`/`ReactionRemove` arms
    run unchanged; when the feature really started (`Features::is_active`) they return at once
-   (`legacy_reaction_roles_active`). The new path uses the same table and the real
-   `ReactionRolesFeature`: an ordinary binding grants the same role as `handle_reaction_add`.
+   (`legacy_reaction_roles_active`). The new path only reads the same table (the `reactionrole`
+   command and its file are untouched); an ordinary binding grants the same role as the direct
+   `handle_reaction_add` (tested with the real `ReactionRolesFeature` and a fake role service).
 5. Bot flag fails closed (`reactions.rs` `precheck_event`): `None` = `bot_flag_unknown`, ignored.
    Removals carry no member, so the feature asks the service, and only for a bound reaction.
 6. Flash channel ids join the log-exclusion scope when flash is planned (shadow too); never
@@ -58,5 +59,11 @@ helpers (`alert_words`, `AlertThrottle`, a seeded 5,000-step run) and two scope 
   repository and policy, `reactions` binding commands, and SW3/SW4 reconcile and shadow summaries.
   No new `#[allow]`. Ticket opening is untouched.
 
-## Mutation checks
-(see below)
+## Mutation checks (each made at least one test fail; run with `timeout 300 cargo test`)
+18 of 18 caught: owned switch always on, inverted (2); mode check inverted (17 failed); flash ids
+dropped in `build_data`, in `plan`, in `from_config_with_flash` (3); unknown flag read as human,
+no re-check after the flag lookup (2); `reaction_roles_owned` false; shadow accepted; `/safeword`
+always listed; ephemeral flag dropped; other guild gets safeword ops; flash without home guild;
+throttle window edge; alert keeps digits; unreadable store reads idle; `is_active` always true.
+Survives, and cannot be tested offline: removing the `legacy_reaction_roles_active` call from the
+two arms in `log_event_body` (needs a live `serenity::Context`); the switch itself is tested.
