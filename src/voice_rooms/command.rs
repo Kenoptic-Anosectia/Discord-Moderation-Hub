@@ -7,7 +7,7 @@
 //!   `transfer`).
 //! - `claim` is the only subcommand a non-owner may use, and only when the caller is
 //!   currently inside the room and the recorded owner has been absent from the room past
-//!   the configured grace period (`empty_grace_secs`), never from a present owner.
+//!   the claim grace (`claim_grace_secs`, VR1 value), never from a present owner.
 //! - `permit` refuses any member who is ineligible per the role service or VR1 (bot user,
 //!   the bot itself, the room owner, active safeword, lacking category visibility, or
 //!   holding a protected, restricted, staff or privileged role).
@@ -1087,16 +1087,14 @@ impl VcCommandHandler {
             self.note_owner_present(row.channel);
             return Self::refuse(RefusalCode::OwnerStillPresent);
         }
-        // The owner is absent. The grace runs from the first time the absence was recorded; an
-        // absence never recorded before starts its grace now, so a claim is never granted on a
-        // guess.
+        // The owner is absent. A claim rests only on an absence that `note_owner_absent` recorded
+        // and that no `note_owner_present` (or claim that saw the owner) has cleared since. A claim
+        // never starts or guesses an absence itself, so an unobserved return fails closed.
         let now = self.now();
-        let since = *self
-            .mem()
-            .owner_absent_since
-            .entry(row.channel)
-            .or_insert(now);
-        if now.saturating_sub(since) < self.deps.settings.empty_grace_secs() {
+        let Some(since) = self.mem().owner_absent_since.get(&row.channel).copied() else {
+            return Self::refuse(RefusalCode::OwnerAbsenceNotRecorded);
+        };
+        if now.saturating_sub(since) < self.deps.claim_grace_secs {
             return Self::refuse(RefusalCode::OwnerGraceNotElapsed);
         }
         self.move_ownership(home_guild, row, actor, SuccessCode::Claimed, mode)
