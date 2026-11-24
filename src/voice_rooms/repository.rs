@@ -203,6 +203,46 @@ fn decode(raw: RawRow) -> Result<RoomRow, RepoError> {
 
 const COLUMNS: &str = "channel, guild, owner, created_at, locked, user_limit";
 
+/// What [`add_deputy`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddDeputy {
+    /// The deputy row was written.
+    Added,
+    /// The user already was a deputy of the room; nothing was written.
+    AlreadyDeputy,
+    /// The room already has `cap` deputies; nothing was written.
+    CapReached,
+    /// The channel has no room row; nothing was written.
+    RoomMissing,
+}
+
+/// Adds `user` as a deputy of `channel` unless the room is missing, the user already is one or
+/// the room already has `cap` deputies. RED scaffold: not implemented yet.
+pub fn add_deputy(
+    _conn: &Connection,
+    _channel: u64,
+    _user: u64,
+    _now: i64,
+    _cap: usize,
+) -> Result<AddDeputy, RepoError> {
+    Ok(AddDeputy::RoomMissing)
+}
+
+/// Removes one deputy row. Returns whether a row was there. RED scaffold.
+pub fn remove_deputy(_conn: &Connection, _channel: u64, _user: u64) -> Result<bool, RepoError> {
+    Ok(false)
+}
+
+/// Whether `user` is a deputy of `channel`. RED scaffold.
+pub fn is_deputy(_conn: &Connection, _channel: u64, _user: u64) -> Result<bool, RepoError> {
+    Ok(false)
+}
+
+/// The deputies of `channel`, oldest first. RED scaffold.
+pub fn deputies(_conn: &Connection, _channel: u64) -> Result<Vec<u64>, RepoError> {
+    Ok(Vec::new())
+}
+
 /// Loads the row of `channel`. `Ok(None)` means the channel is not tracked.
 pub fn get(conn: &Connection, channel: u64) -> Result<Option<RoomRow>, RepoError> {
     let found = conn
@@ -409,5 +449,120 @@ mod tests {
             Err(RepoError::CorruptRow)
         );
         assert_eq!(get(&conn, CH_A).unwrap().unwrap(), updated);
+    }
+
+    const DEP_1: u64 = 6_200_000_000_000_031;
+    const DEP_2: u64 = 6_200_000_000_000_032;
+    const DEP_3: u64 = 6_200_000_000_000_033;
+
+    #[test]
+    fn deputy_rows_round_trip_with_cap_duplicates_and_missing_room() {
+        let mut conn = mem();
+        insert(&conn, &row(CH_A, GUILD, 10)).unwrap();
+        assert_eq!(
+            add_deputy(&conn, CH_A, DEP_1, 100, 2).unwrap(),
+            AddDeputy::Added
+        );
+        assert_eq!(
+            add_deputy(&conn, CH_A, DEP_1, 101, 2).unwrap(),
+            AddDeputy::AlreadyDeputy
+        );
+        assert_eq!(
+            add_deputy(&conn, CH_A, DEP_2, 102, 2).unwrap(),
+            AddDeputy::Added
+        );
+        assert_eq!(
+            add_deputy(&conn, CH_A, DEP_3, 103, 2).unwrap(),
+            AddDeputy::CapReached
+        );
+        // A room with no row never gets a deputy row.
+        assert_eq!(
+            add_deputy(&conn, CH_B, DEP_1, 104, 2).unwrap(),
+            AddDeputy::RoomMissing
+        );
+        // Migrating again keeps the rows; they are oldest first.
+        migrate(&mut conn).unwrap();
+        assert_eq!(deputies(&conn, CH_A).unwrap(), [DEP_1, DEP_2]);
+        assert!(deputies(&conn, CH_B).unwrap().is_empty());
+        assert!(is_deputy(&conn, CH_A, DEP_2).unwrap());
+        assert!(!is_deputy(&conn, CH_A, DEP_3).unwrap());
+        assert!(!is_deputy(&conn, CH_B, DEP_1).unwrap());
+        assert!(remove_deputy(&conn, CH_A, DEP_1).unwrap());
+        assert!(!remove_deputy(&conn, CH_A, DEP_1).unwrap());
+        assert_eq!(deputies(&conn, CH_A).unwrap(), [DEP_2]);
+        // A freed slot can be used again.
+        assert_eq!(
+            add_deputy(&conn, CH_A, DEP_3, 105, 2).unwrap(),
+            AddDeputy::Added
+        );
+        assert_eq!(
+            add_deputy(&conn, CH_A, 0, 106, 9),
+            Err(RepoError::CorruptRow)
+        );
+    }
+
+    fn deputy_row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM voice_room_deputies", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn deleting_a_room_row_removes_its_deputies_and_a_recreated_channel_inherits_none() {
+        let conn = mem();
+        insert(&conn, &row(CH_A, GUILD, 10)).unwrap();
+        insert(&conn, &row(CH_B, GUILD, 11)).unwrap();
+        add_deputy(&conn, CH_A, DEP_1, 1, 5).unwrap();
+        add_deputy(&conn, CH_B, DEP_2, 1, 5).unwrap();
+        assert!(delete(&conn, CH_A).unwrap());
+        assert_eq!(
+            deputy_row_count(&conn),
+            1,
+            "only the deleted room's rows go"
+        );
+        assert_eq!(deputies(&conn, CH_B).unwrap(), [DEP_2]);
+        // The same channel id comes back as a new room: nobody is a deputy of it.
+        insert(&conn, &row(CH_A, GUILD, 20)).unwrap();
+        assert!(deputies(&conn, CH_A).unwrap().is_empty());
+        // Any other way of removing the row (a raw statement) removes the deputies too.
+        add_deputy(&conn, CH_A, DEP_1, 2, 5).unwrap();
+        conn.execute("DELETE FROM voice_rooms", []).unwrap();
+        assert_eq!(deputy_row_count(&conn), 0);
+    }
+
+    #[test]
+    fn a_failed_room_delete_leaves_the_deputies_alone() {
+        let conn = mem();
+        insert(&conn, &row(CH_A, GUILD, 10)).unwrap();
+        add_deputy(&conn, CH_A, DEP_1, 1, 5).unwrap();
+        conn.execute(
+            "CREATE TRIGGER no_delete BEFORE DELETE ON voice_rooms \
+             BEGIN SELECT RAISE(ABORT, 'x'); END;",
+            [],
+        )
+        .unwrap();
+        assert!(delete(&conn, CH_A).is_err());
+        assert_eq!(deputies(&conn, CH_A).unwrap(), [DEP_1]);
+        assert!(get(&conn, CH_A).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_new_owner_stops_being_a_deputy_in_the_same_update_and_others_stay() {
+        let conn = mem();
+        insert(&conn, &row(CH_A, GUILD, 10)).unwrap();
+        insert(&conn, &row(CH_B, GUILD, 11)).unwrap();
+        add_deputy(&conn, CH_A, DEP_1, 1, 5).unwrap();
+        add_deputy(&conn, CH_A, DEP_2, 2, 5).unwrap();
+        add_deputy(&conn, CH_B, DEP_1, 3, 5).unwrap();
+        // A wrong-guild update changes nothing, deputies included.
+        assert!(!update_owner(&conn, CH_A, OTHER_GUILD, DEP_1).unwrap());
+        assert_eq!(deputies(&conn, CH_A).unwrap(), [DEP_1, DEP_2]);
+        assert!(update_owner(&conn, CH_A, GUILD, DEP_1).unwrap());
+        assert_eq!(get(&conn, CH_A).unwrap().unwrap().owner, DEP_1);
+        assert_eq!(deputies(&conn, CH_A).unwrap(), [DEP_2]);
+        assert_eq!(
+            deputies(&conn, CH_B).unwrap(),
+            [DEP_1],
+            "other room untouched"
+        );
     }
 }
