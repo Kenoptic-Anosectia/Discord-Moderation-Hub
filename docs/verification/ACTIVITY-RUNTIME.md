@@ -64,3 +64,6 @@ the persisted heartbeat cap, or the message privacy gate was deliberately broken
 mutation was reverted.
 
 Round 2 RED `135756a`: 109 passed and 2 failed (bot and missing-member voice both opened rows).
+Round 3 RED `5828915`: `timeout 900 cargo test --locked --offline activity::runtime::feature_tests`
+returned 101: 5 passed and 3 failed (memberless leaves credited 3,600 s instead of 10 s).
+Fixed in `5df6396`.
