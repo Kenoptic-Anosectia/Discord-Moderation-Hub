@@ -8,11 +8,12 @@
 //! What it enforces:
 //!
 //! 1. **The custom id is parsed strictly.** The id has the fixed prefix
-//!    [`CUSTOM_ID_PREFIX`] and names a stored menu and one of its options by
-//!    index. It is at most [`MAX_CUSTOM_ID_LEN`] bytes and holds nothing but
-//!    ASCII digits and the prefix's separators. A forged, malformed,
-//!    other-menu, other-guild or other-message id is ignored: no member data
-//!    is read and nothing is written.
+//!    [`CUSTOM_ID_PREFIX`] and names a stored menu and one of its two kinds of
+//!    component: a button (`m<menu id>:r<role id>`) or a select
+//!    (`m<menu id>:s`). It is at most [`MAX_CUSTOM_ID_LEN`] bytes and holds
+//!    nothing but ASCII digits and the prefix's separators. A forged,
+//!    malformed, other-menu, other-guild or other-message id is ignored: no
+//!    member data is read and nothing is written.
 //! 2. **The stored row is the truth.** The interaction's own guild and message
 //!    must be the ones the menu row records, and the option must still be
 //!    stored. A deleted menu or option answers with a notice and writes
@@ -24,7 +25,7 @@
 //! 4. **RM1 decides.** The click is planned by the shared policy
 //!    (`super::policy`): a multi option toggles, an exclusive group swaps, and a
 //!    max-select breach is refused. A partial swap is reported honestly
-//!    (`swap_partial`) and never as a success.
+//!    (`swap_partial` or `swap_partial_removed`) and never as a success.
 //! 5. **Every role write goes through the role service** (K03 decide, K04
 //!    grant), never directly. Protected, managed and privileged roles are
 //!    refused at press time even when the stored row lists them, and an active
@@ -42,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::roles::eligibility::{RoleFacts, SafewordState};
-use crate::roles::grant::{self, FailCode, WriteError};
+use crate::roles::grant::{self, FailCode, GrantItem, RoleOutcome, WriteError};
 
 use super::command::to_policy_menu;
 use super::policy;
@@ -68,6 +69,8 @@ pub enum Code {
     NoHomeGuild,
     /// The custom id is not a role-menu id at all (bad prefix, bad shape or too long).
     InvalidCustomId,
+    /// A submitted select value is not a role id at all.
+    InvalidValue,
     /// The custom id names a menu that is not stored.
     MenuNotFound,
     /// The custom id names an option that is not stored.
@@ -76,10 +79,12 @@ pub enum Code {
     MessageMismatch,
     /// The menu row belongs to another guild than the press.
     GuildMismatch,
-    /// The stored menu row could not be understood.
+    /// The stored menu could not be understood.
     CorruptRow,
     /// The stored menu could not be read.
     StoreFailed,
+    /// The acknowledgement could not be sent.
+    DeferFailed,
     /// The role facts could not be looked up.
     FactsUnavailable,
     /// The member's roles could not be read.
@@ -98,12 +103,18 @@ pub enum Code {
     MaxReached,
     /// The click named an option that is not an option of the group.
     UnknownOption,
+    /// The press named more options than one press may name.
+    TooManySelected,
     /// The exclusive swap could not remove an old option; nothing changed.
     SwapBlocked,
     /// An exclusive swap added the new option but could not remove an old one.
     SwapPartial,
+    /// An exclusive swap removed the old option but could not add the new one.
+    SwapPartialRemoved,
     /// A role write failed (the detail carries the K04 fail code).
     WriteFailed,
+    /// Some of the submitted values were applied and some were refused.
+    Partial,
     /// Nothing changed.
     NoChange,
 }
@@ -116,12 +127,14 @@ impl Code {
             Code::OtherGuild => "other_guild",
             Code::NoHomeGuild => "no_home_guild",
             Code::InvalidCustomId => "invalid_custom_id",
+            Code::InvalidValue => "invalid_value",
             Code::MenuNotFound => "menu_not_found",
             Code::OptionNotFound => "option_not_found",
             Code::MessageMismatch => "message_mismatch",
             Code::GuildMismatch => "guild_mismatch",
             Code::CorruptRow => "corrupt_row",
             Code::StoreFailed => "store_failed",
+            Code::DeferFailed => "defer_failed",
             Code::FactsUnavailable => "facts_unavailable",
             Code::MemberRolesUnavailable => "member_roles_unavailable",
             Code::Ineligible => "ineligible",
@@ -131,9 +144,12 @@ impl Code {
             Code::AlreadySelected => "already_selected",
             Code::MaxReached => "max_reached",
             Code::UnknownOption => "unknown_option",
+            Code::TooManySelected => "too_many_selected",
             Code::SwapBlocked => "swap_blocked",
             Code::SwapPartial => "swap_partial",
+            Code::SwapPartialRemoved => "swap_partial_removed",
             Code::WriteFailed => "write_failed",
+            Code::Partial => "partial",
             Code::NoChange => "no_change",
         }
     }
@@ -175,13 +191,26 @@ impl Outcome {
 // Custom id
 // ---------------------------------------------------------------------------
 
-/// The menu and option a component id names.
+/// Which kind of component a custom id names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selector {
+    /// A button for one stored option, named by the option's role id.
+    ///
+    /// The role id is the option's identity inside a menu: RM2 stores one
+    /// option row per role, so a button keeps naming the same option even
+    /// after another option of the menu is removed.
+    Option(u64),
+    /// A select component of the menu. The submitted values name the roles.
+    Select,
+}
+
+/// The menu and component a custom id names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedCustomId {
     /// The stored menu the id names.
     pub menu_id: i64,
-    /// The index of the option inside the menu, in stored order.
-    pub option_index: usize,
+    /// Which component of the menu the id names.
+    pub selector: Selector,
 }
 
 /// Why a component id was refused.
@@ -191,10 +220,12 @@ pub enum ParseError {
     TooLong,
     /// The id does not start with [`CUSTOM_ID_PREFIX`].
     BadPrefix,
-    /// The id does not have the shape `prefix m<digits>:o<digits>`.
+    /// The id does not have the shape `prefix m<digits>:r<digits>` or `prefix m<digits>:s`.
     Malformed,
     /// A number in the id is not a number, or is zero where zero is not allowed.
     BadNumber,
+    /// A number in the id is written in a spelling the bot never writes.
+    NotCanonical,
 }
 
 impl ParseError {
@@ -205,19 +236,37 @@ impl ParseError {
             ParseError::BadPrefix => "custom_id_bad_prefix",
             ParseError::Malformed => "custom_id_malformed",
             ParseError::BadNumber => "custom_id_bad_number",
+            ParseError::NotCanonical => "custom_id_not_canonical",
         }
     }
 }
 
+/// Parses a decimal number the way the bot writes it.
+///
+/// Only ASCII digits are accepted, the number must not have a leading zero
+/// (unless it is the single digit `0`) and it must fit the target type. Every
+/// other spelling of a number is refused, so a hostile spelling of the class
+/// is refused and not guessed.
+fn parse_canonical<T: std::str::FromStr>(digits: &str) -> Result<T, ParseError> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ParseError::BadNumber);
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err(ParseError::NotCanonical);
+    }
+    digits.parse::<T>().map_err(|_| ParseError::BadNumber)
+}
+
 /// Parse a component id of a role menu.
 ///
-/// The id is `rolemenu:v1:m<menu id>:o<option index>`. Every part must be
+/// The id is `rolemenu:v1:m<menu id>:r<role id>` for a button or
+/// `rolemenu:v1:m<menu id>:s` for a select component. Every part must be
 /// there and must be ASCII digits only: a letter, a sign, a space, a
 /// separator of its own or any other character makes the whole id malformed,
 /// so a hostile spelling of the class is refused and not guessed.
 ///
-/// A menu id of zero or an option index that does not fit in a `usize` is
-/// refused: neither can name a stored row.
+/// A menu id of zero, a role id of zero and a number that does not fit are
+/// refused: none of them can name a stored row.
 pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
     if raw.len() > MAX_CUSTOM_ID_LEN {
         return Err(ParseError::TooLong);
@@ -226,7 +275,7 @@ pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
         return Err(ParseError::BadPrefix);
     };
     let mut parts = rest.split(':');
-    let (Some(menu_part), Some(option_part)) = (parts.next(), parts.next()) else {
+    let (Some(menu_part), Some(kind_part)) = (parts.next(), parts.next()) else {
         return Err(ParseError::Malformed);
     };
     if parts.next().is_some() {
@@ -235,42 +284,70 @@ pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
     let Some(menu_digits) = menu_part.strip_prefix('m') else {
         return Err(ParseError::Malformed);
     };
-    let Some(option_digits) = option_part.strip_prefix('o') else {
-        return Err(ParseError::Malformed);
-    };
-    if menu_digits.is_empty() || option_digits.is_empty() {
-        return Err(ParseError::Malformed);
-    }
-    if !menu_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ParseError::BadNumber);
-    }
-    if !option_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ParseError::BadNumber);
-    }
-    let menu_id: i64 = menu_digits.parse().map_err(|_| ParseError::BadNumber)?;
-    let option_index: usize = option_digits.parse().map_err(|_| ParseError::BadNumber)?;
+    let menu_id: i64 = parse_canonical(menu_digits)?;
     if menu_id <= 0 {
         return Err(ParseError::BadNumber);
     }
+    let selector = if kind_part == "s" {
+        Selector::Select
+    } else {
+        let Some(role_digits) = kind_part.strip_prefix('r') else {
+            return Err(ParseError::Malformed);
+        };
+        let role_id: u64 = parse_canonical(role_digits)?;
+        if role_id == 0 {
+            return Err(ParseError::BadNumber);
+        }
+        Selector::Option(role_id)
+    };
     Ok(ParsedCustomId {
         menu_id,
-        option_index,
+        selector,
     })
 }
 
-/// Build the component id of one option of a menu.
+/// Build the component id of one option (button) of a menu.
 ///
-/// The result is always shorter than [`MAX_CUSTOM_ID_LEN`]; a menu id that
-/// could not fit is refused instead of being cut.
-pub fn custom_id_for(menu_id: i64, option_index: usize) -> Result<String, ParseError> {
-    if menu_id <= 0 {
+/// The result is always shorter than [`MAX_CUSTOM_ID_LEN`]; a menu id or a
+/// role id that could not fit is refused instead of being cut.
+pub fn custom_id_for_option(menu_id: i64, role_id: u64) -> Result<String, ParseError> {
+    if menu_id <= 0 || role_id == 0 {
         return Err(ParseError::BadNumber);
     }
-    let raw = format!("{CUSTOM_ID_PREFIX}m{menu_id}:o{option_index}");
+    let raw = format!("{CUSTOM_ID_PREFIX}m{menu_id}:r{role_id}");
     if raw.len() > MAX_CUSTOM_ID_LEN {
         return Err(ParseError::TooLong);
     }
     Ok(raw)
+}
+
+/// Build the component id of the select component of a menu.
+///
+/// The result is always shorter than [`MAX_CUSTOM_ID_LEN`]; a menu id that
+/// could not fit is refused instead of being cut.
+pub fn custom_id_for_select(menu_id: i64) -> Result<String, ParseError> {
+    if menu_id <= 0 {
+        return Err(ParseError::BadNumber);
+    }
+    let raw = format!("{CUSTOM_ID_PREFIX}m{menu_id}:s");
+    if raw.len() > MAX_CUSTOM_ID_LEN {
+        return Err(ParseError::TooLong);
+    }
+    Ok(raw)
+}
+
+/// Parse one submitted select value into a role id.
+///
+/// The value is the string the bot wrote as the select option's value: the
+/// role id in decimal. Only ASCII digits are accepted, the number must not
+/// have a leading zero and it must not be zero: none of those can name a
+/// stored option.
+pub fn parse_value(raw: &str) -> Result<u64, ParseError> {
+    let role_id: u64 = parse_canonical(raw)?;
+    if role_id == 0 {
+        return Err(ParseError::BadNumber);
+    }
+    Ok(role_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +373,6 @@ pub struct Settings {
     pub mode: Mode,
     /// The one guild these interactions are served in (`GUILD_ID`).
     pub home_guild: Option<u64>,
-    /// The bot's own user id.
-    pub bot_user_id: u64,
     /// Roles that may never be granted through a menu (`PROTECTED_ROLE_IDS`).
     pub protected_role_ids: Vec<u64>,
     /// True when `PROTECTED_ROLE_IDS` could not be read: fail closed.
@@ -312,7 +387,6 @@ impl Settings {
         Settings {
             mode: Mode::Live,
             home_guild: Some(home_guild),
-            bot_user_id: 0,
             protected_role_ids: Vec::new(),
             protected_roles_invalid: false,
             safeword_restricted_role_ids: Vec::new(),
@@ -334,6 +408,8 @@ pub struct Press {
     pub member_id: u64,
     /// The custom id of the component.
     pub custom_id: String,
+    /// The values a select component submitted. Empty for a button.
+    pub values: Vec<String>,
     /// Whether the member's safeword is active.
     pub safeword: SafewordState,
 }
@@ -374,36 +450,25 @@ pub trait RoleFactsSource {
     fn bot_top_position(&self, guild_id: u64) -> Result<u16, LookupFail>;
 }
 
-/// The role service the handler writes through.
+/// Removes one role from a member.
 ///
-/// The handler never writes a role itself: every add and every removal goes
-/// through this port, so the K03 decision and the K04 executor stay in charge.
-pub trait RoleService {
-    /// The role ids the member holds.
-    fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, LookupFail>;
-    /// Adds one role to the member.
-    fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError>;
+/// The shape mirrors `grant::RoleWriter` so removals are offline-testable and
+/// can go through the same bounded retry.
+pub trait RoleRemover {
     /// Removes one role from the member.
     fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError>;
 }
 
-/// The clock. The handler never reads the clock itself.
-pub trait Clock {
-    /// The current time, as a unix timestamp in seconds.
-    fn now(&self) -> i64;
-}
-
-/// A fixed clock for tests and for callers that have no clock.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FixedClock {
-    /// The time the clock reports.
-    pub now: i64,
-}
-
-impl Clock for FixedClock {
-    fn now(&self) -> i64 {
-        self.now
-    }
+/// The role service the handler writes through.
+///
+/// The handler never writes a role itself: every add and every removal goes
+/// through this port, so the K03 decision and the K04 executor stay in charge.
+/// The add side is `grant::RoleWriter`, so the K04 executor can be used
+/// unchanged; the remove side is `RoleRemover`, so a removal can be retried
+/// the same way.
+pub trait RoleService: grant::RoleWriter + RoleRemover {
+    /// The role ids the member holds.
+    fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, LookupFail>;
 }
 
 /// Injectable reporter for sanitized failure lines.
@@ -444,23 +509,43 @@ pub struct PressPorts<'a, S: MenuStore + ?Sized, F: RoleFactsSource + ?Sized, R:
     pub facts: &'a F,
     /// The role service.
     pub roles: &'a mut R,
-    /// The clock.
-    pub clock: &'a dyn Clock,
+    /// The sleeper the K04 retry waits through.
+    pub sleeper: &'a mut dyn grant::Sleeper,
     /// Where sanitized failures go.
     pub reporter: &'a mut dyn FailureReporter,
     /// The Discord side of the interaction.
     pub responder: &'a mut dyn InteractionResponder,
 }
 
+/// A sized adapter around a borrowed sleeper.
+///
+/// The K04 executor is generic over a sized sleeper, so a `dyn` sleeper is
+/// wrapped in this before it is handed over. The wrapper only forwards the
+/// call; it holds no state of its own.
+struct SleeperRef<'a>(&'a mut dyn grant::Sleeper);
+
+impl grant::Sleeper for SleeperRef<'_> {
+    fn sleep_ms(&mut self, ms: u64) {
+        self.0.sleep_ms(ms);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The per-member lock
 // ---------------------------------------------------------------------------
 
-/// One member's lock, with the number of presses that want it.
+/// One member's gate.
 #[derive(Debug, Default)]
-struct MemberLock {
+struct MemberGate {
     gate: Mutex<()>,
-    waiting: Mutex<usize>,
+}
+
+/// One member's entry in the lock map: the gate and the number of presses
+/// that hold it or wait for it.
+#[derive(Debug)]
+struct MemberEntry {
+    gate: Arc<MemberGate>,
+    waiters: usize,
 }
 
 /// Releases the member's turn when the press ends, also on a panic.
@@ -471,25 +556,29 @@ struct MemberLock {
 struct TurnGuard<'a> {
     locks: &'a MemberLocks,
     member_id: u64,
-    lock: Arc<MemberLock>,
+    gate: Arc<MemberGate>,
 }
 
 impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
-        self.locks.finish(self.member_id, &self.lock);
+        self.locks.finish(self.member_id, &self.gate);
     }
 }
 
 /// Serializes the presses of one member.
 ///
 /// A member may press twice in a row; the two read-modify-write cycles must
-/// not interleave. Each member that is being served holds its own lock, so
+/// not interleave. Each member that is being served holds its own gate, so
 /// two different members never wait for each other. The entry is removed when
 /// the last press of that member is done, so the memory is bounded by the
 /// number of members that press at the same time.
+///
+/// The waiter count is taken and given back under the map lock, so a press
+/// that waits for the gate can never be counted as gone: the entry is only
+/// removed when no press of that member is left.
 #[derive(Debug, Default)]
 pub struct MemberLocks {
-    inner: Mutex<HashMap<u64, Arc<MemberLock>>>,
+    inner: Mutex<HashMap<u64, MemberEntry>>,
 }
 
 impl MemberLocks {
@@ -512,17 +601,13 @@ impl MemberLocks {
     /// same member that overlap in time run one after the other: the second
     /// one waits for the first to finish.
     pub fn with_member<T>(&self, member_id: u64, work: impl FnOnce() -> T) -> T {
-        let lock = self.lock_for(member_id);
-        {
-            let mut waiting = lock.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            *waiting += 1;
-        }
-        let guard = lock.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = self.acquire(member_id);
+        let guard = gate.gate.lock().unwrap_or_else(|e| e.into_inner());
         // The guard releases the member's turn even when the work unwinds.
         let turn = TurnGuard {
             locks: self,
             member_id,
-            lock: Arc::clone(&lock),
+            gate: Arc::clone(&gate),
         };
         let result = work();
         drop(guard);
@@ -530,30 +615,33 @@ impl MemberLocks {
         result
     }
 
-    /// The lock of one member, taken out of the map.
-    fn lock_for(&self, member_id: u64) -> Arc<MemberLock> {
+    /// Take the member's gate and count this press as one of its waiters.
+    ///
+    /// The count happens under the map lock, so a press that waits for the
+    /// gate is already counted when the press that holds it gives the turn
+    /// back.
+    fn acquire(&self, member_id: u64) -> Arc<MemberGate> {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(
-            map.entry(member_id)
-                .or_insert_with(|| Arc::new(MemberLock::default())),
-        )
+        let entry = map.entry(member_id).or_insert_with(|| MemberEntry {
+            gate: Arc::new(MemberGate::default()),
+            waiters: 0,
+        });
+        entry.waiters += 1;
+        Arc::clone(&entry.gate)
     }
 
     /// Give the member's turn back and drop the entry when nobody waits.
-    fn finish(&self, member_id: u64, lock: &Arc<MemberLock>) {
-        let last = {
-            let mut waiting = lock.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            *waiting = waiting.saturating_sub(1);
-            *waiting == 0
+    fn finish(&self, member_id: u64, gate: &Arc<MemberGate>) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = map.get_mut(&member_id) else {
+            return;
         };
-        if last {
-            let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let still_the_same = map
-                .get(&member_id)
-                .is_some_and(|current| Arc::ptr_eq(current, lock));
-            if still_the_same {
-                map.remove(&member_id);
-            }
+        if !Arc::ptr_eq(&entry.gate, gate) {
+            return;
+        }
+        entry.waiters = entry.waiters.saturating_sub(1);
+        if entry.waiters == 0 {
+            map.remove(&member_id);
         }
     }
 }
@@ -602,48 +690,9 @@ where
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    // 1. The feature must be on and the home guild must be known.
-    if settings.mode == Mode::Off {
-        return PressOutcome::ignored(Outcome::new(Code::Disabled));
-    }
-    let Some(home) = settings.home_guild else {
-        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
-    };
-    if home == 0 {
-        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
-    }
-    // 2. Only the home guild is served. A press from another guild touches
-    //    nothing at all: not even the member's roles are read.
-    if press.guild_id != home {
-        return PressOutcome::ignored(Outcome::new(Code::OtherGuild));
-    }
-    // 3. The custom id is parsed strictly. A forged id is ignored before any
-    //    member data is read.
-    let parsed = match parse_custom_id(&press.custom_id) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            ports.reporter.report(&format!(
-                "rolemenu_press guild={} member={} error={}",
-                press.guild_id,
-                press.member_id,
-                error.code()
-            ));
-            return PressOutcome::ignored(Outcome::new(Code::InvalidCustomId));
-        }
-    };
-
-    // 4. The acknowledgement comes before the work.
-    if ports.responder.defer().is_err() {
-        ports.reporter.report(&format!(
-            "rolemenu_press guild={} member={} error=defer_failed",
-            press.guild_id, press.member_id
-        ));
-        return PressOutcome::ignored(Outcome::new(Code::StoreFailed));
-    }
-
-    // 5. One member at a time: the whole read-modify-write cycle of a press
-    //    runs under the member's lock.
-    locks.with_member(press.member_id, || serve(settings, press, parsed, ports))
+    // RED STUB: the behaviour is not implemented yet.
+    let _ = (settings, locks, press, ports);
+    PressOutcome::ignored(Outcome::new(Code::NoChange))
 }
 
 /// The work of one press, under the member's lock.
@@ -658,238 +707,104 @@ where
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    // The stored row is the truth: the menu must exist and belong to this
-    // guild.
-    let menu = match ports.store.get_menu_by_id(parsed.menu_id) {
-        Ok(Some(menu)) => menu,
-        Ok(None) => return notice(ports, press, Outcome::new(Code::MenuNotFound)),
-        Err(error) => return notice(ports, press, Outcome::with(Code::StoreFailed, error.code())),
-    };
-    if menu.guild != press.guild_id {
-        return notice(ports, press, Outcome::new(Code::GuildMismatch));
-    }
-    // The message the component is on must be the one the row records.
-    match menu.message {
-        Some(message) if message == press.message_id => {}
-        _ => return notice(ports, press, Outcome::new(Code::MessageMismatch)),
-    }
-    // The option must still be stored.
-    let options = match ports.store.list_options(parsed.menu_id) {
-        Ok(options) => options,
-        Err(error) => return notice(ports, press, Outcome::with(Code::StoreFailed, error.code())),
-    };
-    let Some(option) = options.get(parsed.option_index) else {
-        return notice(ports, press, Outcome::new(Code::OptionNotFound));
-    };
-    let role_id = option.role;
+    // RED STUB: the behaviour is not implemented yet.
+    let _ = (settings, press, parsed, ports);
+    PressOutcome::ignored(Outcome::new(Code::NoChange))
+}
 
-    // The stored menu becomes the shared policy menu. A row whose mode is not
-    // known is corrupt and must not fall back to a more permissive mode.
-    let policy_menu = match to_policy_menu(&menu, &options) {
-        Ok(policy_menu) => policy_menu,
-        Err(_) => return notice(ports, press, Outcome::new(Code::CorruptRow)),
-    };
-    let group_id = match policy_menu.groups.first() {
-        Some(group) => group.id.clone(),
-        None => return notice(ports, press, Outcome::new(Code::CorruptRow)),
-    };
-
-    // An unreadable protected-role list refuses every press.
-    if settings.protected_roles_invalid {
-        return notice(ports, press, Outcome::new(Code::Ineligible));
-    }
-
-    // The member's roles are read from the role service, not from the press.
-    let member_roles = match ports.roles.member_roles(press.guild_id, press.member_id) {
-        Ok(roles) => roles,
-        Err(error) => {
-            return notice(
-                ports,
-                press,
-                Outcome::with(Code::MemberRolesUnavailable, error.code()),
-            )
-        }
-    };
-
-    // The bot's top role position decides which roles the bot may hand out.
-    let bot_top = match ports.facts.bot_top_position(press.guild_id) {
-        Ok(top) => top,
-        Err(error) => {
-            return notice(
-                ports,
-                press,
-                Outcome::with(Code::FactsUnavailable, error.code()),
-            )
-        }
-    };
-
-    // The facts of every role the press may touch are read once.
-    let mut facts_by_role = Vec::new();
-    for option in &options {
-        let facts = match ports.facts.role_facts(press.guild_id, option.role) {
-            Ok(Some(facts)) => facts,
-            Ok(None) => RoleFacts {
-                id: option.role,
-                position: 0,
-                managed: false,
-                permissions: 0,
-                exists: false,
-            },
-            Err(error) => {
-                return notice(
-                    ports,
-                    press,
-                    Outcome::with(Code::FactsUnavailable, error.code()),
-                )
+/// stored option of this menu.
+fn collect_targets(
+    press: &Press,
+    selector: Selector,
+    options: &[OptionRow],
+) -> Result<Vec<u64>, Outcome> {
+    match selector {
+        Selector::Option(role_id) => {
+            if !options.iter().any(|option| option.role == role_id) {
+                return Err(Outcome::new(Code::OptionNotFound));
             }
-        };
-        facts_by_role.push(facts);
-    }
-
-    // The click is planned by the shared RM1 policy.
-    let plan = match policy::plan_click(&policy::PlanRequest {
-        menu: &policy_menu,
-        click: &policy::Click {
-            member_roles: member_roles.clone(),
-            group_id,
-            option_role_id: role_id,
-        },
-        grant: policy::GrantContext {
-            guild_id: press.guild_id,
-            bot_top_position: bot_top,
-            role_facts: &facts_by_role,
-            protected_role_ids: &settings.protected_role_ids,
-            safeword: press.safeword,
-            safeword_restricted_role_ids: &settings.safeword_restricted_role_ids,
-        },
-    }) {
-        Ok(plan) => plan,
-        Err(error) => return notice(ports, press, Outcome::with(Code::Ineligible, error.code())),
-    };
-
-    // The policy's own reasons are reported first: a refusal that never
-    // reaches a write. A blocked swap is reported as `swap_blocked` even
-    // though the policy also names the removal that could not be done.
-    let blocked_swap = plan
-        .skipped
-        .iter()
-        .any(|(_, reason)| matches!(reason, policy::Reason::SwapBlocked));
-    if blocked_swap {
-        return notice(ports, press, Outcome::new(Code::SwapBlocked));
-    }
-    if let Some((_, reason)) = plan.skipped.first() {
-        let code = match reason {
-            policy::Reason::Denied(deny) => Outcome::with(Code::Ineligible, deny.code()),
-            policy::Reason::RemovalDenied(deny) => Outcome::with(Code::Ineligible, deny.code()),
-            policy::Reason::UnknownOption => Outcome::new(Code::UnknownOption),
-            policy::Reason::MaxReached => Outcome::new(Code::MaxReached),
-            policy::Reason::AlreadySelected => Outcome::new(Code::AlreadySelected),
-            policy::Reason::SwapBlocked => Outcome::new(Code::SwapBlocked),
-        };
-        return notice(ports, press, code);
-    }
-
-    // The policy's plan is the only thing that authorizes a write: the
-    // handler writes exactly `plan.add` and `plan.remove` and nothing else.
-    // The press-time refusal of a protected, managed or privileged role is
-    // therefore the policy's own answer: RM1's `check_add` calls K03
-    // `decide` on `GrantPath::Menu` for every role it plans to add, so a
-    // stored row that somehow lists such a role is refused here, at press
-    // time. The handler does not decide again: a second decision could
-    // disagree with the plan it is about to write.
-
-    // In shadow mode nothing is written; the outcome says what would happen.
-    if settings.mode == Mode::Shadow {
-        let outcome = shadow_outcome(&plan);
-        let result = PressOutcome {
-            outcome,
-            added: plan.add.clone(),
-            removed: plan.remove.clone(),
-            shadow: true,
-        };
-        finish(ports, &result);
-        return result;
-    }
-
-    // The removals come first, then the addition: an exclusive swap leaves
-    // the member with the option they pressed.
-    let mut removed = Vec::new();
-    let mut add_failed = false;
-    let mut remove_failed = false;
-    for &role in &plan.remove {
-        match ports.roles.remove_role(press.member_id, role) {
-            Ok(()) => removed.push(role),
-            Err(error) => {
-                remove_failed = true;
-                report_write_failure(ports, press, role, &error);
+            Ok(vec![role_id])
+        }
+        Selector::Select => {
+            if press.values.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-    }
-    let mut added = Vec::new();
-    for &role in &plan.add {
-        match ports.roles.add_role(press.member_id, role) {
-            Ok(()) => added.push(role),
-            Err(error) => {
-                add_failed = true;
-                report_write_failure(ports, press, role, &error);
+            if press.values.len() > policy::SELECT_OPTION_LIMIT {
+                return Err(Outcome::new(Code::TooManySelected));
             }
+            let mut targets = Vec::with_capacity(press.values.len());
+            for value in &press.values {
+                let role_id = match parse_value(value) {
+                    Ok(role_id) => role_id,
+                    Err(_) => return Err(Outcome::new(Code::InvalidValue)),
+                };
+                if !options.iter().any(|option| option.role == role_id) {
+                    return Err(Outcome::new(Code::OptionNotFound));
+                }
+                if targets.contains(&role_id) {
+                    return Err(Outcome::new(Code::InvalidValue));
+                }
+                targets.push(role_id);
+            }
+            Ok(targets)
         }
     }
-
-    let outcome = if add_failed || remove_failed {
-        // A failure is never reported as a success. A swap that added the
-        // new option but could not remove an old one says exactly that.
-        if !added.is_empty() && remove_failed {
-            Outcome::new(Code::SwapPartial)
-        } else {
-            Outcome::with(Code::WriteFailed, FailCode::Other.code())
-        }
-    } else if added.is_empty() && removed.is_empty() {
-        Outcome::new(Code::NoChange)
-    } else if added.is_empty() {
-        Outcome::new(Code::Removed)
-    } else if removed.is_empty() {
-        Outcome::new(Code::Added)
-    } else {
-        Outcome::new(Code::Swapped)
-    };
-
-    let result = PressOutcome {
-        outcome,
-        added,
-        removed,
-        shadow: false,
-    };
-    finish(ports, &result);
-    result
 }
 
 /// The outcome a shadow press reports: what it would have done.
-fn shadow_outcome(plan: &policy::Plan) -> Outcome {
-    if plan.add.is_empty() && plan.remove.is_empty() {
+fn shadow_outcome(add: &[u64], remove: &[u64], refusal: Option<Outcome>) -> Outcome {
+    if let Some(outcome) = refusal {
+        return Outcome::with(Code::Partial, outcome.detail.unwrap_or("refused"));
+    }
+    if add.is_empty() && remove.is_empty() {
         Outcome::new(Code::NoChange)
-    } else if plan.add.is_empty() {
+    } else if add.is_empty() {
         Outcome::new(Code::Removed)
-    } else if plan.remove.is_empty() {
+    } else if remove.is_empty() {
         Outcome::new(Code::Added)
     } else {
         Outcome::new(Code::Swapped)
+    }
+}
+
+/// Remove one role, retrying a rate limit a bounded number of times.
+///
+/// The shape is the one RR2 uses: only a 429 is retried, and the wait is
+/// clamped.
+fn remove_with_retry<R: RoleRemover, L: grant::Sleeper>(
+    remover: &mut R,
+    sleeper: &mut L,
+    member_id: u64,
+    role_id: u64,
+) -> Result<(), FailCode> {
+    let mut retries: u8 = 0;
+    loop {
+        let error = match remover.remove_role(member_id, role_id) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let code = grant::classify(&error);
+        if code == FailCode::RateLimited && retries < grant::MAX_RATE_LIMIT_RETRIES {
+            retries += 1;
+            let wait = error
+                .retry_after_ms
+                .unwrap_or(grant::DEFAULT_BACKOFF_MS * u64::from(retries))
+                .min(grant::MAX_SLEEP_MS);
+            sleeper.sleep_ms(wait);
+            continue;
+        }
+        return Err(code);
     }
 }
 
 /// Report one failed role write with a stable code.
-fn report_write_failure<S, F, R>(
-    ports: &mut PressPorts<'_, S, F, R>,
+fn report_write_failure(
+    reporter: &mut dyn FailureReporter,
     press: &Press,
     role: u64,
-    error: &WriteError,
-) where
-    S: MenuStore + ?Sized,
-    F: RoleFactsSource + ?Sized,
-    R: RoleService,
-{
-    let code = grant::classify(error);
-    ports.reporter.report(&format!(
+    code: FailCode,
+) {
+    reporter.report(&format!(
         "rolemenu_press guild={} member={} role={role}:failed:{}",
         press.guild_id,
         press.member_id,
@@ -898,13 +813,21 @@ fn report_write_failure<S, F, R>(
 }
 
 /// Send the ephemeral follow-up.
+///
+/// A follow-up that fails is a lost answer, so it is reported: it is never
+/// discarded.
 fn finish<S, F, R>(ports: &mut PressPorts<'_, S, F, R>, result: &PressOutcome)
 where
     S: MenuStore + ?Sized,
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    let _ = ports.responder.follow_up(&result.outcome.text());
+    if ports.responder.follow_up(&result.outcome.text()).is_err() {
+        ports.reporter.report(&format!(
+            "rolemenu_press error=follow_up_failed outcome={}",
+            result.outcome.text()
+        ));
+    }
 }
 
 /// Answer with a notice: an ephemeral follow-up and no write at all.
@@ -925,7 +848,12 @@ where
         outcome.text()
     ));
     let result = PressOutcome::ignored(outcome);
-    let _ = ports.responder.follow_up(&result.outcome.text());
+    if ports.responder.follow_up(&result.outcome.text()).is_err() {
+        ports.reporter.report(&format!(
+            "rolemenu_press error=follow_up_failed outcome={}",
+            result.outcome.text()
+        ));
+    }
     result
 }
 
@@ -935,7 +863,7 @@ mod tests {
     use crate::roles::eligibility::{ADMINISTRATOR, MANAGE_ROLES};
     use rusqlite::Connection;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     // Synthetic ids only; never a real Discord id.
@@ -947,6 +875,7 @@ mod tests {
     const ROLE_A: u64 = 770_101;
     const ROLE_B: u64 = 770_102;
     const ROLE_C: u64 = 770_103;
+    const ROLE_D: u64 = 770_104;
     const BOT_TOP: u16 = 10;
 
     // ---------------------------------------------------------------------
@@ -1043,11 +972,15 @@ mod tests {
     }
 
     /// A role service over a plain member-role map, with scripted failures.
+    ///
+    /// The add failures are a queue per role: every call takes the next
+    /// scripted result, so a 429 can be scripted to fail once and then
+    /// succeed.
     #[derive(Default)]
     struct FakeRoles {
         held: HashMap<u64, Vec<u64>>,
-        add_failures: HashMap<u64, WriteError>,
-        remove_failures: HashMap<u64, WriteError>,
+        add_failures: HashMap<u64, Vec<WriteError>>,
+        remove_failures: HashMap<u64, Vec<WriteError>>,
         add_calls: Mutex<Vec<u64>>,
         remove_calls: Mutex<Vec<u64>>,
         member_roles_fail: Option<LookupFail>,
@@ -1066,6 +999,53 @@ mod tests {
         fn removed(&self) -> Vec<u64> {
             self.remove_calls.lock().expect("remove calls").clone()
         }
+        fn add_call_count(&self, role_id: u64) -> usize {
+            self.add_calls
+                .lock()
+                .expect("add calls")
+                .iter()
+                .filter(|r| **r == role_id)
+                .count()
+        }
+        fn remove_call_count(&self, role_id: u64) -> usize {
+            self.remove_calls
+                .lock()
+                .expect("remove calls")
+                .iter()
+                .filter(|r| **r == role_id)
+                .count()
+        }
+    }
+
+    impl grant::RoleWriter for FakeRoles {
+        fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+            self.add_calls.lock().expect("add calls").push(role_id);
+            if let Some(queue) = self.add_failures.get_mut(&role_id) {
+                if !queue.is_empty() {
+                    return Err(queue.remove(0));
+                }
+            }
+            self.held.entry(member_id).or_default().push(role_id);
+            Ok(())
+        }
+    }
+
+    impl RoleRemover for FakeRoles {
+        fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+            self.remove_calls
+                .lock()
+                .expect("remove calls")
+                .push(role_id);
+            if let Some(queue) = self.remove_failures.get_mut(&role_id) {
+                if !queue.is_empty() {
+                    return Err(queue.remove(0));
+                }
+            }
+            if let Some(list) = self.held.get_mut(&member_id) {
+                list.retain(|r| *r != role_id);
+            }
+            Ok(())
+        }
     }
 
     impl RoleService for FakeRoles {
@@ -1076,26 +1056,23 @@ mod tests {
                 None => Ok(self.held.get(&member_id).cloned().unwrap_or_default()),
             }
         }
-        fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
-            self.add_calls.lock().expect("add calls").push(role_id);
-            if let Some(error) = self.add_failures.get(&role_id) {
-                return Err(*error);
-            }
-            self.held.entry(member_id).or_default().push(role_id);
-            Ok(())
+    }
+
+    /// A sleeper that records the waits instead of waiting.
+    #[derive(Default)]
+    struct FakeSleeper {
+        slept: Mutex<Vec<u64>>,
+    }
+
+    impl FakeSleeper {
+        fn slept(&self) -> Vec<u64> {
+            self.slept.lock().expect("slept").clone()
         }
-        fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
-            self.remove_calls
-                .lock()
-                .expect("remove calls")
-                .push(role_id);
-            if let Some(error) = self.remove_failures.get(&role_id) {
-                return Err(*error);
-            }
-            if let Some(list) = self.held.get_mut(&member_id) {
-                list.retain(|r| *r != role_id);
-            }
-            Ok(())
+    }
+
+    impl grant::Sleeper for FakeSleeper {
+        fn sleep_ms(&mut self, ms: u64) {
+            self.slept.lock().expect("slept").push(ms);
         }
     }
 
@@ -1104,6 +1081,7 @@ mod tests {
     struct FakeResponder {
         calls: Mutex<Vec<String>>,
         defer_fails: bool,
+        follow_up_fails: bool,
     }
 
     impl FakeResponder {
@@ -1133,7 +1111,11 @@ mod tests {
                 .lock()
                 .expect("calls")
                 .push(format!("follow_up:{text}"));
-            Ok(())
+            if self.follow_up_fails {
+                Err(())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1142,6 +1124,14 @@ mod tests {
             status: 403,
             api_code: None,
             retry_after_ms: None,
+        }
+    }
+
+    fn rate_limited(retry_after_ms: Option<u64>) -> WriteError {
+        WriteError {
+            status: 429,
+            api_code: None,
+            retry_after_ms,
         }
     }
 
@@ -1172,14 +1162,28 @@ mod tests {
         Settings::live(HOME)
     }
 
+    /// A press of the button of one option.
     fn press(custom_id: &str) -> Press {
         Press {
             guild_id: HOME,
             message_id: MESSAGE,
             member_id: MEMBER,
             custom_id: custom_id.to_string(),
+            values: Vec::new(),
             safeword: SafewordState::Inactive,
         }
+    }
+
+    /// A press of the button of one option of a menu.
+    fn press_option(menu_id: i64, role_id: u64) -> Press {
+        press(&custom_id_for_option(menu_id, role_id).expect("custom id"))
+    }
+
+    /// A press of the select component of a menu, with the given values.
+    fn press_select(menu_id: i64, values: &[u64]) -> Press {
+        let mut press = press(&custom_id_for_select(menu_id).expect("custom id"));
+        press.values = values.iter().map(|role| role.to_string()).collect();
+        press
     }
 
     /// A whole press with the fakes wired up.
@@ -1189,8 +1193,8 @@ mod tests {
         roles: FakeRoles,
         responder: FakeResponder,
         reporter: MemoryReporter,
+        sleeper: FakeSleeper,
         locks: MemberLocks,
-        clock: FixedClock,
     }
 
     impl<S: MenuStore> Harness<S> {
@@ -1201,8 +1205,8 @@ mod tests {
                 roles,
                 responder: FakeResponder::default(),
                 reporter: MemoryReporter::default(),
+                sleeper: FakeSleeper::default(),
                 locks: MemberLocks::new(),
-                clock: FixedClock { now: 1_700_000_000 },
             }
         }
 
@@ -1211,7 +1215,7 @@ mod tests {
                 store: &self.store,
                 facts: &self.facts,
                 roles: &mut self.roles,
-                clock: &self.clock,
+                sleeper: &mut self.sleeper,
                 reporter: &mut self.reporter,
                 responder: &mut self.responder,
             };
@@ -1235,53 +1239,83 @@ mod tests {
         )
     }
 
+    /// An exclusive menu with three options.
+    fn exclusive_menu() -> FakeStore {
+        let mut store = multi_menu();
+        store.menus.get_mut(&1).expect("menu").mode = "exclusive".to_string();
+        store
+    }
+
     // ---------------------------------------------------------------------
     // Custom id parsing
     // ---------------------------------------------------------------------
 
     #[test]
-    fn a_well_formed_custom_id_names_a_menu_and_an_option() {
-        let parsed = parse_custom_id("rolemenu:v1:m12:o3").expect("parsed");
+    fn a_well_formed_button_id_names_a_menu_and_a_role() {
+        let parsed = parse_custom_id("rolemenu:v1:m12:r3").expect("parsed");
         assert_eq!(parsed.menu_id, 12);
-        assert_eq!(parsed.option_index, 3);
+        assert_eq!(parsed.selector, Selector::Option(3));
     }
 
     #[test]
-    fn custom_id_round_trips() {
-        let raw = custom_id_for(42, 7).expect("built");
-        assert_eq!(raw, "rolemenu:v1:m42:o7");
+    fn a_well_formed_select_id_names_a_menu_and_no_role() {
+        let parsed = parse_custom_id("rolemenu:v1:m12:s").expect("parsed");
+        assert_eq!(parsed.menu_id, 12);
+        assert_eq!(parsed.selector, Selector::Select);
+    }
+
+    #[test]
+    fn the_option_custom_id_round_trips() {
+        let raw = custom_id_for_option(42, 7).expect("built");
+        assert_eq!(raw, "rolemenu:v1:m42:r7");
         let parsed = parse_custom_id(&raw).expect("parsed");
         assert_eq!(parsed.menu_id, 42);
-        assert_eq!(parsed.option_index, 7);
+        assert_eq!(parsed.selector, Selector::Option(7));
+    }
+
+    #[test]
+    fn the_select_custom_id_round_trips() {
+        let raw = custom_id_for_select(42).expect("built");
+        assert_eq!(raw, "rolemenu:v1:m42:s");
+        let parsed = parse_custom_id(&raw).expect("parsed");
+        assert_eq!(parsed.menu_id, 42);
+        assert_eq!(parsed.selector, Selector::Select);
     }
 
     #[test]
     fn a_custom_id_longer_than_the_limit_is_refused() {
-        let raw = format!("rolemenu:v1:m1:o{}", "9".repeat(MAX_CUSTOM_ID_LEN));
+        let raw = format!("rolemenu:v1:m1:r{}", "9".repeat(MAX_CUSTOM_ID_LEN));
         assert!(raw.len() > MAX_CUSTOM_ID_LEN);
         assert_eq!(parse_custom_id(&raw), Err(ParseError::TooLong));
     }
 
     #[test]
-    fn a_custom_id_at_the_limit_is_still_parsed() {
-        // A menu id and an option index that are long enough to fill the
-        // limit but still name a row.
-        let fixed = format!("rolemenu:v1:m{}:o{}", 1, 2);
-        let padding = MAX_CUSTOM_ID_LEN - fixed.len();
-        let raw = format!("rolemenu:v1:m{:0>width$}:o{}", 1, 2, width = 1 + padding);
-        assert_eq!(raw.len(), MAX_CUSTOM_ID_LEN);
+    fn the_longest_writable_custom_id_is_parsed() {
+        // The longest id the bot can write: a menu id with the most digits an
+        // i64 holds and a role id with the most digits a u64 holds.
+        let raw = format!("rolemenu:v1:m{}:r{}", i64::MAX, u64::MAX);
+        assert!(raw.len() < MAX_CUSTOM_ID_LEN);
         let parsed = parse_custom_id(&raw).expect("parsed");
-        assert_eq!(parsed.menu_id, 1);
-        assert_eq!(parsed.option_index, 2);
+        assert_eq!(parsed.menu_id, i64::MAX);
+        assert_eq!(parsed.selector, Selector::Option(u64::MAX));
+    }
+
+    #[test]
+    fn a_custom_id_that_fills_the_limit_is_still_length_accepted() {
+        // An id that fills Discord's limit exactly passes the length check;
+        // it is refused later only because its role id does not fit a u64.
+        let raw = format!("rolemenu:v1:m1:r{}", "9".repeat(MAX_CUSTOM_ID_LEN - 16));
+        assert_eq!(raw.len(), MAX_CUSTOM_ID_LEN);
+        assert_eq!(parse_custom_id(&raw), Err(ParseError::BadNumber));
     }
 
     #[test]
     fn a_foreign_prefix_is_refused() {
         assert_eq!(
-            parse_custom_id("rolemenu:v2:m1:o0"),
+            parse_custom_id("rolemenu:v2:m1:r0"),
             Err(ParseError::BadPrefix)
         );
-        assert_eq!(parse_custom_id("vc:v1:m1:o0"), Err(ParseError::BadPrefix));
+        assert_eq!(parse_custom_id("vc:v1:m1:r0"), Err(ParseError::BadPrefix));
         assert_eq!(parse_custom_id(""), Err(ParseError::BadPrefix));
     }
 
@@ -1290,15 +1324,17 @@ mod tests {
         for raw in [
             "rolemenu:v1:",
             "rolemenu:v1:m1",
-            "rolemenu:v1:o1",
+            "rolemenu:v1:r1",
             "rolemenu:v1:m1:",
-            "rolemenu:v1::o1",
-            "rolemenu:v1:m1:o1:extra",
-            "rolemenu:v1:x1:o1",
+            "rolemenu:v1::r1",
+            "rolemenu:v1:m1:r1:extra",
+            "rolemenu:v1:x1:r1",
             "rolemenu:v1:m1:x1",
-            "rolemenu:v1:m1:o1 ",
-            "rolemenu:v1:m 1:o1",
-            "rolemenu:v1:m1:o1\u{0}",
+            "rolemenu:v1:m1:r1 ",
+            "rolemenu:v1:m 1:r1",
+            "rolemenu:v1:m1:r1\u{0}",
+            "rolemenu:v1:m1:sx",
+            "rolemenu:v1:m1:S",
         ] {
             assert!(parse_custom_id(raw).is_err(), "{raw:?} must not parse");
         }
@@ -1307,14 +1343,14 @@ mod tests {
     #[test]
     fn a_custom_id_with_a_hostile_number_is_refused() {
         for raw in [
-            "rolemenu:v1:m-1:o0",
-            "rolemenu:v1:m+1:o0",
-            "rolemenu:v1:m1e3:o0",
-            "rolemenu:v1:m0:o0",
-            "rolemenu:v1:m1:o-1",
-            "rolemenu:v1:m1:o1_0",
-            "rolemenu:v1:m\u{0661}:o0",
-            "rolemenu:v1:m1:o\u{0661}",
+            "rolemenu:v1:m-1:r0",
+            "rolemenu:v1:m+1:r0",
+            "rolemenu:v1:m1e3:r0",
+            "rolemenu:v1:m0:r0",
+            "rolemenu:v1:m1:r-1",
+            "rolemenu:v1:m1:r1_0",
+            "rolemenu:v1:m\u{0661}:r0",
+            "rolemenu:v1:m1:r\u{0661}",
         ] {
             assert_eq!(
                 parse_custom_id(raw),
@@ -1325,8 +1361,27 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_id_with_a_huge_option_index_is_refused() {
-        let raw = format!("rolemenu:v1:m1:o{}", "9".repeat(30));
+    fn a_custom_id_with_a_non_canonical_number_is_refused() {
+        // The bot writes a number in one way only. A spelling with a leading
+        // zero names the same number but is not the spelling the bot writes,
+        // so it is refused instead of being normalized.
+        for raw in [
+            "rolemenu:v1:m001:r0",
+            "rolemenu:v1:m1:r000",
+            "rolemenu:v1:m01:s",
+            "rolemenu:v1:m1:r01",
+        ] {
+            assert_eq!(
+                parse_custom_id(raw),
+                Err(ParseError::NotCanonical),
+                "{raw:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_id_with_a_huge_number_is_refused() {
+        let raw = format!("rolemenu:v1:m1:r{}", "9".repeat(30));
         assert_eq!(parse_custom_id(&raw), Err(ParseError::BadNumber));
     }
 
@@ -1336,6 +1391,28 @@ mod tests {
         assert_eq!(ParseError::BadPrefix.code(), "custom_id_bad_prefix");
         assert_eq!(ParseError::Malformed.code(), "custom_id_malformed");
         assert_eq!(ParseError::BadNumber.code(), "custom_id_bad_number");
+        assert_eq!(ParseError::NotCanonical.code(), "custom_id_not_canonical");
+    }
+
+    #[test]
+    fn a_value_is_parsed_strictly() {
+        assert_eq!(parse_value("42"), Ok(42));
+        for raw in ["", "0", "01", "-1", "+1", "4 2", "42x", "\u{0661}", "999999999999999999999999"] {
+            assert!(parse_value(raw).is_err(), "{raw:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_custom_id_for_a_zero_id_is_refused() {
+        assert_eq!(
+            custom_id_for_option(0, ROLE_A),
+            Err(ParseError::BadNumber)
+        );
+        assert_eq!(
+            custom_id_for_option(1, 0),
+            Err(ParseError::BadNumber)
+        );
+        assert_eq!(custom_id_for_select(0), Err(ParseError::BadNumber));
     }
 
     // ---------------------------------------------------------------------
@@ -1352,7 +1429,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.mode = Mode::Off;
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Disabled);
         assert_eq!(harness.store.menu_reads(), 0);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
@@ -1369,7 +1446,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.home_guild = None;
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::NoHomeGuild);
         assert_eq!(harness.store.menu_reads(), 0);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
@@ -1385,7 +1462,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.home_guild = Some(0);
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::NoHomeGuild);
         assert_eq!(harness.store.menu_reads(), 0);
     }
@@ -1398,7 +1475,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let mut other = press("rolemenu:v1:m1:o0");
+        let mut other = press_option(1, ROLE_A);
         other.guild_id = OTHER_GUILD;
         let result = harness.run(&settings(), &other);
         assert_eq!(result.outcome.code, Code::OtherGuild);
@@ -1424,7 +1501,7 @@ mod tests {
         );
         // A well-formed id that names a menu nobody stored: the press is
         // ignored, the member's roles are never read and nothing is written.
-        let result = harness.run(&settings(), &press("rolemenu:v1:m999:o0"));
+        let result = harness.run(&settings(), &press("rolemenu:v1:m999:r1"));
         assert_eq!(result.outcome.code, Code::MenuNotFound);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
         assert_eq!(harness.facts.reads.load(Ordering::SeqCst), 0);
@@ -1455,7 +1532,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let raw = format!("rolemenu:v1:m1:o{}", "9".repeat(MAX_CUSTOM_ID_LEN));
+        let raw = format!("rolemenu:v1:m1:r{}", "9".repeat(MAX_CUSTOM_ID_LEN));
         let result = harness.run(&settings(), &press(&raw));
         assert_eq!(result.outcome.code, Code::InvalidCustomId);
         assert_eq!(harness.store.menu_reads(), 0);
@@ -1472,12 +1549,26 @@ mod tests {
         );
         // The id is well formed but names a menu that is not stored: the
         // press is ignored and nothing is written.
-        let result = harness.run(&settings(), &press("rolemenu:v1:m2:o0"));
+        let result = harness.run(&settings(), &press("rolemenu:v1:m2:r1"));
         assert_eq!(result.outcome.code, Code::MenuNotFound);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
         assert_eq!(harness.follow_ups(), vec!["menu_not_found".to_string()]);
+    }
+
+    #[test]
+    fn a_button_for_a_role_of_another_menu_is_ignored() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C, ROLE_D]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        // ROLE_D is a real role but not an option of this menu.
+        let result = harness.run(&settings(), &press_option(1, ROLE_D));
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty());
     }
 
     // ---------------------------------------------------------------------
@@ -1492,7 +1583,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::MenuNotFound);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
@@ -1508,10 +1599,32 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o9"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_C));
         assert_eq!(result.outcome.code, Code::OptionNotFound);
         assert!(harness.roles.added().is_empty());
         assert_eq!(harness.follow_ups(), vec!["option_not_found".to_string()]);
+    }
+
+    #[test]
+    fn a_button_for_an_option_removed_from_the_front_grants_nothing() {
+        // The button names the role, not the position of the option, so
+        // removing the first option cannot make the old button grant the
+        // option that took its place.
+        let mut store = multi_menu();
+        store.options.get_mut(&1).expect("options").remove(0);
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
+        // The button of the option that is still there works.
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(harness.roles.added(), vec![ROLE_B]);
     }
 
     #[test]
@@ -1522,7 +1635,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let mut other = press("rolemenu:v1:m1:o0");
+        let mut other = press_option(1, ROLE_A);
         other.message_id = OTHER_MESSAGE;
         let result = harness.run(&settings(), &other);
         assert_eq!(result.outcome.code, Code::MessageMismatch);
@@ -1541,7 +1654,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::GuildMismatch);
         assert!(harness.roles.added().is_empty());
     }
@@ -1554,7 +1667,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::MessageMismatch);
         assert!(harness.roles.added().is_empty());
     }
@@ -1568,7 +1681,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::StoreFailed);
         assert_eq!(result.outcome.detail, Some("sqlite_error"));
         assert!(harness.roles.added().is_empty());
@@ -1583,7 +1696,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::CorruptRow);
         assert!(harness.roles.added().is_empty());
     }
@@ -1600,7 +1713,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        harness.run(&settings(), &press_option(1, ROLE_A));
         let calls = harness.responder.calls();
         assert_eq!(calls[0], "defer");
         assert!(calls.len() >= 2);
@@ -1615,7 +1728,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        harness.run(&settings(), &press_option(1, ROLE_A));
         // The store was read after the deferral: the responder recorded the
         // deferral first and the store read could only follow it.
         assert_eq!(harness.responder.calls()[0], "defer");
@@ -1631,12 +1744,18 @@ mod tests {
             FakeRoles::new(MEMBER, &[]),
         );
         harness.responder.defer_fails = true;
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
-        assert_eq!(result.outcome.code, Code::StoreFailed);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.code, Code::DeferFailed);
         assert_eq!(harness.store.menu_reads(), 0);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
         assert!(harness.roles.added().is_empty());
         assert_eq!(harness.responder.calls(), vec!["defer".to_string()]);
+        // The failure is reported, not discarded.
+        assert!(harness
+            .reporter
+            .lines
+            .iter()
+            .any(|line| line.contains("defer_failed")));
     }
 
     // ---------------------------------------------------------------------
@@ -1651,7 +1770,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Added);
         assert_eq!(result.added, vec![ROLE_A]);
         assert_eq!(harness.roles.added(), vec![ROLE_A]);
@@ -1665,7 +1784,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[ROLE_A]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Removed);
         assert_eq!(result.removed, vec![ROLE_A]);
         assert_eq!(harness.roles.removed(), vec![ROLE_A]);
@@ -1674,14 +1793,13 @@ mod tests {
 
     #[test]
     fn an_exclusive_group_swaps_the_old_option_out() {
-        let mut store = multi_menu();
-        store.menus.get_mut(&1).expect("menu").mode = "exclusive".to_string();
+        let store = exclusive_menu();
         let mut harness = Harness::new(
             store,
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[ROLE_A]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o1"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
         assert_eq!(result.outcome.code, Code::Swapped);
         assert_eq!(result.added, vec![ROLE_B]);
         assert_eq!(result.removed, vec![ROLE_A]);
@@ -1692,14 +1810,13 @@ mod tests {
 
     #[test]
     fn pressing_the_held_option_of_an_exclusive_group_changes_nothing() {
-        let mut store = multi_menu();
-        store.menus.get_mut(&1).expect("menu").mode = "exclusive".to_string();
+        let store = exclusive_menu();
         let mut harness = Harness::new(
             store,
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[ROLE_A]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::AlreadySelected);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
@@ -1714,7 +1831,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[ROLE_A, ROLE_B]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o2"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_C));
         assert_eq!(result.outcome.code, Code::MaxReached);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
@@ -1729,34 +1846,58 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[ROLE_A, ROLE_B]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Removed);
         assert_eq!(harness.roles.removed(), vec![ROLE_A]);
     }
 
     #[test]
     fn a_swap_whose_removal_fails_is_reported_as_partial_and_never_as_success() {
-        let mut store = multi_menu();
-        store.menus.get_mut(&1).expect("menu").mode = "exclusive".to_string();
+        let store = exclusive_menu();
         let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
-        roles.remove_failures.insert(ROLE_A, forbidden());
+        roles
+            .remove_failures
+            .insert(ROLE_A, vec![forbidden()]);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o1"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
         assert_eq!(result.outcome.code, Code::SwapPartial);
         assert_eq!(result.added, vec![ROLE_B]);
         assert!(result.removed.is_empty());
-        // The failure was reported, not discarded.
+        // The failure was reported, not discarded, with the classified code.
         assert!(harness
             .reporter
             .lines
             .iter()
             .any(|line| line.contains("failed:forbidden")));
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+    }
+
+    #[test]
+    fn a_swap_whose_addition_fails_says_the_old_option_is_gone() {
+        // The old option was removed and the new one could not be added: the
+        // member holds neither. The answer says exactly that.
+        let store = exclusive_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
+        roles.add_failures.insert(ROLE_B, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
+        assert_eq!(result.outcome.code, Code::SwapPartialRemoved);
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert!(result.added.is_empty());
+        assert_eq!(result.removed, vec![ROLE_A]);
+        // The member really holds neither option now.
+        assert!(harness
+            .roles
+            .held
+            .get(&MEMBER)
+            .expect("held")
+            .iter()
+            .all(|role| *role != ROLE_A && *role != ROLE_B));
     }
 
     #[test]
     fn a_swap_that_is_blocked_changes_nothing() {
-        let mut store = multi_menu();
-        store.menus.get_mut(&1).expect("menu").mode = "exclusive".to_string();
+        let store = exclusive_menu();
         // The old option sits at the bot's own height: it cannot be removed.
         let mut facts = FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]);
         facts.facts.insert(
@@ -1770,10 +1911,177 @@ mod tests {
             },
         );
         let mut harness = Harness::new(store, facts, FakeRoles::new(MEMBER, &[ROLE_A]));
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o1"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
         assert_eq!(result.outcome.code, Code::SwapBlocked);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // The select path
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_select_with_one_value_adds_that_option() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A]));
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(result.added, vec![ROLE_A]);
+        assert_eq!(harness.roles.added(), vec![ROLE_A]);
+    }
+
+    #[test]
+    fn a_select_with_two_values_adds_both_in_a_multi_group() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A, ROLE_B]));
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(result.added, vec![ROLE_A, ROLE_B]);
+        assert_eq!(harness.roles.added(), vec![ROLE_A, ROLE_B]);
+    }
+
+    #[test]
+    fn a_select_with_two_values_in_an_exclusive_group_is_refused() {
+        let store = exclusive_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A, ROLE_B]));
+        assert_eq!(result.outcome.code, Code::TooManySelected);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
+    }
+
+    #[test]
+    fn a_select_value_of_another_menu_is_refused_and_writes_nothing() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C, ROLE_D]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        // ROLE_D is a real role but not an option of this menu.
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_D]));
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_select_value_that_is_not_a_role_id_is_refused_and_writes_nothing() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let mut bad = press_select(1, &[ROLE_A]);
+        bad.values = vec!["not-a-role".to_string()];
+        let result = harness.run(&settings(), &bad);
+        assert_eq!(result.outcome.code, Code::InvalidValue);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_select_with_a_duplicated_value_is_refused_and_writes_nothing() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A, ROLE_A]));
+        assert_eq!(result.outcome.code, Code::InvalidValue);
+        assert!(harness.roles.added().is_empty());
+    }
+
+    #[test]
+    fn a_select_with_more_values_than_a_select_may_hold_is_refused() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let values: Vec<u64> = (0..=policy::SELECT_OPTION_LIMIT as u64).map(|i| 780_000 + i).collect();
+        let result = harness.run(&settings(), &press_select(1, &values));
+        assert_eq!(result.outcome.code, Code::TooManySelected);
+        assert!(harness.roles.added().is_empty());
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_select_with_no_value_changes_nothing() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[]));
+        assert_eq!(result.outcome.code, Code::NoChange);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
+    }
+
+    #[test]
+    fn a_select_that_toggles_a_held_option_removes_it() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[ROLE_A]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A]));
+        assert_eq!(result.outcome.code, Code::Removed);
+        assert_eq!(result.removed, vec![ROLE_A]);
+    }
+
+    #[test]
+    fn a_select_where_one_value_is_refused_says_it_was_partial() {
+        // The safeword blocks ROLE_A but not ROLE_B: one value is applied and
+        // one is refused, and the answer says so.
+        let store = multi_menu();
+        let mut settings = settings();
+        settings.safeword_restricted_role_ids = vec![ROLE_A];
+        let mut blocked = press_select(1, &[ROLE_A, ROLE_B]);
+        blocked.safeword = SafewordState::Active;
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings, &blocked);
+        assert_eq!(result.outcome.code, Code::Partial);
+        assert_eq!(result.outcome.detail, Some("safeword_restricted"));
+        assert_eq!(result.added, vec![ROLE_B]);
+        assert_eq!(harness.roles.added(), vec![ROLE_B]);
+    }
+
+    #[test]
+    fn a_select_for_a_deleted_option_is_refused_and_writes_nothing() {
+        let mut store = multi_menu();
+        store.options.get_mut(&1).expect("options").retain(|o| o.role != ROLE_A);
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press_select(1, &[ROLE_A]));
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty());
     }
 
     // ---------------------------------------------------------------------
@@ -1790,7 +2098,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.protected_role_ids = vec![ROLE_A];
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Ineligible);
         assert_eq!(result.outcome.detail, Some("protected_role"));
         assert!(harness.roles.added().is_empty());
@@ -1811,7 +2119,7 @@ mod tests {
             },
         );
         let mut harness = Harness::new(store, facts, FakeRoles::new(MEMBER, &[]));
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Ineligible);
         assert_eq!(result.outcome.detail, Some("managed_role"));
         assert!(harness.roles.added().is_empty());
@@ -1832,7 +2140,7 @@ mod tests {
             },
         );
         let mut harness = Harness::new(store, facts, FakeRoles::new(MEMBER, &[]));
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Ineligible);
         assert_eq!(result.outcome.detail, Some("privileged_permission"));
         assert!(harness.roles.added().is_empty());
@@ -1848,7 +2156,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.protected_roles_invalid = true;
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Ineligible);
         assert!(harness.roles.added().is_empty());
     }
@@ -1863,7 +2171,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.safeword_restricted_role_ids = vec![ROLE_A];
-        let mut blocked = press("rolemenu:v1:m1:o0");
+        let mut blocked = press_option(1, ROLE_A);
         blocked.safeword = SafewordState::Active;
         let result = harness.run(&settings, &blocked);
         assert_eq!(result.outcome.code, Code::Ineligible);
@@ -1881,7 +2189,7 @@ mod tests {
         );
         let mut settings = settings();
         settings.safeword_restricted_role_ids = vec![ROLE_C];
-        let mut other = press("rolemenu:v1:m1:o0");
+        let mut other = press_option(1, ROLE_A);
         other.safeword = SafewordState::Active;
         let result = harness.run(&settings, &other);
         assert_eq!(result.outcome.code, Code::Added);
@@ -1893,7 +2201,7 @@ mod tests {
         let store = multi_menu();
         let facts = FakeFacts::new(&[ROLE_B, ROLE_C]);
         let mut harness = Harness::new(store, facts, FakeRoles::new(MEMBER, &[]));
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Ineligible);
         assert_eq!(result.outcome.detail, Some("role_deleted"));
         assert!(harness.roles.added().is_empty());
@@ -1910,7 +2218,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o1"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_B));
         assert_eq!(result.outcome.code, Code::Added);
         assert_eq!(harness.roles.added(), result.added);
         assert_eq!(harness.roles.removed(), result.removed);
@@ -1928,12 +2236,12 @@ mod tests {
         let store = multi_menu();
         let mut harness = Harness::new(
             store,
-            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C, 770_199]),
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C, ROLE_D]),
             FakeRoles::new(MEMBER, &[]),
         );
-        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
-        assert!(!harness.roles.added().contains(&770_199));
-        assert!(!harness.roles.removed().contains(&770_199));
+        harness.run(&settings(), &press_option(1, ROLE_A));
+        assert!(!harness.roles.added().contains(&ROLE_D));
+        assert!(!harness.roles.removed().contains(&ROLE_D));
     }
 
     #[test]
@@ -1942,7 +2250,7 @@ mod tests {
         let mut facts = FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]);
         facts.fail = Some(LookupFail::Unavailable);
         let mut harness = Harness::new(store, facts, FakeRoles::new(MEMBER, &[]));
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::FactsUnavailable);
         assert!(harness.roles.added().is_empty());
     }
@@ -1953,7 +2261,7 @@ mod tests {
         let mut roles = FakeRoles::new(MEMBER, &[]);
         roles.member_roles_fail = Some(LookupFail::Unavailable);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::MemberRolesUnavailable);
         assert!(harness.roles.added().is_empty());
     }
@@ -1966,9 +2274,9 @@ mod tests {
     fn a_failed_add_is_reported_with_a_stable_code() {
         let store = multi_menu();
         let mut roles = FakeRoles::new(MEMBER, &[]);
-        roles.add_failures.insert(ROLE_A, forbidden());
+        roles.add_failures.insert(ROLE_A, vec![forbidden()]);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::WriteFailed);
         assert!(result.added.is_empty());
         assert!(harness
@@ -1979,18 +2287,130 @@ mod tests {
     }
 
     #[test]
+    fn the_member_facing_fail_code_is_the_classified_one() {
+        // A 403 is not reported as `other`.
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[]);
+        roles.add_failures.insert(ROLE_A, vec![forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.detail, Some("forbidden"));
+        assert_eq!(result.outcome.text(), "write_failed (forbidden)");
+    }
+
+    #[test]
+    fn a_rate_limited_add_is_retried_and_then_succeeds() {
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[]);
+        roles
+            .add_failures
+            .insert(ROLE_A, vec![rate_limited(Some(25))]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(result.added, vec![ROLE_A]);
+        // One attempt plus one retry.
+        assert_eq!(harness.roles.add_call_count(ROLE_A), 2);
+        assert_eq!(harness.sleeper.slept(), vec![25]);
+    }
+
+    #[test]
+    fn a_rate_limited_add_that_never_succeeds_is_reported_as_rate_limited() {
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[]);
+        roles.add_failures.insert(
+            ROLE_A,
+            vec![
+                rate_limited(None),
+                rate_limited(None),
+                rate_limited(None),
+                rate_limited(None),
+                rate_limited(None),
+            ],
+        );
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.code, Code::WriteFailed);
+        assert_eq!(result.outcome.detail, Some("rate_limited"));
+        // One attempt plus three retries, then it gives up.
+        assert_eq!(harness.roles.add_call_count(ROLE_A), 4);
+    }
+
+    #[test]
+    fn a_forbidden_add_is_not_retried() {
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[]);
+        roles.add_failures.insert(ROLE_A, vec![forbidden(), forbidden()]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(harness.roles.add_call_count(ROLE_A), 1);
+        assert!(harness.sleeper.slept().is_empty());
+    }
+
+    #[test]
+    fn a_rate_limited_removal_is_retried_and_then_succeeds() {
+        let store = multi_menu();
+        let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
+        roles
+            .remove_failures
+            .insert(ROLE_A, vec![rate_limited(Some(10))]);
+        let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        assert_eq!(result.outcome.code, Code::Removed);
+        assert_eq!(harness.roles.remove_call_count(ROLE_A), 2);
+        assert_eq!(harness.sleeper.slept(), vec![10]);
+    }
+
+    #[test]
     fn a_failed_add_never_echoes_a_role_name_or_member_text() {
         let store = multi_menu();
         let mut roles = FakeRoles::new(MEMBER, &[]);
-        roles.add_failures.insert(ROLE_A, forbidden());
+        roles.add_failures.insert(ROLE_A, vec![forbidden()]);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
-        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        harness.run(&settings(), &press_option(1, ROLE_A));
         let follow_ups = harness.follow_ups();
-        assert_eq!(follow_ups, vec!["write_failed (other)".to_string()]);
+        assert_eq!(follow_ups, vec!["write_failed (forbidden)".to_string()]);
         for line in &harness.reporter.lines {
             assert!(!line.contains("label_"));
             assert!(!line.contains('\u{1F600}'));
         }
+    }
+
+    #[test]
+    fn a_failed_follow_up_is_reported_and_not_discarded() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        harness.responder.follow_up_fails = true;
+        let result = harness.run(&settings(), &press_option(1, ROLE_A));
+        // The role was really added; the answer was lost and that is reported.
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(harness.roles.added(), vec![ROLE_A]);
+        assert!(harness
+            .reporter
+            .lines
+            .iter()
+            .any(|line| line.contains("follow_up_failed")));
+    }
+
+    #[test]
+    fn a_failed_follow_up_of_a_notice_is_reported() {
+        let store = FakeStore::default();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        harness.responder.follow_up_fails = true;
+        harness.run(&settings(), &press_option(1, ROLE_A));
+        assert!(harness
+            .reporter
+            .lines
+            .iter()
+            .any(|line| line.contains("follow_up_failed")));
     }
 
     // ---------------------------------------------------------------------
@@ -2007,13 +2427,30 @@ mod tests {
         );
         let mut settings = settings();
         settings.mode = Mode::Shadow;
-        let result = harness.run(&settings, &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings, &press_option(1, ROLE_A));
         assert_eq!(result.outcome.code, Code::Added);
         assert!(result.shadow);
         assert_eq!(result.added, vec![ROLE_A]);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
         assert!(harness.roles.held.get(&MEMBER).expect("held").is_empty());
+    }
+
+    #[test]
+    fn shadow_mode_writes_nothing_for_a_select_either() {
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let mut settings = settings();
+        settings.mode = Mode::Shadow;
+        let result = harness.run(&settings, &press_select(1, &[ROLE_A, ROLE_B]));
+        assert!(result.shadow);
+        assert_eq!(result.added, vec![ROLE_A, ROLE_B]);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
     }
 
     // ---------------------------------------------------------------------
@@ -2049,10 +2486,7 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
     }
 
-    impl RoleService for LoggingRoles {
-        fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, LookupFail> {
-            self.inner.member_roles(guild_id, member_id)
-        }
+    impl grant::RoleWriter for LoggingRoles {
         fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
             self.log
                 .lock()
@@ -2060,12 +2494,21 @@ mod tests {
                 .push(format!("write:{role_id}"));
             self.inner.add_role(member_id, role_id)
         }
+    }
+
+    impl RoleRemover for LoggingRoles {
         fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
             self.log
                 .lock()
                 .expect("log")
                 .push(format!("write:{role_id}"));
             self.inner.remove_role(member_id, role_id)
+        }
+    }
+
+    impl RoleService for LoggingRoles {
+        fn member_roles(&self, guild_id: u64, member_id: u64) -> Result<Vec<u64>, LookupFail> {
+            self.inner.member_roles(guild_id, member_id)
         }
     }
 
@@ -2097,12 +2540,12 @@ mod tests {
                     };
                     let mut reporter = MemoryReporter::default();
                     let mut responder = FakeResponder::default();
-                    let clock = FixedClock { now: 1_700_000_000 };
+                    let mut sleeper = FakeSleeper::default();
                     let mut ports = PressPorts {
                         store: store.as_ref(),
                         facts: facts.as_ref(),
                         roles: &mut local_roles,
-                        clock: &clock,
+                        sleeper: &mut sleeper,
                         reporter: &mut reporter,
                         responder: &mut responder,
                     };
@@ -2110,7 +2553,7 @@ mod tests {
                     handle_press(
                         settings.as_ref(),
                         locks.as_ref(),
-                        &press(&format!("rolemenu:v1:m1:o{index}")),
+                        &press_option(1, [ROLE_A, ROLE_B][index]),
                         &mut ports,
                     )
                 })
@@ -2152,6 +2595,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn many_presses_of_one_member_never_overlap() {
+        // The lock must hold under a real race: many threads press the same
+        // member at once and no two critical sections may overlap.
+        let locks = Arc::new(MemberLocks::new());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let locks = Arc::clone(&locks);
+            let inside = Arc::clone(&inside);
+            let overlap = Arc::clone(&overlap);
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    locks.with_member(MEMBER, || {
+                        if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                            overlap.fetch_add(1, Ordering::SeqCst);
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        std::hint::spin_loop();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        assert_eq!(
+            overlap.load(Ordering::SeqCst),
+            0,
+            "two presses of one member ran at the same time"
+        );
+        assert_eq!(locks.held(), 0, "the lock was left held");
     }
 
     #[test]
@@ -2206,7 +2690,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(harness.locks.held(), 0);
     }
 
@@ -2251,7 +2735,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(menu_id, ROLE_A));
         assert_eq!(result.outcome.code, Code::Added);
         assert_eq!(harness.roles.added(), vec![ROLE_A]);
     }
@@ -2272,10 +2756,35 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(menu_id, ROLE_A));
         assert_eq!(result.outcome.code, Code::OptionNotFound);
         assert!(harness.roles.added().is_empty());
         assert_eq!(harness.follow_ups(), vec!["option_not_found".to_string()]);
+    }
+
+    #[test]
+    fn the_real_repository_refuses_a_stale_button_after_the_first_option_is_removed() {
+        use crate::role_menus::repository;
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        repository::migrate(&mut conn).expect("migrate");
+        let menu_id = repository::create_menu(&conn, HOME, "main", "multi", 0).expect("menu");
+        repository::add_option(&conn, menu_id, ROLE_A, "label_a", "\u{1F600}").expect("a");
+        repository::add_option(&conn, menu_id, ROLE_B, "label_b", "\u{1F600}").expect("b");
+        repository::add_option(&conn, menu_id, ROLE_C, "label_c", "\u{1F600}").expect("c");
+        repository::set_published(&conn, menu_id, 770_030, MESSAGE, None).expect("published");
+        // The button the member still sees for ROLE_A.
+        let old_button = custom_id_for_option(menu_id, ROLE_A).expect("id");
+        repository::remove_option(&conn, menu_id, ROLE_A).expect("removed");
+
+        let store = RealStore { conn };
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press(&old_button));
+        assert_eq!(result.outcome.code, Code::OptionNotFound);
+        assert!(harness.roles.added().is_empty(), "the stale button granted a role");
     }
 
     #[test]
@@ -2294,7 +2803,7 @@ mod tests {
             FakeFacts::new(&[ROLE_A]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        let result = harness.run(&settings(), &press_option(menu_id, ROLE_A));
         assert_eq!(result.outcome.code, Code::MenuNotFound);
         assert!(harness.roles.added().is_empty());
     }
@@ -2337,7 +2846,7 @@ mod tests {
             let failing_role = [ROLE_A, ROLE_B, ROLE_C][rng.next(3) as usize];
             let mut roles = FakeRoles::new(MEMBER, &[]);
             if failing {
-                roles.add_failures.insert(failing_role, forbidden());
+                roles.add_failures.insert(failing_role, vec![forbidden()]);
             }
             let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
             // The model member: the roles it holds after the presses.
@@ -2345,18 +2854,24 @@ mod tests {
             for step in 0..8u32 {
                 let index = rng.next(3) as usize;
                 let role = [ROLE_A, ROLE_B, ROLE_C][index];
-                let result = harness.run(&settings(), &press(&format!("rolemenu:v1:m1:o{index}")));
+                let lines_before = harness.reporter.lines.len();
+                let result = harness.run(&settings(), &press_option(1, role));
                 // The press always answers exactly once.
                 assert_eq!(
                     harness.follow_ups().len(),
                     (step + 1) as usize,
                     "case {case}"
                 );
-                let role_failed = failing && role == failing_role;
+                // A press that really tried to add the failing role must not
+                // be reported as a success. Only the lines of this press
+                // count.
+                let add_was_attempted = harness.reporter.lines[lines_before..]
+                    .iter()
+                    .any(|line| line.contains(&format!("role={role}:failed:forbidden")));
                 match result.outcome.code {
                     Code::Added | Code::Swapped | Code::Removed => {
                         assert!(
-                            !role_failed,
+                            !add_was_attempted,
                             "case {case}: a failed write was reported as a success"
                         );
                     }
@@ -2366,6 +2881,7 @@ mod tests {
                     | Code::Ineligible
                     | Code::WriteFailed
                     | Code::SwapPartial
+                    | Code::SwapPartialRemoved
                     | Code::NoChange => {}
                     other => panic!("case {case}: unexpected {other:?}"),
                 }
@@ -2402,13 +2918,9 @@ mod tests {
             let store = multi_menu();
             let mut roles = FakeRoles::new(MEMBER, &[]);
             let role = [ROLE_A, ROLE_B, ROLE_C][rng.next(3) as usize];
-            roles.add_failures.insert(role, forbidden());
+            roles.add_failures.insert(role, vec![forbidden()]);
             let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
-            let index = [ROLE_A, ROLE_B, ROLE_C]
-                .iter()
-                .position(|r| *r == role)
-                .expect("role");
-            let result = harness.run(&settings(), &press(&format!("rolemenu:v1:m1:o{index}")));
+            let result = harness.run(&settings(), &press_option(1, role));
             assert!(
                 result.outcome.code != Code::Added && result.outcome.code != Code::Swapped,
                 "case {case}: a failed write was reported as a success"
@@ -2426,6 +2938,61 @@ mod tests {
         }
     }
 
+    /// Liveness sweep over selects: every submitted value is either applied
+    /// or refused, the member never holds more than the group allows, and the
+    /// press always answers exactly once.
+    #[test]
+    fn a_seeded_sequence_of_selects_keeps_every_invariant() {
+        let mut rng = Lcg(0x5E1EC7);
+        for case in 0..120u32 {
+            let mut store = multi_menu();
+            store.menus.get_mut(&1).expect("menu").mode = "multi".to_string();
+            store.menus.get_mut(&1).expect("menu").max_select = 2;
+            let mut harness = Harness::new(
+                store,
+                FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+                FakeRoles::new(MEMBER, &[]),
+            );
+            let mut held: Vec<u64> = Vec::new();
+            for step in 0..10u32 {
+                let count = 1 + rng.next(3) as usize;
+                let mut values: Vec<u64> = Vec::new();
+                for _ in 0..count {
+                    let role = [ROLE_A, ROLE_B, ROLE_C][rng.next(3) as usize];
+                    if !values.contains(&role) {
+                        values.push(role);
+                    }
+                }
+                let result = harness.run(&settings(), &press_select(1, &values));
+                assert_eq!(
+                    harness.follow_ups().len(),
+                    (step + 1) as usize,
+                    "case {case} step {step}"
+                );
+                for removed in &result.removed {
+                    held.retain(|role| role != removed);
+                }
+                for added in &result.added {
+                    held.retain(|role| role != added);
+                    held.push(*added);
+                }
+                // The group holds at most `max` options.
+                assert!(
+                    held.len() <= 2,
+                    "case {case} step {step}: the member holds {held:?}"
+                );
+                // Every role the handler wrote is a stored option.
+                for role in result.added.iter().chain(result.removed.iter()) {
+                    assert!(
+                        [ROLE_A, ROLE_B, ROLE_C].contains(role),
+                        "case {case}: a role outside the menu was written"
+                    );
+                }
+            }
+            assert_eq!(harness.locks.held(), 0, "case {case}");
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Codes
     // ---------------------------------------------------------------------
@@ -2436,12 +3003,14 @@ mod tests {
         assert_eq!(Code::OtherGuild.as_str(), "other_guild");
         assert_eq!(Code::NoHomeGuild.as_str(), "no_home_guild");
         assert_eq!(Code::InvalidCustomId.as_str(), "invalid_custom_id");
+        assert_eq!(Code::InvalidValue.as_str(), "invalid_value");
         assert_eq!(Code::MenuNotFound.as_str(), "menu_not_found");
         assert_eq!(Code::OptionNotFound.as_str(), "option_not_found");
         assert_eq!(Code::MessageMismatch.as_str(), "message_mismatch");
         assert_eq!(Code::GuildMismatch.as_str(), "guild_mismatch");
         assert_eq!(Code::CorruptRow.as_str(), "corrupt_row");
         assert_eq!(Code::StoreFailed.as_str(), "store_failed");
+        assert_eq!(Code::DeferFailed.as_str(), "defer_failed");
         assert_eq!(Code::FactsUnavailable.as_str(), "facts_unavailable");
         assert_eq!(
             Code::MemberRolesUnavailable.as_str(),
@@ -2454,9 +3023,12 @@ mod tests {
         assert_eq!(Code::AlreadySelected.as_str(), "already_selected");
         assert_eq!(Code::MaxReached.as_str(), "max_reached");
         assert_eq!(Code::UnknownOption.as_str(), "unknown_option");
+        assert_eq!(Code::TooManySelected.as_str(), "too_many_selected");
         assert_eq!(Code::SwapBlocked.as_str(), "swap_blocked");
         assert_eq!(Code::SwapPartial.as_str(), "swap_partial");
+        assert_eq!(Code::SwapPartialRemoved.as_str(), "swap_partial_removed");
         assert_eq!(Code::WriteFailed.as_str(), "write_failed");
+        assert_eq!(Code::Partial.as_str(), "partial");
         assert_eq!(Code::NoChange.as_str(), "no_change");
     }
 
