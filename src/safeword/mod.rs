@@ -3,6 +3,8 @@
 
 pub mod command;
 pub mod config;
+pub mod discord;
 pub mod repository;
 pub mod runtime;
+pub mod slash;
 pub mod state;
