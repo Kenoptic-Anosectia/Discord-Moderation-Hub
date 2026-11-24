@@ -371,6 +371,9 @@ pub enum RefusalCode {
     OwnerGraceNotElapsed,
     /// `claim` found no continuous owner absence recorded by `note_owner_absent`.
     OwnerAbsenceNotRecorded,
+    /// `claim` found an absence record whose observations are stale or have a gap, so a return
+    /// of the owner may have gone unseen.
+    OwnerAbsenceNotContinuous,
     /// `transfer` target is not currently connected to the room.
     TargetNotInRoom,
     /// `permit`, `reject` or `transfer` targeted the current room owner.
@@ -421,6 +424,7 @@ impl RefusalCode {
             Self::OwnerStillPresent => "vc_owner_still_present",
             Self::OwnerGraceNotElapsed => "vc_owner_grace_not_elapsed",
             Self::OwnerAbsenceNotRecorded => "vc_owner_absence_not_recorded",
+            Self::OwnerAbsenceNotContinuous => "vc_owner_absence_not_continuous",
             Self::TargetNotInRoom => "vc_target_not_in_room",
             Self::TargetIsOwner => "vc_target_is_owner",
             Self::TargetIsSelfBot => "vc_target_is_self_bot",
@@ -455,6 +459,7 @@ impl RefusalCode {
             Self::OwnerStillPresent => "The room owner is currently in the room. [vc_owner_still_present]",
             Self::OwnerGraceNotElapsed => "The owner absence grace period has not elapsed. [vc_owner_grace_not_elapsed]",
             Self::OwnerAbsenceNotRecorded => "No continuous owner absence has been recorded yet. [vc_owner_absence_not_recorded]",
+            Self::OwnerAbsenceNotContinuous => "The owner absence could not be confirmed as continuous. [vc_owner_absence_not_continuous]",
             Self::TargetNotInRoom => "The target member must be inside the voice room. [vc_target_not_in_room]",
             Self::TargetIsOwner => "That command cannot target the room owner. [vc_target_is_owner]",
             Self::TargetIsSelfBot => "That command cannot target the bot. [vc_target_is_self_bot]",
@@ -574,6 +579,10 @@ pub struct VcCommandDeps {
     /// [`policy::DEFAULT_EMPTY_GRACE_SECS`]); this is deliberately not the VR2 cleanup grace.
     pub claim_grace_secs: i64,
 }
+
+/// Longest gap in seconds between two absence observations for them to count as one continuous
+/// absence. Wiring must call `note_owner_absent` at least this often while the owner is away.
+pub const ABSENCE_MAX_GAP_SECS: i64 = 15;
 
 /// In-memory per-room state tracked alongside the `voice_rooms` table.
 #[derive(Debug, Default)]
@@ -2086,8 +2095,7 @@ mod tests {
             .unwrap()
             .room_members
             .insert(ROOM_CH, vec![MEMBER_A]);
-        h.handler.note_owner_absent(ROOM_CH, 1_100);
-        h.clock.set(1_159);
+        observe_absent(&h, 1_100, 1_159);
         let out_early = h
             .handler
             .handle(&VcCommandRequest {
@@ -3202,6 +3210,17 @@ mod tests {
     }
 
     /// Puts the owner and `MEMBER_A` inside the room.
+    /// Reports the owner absent every 10 s from `from` to `to` (inclusive) and sets the clock to `to`.
+    fn observe_absent(h: &Harness, from: i64, to: i64) {
+        let mut t = from;
+        while t < to {
+            h.handler.note_owner_absent(ROOM_CH, t);
+            t += 10;
+        }
+        h.handler.note_owner_absent(ROOM_CH, to);
+        h.clock.set(to);
+    }
+
     fn owner_inside(h: &Harness) {
         h.ports
             .state
@@ -3235,16 +3254,13 @@ mod tests {
 
     #[tokio::test]
     async fn claim_refuses_the_unobserved_return_sequence_5000_5030_5100_5110() {
-        // qa-2 probe: owner seen absent at 5000, back at 5030, gone again at 5100, claim at 5110.
-        // Nothing recorded the return or the second absence, so the claim must be refused.
+        // qa-2 probe: the absence IS recorded at 5000 (note_owner_absent), the owner is back at
+        // 5030 and gone again at 5100 with nothing reported, and a claim arrives at 5110.
         let h = make_harness(live_settings());
         let claim = VcSubcommand::Claim;
         owner_outside(&h);
         h.clock.set(5_000);
-        assert_eq!(
-            run(&h, MEMBER_A, claim.clone()).await,
-            refused(RefusalCode::OwnerAbsenceNotRecorded)
-        );
+        h.handler.note_owner_absent(ROOM_CH, 5_000);
         owner_inside(&h); // 5030: the owner returns, unobserved by the handler
         h.clock.set(5_030);
         owner_outside(&h); // 5100: leaves again, still unobserved
@@ -3252,10 +3268,61 @@ mod tests {
         h.clock.set(5_110);
         assert_eq!(
             run(&h, MEMBER_A, claim).await,
-            refused(RefusalCode::OwnerAbsenceNotRecorded)
+            refused(RefusalCode::OwnerAbsenceNotContinuous)
         );
         assert_eq!(row_of(&h).owner, OWNER);
         assert!(h.ports.state.lock().unwrap().overwrites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_needs_a_gapless_fresh_absence_record_to_pass() {
+        let claim = VcSubcommand::Claim;
+        // Heartbeat every 10 s from 5000 to 5060: continuous for 60 s, so the claim passes, and
+        // it still passes when the last observation is exactly ABSENCE_MAX_GAP_SECS old.
+        for (now, want) in [
+            (5_060, Some(SuccessCode::Claimed)),
+            (5_060 + ABSENCE_MAX_GAP_SECS, Some(SuccessCode::Claimed)),
+            (5_060 + ABSENCE_MAX_GAP_SECS + 1, None),
+            (9_000, None),
+        ] {
+            let h = make_harness(live_settings());
+            owner_outside(&h);
+            observe_absent(&h, 5_000, 5_060);
+            h.clock.set(now);
+            let out = run(&h, MEMBER_A, claim.clone()).await;
+            match want {
+                Some(code) => assert_eq!(out, applied(code), "now={now}"),
+                None => {
+                    assert_eq!(
+                        out,
+                        refused(RefusalCode::OwnerAbsenceNotContinuous),
+                        "now={now}"
+                    );
+                    assert_eq!(row_of(&h).owner, OWNER);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_observations_restarts_the_grace() {
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        owner_outside(&h);
+        observe_absent(&h, 5_000, 5_010);
+        // 16 s without a report: the owner could have come and gone, so the absence restarts.
+        h.handler.note_owner_absent(ROOM_CH, 5_026);
+        observe_absent(&h, 5_026, 5_085);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerGraceNotElapsed)
+        );
+        observe_absent(&h, 5_085, 5_086);
+        assert_eq!(
+            run(&h, MEMBER_A, claim).await,
+            applied(SuccessCode::Claimed)
+        );
+        assert_eq!(row_of(&h).owner, MEMBER_A);
     }
 
     #[tokio::test]
@@ -3264,10 +3331,9 @@ mod tests {
         let h = make_harness(live_settings());
         let claim = VcSubcommand::Claim;
         owner_outside(&h);
-        h.handler.note_owner_absent(ROOM_CH, 5_000);
-        // A repeated note for the same continuous absence must not move the start.
-        h.handler.note_owner_absent(ROOM_CH, 5_040);
-        for t in [5_000, 5_010, 5_011, 5_059] {
+        // Reported every second: repeated notes of one continuous absence must not move the start.
+        for t in 5_000..=5_059 {
+            h.handler.note_owner_absent(ROOM_CH, t);
             h.clock.set(t);
             assert_eq!(
                 run(&h, MEMBER_A, claim.clone()).await,
@@ -3276,6 +3342,7 @@ mod tests {
             );
         }
         assert_eq!(row_of(&h).owner, OWNER);
+        h.handler.note_owner_absent(ROOM_CH, 5_060);
         h.clock.set(5_060);
         assert_eq!(
             run(&h, MEMBER_A, claim).await,
@@ -3298,8 +3365,7 @@ mod tests {
             run(&h, MEMBER_A, claim.clone()).await,
             refused(RefusalCode::OwnerAbsenceNotRecorded)
         );
-        h.handler.note_owner_absent(ROOM_CH, 5_100);
-        h.clock.set(5_159);
+        observe_absent(&h, 5_100, 5_159);
         assert_eq!(
             run(&h, MEMBER_A, claim.clone()).await,
             refused(RefusalCode::OwnerGraceNotElapsed)
@@ -3343,8 +3409,7 @@ mod tests {
             .unwrap()
             .room_members
             .insert(ROOM_CH, vec![MEMBER_A, MEMBER_B]);
-        h.handler.note_owner_absent(ROOM_CH, 1_000);
-        h.clock.set(2_000);
+        observe_absent(&h, 1_000, 2_000);
         let (a, b) = tokio::join!(
             run(&h, MEMBER_A, VcSubcommand::Claim),
             run(&h, MEMBER_B, VcSubcommand::Claim)
@@ -3470,7 +3535,7 @@ mod tests {
                     s.room_members.insert(ROOM_CH, members);
                 }
                 if claim_step {
-                    h.handler.note_owner_absent(ROOM_CH, 0);
+                    observe_absent(&h, 10_000 + step * 40 - 60, 10_000 + step * 40);
                 }
                 let sub = if claim_step {
                     VcSubcommand::Claim
