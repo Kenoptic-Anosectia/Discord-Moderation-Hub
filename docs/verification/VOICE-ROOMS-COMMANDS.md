@@ -1,5 +1,5 @@
 # VOICE-ROOMS-COMMANDS - `/vc` command logic (VR3, amended by VR4)
-Card VR3: `src/voice_rooms/command.rs` (new), `pub mod command;` in `mod.rs`, and the owner/lock/limit
+Card VR3: `src/voice_rooms/command.rs` (new), `pub mod command;` in `mod.rs`, and owner/lock/limit
 updates in `repository.rs`. Logic only: no poise command, not called from `main.rs`, no feature on,
 nothing registered with or run on Discord. VR4 adds deputies, `refresh`, `reset_observations`
 (`VOICE-ROOMS-DEPUTIES.md`); where the two docs differ, that one wins.
