@@ -10,22 +10,23 @@
 //! 1. **The custom id is parsed strictly.** The id has the fixed prefix
 //!    [`CUSTOM_ID_PREFIX`] and names a stored menu and one of its two kinds of
 //!    component: a button (`m<menu id>:r<role id>`) or a select
-//!    (`m<menu id>:s`). It is at most [`MAX_CUSTOM_ID_LEN`] bytes and holds
-//!    nothing but ASCII digits and the prefix's separators. A forged,
+//!    (`m<menu id>:s<part>`). It is at most [`MAX_CUSTOM_ID_LEN`] bytes and
+//!    holds nothing but ASCII digits and the prefix's separators. A forged,
 //!    malformed, other-menu, other-guild or other-message id is ignored: no
 //!    member data is read and nothing is written.
-//! 2. **The stored row is the truth.** The interaction's own guild and message
-//!    must be the ones the menu row records, and the option must still be
-//!    stored. A deleted menu or option answers with a notice and writes
-//!    nothing.
+//! 2. **The stored row is the truth.** The interaction's own guild and
+//!    message must be the ones the menu row records, and the option must
+//!    still be stored. A deleted menu or option answers with a notice and
+//!    writes nothing.
 //! 3. **Defer first.** The acknowledgement is an ephemeral deferral that
 //!    happens before any slow call, then the work runs, then one ephemeral
 //!    follow-up is sent. Every reply is built from stable codes: no role
 //!    name, no label and no member text is ever echoed.
 //! 4. **RM1 decides.** The click is planned by the shared policy
 //!    (`super::policy`): a multi option toggles, an exclusive group swaps, and a
-//!    max-select breach is refused. A partial swap is reported honestly
-//!    (`swap_partial` or `swap_partial_removed`) and never as a success.
+//!    max-select breach is refused. A partial write is reported honestly
+//!    (`swap_partial`, `swap_partial_removed` or `partial_write`) and never
+//!    as a success.
 //! 5. **Every role write goes through the role service** (K03 decide, K04
 //!    grant), never directly. Protected, managed and privileged roles are
 //!    refused at press time even when the stored row lists them, and an active
@@ -109,15 +110,11 @@ pub enum Code {
     SwapBlocked,
     /// An exclusive swap added the new option but could not remove an old one.
     SwapPartial,
-    /// An exclusive swap removed the old option but could not add the new one.
+    /// An exclusive swap completed all planned removals but failed to add the new option.
     SwapPartialRemoved,
-    /// Some of the planned role writes went through and some did not.
-    ///
-    /// This is the code for a press that was not an exclusive swap: a multi
-    /// group, or a press that only added or only removed. The detail carries
-    /// the K04 fail code.
+    /// Some planned writes failed and some succeeded, without either swap outcome above.
     PartialWrite,
-    /// A role write failed (the detail carries the K04 fail code).
+    /// At least one role write failed and none succeeded.
     WriteFailed,
     /// Some of the submitted values were applied and some were refused.
     Partial,
@@ -191,6 +188,16 @@ impl Outcome {
             Some(detail) => format!("{} ({detail})", self.code.as_str()),
             None => self.code.as_str().to_string(),
         }
+    }
+
+    /// The stable sub-code of this outcome.
+    ///
+    /// An outcome that carries a detail keeps it; an outcome that carries
+    /// only a code uses the code itself. So a refusal that has no detail of
+    /// its own (`max_reached`, `already_selected`) still names itself
+    /// instead of losing its name.
+    fn sub_code(self) -> &'static str {
+        self.detail.unwrap_or_else(|| self.code.as_str())
     }
 }
 
@@ -453,7 +460,8 @@ pub struct Press {
 pub trait MenuStore {
     /// Reads one menu by its row id. `Ok(None)` means no such menu.
     fn get_menu_by_id(&self, menu_id: i64) -> Result<Option<MenuRow>, RepoError>;
-    /// Lists the options of one menu, ordered by position.
+    /// Lists the options of one menu in repository order, as used by RM2 to
+    /// render the select chunks.
     fn list_options(&self, menu_id: i64) -> Result<Vec<OptionRow>, RepoError>;
 }
 
@@ -811,19 +819,24 @@ where
         Ok(policy_menu) => policy_menu,
         Err(_) => return notice(ports, press, Outcome::new(Code::CorruptRow)),
     };
-    let group_id = match policy_menu.groups.first() {
-        Some(group) => group.id.clone(),
+    let group = match policy_menu.groups.first() {
+        Some(group) => group,
         None => return notice(ports, press, Outcome::new(Code::CorruptRow)),
     };
     // An exclusive group takes exactly one option: a select that submits
     // more than one is refused before anything is read about the member.
-    if policy_menu.groups[0].mode == policy::GroupMode::Exclusive && targets.len() > 1 {
+    if group.mode == policy::GroupMode::Exclusive && targets.len() > 1 {
         return notice(ports, press, Outcome::new(Code::TooManySelected));
     }
 
     // An unreadable protected-role list refuses every press.
     if settings.protected_roles_invalid {
         return notice(ports, press, Outcome::new(Code::Ineligible));
+    }
+
+    // A valid empty select needs neither member roles nor role facts.
+    if targets.is_empty() {
+        return notice(ports, press, Outcome::new(Code::NoChange));
     }
 
     // The member's roles are read from the role service, not from the press.
@@ -885,7 +898,7 @@ where
             menu: &policy_menu,
             click: &policy::Click {
                 member_roles: held.clone(),
-                group_id: group_id.clone(),
+                group_id: group.id.clone(),
                 option_role_id: *target,
             },
             grant: policy::GrantContext {
@@ -1023,21 +1036,13 @@ where
 
     let outcome = match failure {
         Some(code) => {
-            // A failure is never reported as a success. A swap that added the
-            // new option but could not remove an old one says exactly that
-            // (the member holds both), and so does the other half: the old
-            // option is gone and the new one could not be added (the member
-            // holds neither).
-            if !added.is_empty() && !remove.is_empty() {
-                Outcome::with(Code::SwapPartial, code.code())
-            } else if !removed.is_empty() {
-                Outcome::with(Code::SwapPartialRemoved, code.code())
-            } else {
-                Outcome::with(Code::WriteFailed, code.code())
-            }
+            // A failure is never reported as a success. The code says what
+            // really happened, so it is derived from the writes that were
+            // planned and the writes that went through.
+            failure_outcome(group.mode, &add, &remove, &added, &removed, code)
         }
         None => match refusal {
-            Some(outcome) => Outcome::with(Code::Partial, outcome.detail.unwrap_or("refused")),
+            Some(outcome) => Outcome::with(Code::Partial, outcome.sub_code()),
             None if added.is_empty() => Outcome::new(Code::Removed),
             None if removed.is_empty() => Outcome::new(Code::Added),
             None => Outcome::new(Code::Swapped),
@@ -1064,7 +1069,9 @@ pub fn options_of_part(options: &[OptionRow], part: usize) -> &[OptionRow] {
     if start >= options.len() {
         return &[];
     }
-    let end = start.saturating_add(policy::SELECT_OPTION_LIMIT).min(options.len());
+    let end = start
+        .saturating_add(policy::SELECT_OPTION_LIMIT)
+        .min(options.len());
     &options[start..end]
 }
 
@@ -1114,10 +1121,51 @@ fn collect_targets(
     }
 }
 
+/// The outcome a failed press reports: exactly what happened.
+///
+/// The code is derived from the writes that were planned and the writes that
+/// went through, so the member is told what really is the case:
+///
+/// * `write_failed` — nothing at all went through.
+/// * `swap_partial` — an exclusive swap added the new option but could not
+///   remove every old option.
+/// * `swap_partial_removed` — an exclusive swap removed every old option
+///   but could not add the new one.
+/// * `partial_write` — some other press: some writes went through and some
+///   did not. This covers a multi group, a press that only added and a
+///   press that only removed.
+///
+/// The detail is the classified K04 fail code of the first failure.
+fn failure_outcome(
+    group_mode: policy::GroupMode,
+    planned_add: &[u64],
+    planned_remove: &[u64],
+    added: &[u64],
+    removed: &[u64],
+    code: FailCode,
+) -> Outcome {
+    // A swap is an exclusive group that removes an old option and adds a new
+    // one in the same press. Nothing else is a swap, so nothing else may
+    // claim to be one.
+    let swap = group_mode == policy::GroupMode::Exclusive
+        && !planned_add.is_empty()
+        && !planned_remove.is_empty();
+    let outcome = if added.is_empty() && removed.is_empty() {
+        Code::WriteFailed
+    } else if swap && !added.is_empty() && removed.len() < planned_remove.len() {
+        Code::SwapPartial
+    } else if swap && added.is_empty() && removed.len() == planned_remove.len() {
+        Code::SwapPartialRemoved
+    } else {
+        Code::PartialWrite
+    };
+    Outcome::with(outcome, code.code())
+}
+
 /// The outcome a shadow press reports: what it would have done.
 fn shadow_outcome(add: &[u64], remove: &[u64], refusal: Option<Outcome>) -> Outcome {
     if let Some(outcome) = refusal {
-        return Outcome::with(Code::Partial, outcome.detail.unwrap_or("refused"));
+        return Outcome::with(Code::Partial, outcome.sub_code());
     }
     if add.is_empty() && remove.is_empty() {
         Outcome::new(Code::NoChange)
@@ -3480,17 +3528,19 @@ mod tests {
     fn every_part_of_a_menu_with_more_than_twenty_five_options_parses() {
         // 30 options: two select components in one message.
         let store = big_menu(30);
+        let chunks = command::split_chunks(store.options.get(&1).expect("options"));
+        assert_eq!(chunks.len(), 2);
         let mut harness = Harness::new(
             store,
             FakeFacts::new(&[ROLE_A, ROLE_A + 25, ROLE_A + 29]),
             FakeRoles::new(MEMBER, &[]),
         );
         let mut ids = Vec::new();
-        for part in 0..2 {
-            let id = custom_id_for_select(1, part).expect("built");
+        for chunk in chunks {
+            let id = custom_id_for_select(1, chunk.part).expect("built");
             let parsed = parse_custom_id(&id).expect("parsed");
             assert_eq!(parsed.menu_id, 1);
-            assert_eq!(parsed.selector, Selector::Select(part));
+            assert_eq!(parsed.selector, Selector::Select(chunk.part));
             ids.push(id);
         }
         assert_ne!(ids[0], ids[1]);
@@ -3525,7 +3575,10 @@ mod tests {
     fn the_options_of_a_part_are_the_ones_of_that_chunk() {
         let store = big_menu(30);
         let options = store.options.get(&1).expect("options");
-        assert_eq!(options_of_part(options, 0).len(), policy::SELECT_OPTION_LIMIT);
+        assert_eq!(
+            options_of_part(options, 0).len(),
+            policy::SELECT_OPTION_LIMIT
+        );
         assert_eq!(options_of_part(options, 1).len(), 5);
         assert!(options_of_part(options, 2).is_empty());
         assert!(options_of_part(options, 9_999).is_empty());
@@ -3593,12 +3646,13 @@ mod tests {
 
     #[test]
     fn the_first_refusal_is_the_one_that_is_reported_when_something_was_applied() {
-        // The first value is refused (safeword) and the second one is
-        // applied. The answer names the first refusal, not the last one.
-        let store = multi_menu();
+        // A hits safeword, B is applied, and C hits max-select. The two
+        // refusals differ, so dropping the first changes the reply.
+        let mut store = multi_menu();
+        store.menus.get_mut(&1).expect("menu").max_select = 1;
         let mut settings = settings();
         settings.safeword_restricted_role_ids = vec![ROLE_A];
-        let mut blocked = press_select(1, &[ROLE_A, ROLE_B]);
+        let mut blocked = press_select(1, &[ROLE_A, ROLE_B, ROLE_C]);
         blocked.safeword = SafewordState::Active;
         let mut harness = Harness::new(
             store,
@@ -3642,7 +3696,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_whose_removal_fails_says_the_member_may_hold_both() {
+    fn an_exclusive_swap_with_a_failed_removal_and_add_is_a_partial_write() {
         // The member holds ROLE_A and ROLE_B of an exclusive group and
         // presses ROLE_C. ROLE_A is removed, ROLE_B's removal fails and
         // ROLE_C cannot be added. The answer must not claim that the member
