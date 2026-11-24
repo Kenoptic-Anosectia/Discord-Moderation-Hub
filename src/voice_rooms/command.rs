@@ -12,7 +12,7 @@
 //!   the bot itself, the room owner, active safeword, lacking category visibility, or
 //!   holding a protected, restricted, staff or privileged role).
 //! - `reject` refuses targeting the room owner, the bot itself, or a member protected by
-//!   permission limits (protected, restricted, staff or privileged role); it denies
+//!   permission limits (protected, staff or privileged-permission role); it denies
 //!   `CONNECT` on the channel and disconnects the target if present in the room (reporting
 //!   a failed disconnect honestly with a stable code).
 //! - `rename` cleans the name through [`policy::sanitize_name`], enforces the VR1 rename
@@ -2848,6 +2848,601 @@ mod tests {
                 .unwrap();
             assert!(row.owner == OWNER || row.owner == MEMBER_A);
             assert!(row.user_limit <= MAX_USER_LIMIT);
+        }
+    }
+
+    const VIEW_CHANNEL: u64 = 1 << 10;
+
+    async fn run(h: &Harness, actor: u64, sub: VcSubcommand) -> CommandOutcome {
+        h.handler
+            .handle(&VcCommandRequest {
+                guild_id: Some(HOME_GUILD),
+                channel_id: ROOM_CH,
+                actor_id: actor,
+                subcommand: sub,
+            })
+            .await
+    }
+
+    fn row_of(h: &Harness) -> RoomRow {
+        repository::get(&h.db.lock().unwrap(), ROOM_CH)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn refused(code: RefusalCode) -> CommandOutcome {
+        CommandOutcome::Refused {
+            code,
+            reply: Reply::refused(code),
+        }
+    }
+
+    fn applied(code: SuccessCode) -> CommandOutcome {
+        CommandOutcome::Applied {
+            code,
+            reply: Reply::ok(code),
+        }
+    }
+
+    fn all_owner_subcommands() -> Vec<VcSubcommand> {
+        vec![
+            VcSubcommand::Rename {
+                name: "New".to_string(),
+            },
+            VcSubcommand::Limit { limit: 5 },
+            VcSubcommand::Lock,
+            VcSubcommand::Unlock,
+            VcSubcommand::Permit {
+                target_id: MEMBER_B,
+            },
+            VcSubcommand::Reject {
+                target_id: MEMBER_B,
+            },
+            VcSubcommand::Transfer {
+                target_id: MEMBER_A,
+            },
+            VcSubcommand::Claim,
+        ]
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_validates_but_writes_nothing() {
+        let h = make_harness(settings_with("shadow", Some(HOME_GUILD)));
+        let before = row_of(&h);
+        for sub in all_owner_subcommands() {
+            let actor = if sub == VcSubcommand::Claim {
+                MEMBER_A
+            } else {
+                OWNER
+            };
+            let out = run(&h, actor, sub.clone()).await;
+            // Claim is refused (owner present); every other command only reports a shadow no-op.
+            if sub == VcSubcommand::Claim {
+                assert_eq!(out, refused(RefusalCode::OwnerStillPresent));
+            } else {
+                assert_eq!(out, applied(SuccessCode::ShadowNoop), "{sub:?}");
+            }
+        }
+        let s = h.ports.state.lock().unwrap();
+        assert!(s.renames.is_empty() && s.limits.is_empty() && s.overwrites.is_empty());
+        assert!(s.deleted_overwrites.is_empty() && s.disconnects.is_empty() && s.moves.is_empty());
+        drop(s);
+        assert_eq!(row_of(&h), before);
+    }
+
+    #[tokio::test]
+    async fn mode_off_and_dm_and_other_guild_are_ignored_for_every_subcommand() {
+        let off = make_harness(settings_with("off", Some(HOME_GUILD)));
+        let live = make_harness(live_settings());
+        for sub in all_owner_subcommands() {
+            let out = run(&off, OWNER, sub.clone()).await;
+            assert_eq!(out, CommandOutcome::Ignored(RefusalCode::FeatureDisabled));
+            for guild in [Some(OTHER_GUILD), None] {
+                let out = live
+                    .handler
+                    .handle(&VcCommandRequest {
+                        guild_id: guild,
+                        channel_id: ROOM_CH,
+                        actor_id: OWNER,
+                        subcommand: sub.clone(),
+                    })
+                    .await;
+                assert_eq!(out, CommandOutcome::Ignored(RefusalCode::WrongGuild));
+            }
+        }
+        assert_eq!(off.ports.state.lock().unwrap().calls_count, 0);
+        assert_eq!(live.ports.state.lock().unwrap().calls_count, 0);
+        assert!(live.alerter.alerts.lock().unwrap().is_empty());
+        assert_eq!(row_of(&live).owner, OWNER);
+    }
+
+    #[tokio::test]
+    async fn row_in_another_guild_is_untracked_for_this_guild() {
+        let h = make_harness(live_settings());
+        h.db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE voice_rooms SET guild = ?1",
+                [OTHER_GUILD.to_string()],
+            )
+            .unwrap();
+        let out = run(&h, OWNER, VcSubcommand::Lock).await;
+        assert_eq!(out, refused(RefusalCode::UntrackedChannel));
+        assert_eq!(h.ports.state.lock().unwrap().calls_count, 0);
+    }
+
+    #[tokio::test]
+    async fn permit_refuses_privileged_restricted_and_unjudgeable_roles() {
+        let h = make_harness(live_settings());
+        for (roles, expected) in [
+            (
+                vec![ROLE_PRIVILEGED],
+                refused(RefusalCode::TargetProtectedOrRestricted),
+            ),
+            (
+                vec![ROLE_NORMAL, ROLE_RESTRICTED],
+                refused(RefusalCode::TargetProtectedOrRestricted),
+            ),
+            (
+                vec![999_999],
+                refused(RefusalCode::DiscordFailed(CommandPortError::Unavailable)),
+            ),
+        ] {
+            h.ports
+                .state
+                .lock()
+                .unwrap()
+                .profiles
+                .get_mut(&MEMBER_B)
+                .unwrap()
+                .role_ids = roles;
+            let out = run(
+                &h,
+                OWNER,
+                VcSubcommand::Permit {
+                    target_id: MEMBER_B,
+                },
+            )
+            .await;
+            assert_eq!(out, expected);
+        }
+        assert!(h.ports.state.lock().unwrap().overwrites.is_empty());
+        let zero = run(&h, OWNER, VcSubcommand::Permit { target_id: 0 }).await;
+        assert_eq!(zero, refused(RefusalCode::InvalidUserId));
+    }
+
+    #[tokio::test]
+    async fn reject_of_absent_member_denies_connect_without_disconnect_and_clears_permit() {
+        let h = make_harness(live_settings());
+        let permit = VcSubcommand::Permit {
+            target_id: MEMBER_B,
+        };
+        assert_eq!(
+            run(&h, OWNER, permit.clone()).await,
+            applied(SuccessCode::Permitted)
+        );
+        let out = run(
+            &h,
+            OWNER,
+            VcSubcommand::Reject {
+                target_id: MEMBER_B,
+            },
+        )
+        .await;
+        assert_eq!(out, applied(SuccessCode::Rejected));
+        {
+            let s = h.ports.state.lock().unwrap();
+            assert!(s.disconnects.is_empty());
+            assert_eq!(
+                s.overwrites.last().unwrap().2,
+                RoomOverwrite {
+                    target: OverwriteTarget::Member(MEMBER_B),
+                    allow: 0,
+                    deny: policy::CONNECT,
+                }
+            );
+        }
+        // The reject cleared the remembered permit, so permitting again is accepted.
+        assert_eq!(
+            run(&h, OWNER, permit).await,
+            applied(SuccessCode::Permitted)
+        );
+        // A restricted-role member (not staff) can be rejected.
+        h.ports
+            .state
+            .lock()
+            .unwrap()
+            .profiles
+            .get_mut(&MEMBER_B)
+            .unwrap()
+            .role_ids = vec![ROLE_RESTRICTED];
+        let out = run(
+            &h,
+            OWNER,
+            VcSubcommand::Reject {
+                target_id: MEMBER_B,
+            },
+        )
+        .await;
+        assert_eq!(out, applied(SuccessCode::Rejected));
+    }
+
+    #[tokio::test]
+    async fn lock_and_unlock_keep_the_category_baseline() {
+        let h = make_harness(live_settings());
+        h.ports.state.lock().unwrap().category_overwrites = vec![RoomOverwrite {
+            target: OverwriteTarget::Everyone,
+            allow: VIEW_CHANNEL | policy::CONNECT,
+            deny: 0,
+        }];
+        assert_eq!(
+            run(&h, OWNER, VcSubcommand::Lock).await,
+            applied(SuccessCode::Locked)
+        );
+        assert_eq!(
+            run(&h, OWNER, VcSubcommand::Unlock).await,
+            applied(SuccessCode::Unlocked)
+        );
+        {
+            let s = h.ports.state.lock().unwrap();
+            assert_eq!(
+                s.overwrites[0].2,
+                RoomOverwrite {
+                    target: OverwriteTarget::Everyone,
+                    allow: VIEW_CHANNEL,
+                    deny: policy::CONNECT,
+                }
+            );
+            assert_eq!(
+                s.overwrites[1].2,
+                RoomOverwrite {
+                    target: OverwriteTarget::Everyone,
+                    allow: VIEW_CHANNEL | policy::CONNECT,
+                    deny: 0,
+                }
+            );
+            assert!(s.deleted_overwrites.is_empty());
+        }
+        // No category baseline for @everyone: unlock removes the room's @everyone overwrite.
+        h.ports.state.lock().unwrap().category_overwrites.clear();
+        assert_eq!(
+            run(&h, OWNER, VcSubcommand::Unlock).await,
+            applied(SuccessCode::Unlocked)
+        );
+        assert_eq!(
+            h.ports.state.lock().unwrap().deleted_overwrites,
+            vec![(HOME_GUILD, ROOM_CH, OverwriteTarget::Everyone)]
+        );
+        // A failed category read changes nothing: the row stays unlocked after a failed lock.
+        h.ports.state.lock().unwrap().fail_category = Some(CommandPortError::Unavailable);
+        let before_overwrites = h.ports.state.lock().unwrap().overwrites.len();
+        assert_eq!(
+            run(&h, OWNER, VcSubcommand::Lock).await,
+            refused(RefusalCode::DiscordFailed(CommandPortError::Unavailable))
+        );
+        assert_eq!(
+            h.ports.state.lock().unwrap().overwrites.len(),
+            before_overwrites
+        );
+        assert!(!row_of(&h).locked);
+    }
+
+    #[tokio::test]
+    async fn transfer_failed_discord_step_keeps_row_and_failed_row_write_alerts() {
+        let h = make_harness(live_settings());
+        let transfer = VcSubcommand::Transfer {
+            target_id: MEMBER_A,
+        };
+        // Dropping the old owner's overwrite fails: the row is unchanged, the rollback also
+        // fails in this fake, so staff are alerted about the leftover overwrite.
+        h.ports.state.lock().unwrap().fail_delete_overwrite = Some(CommandPortError::Forbidden);
+        assert_eq!(
+            run(&h, OWNER, transfer.clone()).await,
+            refused(RefusalCode::DiscordFailed(CommandPortError::Forbidden))
+        );
+        assert_eq!(row_of(&h).owner, OWNER);
+        assert_eq!(
+            *h.alerter.alerts.lock().unwrap(),
+            vec![CommandAlertCode::OwnerOverwriteDrift]
+        );
+        h.ports.state.lock().unwrap().fail_delete_overwrite = None;
+        h.alerter.alerts.lock().unwrap().clear();
+        // The new owner's overwrite fails: nothing was written, no alert.
+        h.ports.state.lock().unwrap().fail_overwrite = Some(CommandPortError::Forbidden);
+        assert_eq!(
+            run(&h, OWNER, transfer.clone()).await,
+            refused(RefusalCode::DiscordFailed(CommandPortError::Forbidden))
+        );
+        assert!(h.alerter.alerts.lock().unwrap().is_empty());
+        h.ports.state.lock().unwrap().fail_overwrite = None;
+        // Row write fails after Discord changed: stable code and an alert.
+        h.db.lock()
+            .unwrap()
+            .execute(
+                "CREATE TRIGGER fail_owner BEFORE UPDATE ON voice_rooms BEGIN SELECT RAISE(ABORT, 'x'); END;",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            run(&h, OWNER, transfer).await,
+            refused(RefusalCode::RowUpdateFailed)
+        );
+        assert_eq!(row_of(&h).owner, OWNER);
+        assert_eq!(
+            *h.alerter.alerts.lock().unwrap(),
+            vec![CommandAlertCode::OwnerRowDrift]
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_never_trusts_an_unrecorded_absence_and_a_return_restarts_the_grace() {
+        let h = make_harness(live_settings());
+        let claim = VcSubcommand::Claim;
+        assert_eq!(
+            run(&h, OWNER, claim.clone()).await,
+            refused(RefusalCode::AlreadyRoomOwner)
+        );
+        // Owner is outside the room but nothing recorded when: the grace starts now.
+        h.ports
+            .state
+            .lock()
+            .unwrap()
+            .room_members
+            .insert(ROOM_CH, vec![MEMBER_A]);
+        h.clock.set(5_000);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerGraceNotElapsed)
+        );
+        // The owner comes back and a claim sees them: the recorded absence is forgotten.
+        h.ports
+            .state
+            .lock()
+            .unwrap()
+            .room_members
+            .insert(ROOM_CH, vec![OWNER, MEMBER_A]);
+        h.clock.set(5_030);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerStillPresent)
+        );
+        // Owner leaves again at 5_100: 59 s later still refused, 60 s later accepted.
+        h.ports
+            .state
+            .lock()
+            .unwrap()
+            .room_members
+            .insert(ROOM_CH, vec![MEMBER_A]);
+        h.clock.set(5_100);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerGraceNotElapsed)
+        );
+        h.clock.set(5_159);
+        assert_eq!(
+            run(&h, MEMBER_A, claim.clone()).await,
+            refused(RefusalCode::OwnerGraceNotElapsed)
+        );
+        h.clock.set(5_160);
+        assert_eq!(
+            run(&h, MEMBER_A, claim).await,
+            applied(SuccessCode::Claimed)
+        );
+        assert_eq!(row_of(&h).owner, MEMBER_A);
+    }
+
+    #[tokio::test]
+    async fn two_simultaneous_claims_make_exactly_one_new_owner() {
+        let h = make_harness(live_settings());
+        h.ports
+            .state
+            .lock()
+            .unwrap()
+            .room_members
+            .insert(ROOM_CH, vec![MEMBER_A, MEMBER_B]);
+        h.handler.note_owner_absent(ROOM_CH, 1_000);
+        h.clock.set(2_000);
+        let (a, b) = tokio::join!(
+            run(&h, MEMBER_A, VcSubcommand::Claim),
+            run(&h, MEMBER_B, VcSubcommand::Claim)
+        );
+        let wins = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, CommandOutcome::Applied { .. }))
+            .count();
+        assert_eq!(wins, 1);
+        let owner = row_of(&h).owner;
+        assert!(owner == MEMBER_A || owner == MEMBER_B);
+        let loser = if owner == MEMBER_A { &b } else { &a };
+        assert_eq!(loser, &refused(RefusalCode::OwnerStillPresent));
+    }
+
+    #[tokio::test]
+    async fn rename_failures_other_than_429_change_nothing_and_budget_recovers_after_the_window() {
+        let h = make_harness(live_settings());
+        h.ports.state.lock().unwrap().fail_rename = Some(CommandPortError::Forbidden);
+        let rename = |name: &str| VcSubcommand::Rename {
+            name: name.to_string(),
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                run(&h, OWNER, rename("Fine")).await,
+                refused(RefusalCode::DiscordFailed(CommandPortError::Forbidden))
+            );
+        }
+        h.ports.state.lock().unwrap().fail_rename = None;
+        // Failed attempts consumed no budget: two renames still fit in the window.
+        for _ in 0..2 {
+            assert_eq!(
+                run(&h, OWNER, rename("@@@ ###")).await,
+                applied(SuccessCode::Renamed)
+            );
+        }
+        {
+            let s = h.ports.state.lock().unwrap();
+            assert_eq!(s.renames.len(), 2);
+            assert_eq!(s.renames[0].2, "###");
+        }
+        assert_eq!(
+            run(&h, OWNER, rename("Late")).await,
+            refused(RefusalCode::RenameBudgetExhausted)
+        );
+        // 599 s after the renames (taken at t=1100) the budget is still exhausted, 600 s later free.
+        h.clock.set(1_100 + 599);
+        assert_eq!(
+            run(&h, OWNER, rename("Late")).await,
+            refused(RefusalCode::RenameBudgetExhausted)
+        );
+        h.clock.set(1_100 + 600);
+        assert_eq!(
+            run(&h, OWNER, rename("Late")).await,
+            applied(SuccessCode::Renamed)
+        );
+        assert_eq!(h.ports.state.lock().unwrap().renames.len(), 3);
+        // A name that cleans to nothing falls back to the default name.
+        h.clock.set(1_100 + 1_300);
+        assert_eq!(
+            run(&h, OWNER, rename("@@@")).await,
+            applied(SuccessCode::Renamed)
+        );
+        assert_eq!(h.ports.state.lock().unwrap().renames[3].2, "Voice Room");
+    }
+
+    type RowSnapshot = (u64, bool, u32);
+
+    fn snapshot(row: &RoomRow) -> RowSnapshot {
+        (row.owner, row.locked, row.user_limit)
+    }
+
+    #[tokio::test]
+    async fn seeded_model_check_row_follows_outcome_under_random_discord_and_row_failures() {
+        for seed0 in [
+            0x9E37_79B9_7F4A_7C15_u64,
+            0xD1B5_4A32_D192_ED03,
+            0x0123_4567_89AB_CDEF,
+        ] {
+            let h = make_harness(live_settings());
+            let mut seed = seed0;
+            let mut next_u64 = || -> u64 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let mut applied_count = 0_u32;
+            let mut drift_count = 0_u32;
+            let mut discord_fail_count = 0_u32;
+            let mut claims = 0_u32;
+            let mut trigger_on = false;
+            for step in 0..300_i64 {
+                h.clock.set(10_000 + step * 40);
+                let r = next_u64();
+                if r % 9 == 0 {
+                    let sql = if trigger_on {
+                        "DROP TRIGGER fail_any"
+                    } else {
+                        "CREATE TRIGGER fail_any BEFORE UPDATE ON voice_rooms BEGIN SELECT RAISE(ABORT, 'x'); END;"
+                    };
+                    h.db.lock().unwrap().execute(sql, []).unwrap();
+                    trigger_on = !trigger_on;
+                }
+                let before = row_of(&h);
+                let owner = before.owner;
+                let other = if owner == OWNER { MEMBER_A } else { OWNER };
+                let claim_step = r % 6 == 0;
+                {
+                    let mut s = h.ports.state.lock().unwrap();
+                    let pick = |m: u64, e: CommandPortError| (r / m).is_multiple_of(4).then_some(e);
+                    s.fail_rename = pick(3, CommandPortError::RateLimited);
+                    s.fail_limit = pick(5, CommandPortError::Unavailable);
+                    s.fail_overwrite = pick(7, CommandPortError::Forbidden);
+                    s.fail_delete_overwrite = pick(11, CommandPortError::Forbidden);
+                    s.fail_disconnect = pick(13, CommandPortError::Forbidden);
+                    s.fail_category = pick(17, CommandPortError::Unavailable);
+                    let members = if claim_step {
+                        vec![other]
+                    } else {
+                        vec![owner, other]
+                    };
+                    s.room_members.insert(ROOM_CH, members);
+                }
+                if claim_step {
+                    h.handler.note_owner_absent(ROOM_CH, 0);
+                }
+                let sub = if claim_step {
+                    VcSubcommand::Claim
+                } else {
+                    match r / 31 % 7 {
+                        0 => VcSubcommand::Rename {
+                            name: format!("Room {step}"),
+                        },
+                        1 => VcSubcommand::Limit {
+                            limit: u32::try_from(r / 101 % 120).unwrap(),
+                        },
+                        2 => VcSubcommand::Lock,
+                        3 => VcSubcommand::Unlock,
+                        4 => VcSubcommand::Permit {
+                            target_id: MEMBER_B,
+                        },
+                        5 => VcSubcommand::Reject {
+                            target_id: MEMBER_B,
+                        },
+                        _ => VcSubcommand::Transfer { target_id: other },
+                    }
+                };
+                let actor = if claim_step { other } else { owner };
+                let alerts_before = h.alerter.alerts.lock().unwrap().len();
+                let out = run(&h, actor, sub.clone()).await;
+                let after = row_of(&h);
+                let alerts_after = h.alerter.alerts.lock().unwrap().len();
+                match &out {
+                    CommandOutcome::Applied { code, .. } => {
+                        applied_count += 1;
+                        match (&sub, code) {
+                            (VcSubcommand::Limit { limit }, SuccessCode::LimitUpdated) => {
+                                assert_eq!(after.user_limit, *limit);
+                            }
+                            (_, SuccessCode::Locked) => assert!(after.locked),
+                            (_, SuccessCode::Unlocked) => assert!(!after.locked),
+                            (VcSubcommand::Transfer { target_id }, SuccessCode::Transferred) => {
+                                assert_eq!(after.owner, *target_id);
+                            }
+                            (_, SuccessCode::Claimed) => {
+                                claims += 1;
+                                assert_eq!(after.owner, actor);
+                            }
+                            _ => assert_eq!(snapshot(&after), snapshot(&before)),
+                        }
+                        assert_eq!(alerts_after, alerts_before);
+                    }
+                    CommandOutcome::Refused { code, .. } => {
+                        // Whatever the reason, a refusal never changes the row, and a row write
+                        // that failed after Discord changed is the only refusal that alerts.
+                        assert_eq!(snapshot(&after), snapshot(&before), "{sub:?} {code:?}");
+                        if *code == RefusalCode::RowUpdateFailed {
+                            drift_count += 1;
+                            assert_eq!(alerts_after, alerts_before + 1);
+                        } else {
+                            if matches!(code, RefusalCode::DiscordFailed(_)) {
+                                discord_fail_count += 1;
+                            }
+                            assert!(alerts_after <= alerts_before + 1);
+                        }
+                    }
+                    CommandOutcome::Ignored(code) => panic!("home guild command ignored: {code:?}"),
+                }
+                assert!(after.user_limit <= MAX_USER_LIMIT);
+            }
+            assert!(
+                applied_count > 20,
+                "seed {seed0:#x} applied {applied_count}"
+            );
+            assert!(drift_count > 0, "seed {seed0:#x} never hit a row failure");
+            assert!(
+                discord_fail_count > 0,
+                "seed {seed0:#x} never hit a Discord failure"
+            );
+            assert!(claims > 0, "seed {seed0:#x} never claimed");
         }
     }
 }
