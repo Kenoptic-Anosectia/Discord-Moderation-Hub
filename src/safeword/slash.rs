@@ -57,11 +57,14 @@ pub fn clear_call(member: u64, confirm: Option<bool>) -> Call {
 
 /// Runs one call through SW4 and maps the reply.
 pub fn dispatch(env: &mut dyn Env, who: &Invoker, call: &Call) -> Answer {
-    let _ = (env, who, call);
-    Answer {
-        text: String::new(),
-        ephemeral: false,
-    }
+    let reply = match *call {
+        Call::Status { member } => command::status(env, who, member),
+        Call::Strike { member, role } => command::strike(env, who, &StrikeRequest { member, role }),
+        Call::Clear { member, confirm } => {
+            command::clear(env, who, &ClearRequest { member, confirm })
+        }
+    };
+    answer(&reply)
 }
 
 /// Runs a call on a blocking thread (SW4 and its collaborators are synchronous) and replies

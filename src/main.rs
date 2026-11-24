@@ -3756,10 +3756,12 @@ fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
 /// Adds the commands of the optional features that are on. With every feature off the list is
 /// returned as it came in.
 fn with_optional_commands(
-    commands: Vec<poise::Command<Data, Error>>,
+    mut commands: Vec<poise::Command<Data, Error>>,
     safeword: bool,
 ) -> Vec<poise::Command<Data, Error>> {
-    let _ = safeword;
+    if safeword {
+        commands.push(safeword::slash::safeword());
+    }
     commands
 }
 
@@ -3793,7 +3795,10 @@ async fn main() -> Result<(), Error> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: configured_commands(config.tickets.is_some()),
+            commands: with_optional_commands(
+                configured_commands(config.tickets.is_some()),
+                plan.safeword_command(),
+            ),
             // poise 0.7 passes (framework, event); the serenity context and our Data live inside the
             // framework context, so adapt here and keep `event_handler` itself unchanged.
             event_handler: |framework, event| {
@@ -3834,6 +3839,28 @@ async fn main() -> Result<(), Error> {
                     for line in &plan.lines {
                         println!("{line}");
                     }
+                    let store = safeword::discord::StoreSpec {
+                        path: feature_settings.core_db_path.clone(),
+                        reserved: feature_settings.reserved_db_paths.clone(),
+                    };
+                    let safeword = features::safeword_runtime(
+                        &plan,
+                        features::SafewordParts {
+                            http: ctx.http.clone(),
+                            cache: ctx.cache.clone(),
+                            bot_user_id: ready.user.id.get(),
+                            store,
+                            protected_role_ids: config.protected_role_ids.clone(),
+                        },
+                    );
+                    // Reaction roles ask the safeword store whether a member is under safeword.
+                    let safeword_lookup: Option<role_menus::reactions::SafewordLookup> =
+                        safeword.as_ref().map(|runtime| {
+                            let runtime = runtime.clone();
+                            Arc::new(move |guild: u64, member: u64| {
+                                runtime.store().reaction_state(guild, member)
+                            }) as role_menus::reactions::SafewordLookup
+                        });
                     let services = features::Services {
                         http: ctx.http.clone(),
                         cache: ctx.cache.clone(),
@@ -3843,8 +3870,9 @@ async fn main() -> Result<(), Error> {
                             ctx.cache.clone(),
                             rr_db.clone(),
                             config.staff_alert_channel_id,
-                            None,
+                            safeword_lookup,
                         )),
+                        safeword: safeword.clone(),
                     };
                     let mut optional = features::production_features();
                     optional.extend(features::build_features(&plan, &services));
@@ -3867,7 +3895,7 @@ async fn main() -> Result<(), Error> {
                         // leave the legacy arms in charge.
                         reaction_roles_owned: plan.reaction_roles_owned()
                             && features.is_active(role_menus::reactions::FEATURE_NAME),
-                        safeword: None,
+                        safeword: safeword.filter(|_| features.is_active("safeword")),
                     };
 
                     Ok(build_data(

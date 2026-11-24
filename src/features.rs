@@ -27,6 +27,9 @@ use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Sc
 use crate::role_menus::reactions::{self, ReactionEnv, ReactionRolesFeature, ReactionServices};
 use crate::safeword::command::CommandConfig;
 use crate::safeword::config::{self as safeword_config, SafewordConfig};
+use crate::safeword::discord::{
+    RuntimeDeps, SafewordHook, SafewordRuntime, SharedStore, StoreSpec,
+};
 use crate::settings::{parse_id_list, parse_mode, Mode};
 use crate::storage;
 use crate::tickets::privacy::{ChannelLookup, Lookup};
@@ -749,10 +752,36 @@ pub struct Services {
     pub cache: Arc<serenity::Cache>,
     pub bot_user_id: u64,
     pub reaction: Arc<dyn ReactionServices>,
+    /// The safeword runtime, present exactly when the plan has the safeword (see
+    /// [`safeword_runtime`]).
+    pub safeword: Option<Arc<SafewordRuntime>>,
 }
 
-/// Builds the planned features, in registration order: flash, then reaction roles. An empty plan
-/// builds nothing.
+/// What [`safeword_runtime`] needs besides the plan.
+pub struct SafewordParts {
+    pub http: Arc<serenity::Http>,
+    pub cache: Arc<serenity::Cache>,
+    pub bot_user_id: u64,
+    pub store: StoreSpec,
+    pub protected_role_ids: Vec<u64>,
+}
+
+/// The safeword runtime for a plan that has the safeword; `None` otherwise.
+pub fn safeword_runtime(plan: &FeaturePlan, parts: SafewordParts) -> Option<Arc<SafewordRuntime>> {
+    let command = plan.safeword.clone()?;
+    Some(Arc::new(SafewordRuntime::new(RuntimeDeps {
+        command,
+        http: parts.http,
+        cache: parts.cache,
+        bot_user_id: parts.bot_user_id,
+        store: SharedStore::new(parts.store),
+        staff_alert_channel: plan.staff_alert_channel,
+        protected_role_ids: parts.protected_role_ids,
+    })))
+}
+
+/// Builds the planned features, in registration order: flash, safeword, reaction roles. An empty
+/// plan builds nothing.
 pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
     plan: &FeaturePlan,
     services: &Services,
@@ -770,6 +799,9 @@ pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
             alerts: ports,
             clock: Arc::new(SystemClock),
         })));
+    }
+    if let (Some(_), Some(runtime)) = (&plan.safeword, &services.safeword) {
+        built.push(Box::new(SafewordHook::new(runtime.clone())));
     }
     if let Some(rr) = &plan.reaction_roles {
         let env = ReactionEnv {
@@ -2452,6 +2484,9 @@ mod wiring_tests {
         ]
     }
 
+    type Keys<'a> = Vec<(&'a str, &'a str)>;
+    type Case<'a> = (Keys<'a>, Config, &'a str);
+
     fn lines_text(plan: &FeaturePlan) -> String {
         plan.lines.join("\n")
     }
@@ -2534,17 +2569,33 @@ mod wiring_tests {
         fn report(&self, _line: &str) {}
     }
 
-    fn services(recorder: &Arc<Recorder>) -> Services {
+    fn services(plan: &FeaturePlan, recorder: &Arc<Recorder>) -> Services {
+        let http = Arc::new(serenity::Http::new("synthetic-token"));
+        let cache = Arc::new(serenity::Cache::new());
+        let safeword = safeword_runtime(
+            plan,
+            SafewordParts {
+                http: http.clone(),
+                cache: cache.clone(),
+                bot_user_id: BOT,
+                store: StoreSpec {
+                    path: None,
+                    reserved: vec![],
+                },
+                protected_role_ids: vec![],
+            },
+        );
         Services {
-            http: Arc::new(serenity::Http::new("synthetic-token")),
-            cache: Arc::new(serenity::Cache::new()),
+            http,
+            cache,
             bot_user_id: BOT,
             reaction: recorder.clone(),
+            safeword,
         }
     }
 
     fn build(plan: &FeaturePlan, recorder: &Arc<Recorder>) -> Vec<Box<dyn Feature<u8, u16>>> {
-        build_features::<u8, u16>(plan, &services(recorder))
+        build_features::<u8, u16>(plan, &services(plan, recorder))
     }
 
     fn core_settings(path: &Path, guild: GuildFilter) -> Settings {
@@ -2857,7 +2908,7 @@ mod wiring_tests {
     fn reaction_roles_refusals_keep_the_legacy_handlers_in_charge() {
         let mut no_guild = config();
         no_guild.guild_id = None;
-        let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
+        let cases: Vec<Case> = vec![
             (
                 vec![("REACTION_ROLES_MODE", "shadow")],
                 config(),
@@ -3002,7 +3053,7 @@ mod wiring_tests {
         bad_list.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "760205,,"));
         let mut bad_flag = safeword_keys("live");
         bad_flag.push(("SAFEWORD_DM", "yes"));
-        let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
+        let cases: Vec<Case> = vec![
             (safeword_keys("live"), no_guild, "home_guild_missing"),
             (
                 safeword_keys("live"),
@@ -3066,6 +3117,27 @@ mod wiring_tests {
             "no runner without job kinds"
         );
         assert!(started.is_active("safeword"));
+    }
+
+    // ---- scope ------------------------------------------------------------------
+    #[tokio::test]
+    async fn the_safeword_collaborators_exist_only_for_the_home_guild() {
+        use crate::safeword::runtime::SafewordContext;
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&safeword_keys("live"), &config());
+        let runtime = services(&plan, &recorder).safeword.expect("planned");
+        assert!(runtime.safeword_ops(OTHER_GUILD).is_none());
+        assert!(runtime.safeword_ops(0).is_none());
+        assert!(runtime.safeword_ops(GUILD).is_some());
+        // No runtime without the safeword in the plan.
+        let off = plan_for(&[], &config());
+        assert!(services(&off, &recorder).safeword.is_none());
+    }
+
+    #[test]
+    fn the_flash_policy_is_scoped_to_the_home_guild() {
+        let plan = plan_for(&flash_keys("live"), &config());
+        assert_eq!(plan.flash.unwrap().policy().guild_id(), Some(GUILD));
     }
 
     // ---- startup lines ----------------------------------------------------------

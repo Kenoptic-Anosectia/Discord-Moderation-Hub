@@ -1063,7 +1063,7 @@ impl<X: Sync, D: Sync> Feature<X, D> for ReactionRolesFeature {
 /// id, number and name is dropped. An alert is built from this, never from the raw line.
 pub fn alert_words(line: &str) -> String {
     let words: Vec<&str> = line
-        .split(|c: char| c == ' ' || c == ',' || c == ':' || c == '=')
+        .split([' ', ',', ':', '='])
         .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
         .collect();
     if words.is_empty() {
@@ -2675,6 +2675,66 @@ mod wiring_tests {
         );
         assert!(log.lock().unwrap().is_empty());
         assert_eq!(SkipReason::BotFlagUnknown.code(), "bot_flag_unknown");
+    }
+
+    #[test]
+    fn alert_text_keeps_only_stable_words_and_drops_every_id_and_number() {
+        let line = "reaction_add guild=720001 message=720020 member=720005 error=sqlite_error";
+        assert_eq!(
+            alert_words(line),
+            "reaction_add guild message member error sqlite_error"
+        );
+        let grant = "grant member=720005 status=partial roles=720201:denied:missing_permission,720202:failed:rate_limited";
+        let text = alert_words(grant);
+        assert!(!text.bytes().any(|b| b.is_ascii_digit()), "{text}");
+        assert!(
+            text.contains("rate_limited") && text.contains("denied"),
+            "{text}"
+        );
+        // Upper case, punctuation and anything that could be a name or message text is dropped.
+        assert_eq!(alert_words("Hello World 12345 !!"), "unspecified");
+        assert_eq!(alert_words(""), "unspecified");
+    }
+
+    #[test]
+    fn the_alert_throttle_lets_one_text_through_per_window_and_stays_small() {
+        let mut t = AlertThrottle::default();
+        assert!(t.allow("a", 1_000));
+        assert!(!t.allow("a", 1_000), "same instant");
+        assert!(
+            !t.allow("a", 1_000 + ALERT_REPEAT_SECS - 1),
+            "last second of the window"
+        );
+        assert!(
+            t.allow("a", 1_000 + ALERT_REPEAT_SECS),
+            "the window is over"
+        );
+        assert!(t.allow("b", 1_001), "another text is its own alert");
+        // A clock that went backwards does not hold an alert back forever.
+        assert!(t.allow("a", 10));
+        // Seeded sequence: never more than one pass per window per text, memory stays bounded.
+        let mut t = AlertThrottle::default();
+        let mut last_pass: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut now: i64 = 0;
+        for _ in 0..5_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            now += (state >> 60) as i64;
+            let key = (state >> 33) % 10;
+            let passed = t.allow(&key.to_string(), now);
+            if passed {
+                if let Some(prev) = last_pass.insert(key, now) {
+                    assert!(
+                        now - prev >= ALERT_REPEAT_SECS,
+                        "key {key}: {prev} then {now}"
+                    );
+                }
+            }
+            assert!(t.sent.len() <= 32);
+        }
+        assert!(!last_pass.is_empty());
     }
 
     #[test]
