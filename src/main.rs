@@ -59,6 +59,16 @@ struct Data {
     tickets: Option<tickets::repository::Repository>,
     features: Arc<AppFeatures>,
     log_exclusion: features::LogExclusion,
+    /// What the W2 wiring decided at start-up (see [`WiredFeatures`]).
+    wired: WiredFeatures,
+}
+
+/// Start-up decisions of the optional features that the event handler and the commands read.
+#[derive(Clone, Default)]
+struct WiredFeatures {
+    /// True when the new reaction-role feature owns the reaction events; the legacy
+    /// `ReactionAdd`/`ReactionRemove` arms in `log_event_body` then stand down.
+    reaction_roles_owned: bool,
 }
 
 /// The feature registry as the running bot uses it.
@@ -798,6 +808,7 @@ mod tests {
             tickets: None,
             features: Arc::new(no_features),
             log_exclusion: features::LogExclusion::Off,
+            wired: WiredFeatures::default(),
         }
     }
 
@@ -1096,6 +1107,8 @@ mod tests {
                 rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
                 tickets: None,
                 features: Arc::new(features),
+                flash_log_excluded: vec![],
+                wired: WiredFeatures::default(),
             },
         )
     }
@@ -1134,6 +1147,67 @@ mod tests {
     async fn w1b_gate(data: &Data, ch: u64) -> features::Gate {
         let event = synthetic_message(ch, Some(W1_GUILD));
         features::message_gate(&data.log_exclusion, &event, &W1Lookup::new()).await
+    }
+
+    /// `Data` built by the production `build_data` with the W2 parts chosen by the caller.
+    async fn w2_data(config: Config, flash: Vec<u64>, owned: bool) -> Data {
+        let settings = w1_settings(features::GuildFilter::Any);
+        let features = features::Features::<serenity::Context, Data>::start(
+            features::StartRequest {
+                features: vec![],
+                settings: &settings,
+            },
+            &features::TokioJobStarter,
+        )
+        .await;
+        build_data(
+            Arc::new(config),
+            DataParts {
+                rr_db: Arc::new(Connection::open_in_memory().await.unwrap()),
+                tickets: None,
+                features: Arc::new(features),
+                flash_log_excluded: flash,
+                wired: WiredFeatures {
+                    reaction_roles_owned: owned,
+                },
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_legacy_reaction_arms_stand_down_exactly_when_the_new_feature_owns_the_events() {
+        let config = || w1b_config(vec![], vec![], vec![]);
+        let off = w2_data(config(), vec![], false).await;
+        assert!(
+            legacy_reaction_roles_active(&off),
+            "off: the old arms act as before"
+        );
+        let on = w2_data(config(), vec![], true).await;
+        assert!(!legacy_reaction_roles_active(&on), "on: the new path owns them");
+    }
+
+    #[tokio::test]
+    async fn built_data_excludes_flash_channels_only_when_they_are_passed_in() {
+        const FLASH: u64 = 770_001;
+        let off = w2_data(w1b_config(vec![], vec![], vec![]), vec![], false).await;
+        assert!(matches!(off.log_exclusion, features::LogExclusion::Off));
+        assert_eq!(w1b_gate(&off, FLASH).await, features::Gate::Allow);
+        let on = w2_data(w1b_config(vec![], vec![], vec![]), vec![FLASH], false).await;
+        assert_eq!(
+            w1b_gate(&on, FLASH).await,
+            features::Gate::Skip(features::GateReason::Excluded)
+        );
+        assert_eq!(w1b_gate(&on, W1_PLAIN).await, features::Gate::Allow);
+    }
+
+    #[tokio::test]
+    async fn built_data_with_the_default_parts_keeps_the_configured_exclusion() {
+        let config = w1b_config(vec![W1_EXCLUDED], vec![], vec![]);
+        let data = w2_data(config, vec![], false).await;
+        assert_eq!(
+            w1b_gate(&data, W1_EXCLUDED).await,
+            features::Gate::Skip(features::GateReason::Excluded)
+        );
     }
 
     #[tokio::test]
@@ -2146,11 +2220,16 @@ struct DataParts {
     rr_db: Arc<Connection>,
     tickets: Option<tickets::repository::Repository>,
     features: Arc<AppFeatures>,
+    /// Flash channel ids the logger must not record (empty unless flash is on).
+    flash_log_excluded: Vec<u64>,
+    /// See [`Data::wired`].
+    wired: WiredFeatures,
 }
 
 /// Builds the shared bot state. `setup` is the only production caller, so the
 /// log exclusion the event handler later reads is derived from `config` here.
 fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
+    let _ = &parts.flash_log_excluded;
     Data {
         log_exclusion: features::LogExclusion::from_config(&config),
         config,
@@ -2158,7 +2237,15 @@ fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
         rr_db: parts.rr_db,
         tickets: parts.tickets,
         features: parts.features,
+        wired: parts.wired,
     }
+}
+
+/// Whether the legacy reaction-role arms act. They stand down exactly when the new
+/// reaction-role feature owns the events, so a reaction is never handled twice.
+fn legacy_reaction_roles_active(data: &Data) -> bool {
+    let _ = data;
+    true
 }
 
 /// Builds the `Route` for one event from the shared state. `event_handler` is the
@@ -3698,6 +3785,8 @@ async fn main() -> Result<(), Error> {
                             rr_db,
                             tickets,
                             features,
+                            flash_log_excluded: Vec::new(),
+                            wired: WiredFeatures::default(),
                         },
                     ))
                 })

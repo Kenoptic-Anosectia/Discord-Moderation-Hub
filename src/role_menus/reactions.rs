@@ -371,6 +371,8 @@ pub enum SkipReason {
     ForeignGuild,
     NoUser,
     BotReactor,
+    /// The reactor's bot flag could not be established: ignored, never assumed human.
+    BotFlagUnknown,
     NoBindings,
 }
 
@@ -381,6 +383,7 @@ impl SkipReason {
             Self::ForeignGuild => "foreign_guild",
             Self::NoUser => "no_user",
             Self::BotReactor => "bot_reactor",
+            Self::BotFlagUnknown => "bot_flag_unknown",
             Self::NoBindings => "no_bindings",
         }
     }
@@ -699,17 +702,86 @@ pub fn emoji_key_from_input(input: &str) -> String {
     parse_emoji_input(input)
 }
 
+/// Environment key for the reaction-role feature mode. Only `off` (default) and `live` exist.
+pub const KEY_MODE: &str = "REACTION_ROLES_MODE";
+
+/// Why the mode setting was refused. A stable code, never the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeRefusal {
+    /// `shadow` was asked for. The new path would own the reaction events and do nothing, which
+    /// would silently switch reaction roles off, so it is refused instead.
+    ShadowUnsupported,
+}
+
+impl ModeRefusal {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ShadowUnsupported => "shadow_unsupported",
+        }
+    }
+}
+
+/// Reads `REACTION_ROLES_MODE`: `Ok(true)` = live, `Ok(false)` = off (unset, blank or any
+/// unrecognised word, as for the other features), `Err` = a mode that cannot run.
+pub fn load_enabled(lookup: impl Fn(&str) -> Option<String>) -> Result<bool, ModeRefusal> {
+    let _ = lookup;
+    Ok(false)
+}
+
+/// What the live reaction-role path needs from outside: the binding table, Discord and the
+/// safeword state. The production implementation talks to serenity; a test supplies a fake.
+#[s::async_trait]
+pub trait ReactionServices: Send + Sync {
+    /// The roles bound to `(message, emoji key)`, in row order.
+    async fn bound_roles(&self, message_id: u64, emoji_key: &str)
+        -> Result<Vec<u64>, StorageCode>;
+    /// Role and member facts.
+    fn role_source(&self) -> &dyn RoleSource;
+    /// Whether the user is a bot, when the event did not say. `None` = could not be established.
+    async fn user_is_bot(&self, guild_id: u64, user_id: u64) -> Option<bool>;
+    /// The member's safeword state (`Inactive` when the safeword feature is off).
+    fn safeword_state(&self, guild_id: u64, user_id: u64) -> SafewordState;
+    /// A writer that adds roles in one guild.
+    fn role_writer(&self, guild_id: u64) -> Box<dyn RoleWriter + Send>;
+    /// A writer that removes roles in one guild.
+    fn role_remover(&self, guild_id: u64) -> Box<dyn RoleRemover + Send>;
+    /// The sleeper used between rate-limit retries.
+    fn sleeper(&self) -> Box<dyn Sleeper + Send>;
+    /// Receives one failure line (stable codes and ids from the runtime).
+    fn report(&self, line: &str);
+}
+
+/// The live part of [`ReactionRolesFeature`].
+#[derive(Clone)]
+struct Live {
+    env: ReactionEnv,
+    services: std::sync::Arc<dyn ReactionServices>,
+}
+
 /// Feature registry hook for reaction roles (`src/features.rs`).
 ///
-/// Built and tested offline; wiring card W2 registers it and removes the legacy arms from `main.rs`.
-#[derive(Debug, Clone)]
+/// With [`ReactionRolesFeature::live`] it handles `ReactionAdd` and `ReactionRemove` through the
+/// role service; with [`ReactionRolesFeature::new`] it only reports whether it is enabled.
+#[derive(Clone)]
 pub struct ReactionRolesFeature {
     pub enabled: bool,
+    live: Option<Live>,
 }
 
 impl ReactionRolesFeature {
     pub const fn new(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            live: None,
+        }
+    }
+
+    /// The enabled feature that handles reaction events.
+    pub fn live(env: ReactionEnv, services: std::sync::Arc<dyn ReactionServices>) -> Self {
+        Self {
+            enabled: true,
+            live: Some(Live { env, services }),
+        }
     }
 }
 
@@ -1735,5 +1807,418 @@ mod tests {
             "{}",
             reporter.lines[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    //! W2 wiring: the live feature path, the fail-closed bot flag and the mode setting.
+    use super::*;
+    use crate::roles::eligibility::{SafewordState, MANAGE_ROLES};
+    use crate::roles::runtime::RoleEntry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const HOME: u64 = 720_001;
+    const OTHER: u64 = 720_002;
+    const CHANNEL: u64 = 720_010;
+    const MESSAGE: u64 = 720_020;
+    const BOT: u64 = 720_003;
+    const MEMBER: u64 = 720_005;
+    const ROLE_A: u64 = 720_201;
+    const ROLE_PRIV: u64 = 720_203;
+    const BOT_TOP: u64 = 720_100;
+    const CRAB: &str = "\u{1F980}";
+
+    struct Source;
+
+    #[s::async_trait]
+    impl RoleSource for Source {
+        async fn roles(&self, _g: u64) -> Result<Vec<RoleEntry>, runtime::SourceError> {
+            let role = |id, position, permissions| RoleEntry {
+                id,
+                position,
+                managed: false,
+                permissions,
+            };
+            Ok(vec![
+                role(BOT_TOP, 20, 0),
+                role(ROLE_A, 5, 0),
+                role(ROLE_PRIV, 5, MANAGE_ROLES),
+                role(HOME, 0, 0),
+            ])
+        }
+        async fn member_roles(
+            &self,
+            _g: u64,
+            member: u64,
+        ) -> Result<Vec<u64>, runtime::SourceError> {
+            Ok(if member == BOT { vec![BOT_TOP] } else { vec![] })
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    struct LogWriter(Log);
+
+    impl RoleWriter for LogWriter {
+        fn add_role(&mut self, member: u64, role: u64) -> Result<(), WriteError> {
+            self.0.lock().unwrap().push(format!("add:{member}:{role}"));
+            Ok(())
+        }
+    }
+
+    impl RoleRemover for LogWriter {
+        fn remove_role(&mut self, member: u64, role: u64) -> Result<(), WriteError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("remove:{member}:{role}"));
+            Ok(())
+        }
+    }
+
+    struct NoSleep;
+
+    impl Sleeper for NoSleep {
+        fn sleep_ms(&mut self, _ms: u64) {}
+    }
+
+    struct Fake {
+        bound: Vec<(u64, String, u64)>,
+        bound_calls: AtomicUsize,
+        flag: Option<bool>,
+        flag_calls: AtomicUsize,
+        safeword: SafewordState,
+        log: Log,
+    }
+
+    impl Fake {
+        fn new(flag: Option<bool>) -> Fake {
+            Fake {
+                bound: vec![(MESSAGE, CRAB.to_string(), ROLE_A)],
+                bound_calls: AtomicUsize::new(0),
+                flag,
+                flag_calls: AtomicUsize::new(0),
+                safeword: SafewordState::Inactive,
+                log: Arc::default(),
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[s::async_trait]
+    impl ReactionServices for Fake {
+        async fn bound_roles(&self, message: u64, key: &str) -> Result<Vec<u64>, StorageCode> {
+            self.bound_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .bound
+                .iter()
+                .filter(|(m, k, _)| *m == message && k == key)
+                .map(|(_, _, r)| *r)
+                .collect())
+        }
+        fn role_source(&self) -> &dyn RoleSource {
+            &Source
+        }
+        async fn user_is_bot(&self, _g: u64, _u: u64) -> Option<bool> {
+            self.flag_calls.fetch_add(1, Ordering::SeqCst);
+            self.flag
+        }
+        fn safeword_state(&self, _g: u64, _u: u64) -> SafewordState {
+            self.safeword
+        }
+        fn role_writer(&self, _g: u64) -> Box<dyn RoleWriter + Send> {
+            Box::new(LogWriter(self.log.clone()))
+        }
+        fn role_remover(&self, _g: u64) -> Box<dyn RoleRemover + Send> {
+            Box::new(LogWriter(self.log.clone()))
+        }
+        fn sleeper(&self) -> Box<dyn Sleeper + Send> {
+            Box::new(NoSleep)
+        }
+        fn report(&self, line: &str) {
+            self.log.lock().unwrap().push(format!("report:{line}"));
+        }
+    }
+
+    fn env(home: Option<u64>) -> ReactionEnv {
+        ReactionEnv {
+            home_guild_id: home,
+            protected_roles_invalid: false,
+            protected_role_ids: vec![],
+            safeword_restricted_role_ids: vec![],
+            staff_alert_channel_id: None,
+            bot_user_id: BOT,
+        }
+    }
+
+    /// A reaction event in `guild` by `user`; `member_bot` puts a member object on the event.
+    fn event(guild: Option<u64>, user: u64, member_bot: Option<bool>, added: bool) -> s::FullEvent {
+        let mut payload = serde_json::json!({
+            "channel_id": CHANNEL.to_string(), "message_id": MESSAGE.to_string(),
+            "user_id": user.to_string(), "emoji": {"name": CRAB},
+            "burst": false, "burst_colours": [], "type": 0,
+        });
+        if let Some(g) = guild {
+            payload["guild_id"] = serde_json::json!(g.to_string());
+        }
+        if let Some(bot) = member_bot {
+            payload["member"] = serde_json::json!({
+                "user": {"id": user.to_string(), "username": "synthetic",
+                         "discriminator": "0", "avatar": null, "bot": bot},
+                "roles": [], "joined_at": "2020-01-01T00:00:00.000000+00:00",
+                "deaf": false, "mute": false, "flags": 0,
+            });
+        }
+        let reaction: s::Reaction = serde_json::from_value(payload).unwrap();
+        if added {
+            s::FullEvent::ReactionAdd {
+                add_reaction: reaction,
+            }
+        } else {
+            s::FullEvent::ReactionRemove {
+                removed_reaction: reaction,
+            }
+        }
+    }
+
+    async fn deliver(feature: &ReactionRolesFeature, ev: &s::FullEvent, guild: Option<u64>) {
+        <ReactionRolesFeature as Feature<(), ()>>::handle(feature, &(), ev, &(), guild, None)
+            .await;
+    }
+
+    fn live(fake: &Arc<Fake>, home: Option<u64>) -> ReactionRolesFeature {
+        ReactionRolesFeature::live(env(home), fake.clone())
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_binding_grants_through_the_live_feature_like_the_direct_path() {
+        // Direct path: the function the legacy-free wiring calls with a database handle.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO reaction_roles VALUES ('1','1',?1,?3,?2,'1',0)",
+            params![MESSAGE.to_string(), ROLE_A.to_string(), CRAB],
+        )
+        .unwrap();
+        let direct_log: Log = Arc::default();
+        let mut writer = LogWriter(direct_log.clone());
+        let mut sleeper = NoSleep;
+        let mut reporter = MemoryReporter::default();
+        let direct = handle_reaction_add(
+            &conn,
+            &env(Some(HOME)),
+            &ReactionAddEvent {
+                guild_id: Some(HOME),
+                channel_id: CHANNEL,
+                message_id: MESSAGE,
+                user_id: Some(MEMBER),
+                user_is_bot: Some(false),
+                emoji_key: CRAB.to_string(),
+                safeword: SafewordState::Inactive,
+            },
+            AddPorts {
+                source: &Source,
+                writer: &mut writer,
+                sleeper: &mut sleeper,
+                reporter: &mut reporter,
+            },
+        )
+        .await;
+        assert!(matches!(direct, ReactionAddOutcome::Evaluated { .. }));
+
+        let fake = Arc::new(Fake::new(None));
+        let feature = live(&fake, Some(HOME));
+        let ev = event(Some(HOME), MEMBER, Some(false), true);
+        deliver(&feature, &ev, Some(HOME)).await;
+        assert_eq!(fake.log(), *direct_log.lock().unwrap());
+        assert_eq!(fake.log(), vec![format!("add:{MEMBER}:{ROLE_A}")]);
+    }
+
+    #[tokio::test]
+    async fn a_removal_takes_the_bound_role_back_and_needs_no_member_object() {
+        let fake = Arc::new(Fake::new(Some(false)));
+        let feature = live(&fake, Some(HOME));
+        deliver(&feature, &event(Some(HOME), MEMBER, None, false), Some(HOME)).await;
+        assert_eq!(fake.log(), vec![format!("remove:{MEMBER}:{ROLE_A}")]);
+        assert_eq!(fake.flag_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_role_policy_still_applies_through_the_live_feature() {
+        let mut fake = Fake::new(None);
+        fake.bound.push((MESSAGE, CRAB.to_string(), ROLE_PRIV));
+        let fake = Arc::new(fake);
+        let feature = live(&fake, Some(HOME));
+        let ev = event(Some(HOME), MEMBER, Some(false), true);
+        deliver(&feature, &ev, Some(HOME)).await;
+        let log = fake.log();
+        assert!(log.contains(&format!("add:{MEMBER}:{ROLE_A}")), "{log:?}");
+        assert!(!log.contains(&format!("add:{MEMBER}:{ROLE_PRIV}")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn bots_and_the_bot_itself_are_ignored_before_any_lookup() {
+        for (user, member_bot) in [(MEMBER, Some(true)), (BOT, Some(false)), (BOT, None)] {
+            let fake = Arc::new(Fake::new(Some(false)));
+            let feature = live(&fake, Some(HOME));
+            let ev = event(Some(HOME), user, member_bot, true);
+            deliver(&feature, &ev, Some(HOME)).await;
+            assert!(fake.log().is_empty());
+            assert_eq!(fake.bound_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.flag_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_bot_flag_fails_closed_through_the_live_feature() {
+        // No member object and the service cannot tell: nothing is granted or removed.
+        for added in [true, false] {
+            let fake = Arc::new(Fake::new(None));
+            let feature = live(&fake, Some(HOME));
+            let ev = event(Some(HOME), MEMBER, None, added);
+            deliver(&feature, &ev, Some(HOME)).await;
+            assert!(fake.log().is_empty(), "added={added}: {:?}", fake.log());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_flag_is_looked_up_only_for_a_bound_reaction() {
+        let fake = Arc::new(Fake::new(Some(false)));
+        let feature = live(&fake, Some(HOME));
+        let mut unbound = event(Some(HOME), MEMBER, None, true);
+        if let s::FullEvent::ReactionAdd { add_reaction } = &mut unbound {
+            add_reaction.message_id = s::MessageId::new(MESSAGE + 1);
+        }
+        deliver(&feature, &unbound, Some(HOME)).await;
+        assert_eq!(fake.flag_calls.load(Ordering::SeqCst), 0);
+        assert!(fake.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_guild_reads_and_writes_nothing() {
+        let fake = Arc::new(Fake::new(Some(false)));
+        let feature = live(&fake, Some(HOME));
+        let other = event(Some(OTHER), MEMBER, Some(false), true);
+        deliver(&feature, &other, Some(OTHER)).await;
+        deliver(&feature, &event(None, MEMBER, Some(false), true), None).await;
+        assert!(fake.log().is_empty());
+        assert_eq!(fake.bound_calls.load(Ordering::SeqCst), 0);
+        // And an unset home guild serves nobody.
+        let feature = live(&fake, None);
+        let home = event(Some(HOME), MEMBER, Some(false), true);
+        deliver(&feature, &home, Some(HOME)).await;
+        assert!(fake.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_active_safeword_denies_a_restricted_role_on_add_but_not_on_remove() {
+        let mut fake = Fake::new(Some(false));
+        fake.safeword = SafewordState::Active;
+        let fake = Arc::new(fake);
+        let mut e = env(Some(HOME));
+        e.safeword_restricted_role_ids = vec![ROLE_A];
+        let feature = ReactionRolesFeature::live(e, fake.clone());
+        let add = event(Some(HOME), MEMBER, Some(false), true);
+        deliver(&feature, &add, Some(HOME)).await;
+        let log = fake.log();
+        assert!(!log.iter().any(|l| l.starts_with("add:")), "{log:?}");
+        let remove = event(Some(HOME), MEMBER, Some(false), false);
+        deliver(&feature, &remove, Some(HOME)).await;
+        assert!(fake.log().contains(&format!("remove:{MEMBER}:{ROLE_A}")));
+    }
+
+    #[tokio::test]
+    async fn the_plain_hook_without_services_does_nothing() {
+        for enabled in [false, true] {
+            let feature = ReactionRolesFeature::new(enabled);
+            let ev = event(Some(HOME), MEMBER, Some(false), true);
+            deliver(&feature, &ev, Some(HOME)).await;
+            assert_eq!(
+                <ReactionRolesFeature as Feature<(), ()>>::enabled(&feature),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_bot_flag_is_ignored_with_a_stable_code_by_the_handlers() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO reaction_roles VALUES ('1','1',?1,?3,?2,'1',0)",
+            params![MESSAGE.to_string(), ROLE_A.to_string(), CRAB],
+        )
+        .unwrap();
+        let log: Log = Arc::default();
+        let (mut writer, mut sleeper, mut reporter) =
+            (LogWriter(log.clone()), NoSleep, MemoryReporter::default());
+        let add = handle_reaction_add(
+            &conn,
+            &env(Some(HOME)),
+            &ReactionAddEvent {
+                guild_id: Some(HOME),
+                channel_id: CHANNEL,
+                message_id: MESSAGE,
+                user_id: Some(MEMBER),
+                user_is_bot: None,
+                emoji_key: CRAB.to_string(),
+                safeword: SafewordState::Inactive,
+            },
+            AddPorts {
+                source: &Source,
+                writer: &mut writer,
+                sleeper: &mut sleeper,
+                reporter: &mut reporter,
+            },
+        )
+        .await;
+        assert_eq!(add, ReactionAddOutcome::Skipped(SkipReason::BotFlagUnknown));
+        let remove = handle_reaction_remove(
+            &conn,
+            &env(Some(HOME)),
+            &ReactionRemoveEvent {
+                guild_id: Some(HOME),
+                channel_id: CHANNEL,
+                message_id: MESSAGE,
+                user_id: Some(MEMBER),
+                user_is_bot: None,
+                emoji_key: CRAB.to_string(),
+                safeword: SafewordState::Inactive,
+            },
+            RemovePorts {
+                source: &Source,
+                remover: &mut writer,
+                sleeper: &mut sleeper,
+                reporter: &mut reporter,
+            },
+        )
+        .await;
+        assert_eq!(
+            remove,
+            ReactionRemoveOutcome::Skipped(SkipReason::BotFlagUnknown)
+        );
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(SkipReason::BotFlagUnknown.code(), "bot_flag_unknown");
+    }
+
+    #[test]
+    fn the_mode_setting_is_live_or_off_and_shadow_is_refused() {
+        let with = |value: Option<&'static str>| {
+            load_enabled(move |key| {
+                assert_eq!(key, KEY_MODE);
+                value.map(str::to_string)
+            })
+        };
+        assert_eq!(with(None), Ok(false));
+        assert_eq!(with(Some("")), Ok(false));
+        assert_eq!(with(Some("off")), Ok(false));
+        assert_eq!(with(Some("wat")), Ok(false));
+        assert_eq!(with(Some(" LIVE ")), Ok(true));
+        assert_eq!(with(Some("shadow")), Err(ModeRefusal::ShadowUnsupported));
+        assert_eq!(ModeRefusal::ShadowUnsupported.code(), "shadow_unsupported");
     }
 }

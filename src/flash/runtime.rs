@@ -2359,6 +2359,7 @@ mod tests {
             tickets: None,
             features: Arc::new(none),
             log_exclusion: features::LogExclusion::Off,
+            wired: Default::default(),
         }
     }
 

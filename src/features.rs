@@ -19,9 +19,12 @@ use crate::config::{
     Config, CORE_DB_PATH_KEY, GUILD_ID_KEY, LOG_EXCLUDED_CATEGORY_IDS_KEY,
     LOG_EXCLUDED_CHANNEL_IDS_KEY,
 };
+use crate::flash::config::FlashSettings;
 use crate::jobs::queue::{self, ReconcileOutcome, Report};
 use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError, SystemClock};
 use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
+use crate::role_menus::reactions::ReactionServices;
+use crate::safeword::command::CommandConfig;
 use crate::storage;
 use crate::tickets::privacy::{ChannelLookup, Lookup};
 use poise::serenity_prelude as serenity;
@@ -302,8 +305,14 @@ impl LogExclusion {
             Vec::new(),
         ))
     }
-}
 
+    /// Like [`LogExclusion::from_config`], with the flash channel ids added to the scope so the
+    /// logger never records flash content. An unusable exclusion list still blocks messages.
+    pub fn from_config_with_flash(config: &Config, flash_channels: &[u64]) -> Self {
+        let _ = flash_channels;
+        Self::from_config(config)
+    }
+}
 /// Why a message event may not be cached or logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateReason {
@@ -500,9 +509,82 @@ pub struct StartRequest<'a, X, D> {
     pub settings: &'a Settings,
 }
 
-/// The features that are registered in production. W1 registers none: each
-/// later card adds its own feature here.
+/// The features that are registered in production without any setting. None: each
+/// configurable feature is added by [`build_features`] from the settings in [`FeaturePlan`].
 pub fn production_features<X, D>() -> Vec<Box<dyn Feature<X, D>>> {
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Production wiring (W2, `docs/verification/WIRING-B.md`)
+// ---------------------------------------------------------------------------
+
+/// Reaction roles, as planned from the settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionRolesPlan {
+    pub home_guild: u64,
+    pub protected_roles_invalid: bool,
+    pub protected_role_ids: Vec<u64>,
+    pub safeword_restricted_role_ids: Vec<u64>,
+    pub staff_alert_channel: Option<u64>,
+}
+
+/// Which optional features are on, read from the environment and `Config`. Pure: no Discord,
+/// no I/O. With every `*_MODE` key unset it is empty and `lines` is empty.
+#[derive(Clone, Debug)]
+pub struct FeaturePlan {
+    pub flash: Option<FlashSettings>,
+    pub safeword: Option<CommandConfig>,
+    pub reaction_roles: Option<ReactionRolesPlan>,
+    pub staff_alert_channel: Option<u64>,
+    /// Start-up lines: states, counts and stable codes. Never an id, a path or a value.
+    pub lines: Vec<String>,
+}
+
+impl FeaturePlan {
+    /// Flash channel ids the logger must never record (empty unless flash is planned).
+    pub fn log_excluded_channels(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// True when the `/safeword` command is part of the command list.
+    pub fn safeword_command(&self) -> bool {
+        false
+    }
+
+    /// True when the new reaction-role path owns the reaction events (the legacy arms stand down).
+    pub fn reaction_roles_owned(&self) -> bool {
+        false
+    }
+}
+
+/// Reads the optional-feature settings. A feature whose mode is off is absent and silent; a
+/// feature that is on but cannot run is absent with one line naming a key and a stable code.
+pub fn plan_features(lookup: &dyn Fn(&str) -> Option<String>, config: &Config) -> FeaturePlan {
+    let _ = lookup;
+    FeaturePlan {
+        flash: None,
+        safeword: None,
+        reaction_roles: None,
+        staff_alert_channel: config.staff_alert_channel_id,
+        lines: Vec::new(),
+    }
+}
+
+/// What building the features needs from Discord.
+pub struct Services {
+    pub http: Arc<serenity::Http>,
+    pub cache: Arc<serenity::Cache>,
+    pub bot_user_id: u64,
+    pub reaction: Arc<dyn ReactionServices>,
+}
+
+/// Builds the planned features. An empty plan builds nothing.
+pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
+    plan: &FeaturePlan,
+    services: &Services,
+) -> Vec<Box<dyn Feature<X, D>>> {
+    let _ = (plan, services);
     Vec::new()
 }
 
@@ -656,6 +738,13 @@ impl<X: Sync + 'static, D: Sync + 'static> Features<X, D> {
     /// Start-up lines for the caller to print (states and counts, no ids).
     pub fn lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// True when the named feature survived start-up (enabled, and its database and job
+    /// registration worked).
+    pub fn is_active(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     /// Hands the event to every active feature, in registration order, when
@@ -2066,5 +2155,649 @@ mod tests {
             .map(|e| e.split(':').next().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["one", "three"]);
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    //! W2 wiring (`docs/verification/WIRING-B.md`): reading the feature settings into a plan,
+    //! building the features, what each one registers, and the log-exclusion scope.
+    use super::*;
+    use crate::flash::runtime::{JOB_KINDS, KIND_DELETE_NOTICE, KIND_DELETE_SOURCE};
+    use crate::roles::eligibility::SafewordState;
+    use crate::roles::grant::{RoleWriter, Sleeper, WriteError};
+    use crate::roles::runtime::{RoleEntry, RoleSource, SourceError};
+    use crate::role_menus::reactions::{ReactionServices, RoleRemover, StorageCode};
+    use ::serenity::all::FullEvent;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const GUILD: u64 = 760_001;
+    const OTHER_GUILD: u64 = 760_002;
+    const STAFF_ROLE: u64 = 760_010;
+    const FLASH_A: u64 = 760_101;
+    const FLASH_B: u64 = 760_102;
+    const FLASH_ROLE: u64 = 760_103;
+    const SW_ROLE: u64 = 760_201;
+    const SW_CHANNEL: u64 = 760_202;
+    const SW_MESSAGE: u64 = 760_203;
+    const SW_EMOJI: u64 = 760_204;
+    const SW_RESTRICTED: u64 = 760_205;
+    const ALERT_CHANNEL: u64 = 760_301;
+    const MEMBER: u64 = 760_401;
+    const BOT: u64 = 760_402;
+    const MESSAGE: u64 = 760_403;
+    const BOUND_ROLE: u64 = 760_404;
+    const CHANNEL: u64 = 760_405;
+    const CRAB: &str = "\u{1F980}";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("w2b-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn config() -> Config {
+        Config {
+            discord_token: "synthetic-token".to_string(),
+            log_channel_id: 760_900,
+            age_role_1: 1,
+            age_role_2: 2,
+            reaction_role_db_path: "reaction-test.sqlite".to_string(),
+            staff_role_id: Some(STAFF_ROLE),
+            tickets: None,
+            ticket_archive_retention: crate::tickets::retention::RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+            core_db_path: Some("core-test.sqlite".to_string()),
+            guild_id: Some(GUILD),
+            staff_alert_channel_id: Some(ALERT_CHANNEL),
+            log_excluded_channel_ids: vec![],
+            log_excluded_category_ids: vec![],
+            protected_role_ids: vec![],
+            invalid_core_keys: vec![],
+        }
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn plan_for(pairs: &[(&str, &str)], config: &Config) -> FeaturePlan {
+        plan_features(&lookup(pairs), config)
+    }
+
+    fn flash_keys(mode: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("FLASH_MODE", mode),
+            ("FLASH_CHANNEL_IDS", "760101,760102"),
+            ("FLASH_PING_ROLE_ID", "760103"),
+        ]
+    }
+
+    fn safeword_keys(mode: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("SAFEWORD_MODE", mode),
+            ("SAFEWORD_ROLE_ID", "760201"),
+            ("SAFEWORD_CHANNEL_ID", "760202"),
+            ("SAFEWORD_MESSAGE_ID", "760203"),
+            ("SAFEWORD_EMOJI_ID", "760204"),
+            ("SAFEWORD_RESTRICTED_ROLE_IDS", "760205"),
+        ]
+    }
+
+    fn lines_text(plan: &FeaturePlan) -> String {
+        plan.lines.join("\n")
+    }
+
+    // ---- reaction-role services fake -------------------------------------------
+    struct Source;
+
+    #[::serenity::async_trait]
+    impl RoleSource for Source {
+        async fn roles(&self, _g: u64) -> Result<Vec<RoleEntry>, SourceError> {
+            let role = |id, position| RoleEntry {
+                id,
+                position,
+                managed: false,
+                permissions: 0,
+            };
+            Ok(vec![role(BOT, 20), role(BOUND_ROLE, 5), role(GUILD, 0)])
+        }
+        async fn member_roles(&self, _g: u64, member: u64) -> Result<Vec<u64>, SourceError> {
+            Ok(if member == BOT { vec![BOT] } else { vec![] })
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        log: Arc<Mutex<Vec<String>>>,
+        bound_calls: AtomicUsize,
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<String>>>);
+
+    impl RoleWriter for LogWriter {
+        fn add_role(&mut self, member: u64, role: u64) -> Result<(), WriteError> {
+            self.0.lock().unwrap().push(format!("add:{member}:{role}"));
+            Ok(())
+        }
+    }
+
+    impl RoleRemover for LogWriter {
+        fn remove_role(&mut self, member: u64, role: u64) -> Result<(), WriteError> {
+            self.0.lock().unwrap().push(format!("rm:{member}:{role}"));
+            Ok(())
+        }
+    }
+
+    struct NoSleep;
+
+    impl Sleeper for NoSleep {
+        fn sleep_ms(&mut self, _ms: u64) {}
+    }
+
+    #[::serenity::async_trait]
+    impl ReactionServices for Recorder {
+        async fn bound_roles(&self, message: u64, key: &str) -> Result<Vec<u64>, StorageCode> {
+            self.bound_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if message == MESSAGE && key == CRAB {
+                vec![BOUND_ROLE]
+            } else {
+                vec![]
+            })
+        }
+        fn role_source(&self) -> &dyn RoleSource {
+            &Source
+        }
+        async fn user_is_bot(&self, _g: u64, _u: u64) -> Option<bool> {
+            Some(false)
+        }
+        fn safeword_state(&self, _g: u64, _u: u64) -> SafewordState {
+            SafewordState::Inactive
+        }
+        fn role_writer(&self, _g: u64) -> Box<dyn RoleWriter + Send> {
+            Box::new(LogWriter(self.log.clone()))
+        }
+        fn role_remover(&self, _g: u64) -> Box<dyn RoleRemover + Send> {
+            Box::new(LogWriter(self.log.clone()))
+        }
+        fn sleeper(&self) -> Box<dyn Sleeper + Send> {
+            Box::new(NoSleep)
+        }
+        fn report(&self, _line: &str) {}
+    }
+
+    fn services(recorder: &Arc<Recorder>) -> Services {
+        Services {
+            http: Arc::new(serenity::Http::new("synthetic-token")),
+            cache: Arc::new(serenity::Cache::new()),
+            bot_user_id: BOT,
+            reaction: recorder.clone(),
+        }
+    }
+
+    fn build(plan: &FeaturePlan, recorder: &Arc<Recorder>) -> Vec<Box<dyn Feature<u8, u16>>> {
+        build_features::<u8, u16>(plan, &services(recorder))
+    }
+
+    fn core_settings(path: &Path, guild: GuildFilter) -> Settings {
+        Settings {
+            guild,
+            core_db_path: Some(path.to_string_lossy().into_owned()),
+            reserved_db_paths: vec![],
+            staff_alert_channel: None,
+            protected_role_count: 0,
+            log_excluded_channels: 0,
+            log_excluded_categories: 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct Starter {
+        kinds: Mutex<Vec<String>>,
+    }
+
+    impl JobStarter for Starter {
+        fn start(
+            &self,
+            _db: tokio_rusqlite::Connection,
+            registry: Registry,
+        ) -> BoxFuture<'_, Result<StartedJobs, RunnerError>> {
+            Box::pin(async move {
+                self.kinds.lock().unwrap().push(format!("{registry:?}"));
+                Ok(StartedJobs {
+                    counts: ReportCounts::default(),
+                    wake: Arc::new(|| {}),
+                    shutdown: Arc::new(|| {}),
+                    finished: Box::pin(async {}),
+                })
+            })
+        }
+    }
+
+    fn reaction_add(guild: u64, user: u64) -> FullEvent {
+        let payload = serde_json::json!({
+            "channel_id": CHANNEL.to_string(), "message_id": MESSAGE.to_string(),
+            "user_id": user.to_string(), "guild_id": guild.to_string(),
+            "emoji": {"name": CRAB}, "burst": false, "burst_colours": [], "type": 0,
+            "member": {"user": {"id": user.to_string(), "username": "synthetic",
+                       "discriminator": "0", "avatar": null, "bot": false},
+                       "roles": [], "joined_at": "2020-01-01T00:00:00.000000+00:00",
+                       "deaf": false, "mute": false, "flags": 0},
+        });
+        FullEvent::ReactionAdd {
+            add_reaction: serde_json::from_value(payload).unwrap(),
+        }
+    }
+
+    // ---- ALL-OFF PARITY ---------------------------------------------------------
+    #[test]
+    fn with_none_of_the_new_keys_set_the_plan_is_empty() {
+        let plan = plan_for(&[], &config());
+        assert!(plan.flash.is_none());
+        assert!(plan.safeword.is_none());
+        assert!(plan.reaction_roles.is_none());
+        assert!(plan.lines.is_empty(), "{:?}", plan.lines);
+        assert!(plan.log_excluded_channels().is_empty());
+        assert!(!plan.safeword_command());
+        assert!(!plan.reaction_roles_owned());
+    }
+
+    #[test]
+    fn keys_set_while_every_mode_is_off_change_nothing_and_print_nothing() {
+        let mut pairs = flash_keys("off");
+        pairs.extend(safeword_keys("off"));
+        pairs.push(("REACTION_ROLES_MODE", "off"));
+        // Even bad values stay silent while the mode is off.
+        pairs.push(("FLASH_DELAY_SECS", "not-a-number"));
+        pairs.push(("SAFEWORD_ROLE_ID", "not-an-id"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.flash.is_none() && plan.safeword.is_none() && plan.reaction_roles.is_none());
+        assert!(plan.lines.is_empty(), "{:?}", plan.lines);
+        assert!(plan.log_excluded_channels().is_empty());
+        // Unset, empty and unknown modes are off too.
+        for mode in ["", "wat", "OFF"] {
+            let pairs = [("FLASH_MODE", mode), ("SAFEWORD_MODE", mode)];
+            assert!(plan_for(&pairs, &config()).lines.is_empty(), "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn all_off_creates_no_database_starts_no_runner_and_delivers_nothing() {
+        let dir = scratch("all-off");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&[], &config());
+        let features = build(&plan, &recorder);
+        assert!(features.is_empty());
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        assert!(!db.exists(), "no core.sqlite");
+        assert!(starter.kinds.lock().unwrap().is_empty());
+        assert!(started.lines().is_empty());
+        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 0);
+        assert_eq!(recorder.bound_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn with_everything_off_the_log_exclusion_is_exactly_the_configured_one() {
+        let plan = plan_for(&[], &config());
+        let c = config();
+        assert!(matches!(
+            LogExclusion::from_config_with_flash(&c, &plan.log_excluded_channels()),
+            LogExclusion::Off
+        ));
+    }
+
+    // ---- flash ------------------------------------------------------------------
+    #[test]
+    fn flash_on_plans_the_feature_and_reports_counts_only() {
+        for mode in ["live", "shadow"] {
+            let plan = plan_for(&flash_keys(mode), &config());
+            assert!(plan.flash.is_some(), "{mode}");
+            assert_eq!(plan.log_excluded_channels(), vec![FLASH_A, FLASH_B], "{mode}");
+            let text = lines_text(&plan);
+            assert!(text.contains("flash") && text.contains(mode), "{text}");
+            assert!(text.contains("channels=2"), "{text}");
+        }
+        assert_eq!(FLASH_ROLE, 760_103);
+    }
+
+    #[test]
+    fn flash_with_a_refused_setting_is_dropped_with_the_key_and_a_code_but_no_value() {
+        let mut pairs = flash_keys("live");
+        pairs.push(("FLASH_DELAY_SECS", "secret-looking-value"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.flash.is_none());
+        assert!(plan.log_excluded_channels().is_empty());
+        let text = lines_text(&plan);
+        assert!(text.contains("FLASH_DELAY_SECS"), "{text}");
+        assert!(text.contains("unreadable"), "{text}");
+        assert!(!text.contains("secret-looking-value"), "{text}");
+        let mut pairs = flash_keys("live");
+        pairs.push(("FLASH_DELAY_SECS", "5"));
+        let text = lines_text(&plan_for(&pairs, &config()));
+        assert!(text.contains("out_of_range"), "{text}");
+    }
+
+    #[test]
+    fn flash_without_channels_is_dropped_because_it_would_do_nothing() {
+        let plan = plan_for(&[("FLASH_MODE", "live")], &config());
+        assert!(plan.flash.is_none());
+        assert!(lines_text(&plan).contains("no_channels"), "{:?}", plan.lines);
+    }
+
+    #[test]
+    fn flash_needs_the_home_guild_unset_or_unusable_drops_it() {
+        let mut unset = config();
+        unset.guild_id = None;
+        let mut unusable = config();
+        unusable.invalid_core_keys = vec!["GUILD_ID"];
+        for c in [unset, unusable] {
+            let plan = plan_for(&flash_keys("live"), &c);
+            assert!(plan.flash.is_none());
+            assert!(plan.log_excluded_channels().is_empty());
+            assert!(lines_text(&plan).contains("home_guild_missing"), "{:?}", plan.lines);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabling_flash_live_registers_only_the_flash_job_kinds() {
+        let dir = scratch("flash-live");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&flash_keys("live"), &config());
+        let features = build(&plan, &recorder);
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name(), "flash");
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let calls = starter.kinds.lock().unwrap().clone();
+        assert_eq!(calls, vec![format!("[{:?}, {:?}]", KIND_DELETE_NOTICE, KIND_DELETE_SOURCE)]);
+        assert_eq!(JOB_KINDS.len(), 2);
+        assert!(db.exists());
+        started.stop().await;
+    }
+
+    #[tokio::test]
+    async fn flash_shadow_opens_no_database_and_registers_no_job() {
+        let dir = scratch("flash-shadow");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&flash_keys("shadow"), &config());
+        let features = build(&plan, &recorder);
+        assert_eq!(features.len(), 1);
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        assert!(!db.exists());
+        assert!(starter.kinds.lock().unwrap().is_empty());
+        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 1);
+    }
+
+    // ---- log exclusion ----------------------------------------------------------
+    fn message_in(channel: u64, guild: u64) -> FullEvent {
+        let mut m = serenity::Message::default();
+        m.id = serenity::MessageId::new(760_500);
+        m.channel_id = serenity::ChannelId::new(channel);
+        m.guild_id = Some(serenity::GuildId::new(guild));
+        FullEvent::Message { new_message: m }
+    }
+
+    struct TopLevel;
+
+    impl ChannelLookup for TopLevel {
+        async fn lookup(&self, _id: serenity::ChannelId) -> Lookup {
+            Lookup::Guild { parent: None }
+        }
+    }
+
+    #[tokio::test]
+    async fn flash_channels_are_excluded_from_the_log_only_when_flash_is_on() {
+        let c = config();
+        let on = plan_for(&flash_keys("live"), &c);
+        let scope = LogExclusion::from_config_with_flash(&c, &on.log_excluded_channels());
+        for channel in [FLASH_A, FLASH_B] {
+            let gate = message_gate(&scope, &message_in(channel, GUILD), &TopLevel).await;
+            assert_eq!(gate, Gate::Skip(GateReason::Excluded), "{channel}");
+        }
+        let other = message_gate(&scope, &message_in(760_999, GUILD), &TopLevel).await;
+        assert_eq!(other, Gate::Allow);
+
+        let off = plan_for(&[], &c);
+        let scope = LogExclusion::from_config_with_flash(&c, &off.log_excluded_channels());
+        let gate = message_gate(&scope, &message_in(FLASH_A, GUILD), &TopLevel).await;
+        assert_eq!(gate, Gate::Allow);
+    }
+
+    #[tokio::test]
+    async fn flash_ids_join_the_configured_exclusions_and_never_unblock_a_bad_list() {
+        let mut c = config();
+        c.log_excluded_channel_ids = vec![760_777];
+        let scope = LogExclusion::from_config_with_flash(&c, &[FLASH_A]);
+        for channel in [760_777, FLASH_A] {
+            let gate = message_gate(&scope, &message_in(channel, GUILD), &TopLevel).await;
+            assert_eq!(gate, Gate::Skip(GateReason::Excluded), "{channel}");
+        }
+        let mut bad = config();
+        bad.invalid_core_keys = vec!["LOG_EXCLUDED_CHANNEL_IDS"];
+        let scope = LogExclusion::from_config_with_flash(&bad, &[FLASH_A]);
+        assert!(matches!(scope, LogExclusion::BlockMessages));
+    }
+
+    // ---- reaction roles ---------------------------------------------------------
+    #[test]
+    fn reaction_roles_live_is_planned_with_the_home_guild_and_owns_the_events() {
+        let plan = plan_for(&[("REACTION_ROLES_MODE", "live")], &config());
+        let rr = plan.reaction_roles.as_ref().expect("planned");
+        assert_eq!(rr.home_guild, GUILD);
+        assert!(plan.reaction_roles_owned());
+        assert!(lines_text(&plan).contains("reaction_roles"), "{:?}", plan.lines);
+    }
+
+    #[test]
+    fn reaction_roles_refusals_keep_the_legacy_handlers_in_charge() {
+        let mut no_guild = config();
+        no_guild.guild_id = None;
+        let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
+            (vec![("REACTION_ROLES_MODE", "shadow")], config(), "shadow_unsupported"),
+            (vec![("REACTION_ROLES_MODE", "live")], no_guild, "home_guild_missing"),
+        ];
+        for (pairs, c, code) in cases {
+            let plan = plan_for(&pairs, &c);
+            assert!(plan.reaction_roles.is_none(), "{code}");
+            assert!(!plan.reaction_roles_owned(), "{code}: the old arms must keep working");
+            assert!(lines_text(&plan).contains(code), "{:?}", plan.lines);
+        }
+    }
+
+    #[test]
+    fn reaction_roles_carry_the_protected_roles_and_safeword_restrictions() {
+        let mut c = config();
+        c.protected_role_ids = vec![760_600];
+        let mut pairs = vec![("REACTION_ROLES_MODE", "live")];
+        pairs.extend(safeword_keys("live"));
+        let plan = plan_for(&pairs, &c);
+        let rr = plan.reaction_roles.unwrap();
+        assert_eq!(rr.protected_role_ids, vec![760_600]);
+        assert_eq!(rr.safeword_restricted_role_ids, vec![SW_RESTRICTED]);
+        assert!(!rr.protected_roles_invalid);
+        let mut bad = config();
+        bad.invalid_core_keys = vec!["PROTECTED_ROLE_IDS"];
+        let plan = plan_for(&[("REACTION_ROLES_MODE", "live")], &bad);
+        assert!(plan.reaction_roles.unwrap().protected_roles_invalid);
+    }
+
+    #[test]
+    fn an_unusable_restricted_list_refuses_reaction_roles_while_safeword_is_on() {
+        let mut pairs = vec![("REACTION_ROLES_MODE", "live")];
+        pairs.extend(safeword_keys("shadow"));
+        pairs.retain(|(k, _)| *k != "SAFEWORD_RESTRICTED_ROLE_IDS");
+        pairs.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "1,oops"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.reaction_roles.is_none());
+        assert!(plan.safeword.is_none());
+        let text = lines_text(&plan);
+        assert!(text.contains("restricted_roles_invalid"), "{text}");
+        assert!(text.contains("invalid_id_list"), "{text}");
+        assert!(!text.contains("oops"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn enabling_reaction_roles_registers_no_job_and_no_database() {
+        let dir = scratch("rr-only");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&[("REACTION_ROLES_MODE", "live")], &config());
+        let features = build(&plan, &recorder);
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name(), "reaction_roles");
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        assert!(!db.exists());
+        assert!(starter.kinds.lock().unwrap().is_empty());
+        assert!(started.is_active("reaction_roles"));
+        assert!(!started.is_active("flash"));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_binding_is_granted_through_the_registered_feature() {
+        let dir = scratch("rr-dispatch");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&[("REACTION_ROLES_MODE", "live")], &config());
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(
+            StartRequest { features: build(&plan, &recorder), settings: &settings },
+            &starter,
+        )
+        .await;
+        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 1);
+        assert_eq!(
+            *recorder.log.lock().unwrap(),
+            vec![format!("add:{MEMBER}:{BOUND_ROLE}")]
+        );
+        // Another guild never reaches the feature.
+        assert_eq!(started.dispatch(&0, &reaction_add(OTHER_GUILD, MEMBER), &0).await, 0);
+        assert_eq!(recorder.log.lock().unwrap().len(), 1);
+    }
+
+    // ---- safeword ---------------------------------------------------------------
+    #[test]
+    fn safeword_on_is_planned_with_the_home_guild_and_staff_role() {
+        for mode in ["shadow", "live"] {
+            let plan = plan_for(&safeword_keys(mode), &config());
+            let cc = plan.safeword.as_ref().expect(mode);
+            assert_eq!(cc.home_guild, Some(GUILD));
+            assert_eq!(cc.staff_role_id, Some(STAFF_ROLE));
+            assert_eq!(cc.safeword.role_id, SW_ROLE);
+            assert_eq!(cc.safeword.channel_id, SW_CHANNEL);
+            assert_eq!(cc.safeword.message_id, SW_MESSAGE);
+            assert_eq!(cc.safeword.emoji_id, SW_EMOJI);
+            assert_eq!(cc.safeword.restricted_role_ids, vec![SW_RESTRICTED]);
+            assert!(plan.safeword_command(), "{mode}");
+            assert!(lines_text(&plan).contains("safeword"), "{:?}", plan.lines);
+        }
+    }
+
+    #[test]
+    fn safeword_refusals_drop_the_feature_and_the_command_with_a_code() {
+        let mut no_guild = config();
+        no_guild.guild_id = None;
+        let mut protected_bad = config();
+        protected_bad.invalid_core_keys = vec!["PROTECTED_ROLE_IDS"];
+        let mut missing = safeword_keys("live");
+        missing.retain(|(k, _)| *k != "SAFEWORD_ROLE_ID");
+        let mut bad_list = safeword_keys("live");
+        bad_list.retain(|(k, _)| *k != "SAFEWORD_RESTRICTED_ROLE_IDS");
+        bad_list.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "760205,,"));
+        let mut bad_flag = safeword_keys("live");
+        bad_flag.push(("SAFEWORD_DM", "yes"));
+        let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
+            (safeword_keys("live"), no_guild, "home_guild_missing"),
+            (safeword_keys("live"), protected_bad, "protected_roles_invalid"),
+            (missing, config(), "SAFEWORD_ROLE_ID"),
+            (bad_list, config(), "SAFEWORD_RESTRICTED_ROLE_IDS"),
+            (bad_flag, config(), "SAFEWORD_DM"),
+        ];
+        for (pairs, c, expect) in cases {
+            let plan = plan_for(&pairs, &c);
+            assert!(plan.safeword.is_none(), "{expect}");
+            assert!(!plan.safeword_command(), "{expect}: no command without the feature");
+            assert!(lines_text(&plan).contains(expect), "{expect}: {:?}", plan.lines);
+        }
+    }
+
+    #[test]
+    fn safeword_without_a_staff_role_runs_but_says_nobody_is_staff() {
+        let mut c = config();
+        c.staff_role_id = None;
+        let plan = plan_for(&safeword_keys("live"), &c);
+        assert_eq!(plan.safeword.as_ref().unwrap().staff_role_id, None);
+        assert!(lines_text(&plan).contains("staff_role_unset"), "{:?}", plan.lines);
+    }
+
+    #[tokio::test]
+    async fn enabling_safeword_registers_no_job_kind_but_needs_the_core_database() {
+        let dir = scratch("sw-only");
+        let db = dir.join("core.sqlite");
+        let recorder = Arc::new(Recorder::default());
+        let plan = plan_for(&safeword_keys("live"), &config());
+        let features = build(&plan, &recorder);
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name(), "safeword");
+        let starter = Starter::default();
+        let settings = core_settings(&db, GuildFilter::Only(GUILD));
+        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        assert!(db.exists(), "the registry opened the core database");
+        assert!(starter.kinds.lock().unwrap().is_empty(), "no runner without job kinds");
+        assert!(started.is_active("safeword"));
+    }
+
+    // ---- startup lines ----------------------------------------------------------
+    #[test]
+    fn startup_lines_carry_counts_and_codes_never_ids_or_values() {
+        let mut c = config();
+        c.protected_role_ids = vec![760_600];
+        let mut pairs = flash_keys("live");
+        pairs.extend(safeword_keys("shadow"));
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &c);
+        assert_eq!(plan.lines.len(), 3, "{:?}", plan.lines);
+        let all = lines_text(&plan);
+        for id in [
+            GUILD, STAFF_ROLE, FLASH_A, FLASH_B, FLASH_ROLE, SW_ROLE, SW_CHANNEL, SW_MESSAGE,
+            SW_EMOJI, SW_RESTRICTED, ALERT_CHANNEL, 760_600,
+        ] {
+            assert!(!all.contains(&id.to_string()), "{id} leaked: {all}");
+        }
+        // No run of five or more digits in any line (an id is 17+ digits in production).
+        let mut run = 0;
+        for ch in all.chars() {
+            run = if ch.is_ascii_digit() { run + 1 } else { 0 };
+            assert!(run < 5, "{all}");
+        }
+        assert!(!all.contains(".sqlite") && !all.contains('\\') && !all.contains('/'), "{all}");
+    }
+
+    #[test]
+    fn the_staff_alert_channel_is_carried_for_the_features() {
+        let plan = plan_for(&flash_keys("live"), &config());
+        assert_eq!(plan.staff_alert_channel, Some(ALERT_CHANNEL));
+        let mut c = config();
+        c.staff_alert_channel_id = None;
+        assert_eq!(plan_for(&flash_keys("live"), &c).staff_alert_channel, None);
     }
 }
