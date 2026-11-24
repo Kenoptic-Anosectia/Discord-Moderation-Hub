@@ -713,6 +713,16 @@ fn plan_reaction_roles(
     } else {
         Vec::new()
     };
+    // The safeword is requested but did not start (a refused key, no home guild, an unusable
+    // protected list): reaction roles would then read every member as "not under safeword" and
+    // could hand out a restricted role. Refuse instead (fail closed); the legacy arms stay.
+    if mode_requested(lookup, safeword_config::KEY_MODE) && plan.safeword.is_none() {
+        plan.lines.push(stays_off(
+            "reaction_roles",
+            "safeword requested but not running (safeword_unavailable)",
+        ));
+        return;
+    }
     plan.lines.push(format!(
         "Feature reaction_roles on: mode=live; protected roles={}; it owns the reaction events.",
         config.protected_role_ids.len()
@@ -834,13 +844,17 @@ pub struct Wiring {
 
 /// Decides [`Wiring`] from the plan and from which features survived start-up. Pure.
 pub fn wire(plan: &FeaturePlan, is_active: &dyn Fn(&str) -> bool) -> Wiring {
-    let _ = (plan, is_active);
     Wiring {
-        reaction_roles_owned: false,
-        safeword_active: false,
-        flash_log_excluded: Vec::new(),
+        // Owned only if the feature was planned AND really started: a dropped feature must
+        // leave the legacy arms in charge.
+        reaction_roles_owned: plan.reaction_roles_owned() && is_active(reactions::FEATURE_NAME),
+        safeword_active: plan.safeword_command() && is_active(SAFEWORD_FEATURE_NAME),
+        flash_log_excluded: plan.log_excluded_channels(),
     }
 }
+
+/// The name the safeword feature registers under.
+const SAFEWORD_FEATURE_NAME: &str = "safeword";
 
 /// Stops the runner started by [`TokioJobStarter`].
 struct JobControl {

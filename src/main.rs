@@ -2431,10 +2431,13 @@ fn app_wiring(
     is_active: &dyn Fn(&str) -> bool,
     safeword: Option<Arc<safeword::discord::SafewordRuntime>>,
 ) -> AppWiring {
-    let _ = (plan, is_active, safeword);
+    let decided = features::wire(plan, is_active);
     AppWiring {
-        flash_log_excluded: Vec::new(),
-        wired: WiredFeatures::default(),
+        flash_log_excluded: decided.flash_log_excluded,
+        wired: WiredFeatures {
+            reaction_roles_owned: decided.reaction_roles_owned,
+            safeword: safeword.filter(|_| decided.safeword_active),
+        },
     }
 }
 
@@ -2444,8 +2447,10 @@ fn framework_commands(
     tickets_enabled: bool,
     plan: &features::FeaturePlan,
 ) -> Vec<poise::Command<Data, Error>> {
-    let _ = plan;
-    configured_commands(tickets_enabled)
+    with_optional_commands(
+        configured_commands(tickets_enabled),
+        plan.safeword_command(),
+    )
 }
 
 /// Builds the shared bot state. `setup` is the only production caller, so the
