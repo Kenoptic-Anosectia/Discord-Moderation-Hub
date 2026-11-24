@@ -2067,6 +2067,55 @@ mod tests {
 
     // ---------------------------------------------------- real runner, real DB
 
+    #[tokio::test]
+    async fn kj3_malformed_payload_through_the_real_queue_fails_once_and_alerts_once() {
+        let w = world("live");
+        // Plain JSON objects pass the queue's own claim check and reach the handler.
+        let raws = [
+            "{}",
+            r#"{"channel_id":0,"message_id":2}"#,
+            r#"{"channel_id":"1","message_id":2}"#,
+        ];
+        for (i, raw) in raws.iter().enumerate() {
+            let (key, raw, now) = (format!("bad-{i}"), raw.to_string(), w.clock.secs());
+            w.db.call(move |c| {
+                queue::schedule(
+                    c,
+                    &NewJob {
+                        kind: KIND_DELETE_SOURCE,
+                        dedupe_key: &key,
+                        payload_json: &raw,
+                        due_at: now,
+                    },
+                    now,
+                )
+            })
+            .await
+            .unwrap();
+        }
+        let up = boot(&w.db, &w.clock, &w.feat).await;
+        let net = w.net.clone();
+        eventually("one alert per failed job", move || net.alerts().len() == 3).await;
+        w.clock.advance(700);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        up.stop().await;
+        let rows: Vec<(String, i64, String)> =
+            w.db.call(|c| {
+                let mut st =
+                    c.prepare("SELECT state, attempts, last_error_code FROM jobs ORDER BY id")?;
+                let rows = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<_, _>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap();
+        let want = ("failed".to_string(), 1, "payload_invalid".to_string());
+        assert_eq!(rows, vec![want; 3], "terminal on the first attempt");
+        assert_eq!(w.net.alerts(), vec![AlertCode::PayloadInvalid; 3]);
+        assert!(w.net.deletes().is_empty());
+    }
+
     struct Up {
         shutdown: ShutdownHandle,
         task: tokio::task::JoinHandle<()>,

@@ -2631,7 +2631,7 @@ mod tests {
         }
     }
 
-    const LIVE_KINDS: [(&str, RestartPolicy); 8] = [
+    const LIVE_KINDS: [(&str, RestartPolicy); 13] = [
         ("t_ok", RestartPolicy::RunAgain),
         ("t_flaky", RestartPolicy::RunAgain),
         ("t_fail", RestartPolicy::RunAgain),
@@ -2640,6 +2640,14 @@ mod tests {
         ("o_ok", RestartPolicy::AtMostOnce),
         ("o_panic", RestartPolicy::AtMostOnce),
         ("o_hang", RestartPolicy::AtMostOnce),
+        // A handler's own terminal refusal: failed on the first attempt.
+        ("t_term", RestartPolicy::RunAgain),
+        // The kinds below track uncertainty: an unconfirmed effect ends
+        // `abandoned`, never `failed`.
+        ("u_unknown", RestartPolicy::RunAgain),
+        ("u_panic", RestartPolicy::RunAgain),
+        ("u_relabel", RestartPolicy::RunAgain),
+        ("u_heal", RestartPolicy::RunAgain),
     ];
 
     fn live_registry(model: &Arc<Model>) -> Registry {
@@ -2655,6 +2663,13 @@ mod tests {
                         "t_flaky" if j.attempts >= 2 => Ok(()),
                         "t_flaky" => Err(HandlerError::new("flaky")),
                         "t_fail" => Err(HandlerError::new("always_fails")),
+                        "t_term" => Err(HandlerError::terminal("refused")),
+                        "u_unknown" => Err(HandlerError::outcome_unknown()),
+                        "u_relabel" if j.attempts >= 2 => Err(HandlerError::terminal("refused")),
+                        "u_relabel" => Err(HandlerError::outcome_unknown()),
+                        "u_heal" if j.attempts >= 2 => Ok(()),
+                        "u_heal" => Err(HandlerError::outcome_unknown()),
+                        "u_panic" => panic!("model panic"),
                         "t_panic" | "o_panic" => panic!("model panic"),
                         _ => {
                             let deadline = model.clock.secs() + LIVE_TIMEOUT_SECS;
@@ -2669,6 +2684,9 @@ mod tests {
                 }
             })
             .unwrap();
+            if kind.starts_with("u_") {
+                reg.track_uncertainty(kind).unwrap();
+            }
         }
         reg
     }
@@ -2733,7 +2751,7 @@ mod tests {
                         let kind = if rng.below(12) == 0 {
                             "t_ghost"
                         } else {
-                            LIVE_KINDS[usize::try_from(rng.below(8)).unwrap()].0
+                            LIVE_KINDS[usize::try_from(rng.below(13)).unwrap()].0
                         };
                         let due = clock.secs() + i64::try_from(rng.below(40)).unwrap() - 8;
                         let id = sched(&db, kind, &format!("s{seed}-{step}"), "{}", due).await;
@@ -2827,6 +2845,33 @@ mod tests {
                         assert_eq!(v.last_error_code.as_deref(), Some(CODE_NO_HANDLER));
                         assert_eq!(runs, 0);
                     }
+                    ("t_term", s) => {
+                        assert_eq!(s, JobState::Failed, "seed {seed}");
+                        assert_eq!(
+                            (v.attempts, runs, v.last_error_code.as_deref()),
+                            (1, 1, Some("refused")),
+                            "seed {seed}: a terminal error is not retried"
+                        );
+                    }
+                    ("u_unknown" | "u_panic", s) => {
+                        assert_eq!(s, JobState::Abandoned, "seed {seed} {kind}");
+                        assert_eq!(
+                            (v.attempts, runs, v.last_error_code.as_deref()),
+                            (3, 3, Some(queue::CODE_OUTCOME_UNKNOWN)),
+                            "seed {seed} {kind}"
+                        );
+                    }
+                    ("u_relabel", s) => {
+                        assert_eq!(s, JobState::Abandoned, "seed {seed}");
+                        assert_eq!(
+                            (v.attempts, v.last_error_code.as_deref()),
+                            (2, Some(queue::CODE_OUTCOME_UNKNOWN)),
+                            "seed {seed}: a later refusal must not relabel an unknown outcome"
+                        );
+                    }
+                    ("u_heal", s) => {
+                        assert_eq!((s, runs), (JobState::Done, 2), "seed {seed}");
+                    }
                     ("t_ok", s) => assert_eq!(s, JobState::Done, "seed {seed}"),
                     ("t_flaky", s) => assert_eq!(s, JobState::Done, "seed {seed}"),
                     ("t_fail", s) => {
@@ -2865,10 +2910,14 @@ mod tests {
                     ),
                     other => panic!("unexpected {other:?}"),
                 }
-                if v.state == JobState::Abandoned {
+                // Uncertain kinds are abandoned by their own acknowledgement, which
+                // no restart report mentions; the rest only by reconciliation.
+                if v.state == JobState::Abandoned && !kind.starts_with("u_") {
                     abandoned.insert(*id);
                 }
             }
+            reported_abandoned
+                .retain(|id| all_ids.iter().any(|(i, k)| i == id && !k.starts_with("u_")));
             assert_eq!(
                 abandoned, reported_abandoned,
                 "seed {seed}: every abandonment was reported"
