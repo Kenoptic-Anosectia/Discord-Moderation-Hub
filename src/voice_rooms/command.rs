@@ -4545,6 +4545,30 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_failed_row_removal_on_undeputize_is_refused_by_code_and_changes_nothing() {
+            let h = make_harness(live_settings());
+            seed_deputy(&h, MEMBER_A);
+            trigger(&h, "no_deputy_delete", "DELETE", "voice_room_deputies");
+            for actor in [OWNER, MEMBER_A] {
+                assert_eq!(
+                    run(&h, actor, undeputize_cmd(Some(MEMBER_A))).await,
+                    refused(RefusalCode::RowWriteFailed),
+                    "actor {actor}"
+                );
+            }
+            assert_eq!(
+                deputies_of(&h),
+                [MEMBER_A],
+                "still a deputy, and the reply says so"
+            );
+            assert_eq!(h.ports.state.lock().unwrap().calls_count, 0);
+            assert!(
+                alerts(&h).is_empty(),
+                "nothing on Discord changed, so nothing drifted"
+            );
+        }
+
+        #[tokio::test]
         async fn a_member_who_is_neither_owner_nor_deputy_is_refused_and_nothing_changes() {
             let h = make_harness(live_settings());
             seed_deputy(&h, MEMBER_A);
@@ -5075,6 +5099,26 @@ mod tests {
                 }))
             );
             assert_eq!(h.ports.state.lock().unwrap().write_attempts, 1);
+        }
+
+        #[tokio::test]
+        async fn a_permit_that_is_already_gone_is_neither_removed_nor_failed() {
+            let h = refresh_fixture(live_settings());
+            h.ports.state.lock().unwrap().fail_delete_overwrite = Some(CommandPortError::NotFound);
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Refresh).await,
+                applied(SuccessCode::Refreshed(RefreshCounts {
+                    removed: 0,
+                    added: 2,
+                    failed: 0
+                })),
+                "the three deletes found nothing to delete: not counted as removed, not as failed"
+            );
+            assert_eq!(
+                run(&h, OWNER, VcSubcommand::Permit { target_id: STALE_1 }).await,
+                applied(SuccessCode::Permitted),
+                "and the map no longer remembers them"
+            );
         }
 
         #[tokio::test]
