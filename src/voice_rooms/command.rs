@@ -778,8 +778,13 @@ impl VcCommandHandler {
         }
     }
 
-    /// RED scaffold: not implemented yet.
-    pub fn reset_observations(&self) {}
+    /// Forgets every recorded owner absence. The wiring calls this when the gateway reconnects
+    /// without a clean resume, because owner voice events may have been lost meanwhile: until a
+    /// fresh [`VcCommandHandler::note_owner_absent`] run covers the full claim grace again, no
+    /// claim passes (fail closed). Nothing else in memory is touched.
+    pub fn reset_observations(&self) {
+        self.mem().owner_absent.clear();
+    }
 
     /// Executes one `/vc` command request.
     pub async fn handle(&self, req: &VcCommandRequest) -> CommandOutcome {
@@ -824,10 +829,49 @@ impl VcCommandHandler {
                     .await
             }
             other => {
-                if req.actor_id != row.owner {
-                    return Self::refuse(RefusalCode::NotRoomOwner);
-                }
-                self.handle_owner_cmd(home_guild, &row, other, mode).await
+                let caller = match self.authority(&row, req.actor_id).await {
+                    Ok(Some(authority)) => Caller {
+                        id: req.actor_id,
+                        authority,
+                    },
+                    Ok(None) => return Self::refuse(RefusalCode::NotRoomOwner),
+                    Err(code) => return Self::refuse(code),
+                };
+                self.handle_owner_cmd(home_guild, &row, caller, other, mode)
+                    .await
+            }
+        }
+    }
+
+    /// Who the actor is for this room, from the stored rows at command time: the row's owner, a
+    /// row in `voice_room_deputies`, or neither. Channel permissions are never consulted.
+    async fn authority(&self, row: &RoomRow, actor: u64) -> Result<Option<Authority>, RefusalCode> {
+        if actor == row.owner {
+            return Ok(Some(Authority::Owner));
+        }
+        let is_deputy = self
+            .read_rows(|conn| repository::is_deputy(conn, row.channel, actor))
+            .await?;
+        Ok(is_deputy.then_some(Authority::Deputy))
+    }
+
+    /// Runs one row read; a failure alerts and becomes a stable refusal, never a default.
+    async fn read_rows<T, F>(&self, read: F) -> Result<T, RefusalCode>
+    where
+        F: FnOnce(&Connection) -> Result<T, repository::RepoError>,
+    {
+        let res = match self.deps.db.lock() {
+            Ok(conn) => read(&conn).ok(),
+            Err(_) => None,
+        };
+        match res {
+            Some(value) => Ok(value),
+            None => {
+                self.deps
+                    .alerter
+                    .alert(CommandAlertCode::RepositoryReadFailed)
+                    .await;
+                Err(RefusalCode::StorageReadFailed)
             }
         }
     }
@@ -836,6 +880,13 @@ impl VcCommandHandler {
         CommandOutcome::Refused {
             code,
             reply: Reply::refused(code),
+        }
+    }
+
+    fn applied_with(code: SuccessCode) -> CommandOutcome {
+        CommandOutcome::Applied {
+            code,
+            reply: Reply::ok(code),
         }
     }
 
@@ -883,9 +934,11 @@ impl VcCommandHandler {
         &self,
         home_guild: u64,
         row: &RoomRow,
+        caller: Caller,
         sub: &VcSubcommand,
         mode: Mode,
     ) -> CommandOutcome {
+        let owner = caller.authority == Authority::Owner;
         match sub {
             VcSubcommand::Rename { name } => self.handle_rename(home_guild, row, name, mode).await,
             VcSubcommand::Limit { limit } => self.handle_limit(home_guild, row, *limit, mode).await,
@@ -895,19 +948,49 @@ impl VcCommandHandler {
                 self.handle_permit(home_guild, row, *target_id, mode).await
             }
             VcSubcommand::Reject { target_id } => {
-                self.handle_reject(home_guild, row, *target_id, mode).await
+                self.handle_reject(home_guild, row, *target_id, caller, mode)
+                    .await
+            }
+            VcSubcommand::Refresh => self.handle_refresh(home_guild, row, mode).await,
+            VcSubcommand::Undeputize { target_id } => {
+                self.handle_undeputize(row, caller, *target_id, mode).await
+            }
+            // The owner-only commands: a deputy is refused before anything is read or written.
+            VcSubcommand::Transfer { .. } | VcSubcommand::Deputize { .. } if !owner => {
+                Self::refuse(RefusalCode::DeputyNotAllowed)
             }
             VcSubcommand::Transfer { target_id } => {
                 self.handle_transfer(home_guild, row, *target_id, mode)
                     .await
             }
+            VcSubcommand::Deputize { target_id } => {
+                self.handle_deputize(home_guild, row, *target_id, mode)
+                    .await
+            }
             VcSubcommand::Claim => Self::refuse(RefusalCode::AlreadyRoomOwner),
-            // RED scaffold: not implemented yet.
-            VcSubcommand::Deputize { .. }
-            | VcSubcommand::Undeputize { .. }
-            | VcSubcommand::Refresh => Self::refuse(RefusalCode::FeatureNotReady),
         }
     }
+}
+
+/// What a caller is to a room, read from the stored rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Authority {
+    /// The `voice_rooms` row's owner.
+    Owner,
+    /// A row in `voice_room_deputies`.
+    Deputy,
+}
+
+/// The member running a command and what they are to the room.
+#[derive(Debug, Clone, Copy)]
+struct Caller {
+    id: u64,
+    authority: Authority,
+}
+
+/// A count for a reply; saturates instead of wrapping.
+fn count_of(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// Role flags of a target member, derived from the role catalog and the role-policy sets.
@@ -1335,23 +1418,8 @@ impl VcCommandHandler {
         if let Some(code) = self.common_target_refusal(row, target) {
             return Self::refuse(code);
         }
-        let (profile, flags) = match self.load_target(home_guild, target).await {
-            Ok(found) => found,
-            Err(code) => return Self::refuse(code),
-        };
-        if profile.is_bot {
-            return Self::refuse(RefusalCode::TargetIsBot);
-        }
-        if flags.protected || flags.restricted || flags.privileged {
-            return Self::refuse(RefusalCode::TargetProtectedOrRestricted);
-        }
-        match self.deps.safeword.state(home_guild, target) {
-            Ok(SafewordState::Inactive) => {}
-            Ok(SafewordState::Active) => return Self::refuse(RefusalCode::TargetSafewordActive),
-            Err(_) => return Self::refuse(RefusalCode::StorageReadFailed),
-        }
-        if !profile.can_view_category {
-            return Self::refuse(RefusalCode::CategoryNotVisible);
+        if let Err(code) = self.check_permit_eligibility(home_guild, target).await {
+            return Self::refuse(code);
         }
         let already = self
             .mem()
@@ -1374,6 +1442,32 @@ impl VcCommandHandler {
         }
         self.remember_permit(row.channel, target);
         Self::applied(SuccessCode::Permitted, mode)
+    }
+
+    /// The eligibility rules `permit` and `deputize` share: the target is not a bot account,
+    /// holds no protected, restricted or privileged role (a role missing from the catalog is
+    /// unjudgeable, so refused), has no active safeword and can view the room category.
+    async fn check_permit_eligibility(
+        &self,
+        home_guild: u64,
+        target: u64,
+    ) -> Result<(), RefusalCode> {
+        let (profile, flags) = self.load_target(home_guild, target).await?;
+        if profile.is_bot {
+            return Err(RefusalCode::TargetIsBot);
+        }
+        if flags.protected || flags.restricted || flags.privileged {
+            return Err(RefusalCode::TargetProtectedOrRestricted);
+        }
+        match self.deps.safeword.state(home_guild, target) {
+            Ok(SafewordState::Inactive) => {}
+            Ok(SafewordState::Active) => return Err(RefusalCode::TargetSafewordActive),
+            Err(_) => return Err(RefusalCode::StorageReadFailed),
+        }
+        if !profile.can_view_category {
+            return Err(RefusalCode::CategoryNotVisible);
+        }
+        Ok(())
     }
 
     /// Remembers a permit; forgets the permits of rooms that no longer have a row once the memory
@@ -1403,10 +1497,23 @@ impl VcCommandHandler {
         home_guild: u64,
         row: &RoomRow,
         target: u64,
+        caller: Caller,
         mode: Mode,
     ) -> CommandOutcome {
         if let Some(code) = self.common_target_refusal(row, target) {
             return Self::refuse(code);
+        }
+        // Only the owner may reject a deputy; otherwise a deputy could remove deputies by banning
+        // them. The owner's reject also removes the deputy row, below.
+        let target_is_deputy = match self
+            .read_rows(|conn| repository::is_deputy(conn, row.channel, target))
+            .await
+        {
+            Ok(found) => found,
+            Err(code) => return Self::refuse(code),
+        };
+        if target_is_deputy && caller.authority != Authority::Owner {
+            return Self::refuse(RefusalCode::TargetIsDeputy);
         }
         let (profile, flags) = match self.load_target(home_guild, target).await {
             Ok(found) => found,
@@ -1446,12 +1553,259 @@ impl VcCommandHandler {
         if let Some(set) = self.mem().permitted_members.get_mut(&row.channel) {
             set.remove(&target);
         }
+        // The deputy row goes in the same command as the ban. A failed write is alerted and
+        // reported; the disconnect below is still attempted so the ban takes effect.
+        let row_failed = target_is_deputy
+            && !self.write_row(|conn| repository::remove_deputy(conn, row.channel, target));
+        if row_failed {
+            self.deps
+                .alerter
+                .alert(CommandAlertCode::DeputyRowDrift)
+                .await;
+        }
         if present {
             if let Err(e) = self.deps.ports.disconnect_member(home_guild, target).await {
-                return Self::refuse(RefusalCode::DisconnectFailed(e));
+                return if row_failed {
+                    Self::refuse(RefusalCode::RowUpdateFailed)
+                } else {
+                    Self::refuse(RefusalCode::DisconnectFailed(e))
+                };
             }
         }
+        if row_failed {
+            return Self::refuse(RefusalCode::RowUpdateFailed);
+        }
         Self::applied(success, mode)
+    }
+
+    /// `/vc deputize`: owner only (the caller gate refuses deputies before this runs).
+    async fn handle_deputize(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        target: u64,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if let Some(code) = self.common_target_refusal(row, target) {
+            return Self::refuse(code);
+        }
+        let (already, count) = match self
+            .read_rows(|conn| {
+                Ok((
+                    repository::is_deputy(conn, row.channel, target)?,
+                    repository::deputies(conn, row.channel)?.len(),
+                ))
+            })
+            .await
+        {
+            Ok(found) => found,
+            Err(code) => return Self::refuse(code),
+        };
+        if already {
+            return Self::refuse(RefusalCode::TargetAlreadyDeputy);
+        }
+        if count >= MAX_DEPUTIES_PER_ROOM {
+            return Self::refuse(RefusalCode::DeputyCapReached);
+        }
+        match self.deps.ports.room_members(home_guild, row.channel).await {
+            Ok(list) if list.contains(&target) => {}
+            Ok(_) => return Self::refuse(RefusalCode::TargetNotInRoom),
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        }
+        if let Err(code) = self.check_permit_eligibility(home_guild, target).await {
+            return Self::refuse(code);
+        }
+        if mode == Mode::Shadow {
+            return Self::applied(SuccessCode::Deputized, mode);
+        }
+        // Discord first (the same permit path as `permit`), the row second.
+        if let Err(e) = self
+            .deps
+            .ports
+            .set_overwrite(home_guild, row.channel, Self::permit_overwrite(target))
+            .await
+        {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        self.remember_permit(row.channel, target);
+        let now = self.now();
+        let stored = match self.deps.db.lock() {
+            Ok(conn) => matches!(
+                repository::add_deputy(&conn, row.channel, target, now, MAX_DEPUTIES_PER_ROOM),
+                Ok(repository::AddDeputy::Added)
+            ),
+            Err(_) => false,
+        };
+        if !stored {
+            self.deps
+                .alerter
+                .alert(CommandAlertCode::DeputyRowDrift)
+                .await;
+            return Self::refuse(RefusalCode::RowUpdateFailed);
+        }
+        Self::applied(SuccessCode::Deputized, mode)
+    }
+
+    /// `/vc undeputize [member]`: the owner may remove any deputy; a deputy only themselves. The
+    /// target's permit overwrite is left alone (`refresh` clears approvals).
+    async fn handle_undeputize(
+        &self,
+        row: &RoomRow,
+        caller: Caller,
+        target: Option<u64>,
+        mode: Mode,
+    ) -> CommandOutcome {
+        let target = target.unwrap_or(caller.id);
+        if target == 0 {
+            return Self::refuse(RefusalCode::InvalidUserId);
+        }
+        if caller.authority != Authority::Owner && target != caller.id {
+            return Self::refuse(RefusalCode::DeputySelfOnly);
+        }
+        let is_deputy = match self
+            .read_rows(|conn| repository::is_deputy(conn, row.channel, target))
+            .await
+        {
+            Ok(found) => found,
+            Err(code) => return Self::refuse(code),
+        };
+        if !is_deputy {
+            return Self::refuse(RefusalCode::TargetNotDeputy);
+        }
+        if mode == Mode::Shadow {
+            return Self::applied(SuccessCode::Undeputized, mode);
+        }
+        if !self.write_row(|conn| repository::remove_deputy(conn, row.channel, target)) {
+            return Self::refuse(RefusalCode::RowWriteFailed);
+        }
+        Self::applied(SuccessCode::Undeputized, mode)
+    }
+
+    /// `/vc refresh`: afterwards the only per-member permit overwrites are the owner's, the
+    /// deputies' and those of members connected now. Reject overwrites, role overwrites and
+    /// `@everyone` are never touched, and nothing is read from the in-memory permit map.
+    async fn handle_refresh(&self, home_guild: u64, row: &RoomRow, mode: Mode) -> CommandOutcome {
+        let ports = &self.deps.ports;
+        let deputies = match self
+            .read_rows(|conn| repository::deputies(conn, row.channel))
+            .await
+        {
+            Ok(list) => list,
+            Err(code) => return Self::refuse(code),
+        };
+        let listed = match ports.member_overwrites(home_guild, row.channel).await {
+            Ok(list) => list,
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        let connected = match ports.room_members(home_guild, row.channel).await {
+            Ok(list) => list,
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        let bot = self.deps.bot_user_id;
+        let mut keep: HashSet<u64> = deputies.into_iter().chain(connected).collect();
+        keep.insert(row.owner);
+        keep.remove(&bot);
+
+        let grants_connect = |o: &MemberOverwrite| o.allow & policy::CONNECT != 0;
+        let denies_connect = |o: &MemberOverwrite| o.deny & policy::CONNECT != 0;
+        // Reject (deny) overwrites are read from the whole list so a keep-set member who is
+        // banned never gets a permit written over the ban.
+        let banned: HashSet<u64> = listed
+            .iter()
+            .filter(|o| denies_connect(o))
+            .map(|o| o.user_id)
+            .collect();
+        let mut permitted: HashSet<u64> = listed
+            .iter()
+            .filter(|o| grants_connect(o) && !denies_connect(o))
+            .map(|o| o.user_id)
+            .collect();
+        let examined = listed.len().min(MAX_OVERWRITES_PER_CHANNEL);
+        let to_remove: Vec<u64> = listed[..examined]
+            .iter()
+            .filter(|o| grants_connect(o) && !denies_connect(o))
+            .map(|o| o.user_id)
+            .filter(|u| *u != bot && !keep.contains(u))
+            .collect();
+        let mut to_add: Vec<u64> = keep
+            .iter()
+            .copied()
+            .filter(|u| !permitted.contains(u) && !banned.contains(u))
+            .collect();
+        to_add.sort_unstable();
+        let mut counts = RefreshCounts {
+            failed: count_of(listed.len() - examined),
+            ..RefreshCounts::default()
+        };
+        if mode == Mode::Shadow {
+            counts.removed = count_of(to_remove.len());
+            counts.added = count_of(to_add.len());
+            return Self::applied_with(SuccessCode::ShadowRefresh(counts));
+        }
+
+        // Approvals are added before any are removed, so a member who stays never loses access
+        // half way. A 429 stops the run: nothing after it is attempted and it counts as failed.
+        let mut rate_limited = false;
+        for user in to_add {
+            if rate_limited {
+                counts.failed += 1;
+                continue;
+            }
+            let wanted = if user == row.owner {
+                Self::owner_overwrite(user)
+            } else {
+                Self::permit_overwrite(user)
+            };
+            match ports.set_overwrite(home_guild, row.channel, wanted).await {
+                Ok(()) => {
+                    counts.added += 1;
+                    permitted.insert(user);
+                }
+                Err(e) => {
+                    rate_limited = e == CommandPortError::RateLimited;
+                    counts.failed += 1;
+                }
+            }
+        }
+        for user in to_remove {
+            if rate_limited {
+                counts.failed += 1;
+                continue;
+            }
+            match ports
+                .delete_overwrite(home_guild, row.channel, OverwriteTarget::Member(user))
+                .await
+            {
+                Ok(()) => {
+                    counts.removed += 1;
+                    permitted.remove(&user);
+                }
+                // Already gone: nothing was removed by this command and nothing failed.
+                Err(CommandPortError::NotFound) => {
+                    permitted.remove(&user);
+                }
+                Err(e) => {
+                    rate_limited = e == CommandPortError::RateLimited;
+                    counts.failed += 1;
+                }
+            }
+        }
+        // Rebuild the in-memory map from what Discord now holds (as far as the writes above show).
+        permitted.remove(&row.owner);
+        permitted.remove(&bot);
+        {
+            let mut mem = self.mem();
+            if permitted.is_empty() {
+                mem.permitted_members.remove(&row.channel);
+            } else {
+                mem.permitted_members.insert(row.channel, permitted);
+            }
+        }
+        if counts.failed == 0 {
+            Self::applied_with(SuccessCode::Refreshed(counts))
+        } else {
+            Self::refuse(RefusalCode::RefreshPartial(counts))
+        }
     }
 }
 
@@ -4592,13 +4946,11 @@ mod tests {
                     failed: 0
                 }))
             );
-            let s = h.ports.state.lock().unwrap();
             assert_eq!(
-                s.deleted_overwrites,
+                h.ports.state.lock().unwrap().deleted_overwrites,
                 [(HOME_GUILD, ROOM_CH, OverwriteTarget::Member(STALE_1))],
                 "the permit memory knew nothing about was removed, nothing else"
             );
-            drop(s);
             // The map was rebuilt from Discord: the connected member is now known as permitted and
             // the forgotten one is not.
             assert_eq!(
@@ -4707,12 +5059,11 @@ mod tests {
                     failed: 3
                 }))
             );
-            let s = h.ports.state.lock().unwrap();
             assert_eq!(
-                s.write_attempts, 3,
+                h.ports.state.lock().unwrap().write_attempts,
+                3,
                 "two adds ok, the first delete hits the 429, no more"
             );
-            drop(s);
             let h = refresh_fixture(live_settings());
             h.ports.state.lock().unwrap().rate_limit_after = Some(0);
             assert_eq!(
@@ -4971,7 +5322,14 @@ mod tests {
                     let now = 10_000 + step * 40;
                     h.clock.set(now);
                     let r = next();
-                    // Toggle SQLite failures.
+                    // Independent-looking draws derived from `r` (a bare division of one xorshift
+                    // output correlates the decisions and starves some commands).
+                    let d = |k: u64| -> u64 {
+                        let mut z = r ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                        z ^ (z >> 31)
+                    };
                     for (i, (name, when, table)) in [
                         ("fi", "INSERT", "voice_room_deputies"),
                         ("fd", "DELETE", "voice_room_deputies"),
@@ -4980,7 +5338,12 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     {
-                        if (r >> (8 * i)) % 9 == 0 {
+                        let flip = if on.contains(name) {
+                            (r >> (8 * i)) % 3 == 0
+                        } else {
+                            (r >> (8 * i)) % 14 == 0
+                        };
+                        if flip {
                             if on.remove(name) {
                                 h.db.lock()
                                     .unwrap()
@@ -5001,6 +5364,9 @@ mod tests {
                         .copied()
                         .filter(|u| (r >> (u % 13)) % 3 != 0)
                         .collect();
+                    if members.is_empty() {
+                        members.push(owner);
+                    }
                     let claim_step = r % 8 == 0;
                     if claim_step {
                         members.retain(|u| *u != owner);
@@ -5016,30 +5382,29 @@ mod tests {
                         let mut s = h.ports.state.lock().unwrap();
                         s.room_members.insert(ROOM_CH, members.clone());
                         let pick =
-                            |m: u64, e: CommandPortError| (r / m).is_multiple_of(5).then_some(e);
+                            |m: u64, e: CommandPortError| d(m).is_multiple_of(12).then_some(e);
                         s.fail_overwrite = pick(3, CommandPortError::Forbidden);
                         s.fail_delete_overwrite = pick(7, CommandPortError::Forbidden);
                         s.fail_member_overwrites = pick(11, CommandPortError::Unavailable);
                         s.fail_room_members = pick(13, CommandPortError::Unavailable);
                         s.fail_set_users.clear();
                         s.fail_delete_users.clear();
-                        if (r / 17) % 4 == 0 {
-                            s.fail_set_users
-                                .insert(pool[(r / 19) as usize % pool.len()]);
+                        if d(17) % 4 == 0 {
+                            s.fail_set_users.insert(pool[d(19) as usize % pool.len()]);
                             s.fail_delete_users
-                                .insert(pool[(r / 23) as usize % pool.len()]);
+                                .insert(pool[d(23) as usize % pool.len()]);
                         }
-                        let limit_at = s.writes_ok + (r / 31) as usize % 4;
-                        s.rate_limit_after = ((r / 29) % 6 == 0).then_some(limit_at);
+                        let limit_at = s.writes_ok + d(31) as usize % 4;
+                        s.rate_limit_after = (d(29) % 12 == 0).then_some(limit_at);
                         // Discord keeps overwrites of members who left; sprinkle stale ones.
-                        if (r / 37) % 3 == 0 {
-                            let who = pool[(r / 41) as usize % pool.len()];
+                        if d(37) % 3 == 0 {
+                            let who = pool[d(41) as usize % pool.len()];
                             if !s
                                 .live
                                 .iter()
                                 .any(|o| o.target == OverwriteTarget::Member(who))
                             {
-                                s.live.push(if (r / 43) % 4 == 0 {
+                                s.live.push(if d(43) % 4 == 0 {
                                     deny(who)
                                 } else {
                                     permit(who)
@@ -5051,7 +5416,7 @@ mod tests {
                         observe_absent(&h, now - 60, now);
                     }
                     // Occasionally delete and recreate the room row (VR2 cleanup + a new room).
-                    if (r / 47) % 25 == 0 {
+                    if d(47) % 70 == 0 {
                         let stored = before_row.clone();
                         let res = {
                             let conn = h.db.lock().unwrap();
@@ -5079,18 +5444,18 @@ mod tests {
                         }
                         continue;
                     }
-                    let other = pool[(r / 53) as usize % pool.len()];
-                    let actor = if claim_step || (r / 59) % 3 == 0 {
-                        members[(r / 61) as usize % members.len()]
-                    } else if (r / 67) % 2 == 0 {
+                    let other = pool[d(53) as usize % pool.len()];
+                    let actor = if claim_step || d(59) % 3 == 0 {
+                        members[d(61) as usize % members.len()]
+                    } else if d(67) % 2 == 0 {
                         owner
                     } else {
-                        pool[(r / 71) as usize % pool.len()]
+                        pool[d(71) as usize % pool.len()]
                     };
                     let sub = if claim_step {
                         VcSubcommand::Claim
                     } else {
-                        match (r / 73) % 9 {
+                        match d(73) % 9 {
                             0 | 1 => deputize_cmd(other),
                             2 => undeputize_cmd(Some(other)),
                             3 => undeputize_cmd(None),

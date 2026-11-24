@@ -5,6 +5,11 @@
 //! user_limit INTEGER`. The row is the truth about which channels the bot may delete: a
 //! channel without a row is never touched.
 //!
+//! VR4 adds `voice_room_deputies(channel, user, added_at)`, primary key `(channel, user)`
+//! (`docs/verification/VOICE-ROOMS-DEPUTIES.md`). Triggers remove a room's deputy rows when its
+//! `voice_rooms` row is deleted and remove the new owner's own row when the owner changes, in the
+//! same statement.
+//!
 //! Functions take a plain `&Connection`, so the runtime can call them inside one
 //! `tokio_rusqlite` call next to the job queue (the queue lives in the same file). Nothing
 //! here holds a Discord type or reads a clock: the caller passes ids and `now`.
@@ -15,9 +20,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Feature name used with `storage::migrate`.
 pub const FEATURE: &str = "voice_rooms";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: "CREATE TABLE voice_rooms (\
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: "CREATE TABLE voice_rooms (\
           channel TEXT NOT NULL PRIMARY KEY, \
           guild TEXT NOT NULL, \
           owner TEXT NOT NULL, \
@@ -25,7 +31,24 @@ const MIGRATIONS: &[Migration] = &[Migration {
           locked INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0,1)), \
           user_limit INTEGER NOT NULL DEFAULT 0 CHECK (user_limit >= 0)); \
           CREATE INDEX voice_rooms_guild ON voice_rooms (guild);",
-}];
+    },
+    // VR4: deputies. The two triggers run inside the statement that deletes a room row or changes
+    // its owner, so a deputy row can never outlive its room, a recreated channel id never inherits
+    // deputies, and a new owner stops being a deputy in the same write.
+    Migration {
+        version: 2,
+        sql: "CREATE TABLE voice_room_deputies (\
+          channel TEXT NOT NULL, \
+          user TEXT NOT NULL, \
+          added_at INTEGER NOT NULL, \
+          PRIMARY KEY (channel, user)); \
+          CREATE TRIGGER voice_rooms_delete_deputies AFTER DELETE ON voice_rooms \
+          BEGIN DELETE FROM voice_room_deputies WHERE channel = OLD.channel; END; \
+          CREATE TRIGGER voice_rooms_owner_not_deputy AFTER UPDATE OF owner ON voice_rooms \
+          BEGIN DELETE FROM voice_room_deputies \
+          WHERE channel = NEW.channel AND user = NEW.owner; END;",
+    },
+];
 
 /// Stable error codes. Never carries SQL text, a path or an id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,30 +240,77 @@ pub enum AddDeputy {
 }
 
 /// Adds `user` as a deputy of `channel` unless the room is missing, the user already is one or
-/// the room already has `cap` deputies. RED scaffold: not implemented yet.
+/// the room already has `cap` deputies. One statement checks all three, so the cap holds even
+/// if two callers race; the row is never written for a channel without a room row.
 pub fn add_deputy(
-    _conn: &Connection,
-    _channel: u64,
-    _user: u64,
-    _now: i64,
-    _cap: usize,
+    conn: &Connection,
+    channel: u64,
+    user: u64,
+    now: i64,
+    cap: usize,
 ) -> Result<AddDeputy, RepoError> {
-    Ok(AddDeputy::RoomMissing)
+    if user == 0 {
+        return Err(RepoError::CorruptRow);
+    }
+    let channel_text = channel.to_string();
+    let user_text = user.to_string();
+    let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+    let n = conn.execute(
+        "INSERT INTO voice_room_deputies (channel, user, added_at) \
+         SELECT ?1, ?2, ?3 \
+         WHERE EXISTS (SELECT 1 FROM voice_rooms WHERE channel = ?1) \
+         AND (SELECT COUNT(*) FROM voice_room_deputies WHERE channel = ?1) < ?4 \
+         ON CONFLICT(channel, user) DO NOTHING",
+        params![channel_text, user_text, now, cap],
+    )?;
+    if n == 1 {
+        return Ok(AddDeputy::Added);
+    }
+    // Nothing was written: say why.
+    if get(conn, channel)?.is_none() {
+        Ok(AddDeputy::RoomMissing)
+    } else if is_deputy(conn, channel, user)? {
+        Ok(AddDeputy::AlreadyDeputy)
+    } else {
+        Ok(AddDeputy::CapReached)
+    }
 }
 
-/// Removes one deputy row. Returns whether a row was there. RED scaffold.
-pub fn remove_deputy(_conn: &Connection, _channel: u64, _user: u64) -> Result<bool, RepoError> {
-    Ok(false)
+/// Removes one deputy row. Returns whether a row was there.
+pub fn remove_deputy(conn: &Connection, channel: u64, user: u64) -> Result<bool, RepoError> {
+    let n = conn.execute(
+        "DELETE FROM voice_room_deputies WHERE channel = ?1 AND user = ?2",
+        params![channel.to_string(), user.to_string()],
+    )?;
+    Ok(n == 1)
 }
 
-/// Whether `user` is a deputy of `channel`. RED scaffold.
-pub fn is_deputy(_conn: &Connection, _channel: u64, _user: u64) -> Result<bool, RepoError> {
-    Ok(false)
+/// Whether `user` is a deputy of `channel`.
+pub fn is_deputy(conn: &Connection, channel: u64, user: u64) -> Result<bool, RepoError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM voice_room_deputies WHERE channel = ?1 AND user = ?2",
+            params![channel.to_string(), user.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
-/// The deputies of `channel`, oldest first. RED scaffold.
-pub fn deputies(_conn: &Connection, _channel: u64) -> Result<Vec<u64>, RepoError> {
-    Ok(Vec::new())
+/// The deputies of `channel`, oldest first. One unreadable row fails the whole read.
+pub fn deputies(conn: &Connection, channel: u64) -> Result<Vec<u64>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT user FROM voice_room_deputies WHERE channel = ?1 ORDER BY added_at, rowid",
+    )?;
+    let raws = stmt
+        .query_map(params![channel.to_string()], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    raws.into_iter()
+        .map(|text| match text.parse::<u64>() {
+            Ok(0) | Err(_) => Err(RepoError::CorruptRow),
+            Ok(id) => Ok(id),
+        })
+        .collect()
 }
 
 /// Loads the row of `channel`. `Ok(None)` means the channel is not tracked.
