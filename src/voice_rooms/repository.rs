@@ -115,6 +115,39 @@ pub fn delete(conn: &Connection, channel: u64) -> Result<bool, RepoError> {
     Ok(n == 1)
 }
 
+/// Updates the recorded owner of `channel` in `guild`. Returns whether a row was updated.
+pub fn update_owner(
+    conn: &Connection,
+    channel: u64,
+    guild: u64,
+    owner: u64,
+) -> Result<bool, RepoError> {
+    let _ = (conn, channel, guild, owner);
+    Ok(false)
+}
+
+/// Updates the locked flag of `channel` in `guild`. Returns whether a row was updated.
+pub fn update_locked(
+    conn: &Connection,
+    channel: u64,
+    guild: u64,
+    locked: bool,
+) -> Result<bool, RepoError> {
+    let _ = (conn, channel, guild, locked);
+    Ok(false)
+}
+
+/// Updates the member limit of `channel` in `guild`. Returns whether a row was updated.
+pub fn update_user_limit(
+    conn: &Connection,
+    channel: u64,
+    guild: u64,
+    user_limit: u32,
+) -> Result<bool, RepoError> {
+    let _ = (conn, channel, guild, user_limit);
+    Ok(false)
+}
+
 type RawRow = (String, String, String, i64, i64, i64);
 
 fn raw(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
@@ -325,5 +358,37 @@ mod tests {
             "sqlite_error"
         );
         assert_eq!(RepoError::CorruptRow.to_string(), "corrupt_row");
+    }
+
+    #[test]
+    fn update_helpers_modify_only_the_matching_guild_row_and_refuse_zero_owner() {
+        let conn = mem();
+        let next_owner = OWNER + 100;
+        insert(&conn, &row(CH_A, GUILD, 10)).unwrap();
+        insert(&conn, &row(CH_B, OTHER_GUILD, 20)).unwrap();
+
+        assert!(update_owner(&conn, CH_A, GUILD, next_owner).unwrap());
+        assert!(update_locked(&conn, CH_A, GUILD, true).unwrap());
+        assert!(update_user_limit(&conn, CH_A, GUILD, 12).unwrap());
+
+        let updated = get(&conn, CH_A).unwrap().unwrap();
+        assert_eq!(updated.owner, next_owner);
+        assert!(updated.locked);
+        assert_eq!(updated.user_limit, 12);
+
+        // Wrong guild or untracked channel updates nothing.
+        assert!(!update_owner(&conn, CH_A, OTHER_GUILD, OWNER).unwrap());
+        assert!(!update_locked(&conn, CH_A, OTHER_GUILD, false).unwrap());
+        assert!(!update_user_limit(&conn, CH_A, OTHER_GUILD, 3).unwrap());
+        assert!(!update_owner(&conn, CH_B + 50, GUILD, OWNER).unwrap());
+        assert_eq!(get(&conn, CH_A).unwrap().unwrap(), updated);
+        assert_eq!(get(&conn, CH_B).unwrap().unwrap(), row(CH_B, OTHER_GUILD, 20));
+
+        // Zero owner is refused with CorruptRow and leaves the row intact.
+        assert_eq!(
+            update_owner(&conn, CH_A, GUILD, 0),
+            Err(RepoError::CorruptRow)
+        );
+        assert_eq!(get(&conn, CH_A).unwrap().unwrap(), updated);
     }
 }
