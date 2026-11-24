@@ -584,13 +584,22 @@ pub struct VcCommandDeps {
 /// absence. Wiring must call `note_owner_absent` at least this often while the owner is away.
 pub const ABSENCE_MAX_GAP_SECS: i64 = 15;
 
+/// A run of owner-absence observations that no gap longer than [`ABSENCE_MAX_GAP_SECS`] split.
+#[derive(Debug, Clone, Copy)]
+struct AbsenceRecord {
+    /// First observation of the run.
+    since: i64,
+    /// Latest observation of the run.
+    last_seen: i64,
+}
+
 /// In-memory per-room state tracked alongside the `voice_rooms` table.
 #[derive(Debug, Default)]
 struct CommandMemState {
     /// Successful renames `(channel_id, timestamp)` for the VR1 rename budget.
     renames: Vec<(u64, i64)>,
     /// When each room's recorded owner was first observed absent `(channel_id -> timestamp)`.
-    owner_absent_since: HashMap<u64, i64>,
+    owner_absent: HashMap<u64, AbsenceRecord>,
     /// Members explicitly permitted in each room `(channel_id -> set of user_ids)`.
     permitted_members: HashMap<u64, HashSet<u64>>,
 }
@@ -613,17 +622,31 @@ impl VcCommandHandler {
         }
     }
 
-    /// Records that the room's current owner left or was observed absent at `at`.
+    /// Records that the room's current owner was observed absent at `at`. Observations at most
+    /// [`ABSENCE_MAX_GAP_SECS`] apart extend one absence; a longer gap could hide a return, so it
+    /// restarts the absence at `at`.
     pub fn note_owner_absent(&self, channel_id: u64, at: i64) {
         if let Ok(mut mem) = self.mem.lock() {
-            mem.owner_absent_since.entry(channel_id).or_insert(at);
+            let record = match mem.owner_absent.get(&channel_id).copied() {
+                Some(prev) if at.saturating_sub(prev.last_seen) <= ABSENCE_MAX_GAP_SECS => {
+                    AbsenceRecord {
+                        since: prev.since,
+                        last_seen: prev.last_seen.max(at),
+                    }
+                }
+                _ => AbsenceRecord {
+                    since: at,
+                    last_seen: at,
+                },
+            };
+            mem.owner_absent.insert(channel_id, record);
         }
     }
 
     /// Clears the recorded owner-absence timestamp when the owner is present.
     pub fn note_owner_present(&self, channel_id: u64) {
         if let Ok(mut mem) = self.mem.lock() {
-            mem.owner_absent_since.remove(&channel_id);
+            mem.owner_absent.remove(&channel_id);
         }
     }
 
@@ -1027,7 +1050,7 @@ impl VcCommandHandler {
             return self.row_drift(CommandAlertCode::OwnerRowDrift).await;
         }
         let mut mem = self.mem();
-        mem.owner_absent_since.remove(&row.channel);
+        mem.owner_absent.remove(&row.channel);
         if let Some(set) = mem.permitted_members.get_mut(&row.channel) {
             set.remove(&new_owner);
         }
@@ -1098,12 +1121,16 @@ impl VcCommandHandler {
         }
         // The owner is absent. A claim rests only on an absence that `note_owner_absent` recorded
         // and that no `note_owner_present` (or claim that saw the owner) has cleared since. A claim
-        // never starts or guesses an absence itself, so an unobserved return fails closed.
+        // never starts or guesses an absence itself. The record must also be fresh: its last
+        // observation at most ABSENCE_MAX_GAP_SECS old, otherwise a return could have gone unseen.
         let now = self.now();
-        let Some(since) = self.mem().owner_absent_since.get(&row.channel).copied() else {
+        let Some(record) = self.mem().owner_absent.get(&row.channel).copied() else {
             return Self::refuse(RefusalCode::OwnerAbsenceNotRecorded);
         };
-        if now.saturating_sub(since) < self.deps.claim_grace_secs {
+        if now.saturating_sub(record.last_seen) > ABSENCE_MAX_GAP_SECS {
+            return Self::refuse(RefusalCode::OwnerAbsenceNotContinuous);
+        }
+        if now.saturating_sub(record.since) < self.deps.claim_grace_secs {
             return Self::refuse(RefusalCode::OwnerGraceNotElapsed);
         }
         self.move_ownership(home_guild, row, actor, SuccessCode::Claimed, mode)
