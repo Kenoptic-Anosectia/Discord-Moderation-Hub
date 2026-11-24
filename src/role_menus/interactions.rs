@@ -915,9 +915,7 @@ where
                 return notice(ports, press, Outcome::with(Code::Ineligible, error.code()))
             }
         };
-        // The policy's own reasons are reported: a refusal that never
-        // reaches a write. A blocked swap is reported as `swap_blocked` even
-        // though the policy also names the removal that could not be done.
+        // Report `swap_blocked` even though RM1 also lists the denied removal.
         let blocked_swap = plan
             .skipped
             .iter()
@@ -925,7 +923,20 @@ where
         if blocked_swap {
             return notice(ports, press, Outcome::new(Code::SwapBlocked));
         }
-        if let Some((_, reason)) = plan.skipped.first() {
+        if let Some((_, first_reason)) = plan.skipped.first() {
+            // On exclusive reselection, the chosen role stays put, but RM1 can
+            // still remove extra roles. A denied removal is more informative
+            // than AlreadySelected when we have only one detail to report.
+            let reselected = matches!(first_reason, policy::Reason::AlreadySelected);
+            let reason = if reselected {
+                plan.skipped
+                    .iter()
+                    .map(|(_, reason)| reason)
+                    .find(|reason| matches!(reason, policy::Reason::RemovalDenied(_)))
+                    .unwrap_or(first_reason)
+            } else {
+                first_reason
+            };
             let outcome = match reason {
                 policy::Reason::Denied(deny) => Outcome::with(Code::Ineligible, deny.code()),
                 policy::Reason::RemovalDenied(deny) => Outcome::with(Code::Ineligible, deny.code()),
@@ -937,7 +948,9 @@ where
             if refusal.is_none() {
                 refusal = Some(outcome);
             }
-            continue;
+            if !reselected {
+                continue;
+            }
         }
         for role in &plan.remove {
             if !remove.contains(role) {

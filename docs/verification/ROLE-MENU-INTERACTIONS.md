@@ -25,7 +25,9 @@ W4 owns the Discord adapter; RM1 planning uses plain values, with no I/O or cloc
    Then the work runs and one ephemeral follow-up is sent.
 5. **RM1 decides.** The shared policy (`super::policy`) plans the click: a multi option
    toggles, an exclusive group swaps (removal first, then the addition), a max-select breach
-   is refused (`max_reached`). The handler writes exactly the roles the plan names.
+   is refused (`max_reached`). Choosing an already held exclusive option keeps it and removes
+   any extras RM1 allows: `partial (already_selected)` for successful cleanup. A denied
+   removal is reported instead of `already_selected`; other allowed removals still proceed.
 6. **Press-time refusals.** RM1's `check_add` calls K03 `decide` on `GrantPath::Menu` for
    every role it plans to add, so a protected, managed, privileged, deleted or @everyone role
    is refused at press time even when the row lists it, and an active safeword refuses a
@@ -38,24 +40,25 @@ W4 owns the Discord adapter; RM1 planning uses plain values, with no I/O or cloc
    not remove every old one; `swap_partial_removed` when an exclusive swap removed every old
    option it planned to remove but could not add the new one; `partial_write` for other
    mixes of successful and failed writes. The reply details the first write failure, if any.
-   With no write failures, a mixed select is `partial` and retains the first refusal's code
-   or detail, e.g. `partial (max_reached)` in live and shadow.
+   With no write failures, a mixed select uses `partial` with the first refusal in live and shadow.
 8. **One member at a time.** A process-local member lock serializes read/plan/write. The
    map entry is dropped after the member's last press (including unwinding on panic).
 9. **Home guild only, fail closed.** A press from another guild reads, writes and answers
    nothing. With the feature on and the home guild unset or zero, nothing is served; with the
    feature off, nothing is served. Shadow mode reports what it would do and writes nothing.
-## What is tested (107 unit tests in `interactions.rs`)
+## What is tested (112 unit tests in `interactions.rs`)
 Includes real in-memory SQLite cases, an eight-thread lock race and three seeded LCG sweeps.
 **RED** `3f6b00c`: 101 passed, six failed (live/shadow refusal details, three partial-write
 codes, empty-select reads). The select-part tests already passed. Mutation M10 (keep the
 last refusal) fails the test with distinct safeword and max-select refusals.
+**RED** `8976c21`: 107 passed, five failed (live and shadow cleanup, forbidden write, denied
+removal, and allowed plus denied removals). All five incorrectly returned `already_selected`.
 ## Config keys (READ by the wiring card, not by this module)
 `ROLE_MENUS_MODE`: `off` (default) | `shadow` | `live`; the wiring card passes `Mode::Off`
 for `off` and for any value it does not know, so a typo is off. `GUILD_ID`: the home guild;
 unset or zero fails closed (`no_home_guild`). `PROTECTED_ROLE_IDS`: roles a menu may not
 grant; a malformed entry makes W4 set `protected_roles_invalid`, refusing any press that
-reaches role planning. `SAFEWORD_RESTRICTED_ROLE_IDS`: roles that may not be granted while a member's
+reaches role planning. `SAFEWORD_RESTRICTED_ROLE_IDS`: roles not granted while a member's
 safeword is active; the wiring card passes the member's safeword state per press.
 The Discord adapter needs the `GUILD_MEMBERS` intent and `MANAGE_ROLES` permission.
 ## NOT done
