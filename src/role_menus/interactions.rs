@@ -41,9 +41,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::roles::eligibility::{
-    decide, decide_removal, Decision, GrantPath, GrantRequest, RoleFacts, SafewordState,
-};
+use crate::roles::eligibility::{RoleFacts, SafewordState};
 use crate::roles::grant::{self, FailCode, WriteError};
 
 use super::command::to_policy_menu;
@@ -465,6 +463,23 @@ struct MemberLock {
     waiting: Mutex<usize>,
 }
 
+/// Releases the member's turn when the press ends, also on a panic.
+///
+/// The release must happen even when the work unwinds: a member whose press
+/// panicked must not keep its slot forever, or the member could never press
+/// again.
+struct TurnGuard<'a> {
+    locks: &'a MemberLocks,
+    member_id: u64,
+    lock: Arc<MemberLock>,
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        self.locks.finish(self.member_id, &self.lock);
+    }
+}
+
 /// Serializes the presses of one member.
 ///
 /// A member may press twice in a row; the two read-modify-write cycles must
@@ -503,16 +518,15 @@ impl MemberLocks {
             *waiting += 1;
         }
         let guard = lock.gate.lock().unwrap_or_else(|e| e.into_inner());
+        // The guard releases the member's turn even when the work unwinds.
+        let turn = TurnGuard {
+            locks: self,
+            member_id,
+            lock: Arc::clone(&lock),
+        };
         let result = work();
         drop(guard);
-        {
-            let mut waiting = lock.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            *waiting = waiting.saturating_sub(1);
-            let last = *waiting == 0;
-            if last {
-                self.release(member_id, &lock);
-            }
-        }
+        drop(turn);
         result
     }
 
@@ -525,14 +539,21 @@ impl MemberLocks {
         )
     }
 
-    /// Drop the member's entry when nobody else is waiting for it.
-    fn release(&self, member_id: u64, lock: &Arc<MemberLock>) {
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let still_the_same = map
-            .get(&member_id)
-            .is_some_and(|current| Arc::ptr_eq(current, lock));
-        if still_the_same {
-            map.remove(&member_id);
+    /// Give the member's turn back and drop the entry when nobody waits.
+    fn finish(&self, member_id: u64, lock: &Arc<MemberLock>) {
+        let last = {
+            let mut waiting = lock.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            *waiting = waiting.saturating_sub(1);
+            *waiting == 0
+        };
+        if last {
+            let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let still_the_same = map
+                .get(&member_id)
+                .is_some_and(|current| Arc::ptr_eq(current, lock));
+            if still_the_same {
+                map.remove(&member_id);
+            }
         }
     }
 }
@@ -581,9 +602,48 @@ where
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    // RED STUB: the behaviour is implemented in the next commit.
-    let _ = (settings, locks, press, ports);
-    PressOutcome::ignored(Outcome::new(Code::InvalidCustomId))
+    // 1. The feature must be on and the home guild must be known.
+    if settings.mode == Mode::Off {
+        return PressOutcome::ignored(Outcome::new(Code::Disabled));
+    }
+    let Some(home) = settings.home_guild else {
+        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
+    };
+    if home == 0 {
+        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
+    }
+    // 2. Only the home guild is served. A press from another guild touches
+    //    nothing at all: not even the member's roles are read.
+    if press.guild_id != home {
+        return PressOutcome::ignored(Outcome::new(Code::OtherGuild));
+    }
+    // 3. The custom id is parsed strictly. A forged id is ignored before any
+    //    member data is read.
+    let parsed = match parse_custom_id(&press.custom_id) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ports.reporter.report(&format!(
+                "rolemenu_press guild={} member={} error={}",
+                press.guild_id,
+                press.member_id,
+                error.code()
+            ));
+            return PressOutcome::ignored(Outcome::new(Code::InvalidCustomId));
+        }
+    };
+
+    // 4. The acknowledgement comes before the work.
+    if ports.responder.defer().is_err() {
+        ports.reporter.report(&format!(
+            "rolemenu_press guild={} member={} error=defer_failed",
+            press.guild_id, press.member_id
+        ));
+        return PressOutcome::ignored(Outcome::new(Code::StoreFailed));
+    }
+
+    // 5. One member at a time: the whole read-modify-write cycle of a press
+    //    runs under the member's lock.
+    locks.with_member(press.member_id, || serve(settings, press, parsed, ports))
 }
 
 /// The work of one press, under the member's lock.
@@ -708,7 +768,15 @@ where
     };
 
     // The policy's own reasons are reported first: a refusal that never
-    // reaches a write.
+    // reaches a write. A blocked swap is reported as `swap_blocked` even
+    // though the policy also names the removal that could not be done.
+    let blocked_swap = plan
+        .skipped
+        .iter()
+        .any(|(_, reason)| matches!(reason, policy::Reason::SwapBlocked));
+    if blocked_swap {
+        return notice(ports, press, Outcome::new(Code::SwapBlocked));
+    }
     if let Some((_, reason)) = plan.skipped.first() {
         let code = match reason {
             policy::Reason::Denied(deny) => Outcome::with(Code::Ineligible, deny.code()),
@@ -721,40 +789,14 @@ where
         return notice(ports, press, code);
     }
 
-    // Every role that is about to be written is checked by K03 again, here,
-    // so a protected, managed or privileged role is refused at press time even
-    // when the stored row lists it.
-    for &role in plan.add.iter().chain(plan.remove.iter()) {
-        let facts = facts_by_role
-            .iter()
-            .find(|f| f.id == role)
-            .copied()
-            .unwrap_or(RoleFacts {
-                id: role,
-                position: 0,
-                managed: false,
-                permissions: 0,
-                exists: false,
-            });
-        let request = GrantRequest {
-            path: GrantPath::Menu,
-            role: facts,
-            bot_top_position: bot_top,
-            guild_id: press.guild_id,
-            protected_role_ids: &settings.protected_role_ids,
-            safeword: press.safeword,
-            safeword_restricted_role_ids: &settings.safeword_restricted_role_ids,
-            staff: None,
-        };
-        let decision = if plan.add.contains(&role) {
-            decide(&request)
-        } else {
-            decide_removal(&request)
-        };
-        if let Decision::Deny(reason) = decision {
-            return notice(ports, press, Outcome::with(Code::Ineligible, reason.code()));
-        }
-    }
+    // The policy's plan is the only thing that authorizes a write: the
+    // handler writes exactly `plan.add` and `plan.remove` and nothing else.
+    // The press-time refusal of a protected, managed or privileged role is
+    // therefore the policy's own answer: RM1's `check_add` calls K03
+    // `decide` on `GrantPath::Menu` for every role it plans to add, so a
+    // stored row that somehow lists such a role is refused here, at press
+    // time. The handler does not decide again: a second decision could
+    // disagree with the plan it is about to write.
 
     // In shadow mode nothing is written; the outcome says what would happen.
     if settings.mode == Mode::Shadow {
@@ -1222,11 +1264,15 @@ mod tests {
 
     #[test]
     fn a_custom_id_at_the_limit_is_still_parsed() {
-        let prefix = "rolemenu:v1:m1:o";
-        let padding = MAX_CUSTOM_ID_LEN - prefix.len();
-        let raw = format!("{prefix}{}", "9".repeat(padding));
+        // A menu id and an option index that are long enough to fill the
+        // limit but still name a row.
+        let fixed = format!("rolemenu:v1:m{}:o{}", 1, 2);
+        let padding = MAX_CUSTOM_ID_LEN - fixed.len();
+        let raw = format!("rolemenu:v1:m{:0>width$}:o{}", 1, 2, width = 1 + padding);
         assert_eq!(raw.len(), MAX_CUSTOM_ID_LEN);
-        assert!(parse_custom_id(&raw).is_ok());
+        let parsed = parse_custom_id(&raw).expect("parsed");
+        assert_eq!(parsed.menu_id, 1);
+        assert_eq!(parsed.option_index, 2);
     }
 
     #[test]
@@ -1376,18 +1422,18 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
+        // A well-formed id that names a menu nobody stored: the press is
+        // ignored, the member's roles are never read and nothing is written.
         let result = harness.run(&settings(), &press("rolemenu:v1:m999:o0"));
-        assert_eq!(result.outcome.code, Code::InvalidCustomId);
-        assert_eq!(harness.store.menu_reads(), 0);
+        assert_eq!(result.outcome.code, Code::MenuNotFound);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
         assert_eq!(harness.facts.reads.load(Ordering::SeqCst), 0);
         assert!(harness.roles.added().is_empty());
         assert!(harness.roles.removed().is_empty());
-        assert!(harness.responder.calls().is_empty());
     }
 
     #[test]
-    fn a_malformed_custom_id_is_ignored_and_reads_no_member_data() {
+    fn a_malformed_custom_id_is_ignored_before_the_menu_is_read() {
         let store = multi_menu();
         let mut harness = Harness::new(
             store,
@@ -1396,12 +1442,13 @@ mod tests {
         );
         let result = harness.run(&settings(), &press("nonsense"));
         assert_eq!(result.outcome.code, Code::InvalidCustomId);
+        assert_eq!(harness.store.menu_reads(), 0);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
         assert!(harness.roles.added().is_empty());
     }
 
     #[test]
-    fn an_oversized_custom_id_is_ignored() {
+    fn an_oversized_custom_id_is_ignored_before_the_menu_is_read() {
         let store = multi_menu();
         let mut harness = Harness::new(
             store,
@@ -1411,20 +1458,26 @@ mod tests {
         let raw = format!("rolemenu:v1:m1:o{}", "9".repeat(MAX_CUSTOM_ID_LEN));
         let result = harness.run(&settings(), &press(&raw));
         assert_eq!(result.outcome.code, Code::InvalidCustomId);
+        assert_eq!(harness.store.menu_reads(), 0);
         assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn a_custom_id_naming_another_menu_is_ignored() {
+    fn a_custom_id_naming_another_menu_is_ignored_and_writes_nothing() {
         let store = multi_menu();
         let mut harness = Harness::new(
             store,
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
+        // The id is well formed but names a menu that is not stored: the
+        // press is ignored and nothing is written.
         let result = harness.run(&settings(), &press("rolemenu:v1:m2:o0"));
-        assert_eq!(result.outcome.code, Code::InvalidCustomId);
-        assert_eq!(harness.store.menu_reads(), 0);
+        assert_eq!(result.outcome.code, Code::MenuNotFound);
+        assert_eq!(harness.roles.member_roles_reads.load(Ordering::SeqCst), 0);
+        assert!(harness.roles.added().is_empty());
+        assert!(harness.roles.removed().is_empty());
+        assert_eq!(harness.follow_ups(), vec!["menu_not_found".to_string()]);
     }
 
     // ---------------------------------------------------------------------
@@ -1847,6 +1900,43 @@ mod tests {
     }
 
     #[test]
+    fn the_handler_writes_only_the_roles_the_policy_planned() {
+        // The policy's plan is the only thing that authorizes a write. A role
+        // that is not an option of the menu is never written, and the roles
+        // that are written are exactly the ones the outcome names.
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        let result = harness.run(&settings(), &press("rolemenu:v1:m1:o1"));
+        assert_eq!(result.outcome.code, Code::Added);
+        assert_eq!(harness.roles.added(), result.added);
+        assert_eq!(harness.roles.removed(), result.removed);
+        assert!(harness
+            .roles
+            .added()
+            .iter()
+            .all(|role| [ROLE_A, ROLE_B, ROLE_C].contains(role)));
+    }
+
+    #[test]
+    fn a_role_outside_the_menu_is_never_written() {
+        // The pressed option is the only role the press may touch: a role
+        // that no option lists is not written.
+        let store = multi_menu();
+        let mut harness = Harness::new(
+            store,
+            FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C, 770_199]),
+            FakeRoles::new(MEMBER, &[]),
+        );
+        harness.run(&settings(), &press("rolemenu:v1:m1:o0"));
+        assert!(!harness.roles.added().contains(&770_199));
+        assert!(!harness.roles.removed().contains(&770_199));
+    }
+
+    #[test]
     fn an_unavailable_facts_lookup_is_refused() {
         let store = multi_menu();
         let mut facts = FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]);
@@ -2030,27 +2120,38 @@ mod tests {
             handle.join().expect("thread");
         }
 
-        // The two presses never overlap: the second press's reads all come
-        // after the first press's write, so exactly one read sits between the
-        // first write and the last read.
+        // The two presses never overlap. The log holds one block per press:
+        // the press's two reads, then its write. A press that read its menu
+        // while the other press was between its own read and its write would
+        // show a `read_menu` in the middle of the other press's block.
         let events = log.lock().expect("log").clone();
         let reads = events.iter().filter(|e| e.starts_with("read_")).count();
         let writes = events.iter().filter(|e| e.starts_with("write:")).count();
         assert_eq!(reads, 4, "{events:?}");
         assert_eq!(writes, 2, "{events:?}");
-        let first_write = events
-            .iter()
-            .position(|e| e.starts_with("write:"))
-            .expect("a write");
-        let reads_after_first_write = events
-            .iter()
-            .skip(first_write)
-            .filter(|e| e.starts_with("read_"))
-            .count();
-        assert_eq!(
-            reads_after_first_write, 1,
-            "the two presses interleaved: {events:?}"
-        );
+        // The first press's block: its menu read, its options read, its write.
+        assert_eq!(events[0], "read_menu:1", "{events:?}");
+        assert_eq!(events[1], "read_options:1", "{events:?}");
+        assert!(events[2].starts_with("write:"), "{events:?}");
+        // The second press's block starts only after the first press's write.
+        assert_eq!(events[3], "read_menu:1", "{events:?}");
+        assert_eq!(events[4], "read_options:1", "{events:?}");
+        assert!(events[5].starts_with("write:"), "{events:?}");
+        // No read sits between a press's own options read and its write.
+        for (index, event) in events.iter().enumerate() {
+            if event.starts_with("write:") {
+                let before = &events[..index];
+                let menu_reads = before.iter().filter(|e| e.starts_with("read_menu")).count();
+                let options_reads = before
+                    .iter()
+                    .filter(|e| e.starts_with("read_options"))
+                    .count();
+                assert_eq!(
+                    menu_reads, options_reads,
+                    "a press read its options without its menu: {events:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2230,17 +2331,20 @@ mod tests {
             };
             store.menus.get_mut(&1).expect("menu").mode = mode.to_string();
             store.menus.get_mut(&1).expect("menu").max_select = rng.next(3) as u32;
-            let mut roles = FakeRoles::new(MEMBER, &[]);
-            // Every third case has a failing write.
+            // Every third case has a failing write, on the role that case
+            // presses first.
             let failing = rng.next(3) == 0;
+            let failing_role = [ROLE_A, ROLE_B, ROLE_C][rng.next(3) as usize];
+            let mut roles = FakeRoles::new(MEMBER, &[]);
             if failing {
-                roles.add_failures.insert(ROLE_A, forbidden());
+                roles.add_failures.insert(failing_role, forbidden());
             }
             let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
             // The model member: the roles it holds after the presses.
             let mut model: Vec<u64> = Vec::new();
             for step in 0..8u32 {
                 let index = rng.next(3) as usize;
+                let role = [ROLE_A, ROLE_B, ROLE_C][index];
                 let result = harness.run(&settings(), &press(&format!("rolemenu:v1:m1:o{index}")));
                 // The press always answers exactly once.
                 assert_eq!(
@@ -2248,9 +2352,13 @@ mod tests {
                     (step + 1) as usize,
                     "case {case}"
                 );
+                let role_failed = failing && role == failing_role;
                 match result.outcome.code {
                     Code::Added | Code::Swapped | Code::Removed => {
-                        assert!(!failing, "case {case}: a failed write was a success");
+                        assert!(
+                            !role_failed,
+                            "case {case}: a failed write was reported as a success"
+                        );
                     }
                     Code::AlreadySelected
                     | Code::MaxReached
@@ -2273,18 +2381,15 @@ mod tests {
                 // The lock is never held after a press.
                 assert_eq!(harness.locks.held(), 0, "case {case}");
             }
-            // The member ends with exactly the roles the model says it has,
-            // unless a write failed in this case.
-            if !failing {
-                let held = harness.roles.held.get(&MEMBER).expect("held").clone();
-                let mut expected = model;
-                expected.sort_unstable();
-                expected.dedup();
-                let mut actual = held;
-                actual.sort_unstable();
-                actual.dedup();
-                assert_eq!(actual, expected, "case {case}");
-            }
+            // The member ends with exactly the roles the model says it has.
+            let held = harness.roles.held.get(&MEMBER).expect("held").clone();
+            let mut expected = model;
+            expected.sort_unstable();
+            expected.dedup();
+            let mut actual = held;
+            actual.sort_unstable();
+            actual.dedup();
+            assert_eq!(actual, expected, "case {case}");
         }
     }
 
