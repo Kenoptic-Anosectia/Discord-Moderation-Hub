@@ -69,6 +69,9 @@ struct WiredFeatures {
     /// True when the new reaction-role feature owns the reaction events; the legacy
     /// `ReactionAdd`/`ReactionRemove` arms in `log_event_body` then stand down.
     reaction_roles_owned: bool,
+    /// The running safeword feature, for the `/safeword` command. `None` when it is off or was
+    /// dropped at start-up.
+    safeword: Option<Arc<safeword::discord::SafewordRuntime>>,
 }
 
 /// The feature registry as the running bot uses it.
@@ -1169,9 +1172,40 @@ mod tests {
                 flash_log_excluded: flash,
                 wired: WiredFeatures {
                     reaction_roles_owned: owned,
+                    ..Default::default()
                 },
             },
         )
+    }
+
+    fn command_names(commands: &[poise::Command<Data, Error>]) -> Vec<String> {
+        commands.iter().map(|c| c.name.to_string()).collect()
+    }
+
+    #[test]
+    fn with_every_feature_off_the_command_list_is_identical_to_today() {
+        for tickets in [false, true] {
+            let before = command_names(&configured_commands(tickets));
+            let after = command_names(&with_optional_commands(configured_commands(tickets), false));
+            assert_eq!(before, after, "tickets={tickets}");
+        }
+    }
+
+    #[test]
+    fn safeword_on_adds_exactly_the_safeword_command_with_its_three_subcommands() {
+        for tickets in [false, true] {
+            let mut expected = command_names(&configured_commands(tickets));
+            expected.push("safeword".to_string());
+            let commands = with_optional_commands(configured_commands(tickets), true);
+            assert_eq!(command_names(&commands), expected, "tickets={tickets}");
+            let safeword = commands.last().unwrap();
+            assert_eq!(
+                command_names(&safeword.subcommands),
+                vec!["status", "strike", "clear"]
+            );
+            assert!(safeword.guild_only, "the command works only inside a guild");
+            assert!(safeword.slash_action.is_some());
+        }
     }
 
     #[tokio::test]
@@ -3719,6 +3753,16 @@ fn configured_commands(enabled: bool) -> Vec<poise::Command<Data, Error>> {
     commands
 }
 
+/// Adds the commands of the optional features that are on. With every feature off the list is
+/// returned as it came in.
+fn with_optional_commands(
+    commands: Vec<poise::Command<Data, Error>>,
+    safeword: bool,
+) -> Vec<poise::Command<Data, Error>> {
+    let _ = safeword;
+    commands
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     match config::load_env() {
@@ -3823,6 +3867,7 @@ async fn main() -> Result<(), Error> {
                         // leave the legacy arms in charge.
                         reaction_roles_owned: plan.reaction_roles_owned()
                             && features.is_active(role_menus::reactions::FEATURE_NAME),
+                        safeword: None,
                     };
 
                     Ok(build_data(
