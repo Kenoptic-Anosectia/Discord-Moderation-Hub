@@ -122,8 +122,14 @@ pub fn update_owner(
     guild: u64,
     owner: u64,
 ) -> Result<bool, RepoError> {
-    let _ = (conn, channel, guild, owner);
-    Ok(false)
+    if owner == 0 {
+        return Err(RepoError::CorruptRow);
+    }
+    let n = conn.execute(
+        "UPDATE voice_rooms SET owner = ?1 WHERE channel = ?2 AND guild = ?3",
+        params![owner.to_string(), channel.to_string(), guild.to_string()],
+    )?;
+    Ok(n == 1)
 }
 
 /// Updates the locked flag of `channel` in `guild`. Returns whether a row was updated.
@@ -133,8 +139,11 @@ pub fn update_locked(
     guild: u64,
     locked: bool,
 ) -> Result<bool, RepoError> {
-    let _ = (conn, channel, guild, locked);
-    Ok(false)
+    let n = conn.execute(
+        "UPDATE voice_rooms SET locked = ?1 WHERE channel = ?2 AND guild = ?3",
+        params![i64::from(locked), channel.to_string(), guild.to_string()],
+    )?;
+    Ok(n == 1)
 }
 
 /// Updates the member limit of `channel` in `guild`. Returns whether a row was updated.
@@ -144,8 +153,15 @@ pub fn update_user_limit(
     guild: u64,
     user_limit: u32,
 ) -> Result<bool, RepoError> {
-    let _ = (conn, channel, guild, user_limit);
-    Ok(false)
+    let n = conn.execute(
+        "UPDATE voice_rooms SET user_limit = ?1 WHERE channel = ?2 AND guild = ?3",
+        params![
+            i64::from(user_limit),
+            channel.to_string(),
+            guild.to_string()
+        ],
+    )?;
+    Ok(n == 1)
 }
 
 type RawRow = (String, String, String, i64, i64, i64);
@@ -382,7 +398,10 @@ mod tests {
         assert!(!update_user_limit(&conn, CH_A, OTHER_GUILD, 3).unwrap());
         assert!(!update_owner(&conn, CH_B + 50, GUILD, OWNER).unwrap());
         assert_eq!(get(&conn, CH_A).unwrap().unwrap(), updated);
-        assert_eq!(get(&conn, CH_B).unwrap().unwrap(), row(CH_B, OTHER_GUILD, 20));
+        assert_eq!(
+            get(&conn, CH_B).unwrap().unwrap(),
+            row(CH_B, OTHER_GUILD, 20)
+        );
 
         // Zero owner is refused with CorruptRow and leaves the row intact.
         assert_eq!(

@@ -38,7 +38,7 @@ use poise::serenity_prelude::async_trait;
 use rusqlite::Connection;
 
 use crate::roles::eligibility::{SafewordState, PRIVILEGED_MASK};
-use crate::roles::runtime::{RoleEntry, RoleSource};
+use crate::roles::runtime::RoleSource;
 use crate::settings::Mode;
 use crate::voice_rooms::config::{NotReady, Readiness, VoiceSettings};
 use crate::voice_rooms::policy::{self, DenyReason, OverwriteTarget, RenameBudget, RoomOverwrite};
@@ -46,6 +46,9 @@ use crate::voice_rooms::repository::{self, RoomRow};
 
 /// Maximum voice-channel user limit accepted by Discord (`0` means unlimited).
 pub const MAX_USER_LIMIT: u32 = 99;
+
+/// Rooms whose permits are remembered before permits of rooms without a row are forgotten.
+const MAX_REMEMBERED_ROOMS: usize = 256;
 
 /// Monotonic/epoch clock in Unix seconds.
 pub trait Clock: Send + Sync {
@@ -173,6 +176,13 @@ pub trait RoomCommandPorts: Send + Sync {
         channel_id: u64,
     ) -> Result<Vec<u64>, CommandPortError>;
 
+    /// Reads the permission overwrites the voice-room category carries (the unlock baseline).
+    async fn category_overwrites(
+        &self,
+        guild_id: u64,
+        category_id: u64,
+    ) -> Result<Vec<RoomOverwrite>, CommandPortError>;
+
     /// Fetches the target member's profile and category visibility in `guild_id`.
     async fn member_profile(
         &self,
@@ -193,6 +203,9 @@ pub enum CommandAlertCode {
     LimitRowDrift,
     /// Reading the tracked room row from SQLite failed.
     RepositoryReadFailed,
+    /// An ownership change left both old and new owner overwrites on the channel (a rollback
+    /// failed), while the row still names the old owner.
+    OwnerOverwriteDrift,
 }
 
 impl CommandAlertCode {
@@ -203,6 +216,7 @@ impl CommandAlertCode {
             Self::LockRowDrift => "vc_cmd_lock_row_drift",
             Self::LimitRowDrift => "vc_cmd_limit_row_drift",
             Self::RepositoryReadFailed => "vc_cmd_repo_read_failed",
+            Self::OwnerOverwriteDrift => "vc_cmd_owner_overwrite_drift",
         }
     }
 
@@ -220,6 +234,9 @@ impl CommandAlertCode {
             }
             Self::RepositoryReadFailed => {
                 "[VOICE_ROOMS] code=vc_cmd_repo_read_failed room_row_read_failed"
+            }
+            Self::OwnerOverwriteDrift => {
+                "[VOICE_ROOMS] code=vc_cmd_owner_overwrite_drift owner_overwrite_rollback_failed"
             }
         }
     }
@@ -380,6 +397,8 @@ pub enum RefusalCode {
     DisconnectFailed(CommandPortError),
     /// Reading the room row or dependency state failed.
     StorageReadFailed,
+    /// The rename policy refused for a reason other than the budget (invalid configuration).
+    RenameRefused,
     /// Discord mutation succeeded, but the subsequent SQLite row update failed (staff alerted).
     RowUpdateFailed,
 }
@@ -413,6 +432,7 @@ impl RefusalCode {
             Self::DiscordFailed(err) => err.code(),
             Self::DisconnectFailed(_) => "vc_disconnect_failed",
             Self::StorageReadFailed => "vc_storage_read_failed",
+            Self::RenameRefused => "vc_rename_refused",
             Self::RowUpdateFailed => "vc_row_update_failed",
         }
     }
@@ -448,6 +468,7 @@ impl RefusalCode {
             Self::DiscordFailed(CommandPortError::Unavailable) => "Discord could not complete the request. [discord_unavailable]",
             Self::DisconnectFailed(_) => "Access was revoked, but disconnecting the member failed. [vc_disconnect_failed]",
             Self::StorageReadFailed => "Could not read voice room state. [vc_storage_read_failed]",
+            Self::RenameRefused => "The room rename was refused; nothing was changed. [vc_rename_refused]",
             Self::RowUpdateFailed => "Discord updated, but saving the room row failed; staff have been alerted. [vc_row_update_failed]",
         }
     }
@@ -496,15 +517,9 @@ pub enum CommandOutcome {
     /// Command was outside the configured home guild or feature is off: touch nothing, send nothing.
     Ignored(RefusalCode),
     /// Command succeeded and produced an ephemeral reply.
-    Applied {
-        code: SuccessCode,
-        reply: Reply,
-    },
+    Applied { code: SuccessCode, reply: Reply },
     /// Command was refused or failed and produced an ephemeral reply.
-    Refused {
-        code: RefusalCode,
-        reply: Reply,
-    },
+    Refused { code: RefusalCode, reply: Reply },
 }
 
 impl CommandOutcome {
@@ -567,6 +582,8 @@ struct CommandMemState {
 pub struct VcCommandHandler {
     deps: VcCommandDeps,
     mem: Mutex<CommandMemState>,
+    /// Serializes command execution so two commands cannot interleave their Discord and row writes.
+    serial: tokio::sync::Mutex<()>,
 }
 
 impl VcCommandHandler {
@@ -575,6 +592,7 @@ impl VcCommandHandler {
         Self {
             deps,
             mem: Mutex::new(CommandMemState::default()),
+            serial: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -594,8 +612,669 @@ impl VcCommandHandler {
 
     /// Executes one `/vc` command request.
     pub async fn handle(&self, req: &VcCommandRequest) -> CommandOutcome {
-        let _ = (req, &self.deps);
-        CommandOutcome::Ignored(RefusalCode::FeatureDisabled)
+        let mode = self.deps.settings.mode();
+        if mode == Mode::Off {
+            return CommandOutcome::Ignored(RefusalCode::FeatureDisabled);
+        }
+        let Some(home_guild) = self.deps.settings.guild_id() else {
+            return Self::refuse(RefusalCode::HomeGuildUnset);
+        };
+        match req.guild_id {
+            Some(gid) if gid == home_guild => {}
+            _ => return CommandOutcome::Ignored(RefusalCode::WrongGuild),
+        }
+        match self.deps.settings.readiness() {
+            Readiness::Off => return CommandOutcome::Ignored(RefusalCode::FeatureDisabled),
+            Readiness::Misconfigured(NotReady::HomeGuildUnset) => {
+                return Self::refuse(RefusalCode::HomeGuildUnset);
+            }
+            Readiness::Misconfigured(NotReady::CategoryUnset | NotReady::NoHubChannel) => {
+                return Self::refuse(RefusalCode::FeatureNotReady);
+            }
+            Readiness::Ready => {}
+        }
+        if req.actor_id == 0 {
+            return Self::refuse(RefusalCode::InvalidUserId);
+        }
+        if req.channel_id == 0 {
+            return Self::refuse(RefusalCode::UntrackedChannel);
+        }
+
+        let _serial = self.serial.lock().await;
+        let row = match self.load_tracked_room(home_guild, req.channel_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Self::refuse(RefusalCode::UntrackedChannel),
+            Err(code) => return Self::refuse(code),
+        };
+
+        match &req.subcommand {
+            VcSubcommand::Claim => {
+                self.handle_claim(home_guild, &row, req.actor_id, mode)
+                    .await
+            }
+            other => {
+                if req.actor_id != row.owner {
+                    return Self::refuse(RefusalCode::NotRoomOwner);
+                }
+                self.handle_owner_cmd(home_guild, &row, other, mode).await
+            }
+        }
+    }
+
+    fn refuse(code: RefusalCode) -> CommandOutcome {
+        CommandOutcome::Refused {
+            code,
+            reply: Reply::refused(code),
+        }
+    }
+
+    fn applied(code: SuccessCode, mode: Mode) -> CommandOutcome {
+        let effective = if mode == Mode::Shadow {
+            SuccessCode::ShadowNoop
+        } else {
+            code
+        };
+        CommandOutcome::Applied {
+            code: effective,
+            reply: Reply::ok(effective),
+        }
+    }
+
+    async fn load_tracked_room(
+        &self,
+        home_guild: u64,
+        channel_id: u64,
+    ) -> Result<Option<RoomRow>, RefusalCode> {
+        let db_res = {
+            let Ok(conn) = self.deps.db.lock() else {
+                self.deps
+                    .alerter
+                    .alert(CommandAlertCode::RepositoryReadFailed)
+                    .await;
+                return Err(RefusalCode::StorageReadFailed);
+            };
+            repository::get(&conn, channel_id)
+        };
+        match db_res {
+            Ok(Some(row)) if row.guild == home_guild => Ok(Some(row)),
+            Ok(_) => Ok(None),
+            Err(_) => {
+                self.deps
+                    .alerter
+                    .alert(CommandAlertCode::RepositoryReadFailed)
+                    .await;
+                Err(RefusalCode::StorageReadFailed)
+            }
+        }
+    }
+
+    async fn handle_owner_cmd(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        sub: &VcSubcommand,
+        mode: Mode,
+    ) -> CommandOutcome {
+        match sub {
+            VcSubcommand::Rename { name } => self.handle_rename(home_guild, row, name, mode).await,
+            VcSubcommand::Limit { limit } => self.handle_limit(home_guild, row, *limit, mode).await,
+            VcSubcommand::Lock => self.handle_lock(home_guild, row, true, mode).await,
+            VcSubcommand::Unlock => self.handle_lock(home_guild, row, false, mode).await,
+            VcSubcommand::Permit { target_id } => {
+                self.handle_permit(home_guild, row, *target_id, mode).await
+            }
+            VcSubcommand::Reject { target_id } => {
+                self.handle_reject(home_guild, row, *target_id, mode).await
+            }
+            VcSubcommand::Transfer { target_id } => {
+                self.handle_transfer(home_guild, row, *target_id, mode)
+                    .await
+            }
+            VcSubcommand::Claim => Self::refuse(RefusalCode::AlreadyRoomOwner),
+        }
+    }
+}
+
+/// Role flags of a target member, derived from the role catalog and the role-policy sets.
+#[derive(Debug, Clone, Copy, Default)]
+struct TargetRoleFlags {
+    protected: bool,
+    restricted: bool,
+    privileged: bool,
+}
+
+impl VcCommandHandler {
+    fn now(&self) -> i64 {
+        self.deps.clock.now_unix()
+    }
+
+    fn mem(&self) -> std::sync::MutexGuard<'_, CommandMemState> {
+        self.mem
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Runs one row write; true only when exactly one row was updated.
+    fn write_row<F>(&self, write: F) -> bool
+    where
+        F: FnOnce(&Connection) -> Result<bool, repository::RepoError>,
+    {
+        match self.deps.db.lock() {
+            Ok(conn) => matches!(write(&conn), Ok(true)),
+            Err(_) => false,
+        }
+    }
+
+    async fn row_drift(&self, alert: CommandAlertCode) -> CommandOutcome {
+        self.deps.alerter.alert(alert).await;
+        Self::refuse(RefusalCode::RowUpdateFailed)
+    }
+
+    fn owner_overwrite(user_id: u64) -> RoomOverwrite {
+        RoomOverwrite {
+            target: OverwriteTarget::Member(user_id),
+            allow: policy::OWNER_RIGHTS,
+            deny: policy::FORBIDDEN_OWNER_RIGHTS,
+        }
+    }
+
+    fn permit_overwrite(user_id: u64) -> RoomOverwrite {
+        RoomOverwrite {
+            target: OverwriteTarget::Member(user_id),
+            allow: policy::CONNECT | policy::SPEAK,
+            deny: 0,
+        }
+    }
+
+    fn policy_config(&self, home_guild: u64) -> policy::VoiceRoomConfig {
+        policy::VoiceRoomConfig {
+            guild_id: home_guild,
+            hub_channel_id: 0,
+            category_id: self.deps.settings.category_id().unwrap_or(0),
+            default_name: self.deps.default_name.clone(),
+            per_user_cap: usize::MAX,
+            global_cap: usize::MAX,
+            create_cooldown_secs: 0,
+            empty_grace_secs: self.deps.settings.empty_grace_secs(),
+            rename_budget: self.deps.rename_budget,
+            category_overwrites: Vec::new(),
+        }
+    }
+
+    async fn handle_rename(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        raw_name: &str,
+        mode: Mode,
+    ) -> CommandOutcome {
+        let clean = policy::sanitize_name(raw_name, &self.deps.default_name);
+        let now = self.now();
+        let config = self.policy_config(home_guild);
+        let state = policy::VoiceRoomState {
+            rooms: vec![policy::Room {
+                channel_id: row.channel,
+                owner_id: row.owner,
+                created_at: row.created_at,
+                empty_since: None,
+                occupants: 0,
+            }],
+            last_create: HashMap::new(),
+            renames: self.mem().renames.clone(),
+        };
+        match policy::decide_rename(row.channel, row.owner, now, &config, &state) {
+            policy::Decision::Allow => {}
+            policy::Decision::Deny(DenyReason::RenameBudgetExhausted) => {
+                return Self::refuse(RefusalCode::RenameBudgetExhausted);
+            }
+            _ => return Self::refuse(RefusalCode::RenameRefused),
+        }
+        if mode == Mode::Shadow {
+            return Self::applied(SuccessCode::Renamed, mode);
+        }
+        match self
+            .deps
+            .ports
+            .rename_room(home_guild, row.channel, &clean)
+            .await
+        {
+            Ok(()) => {}
+            Err(CommandPortError::RateLimited) => {
+                return Self::refuse(RefusalCode::RenameRateLimited);
+            }
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        }
+        let window = self.deps.rename_budget.window_secs;
+        let mut mem = self.mem();
+        mem.renames
+            .retain(|(_, at)| now.saturating_sub(*at) < window);
+        mem.renames.push((row.channel, now));
+        drop(mem);
+        Self::applied(SuccessCode::Renamed, mode)
+    }
+
+    async fn handle_limit(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        limit: u32,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if limit > MAX_USER_LIMIT {
+            return Self::refuse(RefusalCode::LimitOutOfBounds);
+        }
+        if mode == Mode::Shadow {
+            return Self::applied(SuccessCode::LimitUpdated, mode);
+        }
+        if let Err(e) = self
+            .deps
+            .ports
+            .set_user_limit(home_guild, row.channel, limit)
+            .await
+        {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        let stored = self
+            .write_row(|conn| repository::update_user_limit(conn, row.channel, home_guild, limit));
+        if !stored {
+            return self.row_drift(CommandAlertCode::LimitRowDrift).await;
+        }
+        Self::applied(SuccessCode::LimitUpdated, mode)
+    }
+
+    async fn handle_lock(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        lock: bool,
+        mode: Mode,
+    ) -> CommandOutcome {
+        let success = if lock {
+            SuccessCode::Locked
+        } else {
+            SuccessCode::Unlocked
+        };
+        if mode == Mode::Shadow {
+            return Self::applied(success, mode);
+        }
+        let Some(category) = self.deps.settings.category_id() else {
+            return Self::refuse(RefusalCode::FeatureNotReady);
+        };
+        let category_overwrites = match self
+            .deps
+            .ports
+            .category_overwrites(home_guild, category)
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        let baseline = category_overwrites
+            .iter()
+            .find(|o| o.target == OverwriteTarget::Everyone)
+            .copied()
+            .unwrap_or(RoomOverwrite {
+                target: OverwriteTarget::Everyone,
+                allow: 0,
+                deny: 0,
+            });
+        let ports = &self.deps.ports;
+        let written = if lock {
+            ports
+                .set_overwrite(
+                    home_guild,
+                    row.channel,
+                    RoomOverwrite {
+                        target: OverwriteTarget::Everyone,
+                        allow: baseline.allow & !policy::CONNECT,
+                        deny: baseline.deny | policy::CONNECT,
+                    },
+                )
+                .await
+        } else if baseline.allow == 0 && baseline.deny == 0 {
+            match ports
+                .delete_overwrite(home_guild, row.channel, OverwriteTarget::Everyone)
+                .await
+            {
+                Err(CommandPortError::NotFound) => Ok(()),
+                other => other,
+            }
+        } else {
+            ports.set_overwrite(home_guild, row.channel, baseline).await
+        };
+        if let Err(e) = written {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        let stored =
+            self.write_row(|conn| repository::update_locked(conn, row.channel, home_guild, lock));
+        if !stored {
+            return self.row_drift(CommandAlertCode::LockRowDrift).await;
+        }
+        Self::applied(success, mode)
+    }
+
+    /// Hands the room to `new_owner`: grant the new owner's overwrite, drop the old owner's,
+    /// then record the row. A failed Discord step is rolled back where possible and the row is
+    /// left unchanged; a failed row write after Discord changed is alerted.
+    async fn move_ownership(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        new_owner: u64,
+        success: SuccessCode,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if mode == Mode::Shadow {
+            return Self::applied(success, mode);
+        }
+        let ports = &self.deps.ports;
+        if let Err(e) = ports
+            .set_overwrite(home_guild, row.channel, Self::owner_overwrite(new_owner))
+            .await
+        {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        let dropped = match ports
+            .delete_overwrite(home_guild, row.channel, OverwriteTarget::Member(row.owner))
+            .await
+        {
+            Err(CommandPortError::NotFound) => Ok(()),
+            other => other,
+        };
+        if let Err(e) = dropped {
+            let was_permitted = self
+                .mem()
+                .permitted_members
+                .get(&row.channel)
+                .is_some_and(|set| set.contains(&new_owner));
+            let rolled_back = if was_permitted {
+                ports
+                    .set_overwrite(home_guild, row.channel, Self::permit_overwrite(new_owner))
+                    .await
+            } else {
+                ports
+                    .delete_overwrite(home_guild, row.channel, OverwriteTarget::Member(new_owner))
+                    .await
+            };
+            if rolled_back.is_err() {
+                self.deps
+                    .alerter
+                    .alert(CommandAlertCode::OwnerOverwriteDrift)
+                    .await;
+            }
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        let stored = self
+            .write_row(|conn| repository::update_owner(conn, row.channel, home_guild, new_owner));
+        if !stored {
+            return self.row_drift(CommandAlertCode::OwnerRowDrift).await;
+        }
+        let mut mem = self.mem();
+        mem.owner_absent_since.remove(&row.channel);
+        if let Some(set) = mem.permitted_members.get_mut(&row.channel) {
+            set.remove(&new_owner);
+        }
+        drop(mem);
+        Self::applied(success, mode)
+    }
+
+    async fn handle_transfer(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        target: u64,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if target == 0 {
+            return Self::refuse(RefusalCode::InvalidUserId);
+        }
+        if target == row.owner {
+            return Self::refuse(RefusalCode::TargetIsOwner);
+        }
+        if target == self.deps.bot_user_id {
+            return Self::refuse(RefusalCode::TargetIsSelfBot);
+        }
+        let members = match self.deps.ports.room_members(home_guild, row.channel).await {
+            Ok(list) => list,
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        if !members.contains(&target) {
+            return Self::refuse(RefusalCode::TargetNotInRoom);
+        }
+        let Some(category) = self.deps.settings.category_id() else {
+            return Self::refuse(RefusalCode::FeatureNotReady);
+        };
+        match self
+            .deps
+            .ports
+            .member_profile(home_guild, category, target)
+            .await
+        {
+            Ok(profile) if profile.is_bot => return Self::refuse(RefusalCode::TargetIsBot),
+            Ok(_) => {}
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        }
+        self.move_ownership(home_guild, row, target, SuccessCode::Transferred, mode)
+            .await
+    }
+
+    async fn handle_claim(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        actor: u64,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if actor == row.owner {
+            return Self::refuse(RefusalCode::AlreadyRoomOwner);
+        }
+        let members = match self.deps.ports.room_members(home_guild, row.channel).await {
+            Ok(list) => list,
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        if !members.contains(&actor) {
+            return Self::refuse(RefusalCode::CallerNotInRoom);
+        }
+        if members.contains(&row.owner) {
+            self.note_owner_present(row.channel);
+            return Self::refuse(RefusalCode::OwnerStillPresent);
+        }
+        // The owner is absent. The grace runs from the first time the absence was recorded; an
+        // absence never recorded before starts its grace now, so a claim is never granted on a
+        // guess.
+        let now = self.now();
+        let since = *self
+            .mem()
+            .owner_absent_since
+            .entry(row.channel)
+            .or_insert(now);
+        if now.saturating_sub(since) < self.deps.settings.empty_grace_secs() {
+            return Self::refuse(RefusalCode::OwnerGraceNotElapsed);
+        }
+        self.move_ownership(home_guild, row, actor, SuccessCode::Claimed, mode)
+            .await
+    }
+    /// Loads the target's profile and role flags; any failure is refused and nothing is written.
+    async fn load_target(
+        &self,
+        home_guild: u64,
+        target: u64,
+    ) -> Result<(MemberProfile, TargetRoleFlags), RefusalCode> {
+        let Some(category) = self.deps.settings.category_id() else {
+            return Err(RefusalCode::FeatureNotReady);
+        };
+        let profile = self
+            .deps
+            .ports
+            .member_profile(home_guild, category, target)
+            .await
+            .map_err(RefusalCode::DiscordFailed)?;
+        let catalog = self
+            .deps
+            .roles
+            .roles(home_guild)
+            .await
+            .map_err(|_| RefusalCode::DiscordFailed(CommandPortError::Unavailable))?;
+        let mut flags = TargetRoleFlags::default();
+        for role_id in &profile.role_ids {
+            if self.deps.role_limits.protected_role_ids.contains(role_id) {
+                flags.protected = true;
+            }
+            if self.deps.role_limits.restricted_role_ids.contains(role_id) {
+                flags.restricted = true;
+            }
+            match catalog.iter().find(|r| r.id == *role_id) {
+                Some(entry) if entry.permissions & PRIVILEGED_MASK != 0 => {
+                    flags.privileged = true;
+                }
+                Some(_) => {}
+                // A role missing from the catalog cannot be judged: refuse rather than guess.
+                None => return Err(RefusalCode::DiscordFailed(CommandPortError::Unavailable)),
+            }
+        }
+        Ok((profile, flags))
+    }
+
+    /// Refusals shared by `permit` and `reject`: invalid id, owner, the bot itself, a bot account.
+    fn common_target_refusal(&self, row: &RoomRow, target: u64) -> Option<RefusalCode> {
+        if target == 0 {
+            Some(RefusalCode::InvalidUserId)
+        } else if target == row.owner {
+            Some(RefusalCode::TargetIsOwner)
+        } else if target == self.deps.bot_user_id {
+            Some(RefusalCode::TargetIsSelfBot)
+        } else {
+            None
+        }
+    }
+
+    async fn handle_permit(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        target: u64,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if let Some(code) = self.common_target_refusal(row, target) {
+            return Self::refuse(code);
+        }
+        let (profile, flags) = match self.load_target(home_guild, target).await {
+            Ok(found) => found,
+            Err(code) => return Self::refuse(code),
+        };
+        if profile.is_bot {
+            return Self::refuse(RefusalCode::TargetIsBot);
+        }
+        if flags.protected || flags.restricted || flags.privileged {
+            return Self::refuse(RefusalCode::TargetProtectedOrRestricted);
+        }
+        match self.deps.safeword.state(home_guild, target) {
+            Ok(SafewordState::Inactive) => {}
+            Ok(SafewordState::Active) => return Self::refuse(RefusalCode::TargetSafewordActive),
+            Err(_) => return Self::refuse(RefusalCode::StorageReadFailed),
+        }
+        if !profile.can_view_category {
+            return Self::refuse(RefusalCode::CategoryNotVisible);
+        }
+        let already = self
+            .mem()
+            .permitted_members
+            .get(&row.channel)
+            .is_some_and(|set| set.contains(&target));
+        if already {
+            return Self::refuse(RefusalCode::AlreadyPermitted);
+        }
+        if mode == Mode::Shadow {
+            return Self::applied(SuccessCode::Permitted, mode);
+        }
+        if let Err(e) = self
+            .deps
+            .ports
+            .set_overwrite(home_guild, row.channel, Self::permit_overwrite(target))
+            .await
+        {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        self.remember_permit(row.channel, target);
+        Self::applied(SuccessCode::Permitted, mode)
+    }
+
+    /// Remembers a permit; forgets the permits of rooms that no longer have a row once the memory
+    /// holds many rooms.
+    fn remember_permit(&self, channel: u64, target: u64) {
+        let mut mem = self.mem();
+        mem.permitted_members
+            .entry(channel)
+            .or_default()
+            .insert(target);
+        if mem.permitted_members.len() > MAX_REMEMBERED_ROOMS {
+            let alive: HashSet<u64> = match self.deps.db.lock() {
+                Ok(conn) => mem
+                    .permitted_members
+                    .keys()
+                    .copied()
+                    .filter(|c| matches!(repository::get(&conn, *c), Ok(Some(_))))
+                    .collect(),
+                Err(_) => return,
+            };
+            mem.permitted_members.retain(|c, _| alive.contains(c));
+        }
+    }
+
+    async fn handle_reject(
+        &self,
+        home_guild: u64,
+        row: &RoomRow,
+        target: u64,
+        mode: Mode,
+    ) -> CommandOutcome {
+        if let Some(code) = self.common_target_refusal(row, target) {
+            return Self::refuse(code);
+        }
+        let (profile, flags) = match self.load_target(home_guild, target).await {
+            Ok(found) => found,
+            Err(code) => return Self::refuse(code),
+        };
+        if profile.is_bot {
+            return Self::refuse(RefusalCode::TargetIsBot);
+        }
+        if flags.protected || flags.privileged {
+            return Self::refuse(RefusalCode::TargetProtectedOrRestricted);
+        }
+        let present = match self.deps.ports.room_members(home_guild, row.channel).await {
+            Ok(list) => list.contains(&target),
+            Err(e) => return Self::refuse(RefusalCode::DiscordFailed(e)),
+        };
+        let success = if present {
+            SuccessCode::RejectedAndDisconnected
+        } else {
+            SuccessCode::Rejected
+        };
+        if mode == Mode::Shadow {
+            return Self::applied(success, mode);
+        }
+        let denied = RoomOverwrite {
+            target: OverwriteTarget::Member(target),
+            allow: 0,
+            deny: policy::CONNECT,
+        };
+        if let Err(e) = self
+            .deps
+            .ports
+            .set_overwrite(home_guild, row.channel, denied)
+            .await
+        {
+            return Self::refuse(RefusalCode::DiscordFailed(e));
+        }
+        if let Some(set) = self.mem().permitted_members.get_mut(&row.channel) {
+            set.remove(&target);
+        }
+        if present {
+            if let Err(e) = self.deps.ports.disconnect_member(home_guild, target).await {
+                return Self::refuse(RefusalCode::DisconnectFailed(e));
+            }
+        }
+        Self::applied(success, mode)
     }
 }
 
@@ -617,6 +1296,22 @@ fn map_serenity_err(err: &serenity::Error) -> CommandPortError {
         return command_port_error_from_status(Some(resp.status_code.as_u16()));
     }
     CommandPortError::Unavailable
+}
+
+fn from_serenity_overwrite(guild_id: u64, o: &serenity::PermissionOverwrite) -> RoomOverwrite {
+    let target = match o.kind {
+        serenity::PermissionOverwriteType::Role(id) if id.get() == guild_id => {
+            OverwriteTarget::Everyone
+        }
+        serenity::PermissionOverwriteType::Role(id) => OverwriteTarget::Role(id.get()),
+        serenity::PermissionOverwriteType::Member(id) => OverwriteTarget::Member(id.get()),
+        _ => OverwriteTarget::Role(0),
+    };
+    RoomOverwrite {
+        target,
+        allow: o.allow.bits(),
+        deny: o.deny.bits(),
+    }
 }
 
 fn to_serenity_overwrite(
@@ -795,6 +1490,34 @@ impl RoomCommandPorts for SerenityRoomCommandPorts {
         Err(CommandPortError::Unavailable)
     }
 
+    async fn category_overwrites(
+        &self,
+        guild_id: u64,
+        category_id: u64,
+    ) -> Result<Vec<RoomOverwrite>, CommandPortError> {
+        if guild_id == 0 || category_id == 0 {
+            return Err(CommandPortError::Unavailable);
+        }
+        match self
+            .http
+            .get_channel(serenity::ChannelId::new(category_id))
+            .await
+        {
+            Ok(serenity::Channel::Guild(found))
+                if found.guild_id.get() == guild_id
+                    && found.kind == serenity::ChannelType::Category =>
+            {
+                Ok(found
+                    .permission_overwrites
+                    .iter()
+                    .map(|o| from_serenity_overwrite(guild_id, o))
+                    .collect())
+            }
+            Ok(_) => Err(CommandPortError::Unavailable),
+            Err(e) => Err(map_serenity_err(&e)),
+        }
+    }
+
     async fn member_profile(
         &self,
         guild_id: u64,
@@ -834,6 +1557,7 @@ impl RoomCommandPorts for SerenityRoomCommandPorts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roles::runtime::RoleEntry;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     const HOME_GUILD: u64 = 10_001;
@@ -892,6 +1616,8 @@ mod tests {
         fail_disconnect: Option<CommandPortError>,
         fail_room_members: Option<CommandPortError>,
         fail_profile: Option<CommandPortError>,
+        fail_category: Option<CommandPortError>,
+        category_overwrites: Vec<RoomOverwrite>,
         calls_count: usize,
     }
 
@@ -969,7 +1695,8 @@ mod tests {
             if let Some(err) = s.fail_rename {
                 return Err(err);
             }
-            s.renames.push((guild_id, channel_id, clean_name.to_string()));
+            s.renames
+                .push((guild_id, channel_id, clean_name.to_string()));
             Ok(())
         }
 
@@ -1058,6 +1785,19 @@ mod tests {
                 return Err(err);
             }
             Ok(s.room_members.get(&channel_id).cloned().unwrap_or_default())
+        }
+
+        async fn category_overwrites(
+            &self,
+            _guild_id: u64,
+            _category_id: u64,
+        ) -> Result<Vec<RoomOverwrite>, CommandPortError> {
+            let mut s = self.state.lock().unwrap();
+            s.calls_count += 1;
+            if let Some(err) = s.fail_category {
+                return Err(err);
+            }
+            Ok(s.category_overwrites.clone())
         }
 
         async fn member_profile(
@@ -1356,7 +2096,13 @@ mod tests {
                 reply: Reply::refused(RefusalCode::OwnerGraceNotElapsed),
             }
         );
-        assert_eq!(repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().owner, OWNER);
+        assert_eq!(
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .owner,
+            OWNER
+        );
 
         // 4. At t=1160 (60s >= 60s grace) -> claim succeeds, updates Discord overwrites and DB owner.
         h.clock.set(1_160);
@@ -1376,10 +2122,16 @@ mod tests {
                 reply: Reply::ok(SuccessCode::Claimed),
             }
         );
-        let row = repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap();
+        let row = repository::get(&h.db.lock().unwrap(), ROOM_CH)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.owner, MEMBER_A);
         let s = h.ports.state.lock().unwrap();
-        assert!(s.deleted_overwrites.contains(&(HOME_GUILD, ROOM_CH, OverwriteTarget::Member(OWNER))));
+        assert!(s.deleted_overwrites.contains(&(
+            HOME_GUILD,
+            ROOM_CH,
+            OverwriteTarget::Member(OWNER)
+        )));
         assert!(s.overwrites.contains(&(
             HOME_GUILD,
             ROOM_CH,
@@ -1414,7 +2166,13 @@ mod tests {
                 reply: Reply::refused(RefusalCode::TargetNotInRoom),
             }
         );
-        assert_eq!(repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().owner, OWNER);
+        assert_eq!(
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .owner,
+            OWNER
+        );
 
         // MEMBER_A is inside the room -> transfer succeeds.
         let out_ok = h
@@ -1436,7 +2194,10 @@ mod tests {
             }
         );
         assert_eq!(
-            repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().owner,
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .owner,
             MEMBER_A
         );
     }
@@ -1621,7 +2382,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_refuses_protected_targets_disconnects_present_member_and_reports_failed_disconnect() {
+    async fn reject_refuses_protected_targets_disconnects_present_member_and_reports_failed_disconnect(
+    ) {
         let h = make_harness(live_settings());
 
         // Cannot reject owner, self bot, or staff.
@@ -1797,7 +2559,13 @@ mod tests {
                 reply: Reply::refused(RefusalCode::LimitOutOfBounds),
             }
         );
-        assert_eq!(repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().user_limit, 0);
+        assert_eq!(
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .user_limit,
+            0
+        );
 
         // Boundary limits 99 and 0 succeed.
         for lim in [99, 0] {
@@ -1818,7 +2586,10 @@ mod tests {
                 }
             );
             assert_eq!(
-                repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().user_limit,
+                repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                    .unwrap()
+                    .unwrap()
+                    .user_limit,
                 lim
             );
         }
@@ -1840,7 +2611,12 @@ mod tests {
                 reply: Reply::ok(SuccessCode::Locked),
             }
         );
-        assert!(repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().locked);
+        assert!(
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .locked
+        );
 
         let out_unlock = h
             .handler
@@ -1858,7 +2634,12 @@ mod tests {
                 reply: Reply::ok(SuccessCode::Unlocked),
             }
         );
-        assert!(!repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().locked);
+        assert!(
+            !repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .locked
+        );
     }
 
     #[tokio::test]
@@ -1898,7 +2679,12 @@ mod tests {
         assert!(out_other.reply().is_none());
         assert_eq!(h.ports.state.lock().unwrap().calls_count, before_calls);
         assert!(h.alerter.alerts.lock().unwrap().is_empty());
-        assert!(!repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().locked);
+        assert!(
+            !repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .locked
+        );
 
         // 3. Mode is Live/Shadow and home_guild_id is unset (None or Some(0)) -> fail closed.
         let unset_settings = settings_with("live", None);
@@ -1944,7 +2730,13 @@ mod tests {
                 reply: Reply::refused(RefusalCode::DiscordFailed(CommandPortError::Unavailable)),
             }
         );
-        assert_eq!(repository::get(&h.db.lock().unwrap(), ROOM_CH).unwrap().unwrap().user_limit, 0);
+        assert_eq!(
+            repository::get(&h.db.lock().unwrap(), ROOM_CH)
+                .unwrap()
+                .unwrap()
+                .user_limit,
+            0
+        );
         assert!(h.alerter.alerts.lock().unwrap().is_empty());
         h.ports.state.lock().unwrap().fail_limit = None;
 
