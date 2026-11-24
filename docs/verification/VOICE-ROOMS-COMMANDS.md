@@ -1,8 +1,7 @@
 # VOICE-ROOMS-COMMANDS - `/vc` command logic (VR3)
 Card VR3: `src/voice_rooms/command.rs` (new), `pub mod command;` in `mod.rs`, and the owner/lock/limit
-updates in `repository.rs` (`update_owner`, `update_locked`, `update_user_limit`; stubs in the RED
-commit, filled in later). Logic only: no poise command, not called from `main.rs`, no feature
-switched on, nothing registered with Discord, never run against Discord.
+updates in `repository.rs`. Logic only: no poise command, not called from `main.rs`, no feature on,
+nothing registered with or run on Discord.
 - **API.** `VcCommandHandler::new(VcCommandDeps)` and `handle(&VcCommandRequest) -> CommandOutcome`
   (`Ignored(code)`, `Applied{code,reply}`, `Refused{code,reply}`). Ports: `RoomCommandPorts` (rename,
   limit, overwrite set/delete, disconnect, move, room members, category overwrites, member profile),
@@ -18,11 +17,11 @@ switched on, nothing registered with Discord, never run against Discord.
   absence: none recorded -> `vc_owner_absence_not_recorded`. `note_owner_present`, or a claim that
   finds the owner inside, clears the record. The record must be gapless: observations more than
   `ABSENCE_MAX_GAP_SECS` (15 s) apart restart it, and a claim needs a last observation at most that
-  old, else `vc_owner_absence_not_continuous`. A return longer than 15 s stops the heartbeat, so it is not bridged.
-- **Grace conflict (Directorate ruling).** Two modules on main define the same idea with different
-  keys and defaults: VR1 policy `VOICE_ROOM_EMPTY_GRACE_SECS`=60, VR2 config `VC_EMPTY_GRACE_SECS`=10.
-  VR3 claims follow VR1 (waiting longer is safer); VR2's cleanup grace is untouched. Reconciling
-  the two keys is a separate decision before voice rooms are wired.
+  old, else `vc_owner_absence_not_continuous`.
+- **Grace conflict (Directorate ruling).** Two modules on main define the same idea differently:
+  VR1 policy `VOICE_ROOM_EMPTY_GRACE_SECS`=60, VR2 config `VC_EMPTY_GRACE_SECS`=10. VR3 claims follow
+  VR1 (waiting longer is safer); VR2's cleanup grace is untouched. Reconciling the two keys is a
+  separate decision before voice rooms are wired.
 - **permit.** Refuses owner, the bot, bot accounts, protected/restricted/privileged-permission roles
   (a role missing from the catalog is unjudgeable, so refused), active safeword, no category view,
   and a member already permitted since this process started. **reject** refuses owner, bot, bot
@@ -43,28 +42,29 @@ switched on, nothing registered with Discord, never run against Discord.
   Shadow mode runs checks and reads, writes nothing, answers `vc_shadow_noop`.
 ## Tests (27 command unit + 1 repository unit; fakes plus real in-memory SQLite)
 Non-owner on all seven owner commands; claim (present owner, outsider, 59 s refused / 60 s accepted,
-no recorded absence refused at any age, absence noted at 5000 then an unreported return at 5030 and
-exit at 5100 refused at a 5110 claim, a 10 s heartbeat accepted and a stale or gapped one refused at
-the 15 s boundary, a gap restarts the grace, an observed return restarts it, racing claims);
-transfer, permit and reject refusals; rename 429 and budget; limit bounds; lock/unlock baseline;
-failed Discord and row writes; shadow, off, DM, other guild; two seeded runs (80 steps, floor of 15
-applied; 3 seeds x 300 steps with a row-vs-outcome model check).
+no recorded absence, the 5000 noted / 5030 back / 5100 gone / 5110 claim probe refused, 15 s
+heartbeat boundary, gap and observed return restart the grace, racing claims); transfer, permit and
+reject refusals; rename 429 and budget; limit bounds; lock/unlock baseline; failed Discord and row
+writes; shadow, off, DM, other guild; two seeded runs (80 steps with a floor of 15 applied; 3 x 300).
 **RED** round 1 `f6b8a54`: 11 failed / 200 passed in `voice_rooms` (14 of 14 mutants failed a test;
-not re-run later). Round 2 `93b38f2`: 6 failed / 19 passed in `voice_rooms::command` (continuous
-absence, 60 s grace). Round 3 `3d64491`: 3 failed / 24 passed (the 5000/5030/5100/5110 probe with
-5000 recorded, the 15 s freshness boundary, the gap restart), then fixed.
+not re-run later). Round 2 `93b38f2`: 6 failed / 19 passed in `voice_rooms::command`. Round 3
+`3d64491`: 3 failed / 24 passed (the 5000/5030/5100/5110 probe, 15 s freshness, gap restart).
 ## Config keys (read by the wiring card, not here)
 `VC_MODE` off|shadow|live (default off), `VC_CATEGORY_ID` (unset = not ready, refused), `GUILD_ID`
 (home guild; unset with mode on = refused). Claim grace: wiring passes `VOICE_ROOM_EMPTY_GRACE_SECS`
 (default 60, `policy::DEFAULT_EMPTY_GRACE_SECS`) as `VcCommandDeps.claim_grace_secs`. Also passed:
-bot id, role-policy sets, rename budget (VR1 default 2 per 600 s), default name. Wiring must call
-`note_owner_absent` at least every 15 s while an owner is out, else claims are refused.
+bot id, role-policy sets, rename budget (VR1 default 2 per 600 s), default name.
+## WIRING CONTRACT (hard; `/vc claim` depends on it)
+The voice-state handler MUST call `note_owner_present` on every owner voice join or leave of a temp
+room, and `note_owner_absent` at least every 15 s while the owner is out. Until the wiring card does
+both, `/vc claim` MUST NOT be registered or enabled. A return plus a second exit inside one 15 s gap
+looks like unbroken absence unless `note_owner_present` reports the return; only that call closes
+this window. The Directorate accepted this residual on that condition. A missing heartbeat fails
+closed (claims refused); a missing presence report does not.
 ## NOT done / known limits
 No poise shell (W4), not wired, `main.rs`/`config.rs`/`.env.example` untouched; enabling needs D10.
 Permits, rename times and owner-absence records live in memory: a restart forgets them (a permit can
 be repeated; after a restart claims are refused until an absence is recorded again). Nothing calls
-`note_owner_absent`/`note_owner_present` yet. Blind spot: a return and a second exit both inside one
-15 s gap between observations, if wiring also misses `note_owner_present`. serenity may wait on its
-own rate limiter instead of returning 429. A member who leaves between `room_members` and the
-disconnect is not re-checked. `restricted` roles are the caller's `RoleLimits`; the role service's
-own deny reasons are not re-run.
+`note_owner_absent`/`note_owner_present` yet (see the contract). serenity may wait on its own rate
+limiter instead of returning 429. A member leaving between `room_members` and the disconnect is not
+re-checked. `restricted` roles come from the caller's `RoleLimits`; role deny reasons not re-run.
