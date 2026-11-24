@@ -13,6 +13,7 @@ use crate::roles::grant::{
     self, FailCode, GrantReport, RoleOutcome, RoleWriter, Sleeper, WriteError,
 };
 use crate::roles::runtime::{self, DecisionInputs, FactsOutcome, RoleSource, RuntimeDecision};
+use crate::settings::{parse_mode, Mode};
 use crate::text_helpers::{normalize_reaction_type, parse_emoji_input};
 use poise::serenity_prelude as s;
 use rusqlite::{params, Connection};
@@ -458,6 +459,10 @@ fn precheck_event(
     if uid == env.bot_user_id || user_is_bot == Some(true) {
         return Err(SkipReason::BotReactor);
     }
+    // An unknown flag is not "human": without proof the reactor is not a bot, ignore it.
+    if user_is_bot.is_none() {
+        return Err(SkipReason::BotFlagUnknown);
+    }
     Ok((gid, uid))
 }
 
@@ -519,6 +524,47 @@ where
             return ReactionAddOutcome::Aborted(code);
         }
     };
+    evaluate_add(
+        env,
+        event,
+        Resolved {
+            guild_id,
+            member_id,
+            role_ids,
+        },
+        ports,
+    )
+    .await
+}
+
+/// The ids a reaction event resolved to before any role is evaluated.
+struct Resolved {
+    guild_id: u64,
+    member_id: u64,
+    /// The roles bound to the message and emoji, in row order.
+    role_ids: Vec<u64>,
+}
+
+/// The part of [`handle_reaction_add`] that follows the binding lookup. It holds no database
+/// handle (a `rusqlite::Connection` is not `Sync`, so it cannot be held across an `.await` in a
+/// future that must be `Send`), which is what lets the live feature call it.
+async fn evaluate_add<S, W, L, R>(
+    env: &ReactionEnv,
+    event: &ReactionAddEvent,
+    resolved: Resolved,
+    ports: AddPorts<'_, S, W, L, R>,
+) -> ReactionAddOutcome
+where
+    S: RoleSource + ?Sized,
+    W: RoleWriter,
+    L: Sleeper,
+    R: FailureReporter,
+{
+    let Resolved {
+        guild_id,
+        member_id,
+        role_ids,
+    } = resolved;
     if role_ids.is_empty() {
         return ReactionAddOutcome::Skipped(SkipReason::NoBindings);
     }
@@ -632,6 +678,37 @@ where
             return ReactionRemoveOutcome::Aborted(code);
         }
     };
+    evaluate_remove(
+        env,
+        event,
+        Resolved {
+            guild_id,
+            member_id,
+            role_ids,
+        },
+        ports,
+    )
+    .await
+}
+
+/// The part of [`handle_reaction_remove`] that follows the binding lookup (see [`evaluate_add`]).
+async fn evaluate_remove<S, M, L, R>(
+    env: &ReactionEnv,
+    event: &ReactionRemoveEvent,
+    resolved: Resolved,
+    ports: RemovePorts<'_, S, M, L, R>,
+) -> ReactionRemoveOutcome
+where
+    S: RoleSource + ?Sized,
+    M: RoleRemover,
+    L: Sleeper,
+    R: FailureReporter,
+{
+    let Resolved {
+        guild_id,
+        member_id,
+        role_ids,
+    } = resolved;
     if role_ids.is_empty() {
         return ReactionRemoveOutcome::Skipped(SkipReason::NoBindings);
     }
@@ -724,8 +801,11 @@ impl ModeRefusal {
 /// Reads `REACTION_ROLES_MODE`: `Ok(true)` = live, `Ok(false)` = off (unset, blank or any
 /// unrecognised word, as for the other features), `Err` = a mode that cannot run.
 pub fn load_enabled(lookup: impl Fn(&str) -> Option<String>) -> Result<bool, ModeRefusal> {
-    let _ = lookup;
-    Ok(false)
+    match parse_mode(KEY_MODE, lookup(KEY_MODE).as_deref()).unwrap_or(Mode::Off) {
+        Mode::Off => Ok(false),
+        Mode::Live => Ok(true),
+        Mode::Shadow => Err(ModeRefusal::ShadowUnsupported),
+    }
 }
 
 /// What the live reaction-role path needs from outside: the binding table, Discord and the
@@ -733,8 +813,7 @@ pub fn load_enabled(lookup: impl Fn(&str) -> Option<String>) -> Result<bool, Mod
 #[s::async_trait]
 pub trait ReactionServices: Send + Sync {
     /// The roles bound to `(message, emoji key)`, in row order.
-    async fn bound_roles(&self, message_id: u64, emoji_key: &str)
-        -> Result<Vec<u64>, StorageCode>;
+    async fn bound_roles(&self, message_id: u64, emoji_key: &str) -> Result<Vec<u64>, StorageCode>;
     /// Role and member facts.
     fn role_source(&self) -> &dyn RoleSource;
     /// Whether the user is a bot, when the event did not say. `None` = could not be established.
@@ -785,6 +864,161 @@ impl ReactionRolesFeature {
     }
 }
 
+impl RoleWriter for Box<dyn RoleWriter + Send> {
+    fn add_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        (**self).add_role(member_id, role_id)
+    }
+}
+
+impl RoleRemover for Box<dyn RoleRemover + Send> {
+    fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        (**self).remove_role(member_id, role_id)
+    }
+}
+
+impl Sleeper for Box<dyn Sleeper + Send> {
+    fn sleep_ms(&mut self, ms: u64) {
+        (**self).sleep_ms(ms)
+    }
+}
+
+/// Hands the handlers' failure lines to [`ReactionServices::report`].
+struct ServicesReporter<'a>(&'a dyn ReactionServices);
+
+impl FailureReporter for ServicesReporter<'_> {
+    fn report(&mut self, line: &str) {
+        self.0.report(line);
+    }
+}
+
+/// One reaction, reduced to plain values, with the roles bound to it.
+struct Prepared {
+    guild_id: u64,
+    user_id: u64,
+    channel_id: u64,
+    message_id: u64,
+    emoji_key: String,
+    user_is_bot: Option<bool>,
+    role_ids: Vec<u64>,
+}
+
+impl Live {
+    /// Reduces a reaction to its bound roles, or `None` when it is to be ignored: another
+    /// guild, no user, the bot itself or a bot, nothing bound, or a bot flag that cannot be
+    /// established. The cheap checks come first, so a reaction that is not bound to a role
+    /// costs one database read and no Discord call.
+    async fn prepare(&self, reaction: &s::Reaction) -> Option<Prepared> {
+        let guild_id = reaction.guild_id.map(|g| g.get());
+        let user_id = reaction.user_id.map(|u| u.get());
+        let from_event = reaction.member.as_ref().map(|member| member.user.bot);
+        // Step 1: everything that needs no flag. An unknown flag stands in as "human" here only.
+        let (guild, user) = precheck_event(
+            &self.env,
+            guild_id,
+            user_id,
+            Some(from_event.unwrap_or(false)),
+        )
+        .ok()?;
+        let message_id = reaction.message_id.get();
+        let emoji_key = emoji_key_from_reaction(&reaction.emoji);
+        // Step 2: is anything bound?
+        let role_ids = match self.services.bound_roles(message_id, &emoji_key).await {
+            Ok(ids) => ids,
+            Err(code) => {
+                self.services
+                    .report(&format!("reaction_roles error={}", code.code()));
+                return None;
+            }
+        };
+        if role_ids.is_empty() {
+            return None;
+        }
+        // Step 3: the real flag. When the event carried none, ask; unknown means ignore.
+        let user_is_bot = match from_event {
+            Some(flag) => Some(flag),
+            None => self.services.user_is_bot(guild, user).await,
+        };
+        precheck_event(&self.env, guild_id, user_id, user_is_bot).ok()?;
+        Some(Prepared {
+            guild_id: guild,
+            user_id: user,
+            channel_id: reaction.channel_id.get(),
+            message_id,
+            emoji_key,
+            user_is_bot,
+            role_ids,
+        })
+    }
+
+    async fn on_add(&self, reaction: &s::Reaction) {
+        let Some(p) = self.prepare(reaction).await else {
+            return;
+        };
+        let event = ReactionAddEvent {
+            guild_id: Some(p.guild_id),
+            channel_id: p.channel_id,
+            message_id: p.message_id,
+            user_id: Some(p.user_id),
+            user_is_bot: p.user_is_bot,
+            emoji_key: p.emoji_key,
+            safeword: self.services.safeword_state(p.guild_id, p.user_id),
+        };
+        let mut writer = self.services.role_writer(p.guild_id);
+        let mut sleeper = self.services.sleeper();
+        let mut reporter = ServicesReporter(&*self.services);
+        let _ = evaluate_add(
+            &self.env,
+            &event,
+            Resolved {
+                guild_id: p.guild_id,
+                member_id: p.user_id,
+                role_ids: p.role_ids,
+            },
+            AddPorts {
+                source: self.services.role_source(),
+                writer: &mut writer,
+                sleeper: &mut sleeper,
+                reporter: &mut reporter,
+            },
+        )
+        .await;
+    }
+
+    async fn on_remove(&self, reaction: &s::Reaction) {
+        let Some(p) = self.prepare(reaction).await else {
+            return;
+        };
+        let event = ReactionRemoveEvent {
+            guild_id: Some(p.guild_id),
+            channel_id: p.channel_id,
+            message_id: p.message_id,
+            user_id: Some(p.user_id),
+            user_is_bot: p.user_is_bot,
+            emoji_key: p.emoji_key,
+            safeword: self.services.safeword_state(p.guild_id, p.user_id),
+        };
+        let mut remover = self.services.role_remover(p.guild_id);
+        let mut sleeper = self.services.sleeper();
+        let mut reporter = ServicesReporter(&*self.services);
+        let _ = evaluate_remove(
+            &self.env,
+            &event,
+            Resolved {
+                guild_id: p.guild_id,
+                member_id: p.user_id,
+                role_ids: p.role_ids,
+            },
+            RemovePorts {
+                source: self.services.role_source(),
+                remover: &mut remover,
+                sleeper: &mut sleeper,
+                reporter: &mut reporter,
+            },
+        )
+        .await;
+    }
+}
+
 impl<X: Sync, D: Sync> Feature<X, D> for ReactionRolesFeature {
     fn name(&self) -> &'static str {
         FEATURE_NAME
@@ -801,12 +1035,243 @@ impl<X: Sync, D: Sync> Feature<X, D> for ReactionRolesFeature {
     fn handle<'a>(
         &'a self,
         _ctx: &'a X,
-        _event: &'a s::FullEvent,
+        event: &'a s::FullEvent,
         _data: &'a D,
         _guild: Option<u64>,
         _core_db: Option<&'a tokio_rusqlite::Connection>,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+        Box::pin(async move {
+            let Some(live) = &self.live else {
+                return;
+            };
+            match event {
+                s::FullEvent::ReactionAdd { add_reaction } => live.on_add(add_reaction).await,
+                s::FullEvent::ReactionRemove { removed_reaction } => {
+                    live.on_remove(removed_reaction).await
+                }
+                _ => {}
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The serenity services (never run against Discord; only the pure helpers are tested)
+// ---------------------------------------------------------------------------
+
+/// Reduces a failure line to its stable words: lower-case letters and underscores only, so every
+/// id, number and name is dropped. An alert is built from this, never from the raw line.
+pub fn alert_words(line: &str) -> String {
+    let words: Vec<&str> = line
+        .split(|c: char| c == ' ' || c == ',' || c == ':' || c == '=')
+        .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+        .collect();
+    if words.is_empty() {
+        "unspecified".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// How long the same alert text is held back after it was sent, in seconds.
+pub const ALERT_REPEAT_SECS: i64 = 300;
+/// How many distinct alert texts the throttle remembers.
+const ALERT_MEMORY: usize = 32;
+
+/// Lets one alert text through at most once per [`ALERT_REPEAT_SECS`], so a role that keeps
+/// failing does not flood the staff channel. Remembers at most [`ALERT_MEMORY`] texts; when
+/// full, the oldest is forgotten.
+#[derive(Debug, Default)]
+pub struct AlertThrottle {
+    sent: Vec<(String, i64)>,
+}
+
+impl AlertThrottle {
+    /// True when `text` may be sent at `now` (and records it).
+    pub fn allow(&mut self, text: &str, now: i64) -> bool {
+        if let Some(entry) = self.sent.iter_mut().find(|(t, _)| t == text) {
+            let held = now
+                .checked_sub(entry.1)
+                .is_some_and(|age| (0..ALERT_REPEAT_SECS).contains(&age));
+            if held {
+                return false;
+            }
+            entry.1 = now;
+            return true;
+        }
+        if self.sent.len() >= ALERT_MEMORY {
+            if let Some(oldest) = self
+                .sent
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(i, _)| i)
+            {
+                self.sent.remove(oldest);
+            }
+        }
+        self.sent.push((text.to_string(), now));
+        true
+    }
+}
+
+/// Removes one role from a member over serenity's `remove_member_role`.
+struct SerenityRoleRemover {
+    guild_id: u64,
+    http: std::sync::Arc<s::Http>,
+    handle: tokio::runtime::Handle,
+}
+
+impl RoleRemover for SerenityRoleRemover {
+    fn remove_role(&mut self, member_id: u64, role_id: u64) -> Result<(), WriteError> {
+        let http = std::sync::Arc::clone(&self.http);
+        let guild_id = self.guild_id;
+        let outcome = runtime::drive_blocking(&self.handle, async move {
+            http.remove_member_role(
+                s::GuildId::new(guild_id),
+                s::UserId::new(member_id),
+                s::RoleId::new(role_id),
+                None,
+            )
+            .await
+        })?;
+        outcome.map_err(|error| runtime::map_serenity_error(&error))
+    }
+}
+
+/// Looks up a member's safeword state; `None` of the lookup means the safeword feature is off.
+pub type SafewordLookup = std::sync::Arc<dyn Fn(u64, u64) -> SafewordState + Send + Sync>;
+
+/// The production [`ReactionServices`]: the `reaction_roles` table through its own connection,
+/// serenity for Discord, and an optional safeword lookup.
+pub struct SerenityReactionServices {
+    http: std::sync::Arc<s::Http>,
+    cache: std::sync::Arc<s::Cache>,
+    db: std::sync::Arc<tokio_rusqlite::Connection>,
+    source: runtime::CachedRoleSource<runtime::SerenityCacheSource, runtime::SerenityHttpSource>,
+    staff_alert_channel: Option<u64>,
+    safeword: Option<SafewordLookup>,
+    throttle: std::sync::Mutex<AlertThrottle>,
+}
+
+impl SerenityReactionServices {
+    pub fn new(
+        http: std::sync::Arc<s::Http>,
+        cache: std::sync::Arc<s::Cache>,
+        db: std::sync::Arc<tokio_rusqlite::Connection>,
+        staff_alert_channel: Option<u64>,
+        safeword: Option<SafewordLookup>,
+    ) -> Self {
+        let source = runtime::CachedRoleSource::new(
+            runtime::SerenityCacheSource {
+                cache: cache.clone(),
+            },
+            runtime::SerenityHttpSource { http: http.clone() },
+        );
+        Self {
+            http,
+            cache,
+            db,
+            source,
+            staff_alert_channel,
+            safeword,
+            throttle: std::sync::Mutex::new(AlertThrottle::default()),
+        }
+    }
+
+    /// The bot flag from the cached member, if the cache has the member.
+    fn cached_flag(&self, guild_id: u64, user_id: u64) -> Option<bool> {
+        let guild = self.cache.guild(s::GuildId::new(guild_id))?;
+        guild
+            .members
+            .get(&s::UserId::new(user_id))
+            .map(|member| member.user.bot)
+    }
+}
+
+#[s::async_trait]
+impl ReactionServices for SerenityReactionServices {
+    async fn bound_roles(&self, message_id: u64, emoji_key: &str) -> Result<Vec<u64>, StorageCode> {
+        let key = emoji_key.to_string();
+        self.db
+            .call(
+                move |conn| -> Result<Result<Vec<u64>, StorageCode>, rusqlite::Error> {
+                    Ok(lookup_roles_for_message_emoji(conn, message_id, &key))
+                },
+            )
+            .await
+            .map_err(|_| StorageCode::Sqlite)?
+    }
+
+    fn role_source(&self) -> &dyn RoleSource {
+        &self.source
+    }
+
+    async fn user_is_bot(&self, guild_id: u64, user_id: u64) -> Option<bool> {
+        if let Some(flag) = self.cached_flag(guild_id, user_id) {
+            return Some(flag);
+        }
+        self.http
+            .get_member(s::GuildId::new(guild_id), s::UserId::new(user_id))
+            .await
+            .ok()
+            .map(|member| member.user.bot)
+    }
+
+    fn safeword_state(&self, guild_id: u64, user_id: u64) -> SafewordState {
+        match &self.safeword {
+            Some(lookup) => lookup(guild_id, user_id),
+            None => SafewordState::Inactive,
+        }
+    }
+
+    fn role_writer(&self, guild_id: u64) -> Box<dyn RoleWriter + Send> {
+        Box::new(runtime::SerenityRoleWriter::new(
+            guild_id,
+            self.http.clone(),
+            tokio::runtime::Handle::current(),
+        ))
+    }
+
+    fn role_remover(&self, guild_id: u64) -> Box<dyn RoleRemover + Send> {
+        Box::new(SerenityRoleRemover {
+            guild_id,
+            http: self.http.clone(),
+            handle: tokio::runtime::Handle::current(),
+        })
+    }
+
+    fn sleeper(&self) -> Box<dyn Sleeper + Send> {
+        Box::new(runtime::TokioSleeper::new(tokio::runtime::Handle::current()))
+    }
+
+    fn report(&self, line: &str) {
+        let text = format!("reaction roles alert: {}", alert_words(line));
+        eprintln!("{text}");
+        let Some(channel) = self.staff_alert_channel.filter(|id| *id != 0) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let allowed = self
+            .throttle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .allow(&text, now);
+        if !allowed {
+            return;
+        }
+        let http = self.http.clone();
+        tokio::spawn(async move {
+            // No mention can fire from an alert: the allowed-mentions object is empty.
+            let message = s::builder::CreateMessage::new()
+                .content(text)
+                .allowed_mentions(s::builder::CreateAllowedMentions::new());
+            let _ = s::ChannelId::new(channel)
+                .send_message(&http, message)
+                .await;
+        });
     }
 }
 
@@ -1986,8 +2451,7 @@ mod wiring_tests {
     }
 
     async fn deliver(feature: &ReactionRolesFeature, ev: &s::FullEvent, guild: Option<u64>) {
-        <ReactionRolesFeature as Feature<(), ()>>::handle(feature, &(), ev, &(), guild, None)
-            .await;
+        <ReactionRolesFeature as Feature<(), ()>>::handle(feature, &(), ev, &(), guild, None).await;
     }
 
     fn live(fake: &Arc<Fake>, home: Option<u64>) -> ReactionRolesFeature {
@@ -2042,7 +2506,12 @@ mod wiring_tests {
     async fn a_removal_takes_the_bound_role_back_and_needs_no_member_object() {
         let fake = Arc::new(Fake::new(Some(false)));
         let feature = live(&fake, Some(HOME));
-        deliver(&feature, &event(Some(HOME), MEMBER, None, false), Some(HOME)).await;
+        deliver(
+            &feature,
+            &event(Some(HOME), MEMBER, None, false),
+            Some(HOME),
+        )
+        .await;
         assert_eq!(fake.log(), vec![format!("remove:{MEMBER}:{ROLE_A}")]);
         assert_eq!(fake.flag_calls.load(Ordering::SeqCst), 1);
     }
@@ -2057,7 +2526,10 @@ mod wiring_tests {
         deliver(&feature, &ev, Some(HOME)).await;
         let log = fake.log();
         assert!(log.contains(&format!("add:{MEMBER}:{ROLE_A}")), "{log:?}");
-        assert!(!log.contains(&format!("add:{MEMBER}:{ROLE_PRIV}")), "{log:?}");
+        assert!(
+            !log.contains(&format!("add:{MEMBER}:{ROLE_PRIV}")),
+            "{log:?}"
+        );
     }
 
     #[tokio::test]

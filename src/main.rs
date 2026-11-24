@@ -1183,7 +1183,10 @@ mod tests {
             "off: the old arms act as before"
         );
         let on = w2_data(config(), vec![], true).await;
-        assert!(!legacy_reaction_roles_active(&on), "on: the new path owns them");
+        assert!(
+            !legacy_reaction_roles_active(&on),
+            "on: the new path owns them"
+        );
     }
 
     #[tokio::test]
@@ -2229,9 +2232,14 @@ struct DataParts {
 /// Builds the shared bot state. `setup` is the only production caller, so the
 /// log exclusion the event handler later reads is derived from `config` here.
 fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
-    let _ = &parts.flash_log_excluded;
+    // With no flash channel the exclusion is exactly the configured one, as before W2.
+    let log_exclusion = if parts.flash_log_excluded.is_empty() {
+        features::LogExclusion::from_config(&config)
+    } else {
+        features::LogExclusion::from_config_with_flash(&config, &parts.flash_log_excluded)
+    };
     Data {
-        log_exclusion: features::LogExclusion::from_config(&config),
+        log_exclusion,
         config,
         message_cache: Arc::new(RwLock::new(HashMap::new())),
         rr_db: parts.rr_db,
@@ -2244,8 +2252,7 @@ fn build_data(config: Arc<Config>, parts: DataParts) -> Data {
 /// Whether the legacy reaction-role arms act. They stand down exactly when the new
 /// reaction-role feature owns the events, so a reaction is never handled twice.
 fn legacy_reaction_roles_active(data: &Data) -> bool {
-    let _ = data;
-    true
+    !data.wired.reaction_roles_owned
 }
 
 /// Builds the `Route` for one event from the shared state. `event_handler` is the
@@ -2392,6 +2399,10 @@ async fn log_event_body(
         }
 
         serenity::FullEvent::ReactionAdd { add_reaction } => {
+            // The new reaction-role feature owns these events when it is on (W2).
+            if !legacy_reaction_roles_active(data) {
+                return Ok(());
+            }
             if add_reaction.user_id == Some(ctx.cache.current_user().id) {
                 return Ok(());
             }
@@ -2426,6 +2437,10 @@ async fn log_event_body(
         }
 
         serenity::FullEvent::ReactionRemove { removed_reaction } => {
+            // The new reaction-role feature owns these events when it is on (W2).
+            if !legacy_reaction_roles_active(data) {
+                return Ok(());
+            }
             let Some(guild_id) = removed_reaction.guild_id else {
                 return Ok(());
             };
@@ -3713,6 +3728,12 @@ async fn main() -> Result<(), Error> {
 
     let config = Arc::new(Config::from_env()?);
     let token = config.discord_token.clone();
+    // The optional features that are on, read once from the environment (W2). With every
+    // `*_MODE` key unset the plan is empty.
+    let plan = Arc::new(features::plan_features(
+        &|key| std::env::var(key).ok(),
+        &config,
+    ));
     // Filled by `setup` once the feature registry is built, so shutdown can stop its runner.
     let features_slot: Arc<std::sync::OnceLock<Arc<AppFeatures>>> =
         Arc::new(std::sync::OnceLock::new());
@@ -3740,9 +3761,11 @@ async fn main() -> Result<(), Error> {
         .setup({
             let config = config.clone();
             let features_slot = features_slot.clone();
+            let plan = plan.clone();
             move |ctx, ready, framework| {
                 let config = config.clone();
                 let features_slot = features_slot.clone();
+                let plan = plan.clone();
                 Box::pin(async move {
                     println!("Bot is online as {}", ready.user.name);
 
@@ -3764,10 +3787,27 @@ async fn main() -> Result<(), Error> {
 
                     let feature_settings = features::Settings::from_config(&config);
                     println!("{}", feature_settings.summary());
+                    for line in &plan.lines {
+                        println!("{line}");
+                    }
+                    let services = features::Services {
+                        http: ctx.http.clone(),
+                        cache: ctx.cache.clone(),
+                        bot_user_id: ready.user.id.get(),
+                        reaction: Arc::new(role_menus::reactions::SerenityReactionServices::new(
+                            ctx.http.clone(),
+                            ctx.cache.clone(),
+                            rr_db.clone(),
+                            config.staff_alert_channel_id,
+                            None,
+                        )),
+                    };
+                    let mut optional = features::production_features();
+                    optional.extend(features::build_features(&plan, &services));
                     let features = Arc::new(
                         AppFeatures::start(
                             features::StartRequest {
-                                features: features::production_features(),
+                                features: optional,
                                 settings: &feature_settings,
                             },
                             &features::TokioJobStarter,
@@ -3778,6 +3818,12 @@ async fn main() -> Result<(), Error> {
                         println!("{line}");
                     }
                     let _ = features_slot.set(features.clone());
+                    let wired = WiredFeatures {
+                        // Owned only if the feature really started: a dropped feature must
+                        // leave the legacy arms in charge.
+                        reaction_roles_owned: plan.reaction_roles_owned()
+                            && features.is_active(role_menus::reactions::FEATURE_NAME),
+                    };
 
                     Ok(build_data(
                         config,
@@ -3785,8 +3831,8 @@ async fn main() -> Result<(), Error> {
                             rr_db,
                             tickets,
                             features,
-                            flash_log_excluded: Vec::new(),
-                            wired: WiredFeatures::default(),
+                            flash_log_excluded: plan.log_excluded_channels(),
+                            wired,
                         },
                     ))
                 })

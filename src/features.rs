@@ -17,14 +17,17 @@
 
 use crate::config::{
     Config, CORE_DB_PATH_KEY, GUILD_ID_KEY, LOG_EXCLUDED_CATEGORY_IDS_KEY,
-    LOG_EXCLUDED_CHANNEL_IDS_KEY,
+    LOG_EXCLUDED_CHANNEL_IDS_KEY, PROTECTED_ROLE_IDS_KEY,
 };
-use crate::flash::config::FlashSettings;
+use crate::flash::config::{self as flash_config, FlashConfigErrorKind, FlashSettings};
+use crate::flash::runtime::{FlashDeps, FlashFeature, SerenityFlashPorts};
 use crate::jobs::queue::{self, ReconcileOutcome, Report};
 use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError, SystemClock};
 use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
-use crate::role_menus::reactions::ReactionServices;
+use crate::role_menus::reactions::{self, ReactionEnv, ReactionRolesFeature, ReactionServices};
 use crate::safeword::command::CommandConfig;
+use crate::safeword::config::{self as safeword_config, SafewordConfig};
+use crate::settings::{parse_id_list, parse_mode, Mode};
 use crate::storage;
 use crate::tickets::privacy::{ChannelLookup, Lookup};
 use poise::serenity_prelude as serenity;
@@ -288,6 +291,12 @@ pub enum LogExclusion {
 
 impl LogExclusion {
     pub fn from_config(config: &Config) -> Self {
+        Self::from_config_with_flash(config, &[])
+    }
+
+    /// Like [`LogExclusion::from_config`], with the flash channel ids added to the scope so the
+    /// logger never records flash content. An unusable exclusion list still blocks messages.
+    pub fn from_config_with_flash(config: &Config, flash_channels: &[u64]) -> Self {
         let unusable = config
             .invalid_core_keys
             .iter()
@@ -295,22 +304,17 @@ impl LogExclusion {
         if unusable {
             return LogExclusion::BlockMessages;
         }
-        if config.log_excluded_channel_ids.is_empty() && config.log_excluded_category_ids.is_empty()
+        if config.log_excluded_channel_ids.is_empty()
+            && config.log_excluded_category_ids.is_empty()
+            && flash_channels.is_empty()
         {
             return LogExclusion::Off;
         }
         LogExclusion::Scope(Scope::new(
             config.log_excluded_channel_ids.clone(),
             config.log_excluded_category_ids.clone(),
-            Vec::new(),
+            flash_channels.to_vec(),
         ))
-    }
-
-    /// Like [`LogExclusion::from_config`], with the flash channel ids added to the scope so the
-    /// logger never records flash content. An unusable exclusion list still blocks messages.
-    pub fn from_config_with_flash(config: &Config, flash_channels: &[u64]) -> Self {
-        let _ = flash_channels;
-        Self::from_config(config)
     }
 }
 /// Why a message event may not be cached or logged.
@@ -544,31 +548,199 @@ pub struct FeaturePlan {
 impl FeaturePlan {
     /// Flash channel ids the logger must never record (empty unless flash is planned).
     pub fn log_excluded_channels(&self) -> Vec<u64> {
-        Vec::new()
+        self.flash
+            .as_ref()
+            .map(|settings| settings.policy().channel_ids().to_vec())
+            .unwrap_or_default()
     }
 
     /// True when the `/safeword` command is part of the command list.
     pub fn safeword_command(&self) -> bool {
-        false
+        self.safeword.is_some()
     }
 
     /// True when the new reaction-role path owns the reaction events (the legacy arms stand down).
     pub fn reaction_roles_owned(&self) -> bool {
-        false
+        self.reaction_roles.is_some()
     }
+}
+
+/// True when the key names a mode other than off. Unset, blank and unknown words are off, as
+/// everywhere else, so a feature that is off stays silent even when its other keys are bad.
+fn mode_requested(lookup: &dyn Fn(&str) -> Option<String>, key: &str) -> bool {
+    parse_mode(key, lookup(key).as_deref()).unwrap_or(Mode::Off) != Mode::Off
+}
+
+fn mode_word(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Off => "off",
+        Mode::Shadow => "shadow",
+        Mode::Live => "live",
+    }
+}
+
+fn stays_off(feature: &str, why: &str) -> String {
+    format!("Feature {feature} stays off: {why}.")
+}
+
+fn plan_flash(plan: &mut FeaturePlan, lookup: &dyn Fn(&str) -> Option<String>, home: Option<u64>) {
+    if !mode_requested(lookup, flash_config::KEY_MODE) {
+        return;
+    }
+    if home.is_none() {
+        plan.lines.push(stays_off(
+            "flash",
+            "home guild missing (home_guild_missing)",
+        ));
+        return;
+    }
+    let loaded = flash_config::load(lookup, home);
+    if let Some(error) = loaded.error {
+        let code = match error.kind() {
+            FlashConfigErrorKind::Unreadable => "unreadable",
+            FlashConfigErrorKind::OutOfRange => "out_of_range",
+        };
+        plan.lines.push(stays_off(
+            "flash",
+            &format!("setting refused ({}: {code})", error.key()),
+        ));
+        return;
+    }
+    let settings = loaded.settings;
+    if !settings.is_active() {
+        plan.lines
+            .push(stays_off("flash", "no flash channel set (no_channels)"));
+        return;
+    }
+    plan.lines.push(format!(
+        "Feature flash on: mode={}; channels={}.",
+        mode_word(settings.mode()),
+        settings.policy().channel_ids().len()
+    ));
+    plan.flash = Some(settings);
+}
+
+fn plan_safeword(
+    plan: &mut FeaturePlan,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    config: &Config,
+    home: Option<u64>,
+) {
+    if !mode_requested(lookup, safeword_config::KEY_MODE) {
+        return;
+    }
+    if home.is_none() {
+        plan.lines.push(stays_off(
+            "safeword",
+            "home guild missing (home_guild_missing)",
+        ));
+        return;
+    }
+    // The safeword writes roles under the protected-role rule; an unusable list cannot be
+    // read as "nothing is protected".
+    if config.invalid_core_keys.contains(&PROTECTED_ROLE_IDS_KEY) {
+        plan.lines.push(stays_off(
+            "safeword",
+            "protected role list unusable (protected_roles_invalid)",
+        ));
+        return;
+    }
+    match SafewordConfig::from_lookup(lookup) {
+        Err(error) => plan.lines.push(stays_off(
+            "safeword",
+            &format!("setting refused ({}: {})", error.key(), error.kind().code()),
+        )),
+        Ok(parsed) => {
+            let staff = if config.staff_role_id.is_some() {
+                "staff role=set".to_string()
+            } else {
+                "staff_role_unset (strike and clear are denied)".to_string()
+            };
+            plan.lines.push(format!(
+                "Feature safeword on: mode={}; restricted roles={}; {staff}.",
+                mode_word(parsed.mode),
+                parsed.restricted_role_ids.len()
+            ));
+            plan.safeword = Some(CommandConfig {
+                safeword: parsed,
+                home_guild: home,
+                staff_role_id: config.staff_role_id,
+            });
+        }
+    }
+}
+
+fn plan_reaction_roles(
+    plan: &mut FeaturePlan,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    config: &Config,
+    home: Option<u64>,
+) {
+    match reactions::load_enabled(lookup) {
+        Ok(false) => return,
+        Err(refusal) => {
+            plan.lines.push(stays_off("reaction_roles", refusal.code()));
+            return;
+        }
+        Ok(true) => {}
+    }
+    let Some(home_guild) = home else {
+        plan.lines.push(stays_off(
+            "reaction_roles",
+            "home guild missing (home_guild_missing)",
+        ));
+        return;
+    };
+    // The safeword's restricted roles matter only while the safeword runs; if its list cannot
+    // be read, the reaction path cannot tell what to deny and stays off (fail closed).
+    let restricted = if mode_requested(lookup, safeword_config::KEY_MODE) {
+        match parse_id_list(
+            safeword_config::KEY_RESTRICTED_ROLE_IDS,
+            lookup(safeword_config::KEY_RESTRICTED_ROLE_IDS).as_deref(),
+        ) {
+            Ok(ids) => ids,
+            Err(_) => {
+                plan.lines.push(stays_off(
+                    "reaction_roles",
+                    "safeword restricted roles unusable (restricted_roles_invalid)",
+                ));
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    plan.lines.push(format!(
+        "Feature reaction_roles on: mode=live; protected roles={}; it owns the reaction events.",
+        config.protected_role_ids.len()
+    ));
+    plan.reaction_roles = Some(ReactionRolesPlan {
+        home_guild,
+        protected_roles_invalid: config.invalid_core_keys.contains(&PROTECTED_ROLE_IDS_KEY),
+        protected_role_ids: config.protected_role_ids.clone(),
+        safeword_restricted_role_ids: restricted,
+        staff_alert_channel: config.staff_alert_channel_id,
+    });
 }
 
 /// Reads the optional-feature settings. A feature whose mode is off is absent and silent; a
 /// feature that is on but cannot run is absent with one line naming a key and a stable code.
 pub fn plan_features(lookup: &dyn Fn(&str) -> Option<String>, config: &Config) -> FeaturePlan {
-    let _ = lookup;
-    FeaturePlan {
+    let home = match guild_filter(config.guild_id, &config.invalid_core_keys) {
+        GuildFilter::Only(guild) => Some(guild),
+        GuildFilter::Any | GuildFilter::Closed => None,
+    };
+    let mut plan = FeaturePlan {
         flash: None,
         safeword: None,
         reaction_roles: None,
         staff_alert_channel: config.staff_alert_channel_id,
         lines: Vec::new(),
-    }
+    };
+    plan_flash(&mut plan, lookup, home);
+    plan_safeword(&mut plan, lookup, config, home);
+    plan_reaction_roles(&mut plan, lookup, config, home);
+    plan
 }
 
 /// What building the features needs from Discord.
@@ -579,13 +751,41 @@ pub struct Services {
     pub reaction: Arc<dyn ReactionServices>,
 }
 
-/// Builds the planned features. An empty plan builds nothing.
+/// Builds the planned features, in registration order: flash, then reaction roles. An empty plan
+/// builds nothing.
 pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
     plan: &FeaturePlan,
     services: &Services,
 ) -> Vec<Box<dyn Feature<X, D>>> {
-    let _ = (plan, services);
-    Vec::new()
+    let mut built: Vec<Box<dyn Feature<X, D>>> = Vec::new();
+    if let Some(settings) = &plan.flash {
+        let ports = Arc::new(SerenityFlashPorts {
+            http: services.http.clone(),
+            cache: services.cache.clone(),
+            staff_alert_channel: plan.staff_alert_channel,
+        });
+        built.push(Box::new(FlashFeature::new(FlashDeps {
+            settings: settings.clone(),
+            ports: ports.clone(),
+            alerts: ports,
+            clock: Arc::new(SystemClock),
+        })));
+    }
+    if let Some(rr) = &plan.reaction_roles {
+        let env = ReactionEnv {
+            home_guild_id: Some(rr.home_guild),
+            protected_roles_invalid: rr.protected_roles_invalid,
+            protected_role_ids: rr.protected_role_ids.clone(),
+            safeword_restricted_role_ids: rr.safeword_restricted_role_ids.clone(),
+            staff_alert_channel_id: rr.staff_alert_channel,
+            bot_user_id: services.bot_user_id,
+        };
+        built.push(Box::new(ReactionRolesFeature::live(
+            env,
+            services.reaction.clone(),
+        )));
+    }
+    built
 }
 
 /// Stops the runner started by [`TokioJobStarter`].
@@ -743,8 +943,7 @@ impl<X: Sync + 'static, D: Sync + 'static> Features<X, D> {
     /// True when the named feature survived start-up (enabled, and its database and job
     /// registration worked).
     pub fn is_active(&self, name: &str) -> bool {
-        let _ = name;
-        false
+        self.active.iter().any(|feature| feature.name() == name)
     }
 
     /// Hands the event to every active feature, in registration order, when
@@ -2164,10 +2363,10 @@ mod wiring_tests {
     //! building the features, what each one registers, and the log-exclusion scope.
     use super::*;
     use crate::flash::runtime::{JOB_KINDS, KIND_DELETE_NOTICE, KIND_DELETE_SOURCE};
+    use crate::role_menus::reactions::{ReactionServices, RoleRemover, StorageCode};
     use crate::roles::eligibility::SafewordState;
     use crate::roles::grant::{RoleWriter, Sleeper, WriteError};
     use crate::roles::runtime::{RoleEntry, RoleSource, SourceError};
-    use crate::role_menus::reactions::{ReactionServices, RoleRemover, StorageCode};
     use ::serenity::all::FullEvent;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2440,11 +2639,21 @@ mod wiring_tests {
         assert!(features.is_empty());
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
-        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let started = Features::<u8, u16>::start(
+            StartRequest {
+                features,
+                settings: &settings,
+            },
+            &starter,
+        )
+        .await;
         assert!(!db.exists(), "no core.sqlite");
         assert!(starter.kinds.lock().unwrap().is_empty());
         assert!(started.lines().is_empty());
-        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 0);
+        assert_eq!(
+            started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await,
+            0
+        );
         assert_eq!(recorder.bound_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2464,7 +2673,11 @@ mod wiring_tests {
         for mode in ["live", "shadow"] {
             let plan = plan_for(&flash_keys(mode), &config());
             assert!(plan.flash.is_some(), "{mode}");
-            assert_eq!(plan.log_excluded_channels(), vec![FLASH_A, FLASH_B], "{mode}");
+            assert_eq!(
+                plan.log_excluded_channels(),
+                vec![FLASH_A, FLASH_B],
+                "{mode}"
+            );
             let text = lines_text(&plan);
             assert!(text.contains("flash") && text.contains(mode), "{text}");
             assert!(text.contains("channels=2"), "{text}");
@@ -2493,7 +2706,11 @@ mod wiring_tests {
     fn flash_without_channels_is_dropped_because_it_would_do_nothing() {
         let plan = plan_for(&[("FLASH_MODE", "live")], &config());
         assert!(plan.flash.is_none());
-        assert!(lines_text(&plan).contains("no_channels"), "{:?}", plan.lines);
+        assert!(
+            lines_text(&plan).contains("no_channels"),
+            "{:?}",
+            plan.lines
+        );
     }
 
     #[test]
@@ -2506,7 +2723,11 @@ mod wiring_tests {
             let plan = plan_for(&flash_keys("live"), &c);
             assert!(plan.flash.is_none());
             assert!(plan.log_excluded_channels().is_empty());
-            assert!(lines_text(&plan).contains("home_guild_missing"), "{:?}", plan.lines);
+            assert!(
+                lines_text(&plan).contains("home_guild_missing"),
+                "{:?}",
+                plan.lines
+            );
         }
     }
 
@@ -2521,9 +2742,22 @@ mod wiring_tests {
         assert_eq!(features[0].name(), "flash");
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
-        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let started = Features::<u8, u16>::start(
+            StartRequest {
+                features,
+                settings: &settings,
+            },
+            &starter,
+        )
+        .await;
         let calls = starter.kinds.lock().unwrap().clone();
-        assert_eq!(calls, vec![format!("[{:?}, {:?}]", KIND_DELETE_NOTICE, KIND_DELETE_SOURCE)]);
+        assert_eq!(
+            calls,
+            vec![format!(
+                "[{:?}, {:?}]",
+                KIND_DELETE_NOTICE, KIND_DELETE_SOURCE
+            )]
+        );
         assert_eq!(JOB_KINDS.len(), 2);
         assert!(db.exists());
         started.stop().await;
@@ -2539,10 +2773,20 @@ mod wiring_tests {
         assert_eq!(features.len(), 1);
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
-        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let started = Features::<u8, u16>::start(
+            StartRequest {
+                features,
+                settings: &settings,
+            },
+            &starter,
+        )
+        .await;
         assert!(!db.exists());
         assert!(starter.kinds.lock().unwrap().is_empty());
-        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 1);
+        assert_eq!(
+            started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await,
+            1
+        );
     }
 
     // ---- log exclusion ----------------------------------------------------------
@@ -2602,7 +2846,11 @@ mod wiring_tests {
         let rr = plan.reaction_roles.as_ref().expect("planned");
         assert_eq!(rr.home_guild, GUILD);
         assert!(plan.reaction_roles_owned());
-        assert!(lines_text(&plan).contains("reaction_roles"), "{:?}", plan.lines);
+        assert!(
+            lines_text(&plan).contains("reaction_roles"),
+            "{:?}",
+            plan.lines
+        );
     }
 
     #[test]
@@ -2610,13 +2858,24 @@ mod wiring_tests {
         let mut no_guild = config();
         no_guild.guild_id = None;
         let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
-            (vec![("REACTION_ROLES_MODE", "shadow")], config(), "shadow_unsupported"),
-            (vec![("REACTION_ROLES_MODE", "live")], no_guild, "home_guild_missing"),
+            (
+                vec![("REACTION_ROLES_MODE", "shadow")],
+                config(),
+                "shadow_unsupported",
+            ),
+            (
+                vec![("REACTION_ROLES_MODE", "live")],
+                no_guild,
+                "home_guild_missing",
+            ),
         ];
         for (pairs, c, code) in cases {
             let plan = plan_for(&pairs, &c);
             assert!(plan.reaction_roles.is_none(), "{code}");
-            assert!(!plan.reaction_roles_owned(), "{code}: the old arms must keep working");
+            assert!(
+                !plan.reaction_roles_owned(),
+                "{code}: the old arms must keep working"
+            );
             assert!(lines_text(&plan).contains(code), "{:?}", plan.lines);
         }
     }
@@ -2664,7 +2923,14 @@ mod wiring_tests {
         assert_eq!(features[0].name(), "reaction_roles");
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
-        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let started = Features::<u8, u16>::start(
+            StartRequest {
+                features,
+                settings: &settings,
+            },
+            &starter,
+        )
+        .await;
         assert!(!db.exists());
         assert!(starter.kinds.lock().unwrap().is_empty());
         assert!(started.is_active("reaction_roles"));
@@ -2680,17 +2946,28 @@ mod wiring_tests {
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
         let started = Features::<u8, u16>::start(
-            StartRequest { features: build(&plan, &recorder), settings: &settings },
+            StartRequest {
+                features: build(&plan, &recorder),
+                settings: &settings,
+            },
             &starter,
         )
         .await;
-        assert_eq!(started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await, 1);
+        assert_eq!(
+            started.dispatch(&0, &reaction_add(GUILD, MEMBER), &0).await,
+            1
+        );
         assert_eq!(
             *recorder.log.lock().unwrap(),
             vec![format!("add:{MEMBER}:{BOUND_ROLE}")]
         );
         // Another guild never reaches the feature.
-        assert_eq!(started.dispatch(&0, &reaction_add(OTHER_GUILD, MEMBER), &0).await, 0);
+        assert_eq!(
+            started
+                .dispatch(&0, &reaction_add(OTHER_GUILD, MEMBER), &0)
+                .await,
+            0
+        );
         assert_eq!(recorder.log.lock().unwrap().len(), 1);
     }
 
@@ -2727,7 +3004,11 @@ mod wiring_tests {
         bad_flag.push(("SAFEWORD_DM", "yes"));
         let cases: Vec<(Vec<(&str, &str)>, Config, &str)> = vec![
             (safeword_keys("live"), no_guild, "home_guild_missing"),
-            (safeword_keys("live"), protected_bad, "protected_roles_invalid"),
+            (
+                safeword_keys("live"),
+                protected_bad,
+                "protected_roles_invalid",
+            ),
             (missing, config(), "SAFEWORD_ROLE_ID"),
             (bad_list, config(), "SAFEWORD_RESTRICTED_ROLE_IDS"),
             (bad_flag, config(), "SAFEWORD_DM"),
@@ -2735,8 +3016,15 @@ mod wiring_tests {
         for (pairs, c, expect) in cases {
             let plan = plan_for(&pairs, &c);
             assert!(plan.safeword.is_none(), "{expect}");
-            assert!(!plan.safeword_command(), "{expect}: no command without the feature");
-            assert!(lines_text(&plan).contains(expect), "{expect}: {:?}", plan.lines);
+            assert!(
+                !plan.safeword_command(),
+                "{expect}: no command without the feature"
+            );
+            assert!(
+                lines_text(&plan).contains(expect),
+                "{expect}: {:?}",
+                plan.lines
+            );
         }
     }
 
@@ -2746,7 +3034,11 @@ mod wiring_tests {
         c.staff_role_id = None;
         let plan = plan_for(&safeword_keys("live"), &c);
         assert_eq!(plan.safeword.as_ref().unwrap().staff_role_id, None);
-        assert!(lines_text(&plan).contains("staff_role_unset"), "{:?}", plan.lines);
+        assert!(
+            lines_text(&plan).contains("staff_role_unset"),
+            "{:?}",
+            plan.lines
+        );
     }
 
     #[tokio::test]
@@ -2760,9 +3052,19 @@ mod wiring_tests {
         assert_eq!(features[0].name(), "safeword");
         let starter = Starter::default();
         let settings = core_settings(&db, GuildFilter::Only(GUILD));
-        let started = Features::<u8, u16>::start(StartRequest { features, settings: &settings }, &starter).await;
+        let started = Features::<u8, u16>::start(
+            StartRequest {
+                features,
+                settings: &settings,
+            },
+            &starter,
+        )
+        .await;
         assert!(db.exists(), "the registry opened the core database");
-        assert!(starter.kinds.lock().unwrap().is_empty(), "no runner without job kinds");
+        assert!(
+            starter.kinds.lock().unwrap().is_empty(),
+            "no runner without job kinds"
+        );
         assert!(started.is_active("safeword"));
     }
 
@@ -2778,8 +3080,18 @@ mod wiring_tests {
         assert_eq!(plan.lines.len(), 3, "{:?}", plan.lines);
         let all = lines_text(&plan);
         for id in [
-            GUILD, STAFF_ROLE, FLASH_A, FLASH_B, FLASH_ROLE, SW_ROLE, SW_CHANNEL, SW_MESSAGE,
-            SW_EMOJI, SW_RESTRICTED, ALERT_CHANNEL, 760_600,
+            GUILD,
+            STAFF_ROLE,
+            FLASH_A,
+            FLASH_B,
+            FLASH_ROLE,
+            SW_ROLE,
+            SW_CHANNEL,
+            SW_MESSAGE,
+            SW_EMOJI,
+            SW_RESTRICTED,
+            ALERT_CHANNEL,
+            760_600,
         ] {
             assert!(!all.contains(&id.to_string()), "{id} leaked: {all}");
         }
@@ -2789,7 +3101,10 @@ mod wiring_tests {
             run = if ch.is_ascii_digit() { run + 1 } else { 0 };
             assert!(run < 5, "{all}");
         }
-        assert!(!all.contains(".sqlite") && !all.contains('\\') && !all.contains('/'), "{all}");
+        assert!(
+            !all.contains(".sqlite") && !all.contains('\\') && !all.contains('/'),
+            "{all}"
+        );
     }
 
     #[test]
