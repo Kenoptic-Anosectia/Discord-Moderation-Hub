@@ -125,37 +125,75 @@ impl std::fmt::Display for RunnerError {
 
 impl std::error::Error for RunnerError {}
 
-/// A handler's failure: a stable code and nothing else. `&'static str` means a
+/// A handler's failure: a stable code and retry disposition. `&'static str` means a
 /// handler cannot put runtime text (payload, user content) into it. A code that
 /// is not `[a-z0-9_]{1,48}` is stored by the queue as `invalid_error_code`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandlerError {
     code: &'static str,
+    terminal: bool,
+    min_delay_secs: i64,
 }
 
 impl HandlerError {
     pub const fn new(code: &'static str) -> Self {
-        HandlerError { code }
+        Self {
+            code,
+            terminal: false,
+            min_delay_secs: 0,
+        }
+    }
+
+    pub const fn terminal(code: &'static str) -> Self {
+        Self {
+            terminal: true,
+            ..Self::new(code)
+        }
+    }
+
+    /// Retry no earlier than this many queue-clock seconds after acknowledgement.
+    pub const fn retry_after(code: &'static str, min_delay_secs: i64) -> Self {
+        Self {
+            min_delay_secs,
+            ..Self::new(code)
+        }
     }
 
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    /// An idempotent effect may have happened, but could not be confirmed.
+    pub const fn outcome_unknown() -> Self {
+        Self::new(queue::CODE_OUTCOME_UNKNOWN)
+    }
 }
 
 pub type HandlerResult = Result<(), HandlerError>;
 type Handler = Arc<dyn Fn(ClaimedJob) -> BoxFuture<'static, HandlerResult> + Send + Sync>;
+type FinalObserver = Box<dyn Fn(FinalOutcome) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Delivered only after a final acknowledgement was committed. The previous
+/// diagnostic is for reporting, not a retry gate.
+pub enum FinalOutcome {
+    Done { previous_error: Option<String> },
+    Failed { code: &'static str },
+    Abandoned { code: &'static str },
+}
 
 struct Entry {
     policy: RestartPolicy,
+    retry: Option<RetryPolicy>,
     handler: Handler,
+    observer: Option<FinalObserver>,
+    track_uncertainty: bool,
 }
 
 /// Kind name -> (restart policy, async handler). The same table feeds
 /// `reconcile_after_restart`, so a kind's policy has one source of truth.
 #[derive(Default)]
 pub struct Registry {
-    entries: BTreeMap<String, Entry>,
+    entries: BTreeMap<String, Arc<Entry>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -171,12 +209,73 @@ impl Registry {
 
     /// Register `handler` for `kind` (`[a-z0-9_]{1,64}`, once). The handler
     /// returns `Ok(())` when its effect is done, or `Err` ONLY when the effect
-    /// did not happen and running it again is acceptable: an `Err` is retried
-    /// by the queue's retry policy whatever the restart policy says.
+    /// did not happen. Nonterminal errors use the runner's default retry policy.
     pub fn register<F, Fut>(
         &mut self,
         kind: &str,
         policy: RestartPolicy,
+        handler: F,
+    ) -> Result<(), RunnerError>
+    where
+        F: Fn(ClaimedJob) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HandlerResult> + Send + 'static,
+    {
+        self.insert(kind, policy, None, handler)
+    }
+
+    /// Use this retry policy instead of the runner default, including at restart.
+    pub fn register_with_retry<F, Fut>(
+        &mut self,
+        kind: &str,
+        policy: RestartPolicy,
+        retry: RetryPolicy,
+        handler: F,
+    ) -> Result<(), RunnerError>
+    where
+        F: Fn(ClaimedJob) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HandlerResult> + Send + 'static,
+    {
+        retry
+            .validate()
+            .map_err(|_| RunnerError::InvalidRetryPolicy)?;
+        self.insert(kind, policy, Some(retry), handler)
+    }
+
+    /// Set a best-effort callback on an existing kind, for final acknowledgements
+    /// only. Not replayed on restart; it must not block the async executor.
+    pub fn observe_final<F, Fut>(&mut self, kind: &str, observer: F) -> Result<(), RunnerError>
+    where
+        F: Fn(FinalOutcome) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let entry = self.entry_mut(kind)?;
+        entry.observer = Some(Box::new(move |outcome| Box::pin(observer(outcome))));
+        Ok(())
+    }
+
+    /// For an idempotent kind, retain unresolved effects across retries and
+    /// abandon rather than report a known failure when they cannot be confirmed.
+    pub fn track_uncertainty(&mut self, kind: &str) -> Result<(), RunnerError> {
+        let entry = self.entry_mut(kind)?;
+        if entry.policy != RestartPolicy::RunAgain {
+            return Err(RunnerError::InvalidKind);
+        }
+        entry.track_uncertainty = true;
+        Ok(())
+    }
+
+    fn entry_mut(&mut self, kind: &str) -> Result<&mut Entry, RunnerError> {
+        self.entries
+            .get_mut(kind)
+            .and_then(Arc::get_mut)
+            .ok_or(RunnerError::InvalidKind)
+    }
+
+    fn insert<F, Fut>(
+        &mut self,
+        kind: &str,
+        policy: RestartPolicy,
+        retry: Option<RetryPolicy>,
         handler: F,
     ) -> Result<(), RunnerError>
     where
@@ -195,8 +294,16 @@ impl Registry {
             return Err(RunnerError::DuplicateKind);
         }
         let handler: Handler = Arc::new(move |job| Box::pin(handler(job)));
-        self.entries
-            .insert(kind.to_string(), Entry { policy, handler });
+        self.entries.insert(
+            kind.to_string(),
+            Arc::new(Entry {
+                policy,
+                retry,
+                handler,
+                observer: None,
+                track_uncertainty: false,
+            }),
+        );
         Ok(())
     }
 
@@ -292,6 +399,8 @@ pub struct RunSummary {
     /// Jobs made terminal `failed` by an acknowledgement (retries exhausted,
     /// no handler, or an at-most-once panic).
     pub failed: u64,
+    /// Jobs whose effect could not be confirmed after their final attempt.
+    pub abandoned: u64,
     /// Jobs the queue refused at claim (malformed payload or kind).
     pub refused_at_claim: u64,
     /// Database calls that failed and were retried or dropped.
@@ -349,6 +458,7 @@ impl<C: Clock> Runner<C> {
     /// mid-run) using the registry's policies, BEFORE anything is claimed.
     pub async fn start(self) -> Result<Started<C>, RunnerError> {
         let table = self.registry.kind_table();
+        let registry = self.registry.clone();
         let retry = self.cfg.retry;
         let now = self.clock.now();
         let report = self
@@ -356,7 +466,13 @@ impl<C: Clock> Runner<C> {
             .call(move |c| {
                 let table: Vec<(&str, RestartPolicy)> =
                     table.iter().map(|(k, p)| (k.as_str(), *p)).collect();
-                queue::reconcile_after_restart(c, now, &table, &retry)
+                queue::reconcile_with_retry(c, now, &table, |kind| {
+                    let entry = registry.entries.get(kind);
+                    (
+                        entry.and_then(|e| e.retry).unwrap_or(retry).max_attempts,
+                        entry.is_some_and(|e| e.track_uncertainty),
+                    )
+                })
             })
             .await
             .map_err(map_db)?;
@@ -384,30 +500,17 @@ const TERMINAL: RetryPolicy = RetryPolicy {
 };
 
 /// A handler result waiting to be written to the queue.
-#[derive(Debug, Clone, Copy)]
-enum Ack {
-    Complete {
-        id: i64,
-    },
-    Fail {
-        id: i64,
-        code: &'static str,
-        terminal: bool,
-    },
-}
-
-impl Ack {
-    fn id(&self) -> i64 {
-        match self {
-            Ack::Complete { id } | Ack::Fail { id, .. } => *id,
-        }
-    }
+struct Ack {
+    id: i64,
+    entry: Option<Arc<Entry>>,
+    result: HandlerResult,
 }
 
 enum AckDone {
-    Completed,
+    Completed(Option<String>),
     Retried,
-    Failed,
+    Failed(&'static str),
+    Abandoned,
 }
 
 enum AckError {
@@ -432,8 +535,8 @@ enum TaskEnd {
 /// Mutable state of one `run`.
 struct Live {
     set: JoinSet<TaskEnd>,
-    /// task id -> (job id, restart policy of its kind)
-    tasks: HashMap<tokio::task::Id, (i64, RestartPolicy)>,
+    /// task id -> (job id, registry entry of its kind)
+    tasks: HashMap<tokio::task::Id, (i64, Arc<Entry>)>,
     acks: Vec<Ack>,
     sum: RunSummary,
 }
@@ -441,46 +544,36 @@ struct Live {
 impl Live {
     /// Turn a finished handler task into an acknowledgement to write.
     fn finish(&mut self, res: JoinResult) {
-        let ack = match res {
-            Ok((tid, end)) => {
-                let Some((id, policy)) = self.tasks.remove(&tid) else {
-                    return;
-                };
-                match end {
-                    TaskEnd::Returned(Ok(())) => Ack::Complete { id },
-                    TaskEnd::Returned(Err(e)) => Ack::Fail {
-                        id,
-                        code: e.code(),
-                        terminal: false,
-                    },
-                    // Treated as a cancel: the effect may have happened
-                    // before the handler hung, so at-most-once is terminal.
-                    TaskEnd::TimedOut => Ack::Fail {
-                        id,
-                        code: CODE_TIMED_OUT,
-                        terminal: policy == RestartPolicy::AtMostOnce,
-                    },
-                }
-            }
+        let (tid, end) = match res {
+            Ok((tid, TaskEnd::Returned(result))) => (tid, Ok(result)),
+            Ok((tid, TaskEnd::TimedOut)) => (tid, Err(CODE_TIMED_OUT)),
             Err(join_err) => {
-                let Some((id, policy)) = self.tasks.remove(&join_err.id()) else {
-                    return;
-                };
                 let code = if join_err.is_panic() {
                     CODE_PANICKED
                 } else {
                     CODE_CANCELLED
                 };
-                // A panic or cancel may have come after the effect: an
-                // at-most-once job must not be run again.
-                Ack::Fail {
-                    id,
-                    code,
-                    terminal: policy == RestartPolicy::AtMostOnce,
-                }
+                (join_err.id(), Err(code))
             }
         };
-        self.acks.push(ack);
+        let Some((id, entry)) = self.tasks.remove(&tid) else {
+            return;
+        };
+        // An interruption may follow the effect; AtMostOnce must not run again.
+        let result = end.unwrap_or_else(|code| {
+            Err(if entry.policy == RestartPolicy::AtMostOnce {
+                HandlerError::terminal(code)
+            } else if entry.track_uncertainty {
+                HandlerError::outcome_unknown()
+            } else {
+                HandlerError::new(code)
+            })
+        });
+        self.acks.push(Ack {
+            id,
+            entry: Some(entry),
+            result,
+        });
     }
 
     fn reap_finished(&mut self) {
@@ -514,20 +607,43 @@ impl<C: Clock> Runner<C> {
             .map_err(map_db)
     }
 
-    async fn write_ack(&self, ack: Ack) -> Result<AckDone, AckError> {
+    async fn write_ack(&self, ack: &Ack) -> Result<AckDone, AckError> {
         let now = self.clock.now();
-        let retry = match ack {
-            Ack::Fail { terminal: true, .. } => TERMINAL,
-            _ => self.cfg.retry,
-        };
+        let (id, result) = (ack.id, ack.result);
+        let retry = ack
+            .entry
+            .as_ref()
+            .and_then(|e| e.retry)
+            .unwrap_or(self.cfg.retry);
+        let observed = ack.entry.as_ref().is_some_and(|e| e.observer.is_some());
+        let track_uncertainty = ack.entry.as_ref().is_some_and(|e| e.track_uncertainty);
         let res = self
             .db
-            .call(move |c| match ack {
-                Ack::Complete { id } => queue::complete(c, id, now).map(|()| AckDone::Completed),
-                Ack::Fail { id, code, .. } => {
-                    queue::fail(c, id, code, now, &retry).map(|o| match o {
-                        FailOutcome::Retry { .. } => AckDone::Retried,
-                        FailOutcome::Failed { .. } => AckDone::Failed,
+            .call(move |c| match result {
+                Ok(()) => {
+                    let previous_error = if observed {
+                        queue::get(c, id)?.and_then(|row| row.last_error_code)
+                    } else {
+                        None
+                    };
+                    queue::complete(c, id, now)?;
+                    Ok(AckDone::Completed(previous_error))
+                }
+                Err(error) => {
+                    let policy = if error.terminal { &TERMINAL } else { &retry };
+                    queue::fail_after(
+                        c,
+                        id,
+                        error.code,
+                        now,
+                        policy,
+                        error.min_delay_secs,
+                        track_uncertainty,
+                    )
+                    .map(|o| match o {
+                        (FailOutcome::Retry { .. }, _) => AckDone::Retried,
+                        (FailOutcome::Failed { .. }, false) => AckDone::Failed(error.code),
+                        (FailOutcome::Failed { .. }, true) => AckDone::Abandoned,
                     })
                 }
             })
@@ -549,10 +665,27 @@ impl<C: Clock> Runner<C> {
         let mut left = false;
         let mut it = pending.into_iter();
         while let Some(ack) = it.next() {
-            match self.write_ack(ack).await {
-                Ok(AckDone::Completed) => live.sum.completed += 1,
+            match self.write_ack(&ack).await {
+                Ok(AckDone::Completed(previous_error)) => {
+                    live.sum.completed += 1;
+                    self.observe(&ack, FinalOutcome::Done { previous_error })
+                        .await;
+                }
                 Ok(AckDone::Retried) => live.sum.retried += 1,
-                Ok(AckDone::Failed) => live.sum.failed += 1,
+                Ok(AckDone::Failed(code)) => {
+                    live.sum.failed += 1;
+                    self.observe(&ack, FinalOutcome::Failed { code }).await;
+                }
+                Ok(AckDone::Abandoned) => {
+                    live.sum.abandoned += 1;
+                    self.observe(
+                        &ack,
+                        FinalOutcome::Abandoned {
+                            code: queue::CODE_OUTCOME_UNKNOWN,
+                        },
+                    )
+                    .await;
+                }
                 Err(AckError::Refused) => live.sum.refused_acks += 1,
                 Err(AckError::Transient) => {
                     live.sum.db_errors += 1;
@@ -569,16 +702,26 @@ impl<C: Clock> Runner<C> {
         Ok(left)
     }
 
+    async fn observe(&self, ack: &Ack, outcome: FinalOutcome) {
+        if let Some(observer) = ack.entry.as_ref().and_then(|e| e.observer.as_ref()) {
+            tokio::select! {
+                biased;
+                () = observer(outcome) => {},
+                () = self.clock.sleep(self.cfg.handler_timeout) => {},
+            }
+        }
+    }
+
     /// Run the handler for `job` as its own task, or queue the terminal
     /// failure for a kind with no handler.
     fn dispatch(&self, live: &mut Live, job: ClaimedJob) {
         live.sum.claimed += 1;
         let id = job.id;
         let Some(entry) = self.registry.entries.get(&job.kind) else {
-            live.acks.push(Ack::Fail {
+            live.acks.push(Ack {
                 id,
-                code: CODE_NO_HANDLER,
-                terminal: true,
+                entry: None,
+                result: Err(HandlerError::terminal(CODE_NO_HANDLER)),
             });
             return;
         };
@@ -598,7 +741,7 @@ impl<C: Clock> Runner<C> {
                 () = clock.sleep(timeout) => TaskEnd::TimedOut,
             }
         });
-        live.tasks.insert(handle.id(), (id, entry.policy));
+        live.tasks.insert(handle.id(), (id, entry.clone()));
     }
 
     /// Deadline (unix seconds) to sleep until when nothing can be claimed now.
@@ -736,7 +879,7 @@ impl<C: Clock> Started<C> {
             .tasks
             .values()
             .map(|(id, _)| *id)
-            .chain(live.acks.iter().map(Ack::id))
+            .chain(live.acks.iter().map(|ack| ack.id))
             .collect();
         left.sort_unstable();
         left.dedup();
@@ -1442,6 +1585,120 @@ mod tests {
         linger().await;
         assert_eq!(calls.load(SeqCst), 3);
         up.stop_idle().await;
+    }
+
+    #[tokio::test]
+    async fn kj3_custom_retry_does_not_change_the_default_five_attempts() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let short = sched(&db, "short", "short", "{}", T0).await;
+        let normal = sched(&db, "normal", "normal", "{}", T0).await;
+        let mut registry = Registry::new();
+        let short_retry = RetryPolicy {
+            base_secs: 2,
+            cap_secs: 2,
+            max_attempts: 3,
+        };
+        let unavailable = |_| async { Err(HandlerError::new("unavailable")) };
+        assert_eq!(
+            registry.register_with_retry(
+                "short",
+                RestartPolicy::RunAgain,
+                RetryPolicy {
+                    max_attempts: 0,
+                    ..short_retry
+                },
+                unavailable
+            ),
+            Err(RunnerError::InvalidRetryPolicy)
+        );
+        registry
+            .register_with_retry("short", RestartPolicy::RunAgain, short_retry, unavailable)
+            .unwrap();
+        registry
+            .register("normal", RestartPolicy::RunAgain, unavailable)
+            .unwrap();
+        let up = boot(&db, &clock, registry, RunnerConfig::DEFAULT).await;
+        wait_retry(&db, normal, 1).await;
+        for attempt in 1..=2 {
+            wait_retry(&db, short, attempt).await;
+            assert_eq!(view(&db, short).await.due_at, clock.secs() + 2);
+            clock.advance(2);
+        }
+        wait_state(&db, short, JobState::Failed).await;
+        assert_eq!(view(&db, short).await.attempts, 3);
+        for (attempt, delay) in [(1, 30), (2, 60), (3, 120), (4, 240)] {
+            wait_retry(&db, normal, attempt).await;
+            let row = view(&db, normal).await;
+            assert_eq!(row.due_at, row.updated_at + delay);
+            clock.advance(row.due_at - clock.secs());
+        }
+        wait_state(&db, normal, JobState::Failed).await;
+        assert_eq!(view(&db, normal).await.attempts, 5);
+        let summary = up.stop_idle().await;
+        assert_eq!(
+            (summary.failed, summary.retried, summary.claimed),
+            (2, 6, 8)
+        );
+    }
+
+    #[tokio::test]
+    async fn kj3_reconcile_uses_per_kind_caps_and_leaves_exhausted_rows_final() {
+        let db = mem_db();
+        let clock = FakeClock::new();
+        let mut ids = Vec::new();
+        for kind in ["custom", "default", "uncertain"] {
+            let id = sched(&db, kind, kind, "{}", T0).await;
+            db.call(move |c| {
+                for now in [T0, T0 + 30, T0 + 90] {
+                    assert!(queue::try_claim(c, id, now)?);
+                    if now != T0 + 90 {
+                        queue::fail(c, id, "unavailable", now, &RetryPolicy::DEFAULT)?;
+                    }
+                }
+                Ok::<_, QueueError>(())
+            })
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        clock.advance(90);
+        for pass in 0..2 {
+            let mut registry = Registry::new();
+            let handler = |_| async { Ok(()) };
+            for kind in ["custom", "uncertain"] {
+                registry
+                    .register_with_retry(kind, RestartPolicy::RunAgain, cfg(1).retry, handler)
+                    .unwrap();
+            }
+            registry.track_uncertainty("uncertain").unwrap();
+            registry
+                .register("default", RestartPolicy::RunAgain, handler)
+                .unwrap();
+            let runner =
+                Runner::new(db.clone(), clock.clone(), registry, RunnerConfig::DEFAULT).unwrap();
+            let started = runner.start().await.unwrap();
+            let report = started.report();
+            if pass == 0 {
+                assert_eq!(
+                    report.entries.iter().map(|e| e.outcome).collect::<Vec<_>>(),
+                    vec![
+                        ReconcileOutcome::FailedMaxAttempts,
+                        ReconcileOutcome::Requeued,
+                        ReconcileOutcome::AbandonedAtMostOnce,
+                    ]
+                );
+            } else {
+                assert!(report.entries.is_empty());
+            }
+            for (&id, state) in
+                ids.iter()
+                    .zip([JobState::Failed, JobState::Pending, JobState::Abandoned])
+            {
+                let row = view(&db, id).await;
+                assert_eq!((row.state, row.attempts), (state, 3));
+            }
+        }
     }
 
     #[tokio::test]

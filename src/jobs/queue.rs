@@ -298,7 +298,8 @@ pub enum FailOutcome {
 pub enum ReconcileOutcome {
     /// `RunAgain`: pending again, due now.
     Requeued,
-    /// `AtMostOnce`: abandoned, not re-run.
+    /// Abandoned rather than repeating an interrupted effect (`AtMostOnce`
+    /// or an uncertainty-aware kind whose claims are used up).
     AbandonedAtMostOnce,
     /// Kind not in the caller's table: abandoned, not re-run.
     AbandonedUnregistered,
@@ -525,33 +526,59 @@ pub fn fail(
     now: i64,
     policy: &RetryPolicy,
 ) -> Result<FailOutcome, QueueError> {
+    fail_after(conn, id, code, now, policy, 0, false).map(|(outcome, _)| outcome)
+}
+
+pub(super) const CODE_OUTCOME_UNKNOWN: &str = "job_outcome_unknown";
+
+/// Like `fail`, but honors Retry-After and can preserve an unresolved effect.
+/// The second return value says whether exhaustion abandoned an uncertain job.
+pub(super) fn fail_after(
+    conn: &Connection,
+    id: i64,
+    code: &str,
+    now: i64,
+    policy: &RetryPolicy,
+    min_delay_secs: i64,
+    track_uncertainty: bool,
+) -> Result<(FailOutcome, bool), QueueError> {
     policy.validate()?;
     check_time(now)?;
-    let attempts: Option<i64> = conn
+    let row = conn
         .query_row(
-            "SELECT attempts FROM jobs WHERE id = ?1 AND state = 'running'",
+            "SELECT attempts, last_error_code FROM jobs WHERE id = ?1 AND state = 'running'",
             [id],
-            |r| r.get(0),
+            |r| Ok((r.get::<_, i64>(0)?, text_col(r, 1)?)),
         )
         .optional()?;
-    let Some(attempts) = attempts else {
+    let Some((attempts, previous)) = row else {
         return Err(missing_job_error(conn, id)?);
     };
-    let code = if valid_token(code, MAX_CODE_LEN) {
+    let uncertain = track_uncertainty
+        && (code == CODE_OUTCOME_UNKNOWN || previous.as_deref() == Some(CODE_OUTCOME_UNKNOWN));
+    let code = if uncertain {
+        CODE_OUTCOME_UNKNOWN
+    } else if valid_token(code, MAX_CODE_LEN) {
         code
     } else {
         CODE_INVALID_CODE
     };
     let exhausted = attempts >= i64::from(policy.max_attempts);
-    let due_at = now.saturating_add(policy.backoff_secs(attempts));
+    let due_at = now.saturating_add(policy.backoff_secs(attempts).max(min_delay_secs));
     // `attempts = ?3` makes this a CAS on the run we just read: if the row
     // changed between the read and this write, nothing is updated. It does not
     // identify the worker: a stale `fail` from an earlier run is not detectable.
     let n = if exhausted {
         conn.execute(
-            "UPDATE jobs SET state = 'failed', last_error_code = ?4, updated_at = ?2 \
+            "UPDATE jobs SET state = ?5, last_error_code = ?4, updated_at = ?2 \
              WHERE id = ?1 AND state = 'running' AND attempts = ?3",
-            params![id, now, attempts, code],
+            params![
+                id,
+                now,
+                attempts,
+                code,
+                if uncertain { "abandoned" } else { "failed" }
+            ],
         )?
     } else {
         conn.execute(
@@ -564,9 +591,9 @@ pub fn fail(
         return Err(QueueError::NotRunning);
     }
     Ok(if exhausted {
-        FailOutcome::Failed { attempts }
+        (FailOutcome::Failed { attempts }, uncertain)
     } else {
-        FailOutcome::Retry { due_at, attempts }
+        (FailOutcome::Retry { due_at, attempts }, false)
     })
 }
 
@@ -640,6 +667,16 @@ pub fn reconcile_after_restart(
     retry: &RetryPolicy,
 ) -> Result<Report, QueueError> {
     retry.validate()?;
+    reconcile_with_retry(conn, now, table, |_| (retry.max_attempts, false))
+}
+
+/// Runner variant: resolve each registered kind's validated retry policy.
+pub(super) fn reconcile_with_retry(
+    conn: &Connection,
+    now: i64,
+    table: KindTable<'_>,
+    retry_for: impl Fn(&str) -> (u32, bool),
+) -> Result<Report, QueueError> {
     check_time(now)?;
     let running: Vec<(i64, Option<String>, i64)> = {
         let mut stmt = conn
@@ -652,20 +689,39 @@ pub fn reconcile_after_restart(
         // A kind that is not a plain token (or not UTF-8) cannot be in the
         // caller's table: fail closed (abandoned, reported) without echoing it.
         let kind = kind.filter(|k| valid_token(k, MAX_KIND_LEN));
-        let (outcome, n) = match kind.as_deref().and_then(|k| policy_for(table, k)) {
-            Some(RestartPolicy::RunAgain) if attempts < i64::from(retry.max_attempts) => (
-                ReconcileOutcome::Requeued,
-                conn.execute(
-                    "UPDATE jobs SET state = 'pending', due_at = MIN(due_at, ?2), \
+        let policy = kind
+            .as_deref()
+            .and_then(|k| policy_for(table, k).map(|p| (p, retry_for(k))));
+        let (outcome, n) = match policy {
+            Some((RestartPolicy::RunAgain, (max_attempts, track_uncertainty)))
+                if attempts < i64::from(max_attempts) =>
+            {
+                (
+                    ReconcileOutcome::Requeued,
+                    conn.execute(
+                        "UPDATE jobs SET state = 'pending', due_at = MIN(due_at, ?2), \
                      last_error_code = ?3, updated_at = ?2 WHERE id = ?1 AND state = 'running'",
-                    params![id, now, CODE_RESTART_RERUN],
-                )?,
+                        params![
+                            id,
+                            now,
+                            if track_uncertainty {
+                                CODE_OUTCOME_UNKNOWN
+                            } else {
+                                CODE_RESTART_RERUN
+                            }
+                        ],
+                    )?,
+                )
+            }
+            Some((RestartPolicy::RunAgain, (_, true))) => (
+                ReconcileOutcome::AbandonedAtMostOnce,
+                set_terminal(conn, id, now, "abandoned", CODE_OUTCOME_UNKNOWN)?,
             ),
-            Some(RestartPolicy::RunAgain) => (
+            Some((RestartPolicy::RunAgain, _)) => (
                 ReconcileOutcome::FailedMaxAttempts,
                 set_terminal(conn, id, now, "failed", CODE_RESTART_MAX_ATTEMPTS)?,
             ),
-            Some(RestartPolicy::AtMostOnce) => (
+            Some((RestartPolicy::AtMostOnce, _)) => (
                 ReconcileOutcome::AbandonedAtMostOnce,
                 set_terminal(conn, id, now, "abandoned", CODE_RESTART_AT_MOST_ONCE)?,
             ),
