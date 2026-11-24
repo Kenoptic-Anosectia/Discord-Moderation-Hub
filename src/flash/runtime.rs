@@ -2022,11 +2022,7 @@ mod tests {
             max_poll: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(2),
             handler_timeout: Duration::from_secs(600),
-            retry: RetryPolicy {
-                base_secs: 30,
-                cap_secs: 600,
-                max_attempts: 3,
-            },
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -2191,7 +2187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_403_ends_as_a_failed_job_with_a_staff_alert_per_attempt() {
+    async fn a_403_ends_as_a_failed_job_with_one_staff_alert() {
         let db = mem_db();
         let net = Net::new();
         let clock = FakeClock::new();
@@ -2203,24 +2199,15 @@ mod tests {
             .insert(MESSAGE, PortError::Forbidden);
         clock.advance(180);
         let up = boot(&db, &clock, &feat).await;
-        // max_attempts is 3: back-offs of 30 s and 60 s.
-        for wait in [30, 60] {
-            eventually_rows(&db, "a failed attempt", |rows| {
-                rows.iter().any(|r| {
-                    r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.due > clock.secs()
-                })
-            })
-            .await;
-            clock.advance(wait);
-        }
-        eventually_rows(&db, "source failed", |rows| {
+        eventually_rows(&db, "both first attempts acknowledged", |rows| {
             rows.iter()
-                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state == "failed")
+                .all(|r| r.attempts == 1 && r.state != "running" && r.due != 0)
         })
         .await;
         let rows = jobs(&db).await;
         let src = rows.iter().find(|r| r.kind == KIND_DELETE_SOURCE).unwrap();
-        assert_eq!(src.attempts, 3);
+        assert_eq!(src.state, "failed");
+        assert_eq!(src.attempts, 1);
         let notice = rows.iter().find(|r| r.kind == KIND_DELETE_NOTICE).unwrap();
         assert_eq!(notice.state, "done", "the notice delete is independent");
         let forbidden = net
@@ -2228,12 +2215,75 @@ mod tests {
             .iter()
             .filter(|a| **a == AlertCode::DeleteForbidden)
             .count();
-        assert_eq!(forbidden, 3);
+        assert_eq!(forbidden, 1);
         assert!(net
             .alerts()
             .iter()
             .all(|a| *a == AlertCode::DeleteForbidden));
+        assert_eq!(
+            net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+            1
+        );
+        let code = db
+            .call(|c| {
+                c.query_row(
+                    "SELECT last_error_code FROM jobs WHERE kind = ?1",
+                    [KIND_DELETE_SOURCE],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(code, "delete_forbidden");
         up.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_persistent_transient_delete_alerts_once_at_its_own_cap() {
+        let db = mem_db();
+        let net = Net::new();
+        let clock = FakeClock::new();
+        let feat = feature(&net, &clock, settings("live", &[]));
+        feat.process(facts(), Some(&db)).await;
+        net.delete_always
+            .lock()
+            .unwrap()
+            .insert(MESSAGE, PortError::Unavailable);
+        clock.advance(180);
+        let up = boot(&db, &clock, &feat).await;
+        for (attempt, delay) in [(1, 30), (2, 60)] {
+            eventually_rows(&db, "source pending with backoff", |rows| {
+                rows.iter().any(|r| {
+                    r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.attempts == attempt
+                })
+            })
+            .await;
+            assert_eq!(
+                net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+                attempt as usize
+            );
+            assert!(net.alerts().is_empty(), "do not alert while retrying");
+            clock.advance(delay);
+        }
+        eventually_rows(&db, "source acknowledged after the third attempt", |rows| {
+            rows.iter()
+                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state != "running" && r.attempts == 3)
+        })
+        .await;
+        up.stop().await;
+        let rows = jobs(&db).await;
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.kind == KIND_DELETE_SOURCE)
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+            3
+        );
+        assert_eq!(net.alerts(), vec![AlertCode::DeleteFailed]);
     }
 
     #[tokio::test]
@@ -2727,9 +2777,7 @@ mod tests {
             let mut notices_posted = 0usize;
             let mut crashes = 0;
             let mut next_message = MESSAGE;
-            // Transient (`Unavailable`) delete failures scripted: each yields exactly one
-            // `DeleteFailed` alert, so any more means something else was treated as a failure.
-            let mut transient_scripted = 0usize;
+            let mut transient_chains = 0usize;
             // Claims lost to a simulated crash, per (kind, payload): they count as attempts.
             let mut crash_claims: HashMap<(String, String), i64> = HashMap::new();
             for _ in 0..60 {
@@ -2749,7 +2797,7 @@ mod tests {
                                     w.net.peek_next_notice(),
                                     &[PortError::Unavailable],
                                 );
-                                transient_scripted += 1;
+                                transient_chains += 1;
                             }
                         } else {
                             w.net.script_notice(Err(PortError::Unavailable));
@@ -2772,7 +2820,7 @@ mod tests {
                             }
                             Fate::Normal => {
                                 let transient = rng.below(3) as usize;
-                                transient_scripted += transient;
+                                transient_chains += usize::from(transient != 0);
                                 w.net.script_delete_failures(
                                     next_message,
                                     &[PortError::Unavailable; 2][..transient],
@@ -2922,16 +2970,15 @@ mod tests {
                     "seed {seed}: notice deletes only see transient faults"
                 );
             }
-            // Already-gone (404) sources raise no `DeleteFailed`: only the scripted transient
-            // faults do, one alert each.
+            // Already-gone (404) sources raise no `DeleteFailed`; only the transient chains do.
             assert_eq!(
                 w.net
                     .alerts()
                     .iter()
                     .filter(|a| **a == AlertCode::DeleteFailed)
                     .count(),
-                transient_scripted,
-                "seed {seed}: DeleteFailed alerts only for transient faults"
+                transient_chains,
+                "seed {seed}: one DeleteFailed alert per transient chain"
             );
         }
     }
