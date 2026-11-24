@@ -300,10 +300,7 @@ pub fn parse_custom_id(raw: &str) -> Result<ParsedCustomId, ParseError> {
         }
         Selector::Option(role_id)
     };
-    Ok(ParsedCustomId {
-        menu_id,
-        selector,
-    })
+    Ok(ParsedCustomId { menu_id, selector })
 }
 
 /// Build the component id of one option (button) of a menu.
@@ -690,9 +687,48 @@ where
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    // RED STUB: the behaviour is not implemented yet.
-    let _ = (settings, locks, press, ports);
-    PressOutcome::ignored(Outcome::new(Code::NoChange))
+    // 1. The feature must be on and the home guild must be known.
+    if settings.mode == Mode::Off {
+        return PressOutcome::ignored(Outcome::new(Code::Disabled));
+    }
+    let Some(home) = settings.home_guild else {
+        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
+    };
+    if home == 0 {
+        return PressOutcome::ignored(Outcome::new(Code::NoHomeGuild));
+    }
+    // 2. Only the home guild is served. A press from another guild touches
+    //    nothing at all: not even the member's roles are read.
+    if press.guild_id != home {
+        return PressOutcome::ignored(Outcome::new(Code::OtherGuild));
+    }
+    // 3. The custom id is parsed strictly. A forged id is ignored before any
+    //    member data is read.
+    let parsed = match parse_custom_id(&press.custom_id) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ports.reporter.report(&format!(
+                "rolemenu_press guild={} member={} error={}",
+                press.guild_id,
+                press.member_id,
+                error.code()
+            ));
+            return PressOutcome::ignored(Outcome::new(Code::InvalidCustomId));
+        }
+    };
+
+    // 4. The acknowledgement comes before the work.
+    if ports.responder.defer().is_err() {
+        ports.reporter.report(&format!(
+            "rolemenu_press guild={} member={} error=defer_failed",
+            press.guild_id, press.member_id
+        ));
+        return PressOutcome::ignored(Outcome::new(Code::DeferFailed));
+    }
+
+    // 5. One member at a time: the whole read-modify-write cycle of a press
+    //    runs under the member's lock.
+    locks.with_member(press.member_id, || serve(settings, press, parsed, ports))
 }
 
 /// The work of one press, under the member's lock.
@@ -707,11 +743,287 @@ where
     F: RoleFactsSource + ?Sized,
     R: RoleService,
 {
-    // RED STUB: the behaviour is not implemented yet.
-    let _ = (settings, press, parsed, ports);
-    PressOutcome::ignored(Outcome::new(Code::NoChange))
+    // The stored row is the truth: the menu must exist and belong to this
+    // guild.
+    let menu = match ports.store.get_menu_by_id(parsed.menu_id) {
+        Ok(Some(menu)) => menu,
+        Ok(None) => return notice(ports, press, Outcome::new(Code::MenuNotFound)),
+        Err(error) => return notice(ports, press, Outcome::with(Code::StoreFailed, error.code())),
+    };
+    if menu.guild != press.guild_id {
+        return notice(ports, press, Outcome::new(Code::GuildMismatch));
+    }
+    // The message the component is on must be the one the row records.
+    match menu.message {
+        Some(message) if message == press.message_id => {}
+        _ => return notice(ports, press, Outcome::new(Code::MessageMismatch)),
+    }
+    // The options must still be stored.
+    let options = match ports.store.list_options(parsed.menu_id) {
+        Ok(options) => options,
+        Err(error) => return notice(ports, press, Outcome::with(Code::StoreFailed, error.code())),
+    };
+
+    // The targets of the press: the roles the press names. A button names
+    // one option by its role id; a select names the options by its values.
+    let targets = match collect_targets(press, parsed.selector, &options) {
+        Ok(targets) => targets,
+        Err(outcome) => return notice(ports, press, outcome),
+    };
+
+    // The stored menu becomes the shared policy menu. A row whose mode is not
+    // known is corrupt and must not fall back to a more permissive mode.
+    let policy_menu = match to_policy_menu(&menu, &options) {
+        Ok(policy_menu) => policy_menu,
+        Err(_) => return notice(ports, press, Outcome::new(Code::CorruptRow)),
+    };
+    let group_id = match policy_menu.groups.first() {
+        Some(group) => group.id.clone(),
+        None => return notice(ports, press, Outcome::new(Code::CorruptRow)),
+    };
+    // An exclusive group takes exactly one option: a select that submits
+    // more than one is refused before anything is read about the member.
+    if policy_menu.groups[0].mode == policy::GroupMode::Exclusive && targets.len() > 1 {
+        return notice(ports, press, Outcome::new(Code::TooManySelected));
+    }
+
+    // An unreadable protected-role list refuses every press.
+    if settings.protected_roles_invalid {
+        return notice(ports, press, Outcome::new(Code::Ineligible));
+    }
+
+    // The member's roles are read from the role service, not from the press.
+    let member_roles = match ports.roles.member_roles(press.guild_id, press.member_id) {
+        Ok(roles) => roles,
+        Err(error) => {
+            return notice(
+                ports,
+                press,
+                Outcome::with(Code::MemberRolesUnavailable, error.code()),
+            )
+        }
+    };
+
+    // The bot's top role position decides which roles the bot may hand out.
+    let bot_top = match ports.facts.bot_top_position(press.guild_id) {
+        Ok(top) => top,
+        Err(error) => {
+            return notice(
+                ports,
+                press,
+                Outcome::with(Code::FactsUnavailable, error.code()),
+            )
+        }
+    };
+
+    // The facts of every role the press may touch are read once.
+    let mut facts_by_role = Vec::new();
+    for option in &options {
+        let facts = match ports.facts.role_facts(press.guild_id, option.role) {
+            Ok(Some(facts)) => facts,
+            Ok(None) => RoleFacts {
+                id: option.role,
+                position: 0,
+                managed: false,
+                permissions: 0,
+                exists: false,
+            },
+            Err(error) => {
+                return notice(
+                    ports,
+                    press,
+                    Outcome::with(Code::FactsUnavailable, error.code()),
+                )
+            }
+        };
+        facts_by_role.push(facts);
+    }
+
+    // Every target is planned by the shared RM1 policy, one click at a time.
+    // The member's roles are carried along so the second target of a select
+    // sees what the first one changed.
+    let mut held: Vec<u64> = member_roles.clone();
+    let mut add: Vec<u64> = Vec::new();
+    let mut remove: Vec<u64> = Vec::new();
+    let mut refusal: Option<Outcome> = None;
+    for target in &targets {
+        let plan = match policy::plan_click(&policy::PlanRequest {
+            menu: &policy_menu,
+            click: &policy::Click {
+                member_roles: held.clone(),
+                group_id: group_id.clone(),
+                option_role_id: *target,
+            },
+            grant: policy::GrantContext {
+                guild_id: press.guild_id,
+                bot_top_position: bot_top,
+                role_facts: &facts_by_role,
+                protected_role_ids: &settings.protected_role_ids,
+                safeword: press.safeword,
+                safeword_restricted_role_ids: &settings.safeword_restricted_role_ids,
+            },
+        }) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return notice(ports, press, Outcome::with(Code::Ineligible, error.code()))
+            }
+        };
+        // The policy's own reasons are reported: a refusal that never
+        // reaches a write. A blocked swap is reported as `swap_blocked` even
+        // though the policy also names the removal that could not be done.
+        let blocked_swap = plan
+            .skipped
+            .iter()
+            .any(|(_, reason)| matches!(reason, policy::Reason::SwapBlocked));
+        if blocked_swap {
+            return notice(ports, press, Outcome::new(Code::SwapBlocked));
+        }
+        if let Some((_, reason)) = plan.skipped.first() {
+            let outcome = match reason {
+                policy::Reason::Denied(deny) => Outcome::with(Code::Ineligible, deny.code()),
+                policy::Reason::RemovalDenied(deny) => Outcome::with(Code::Ineligible, deny.code()),
+                policy::Reason::UnknownOption => Outcome::new(Code::UnknownOption),
+                policy::Reason::MaxReached => Outcome::new(Code::MaxReached),
+                policy::Reason::AlreadySelected => Outcome::new(Code::AlreadySelected),
+                policy::Reason::SwapBlocked => Outcome::new(Code::SwapBlocked),
+            };
+            if refusal.is_none() {
+                refusal = Some(outcome);
+            }
+            continue;
+        }
+        for role in &plan.remove {
+            if !remove.contains(role) {
+                remove.push(*role);
+            }
+            held.retain(|held_role| held_role != role);
+        }
+        for role in &plan.add {
+            if !add.contains(role) {
+                add.push(*role);
+            }
+            held.push(*role);
+        }
+    }
+
+    // Nothing was planned and something was refused: the press is a notice.
+    if add.is_empty() && remove.is_empty() {
+        if let Some(outcome) = refusal {
+            return notice(ports, press, outcome);
+        }
+        return notice(ports, press, Outcome::new(Code::NoChange));
+    }
+
+    // In shadow mode nothing is written; the outcome says what would happen.
+    if settings.mode == Mode::Shadow {
+        let outcome = shadow_outcome(&add, &remove, refusal);
+        let result = PressOutcome {
+            outcome,
+            added: add,
+            removed: remove,
+            shadow: true,
+        };
+        finish(ports, &result);
+        return result;
+    }
+
+    // The removals come first, then the additions: an exclusive swap leaves
+    // the member with the option they pressed.
+    let mut removed = Vec::new();
+    let mut failure: Option<FailCode> = None;
+    for &role in &remove {
+        let outcome = {
+            let mut sleeper = SleeperRef(ports.sleeper);
+            remove_with_retry(&mut *ports.roles, &mut sleeper, press.member_id, role)
+        };
+        match outcome {
+            Ok(()) => removed.push(role),
+            Err(code) => {
+                if failure.is_none() {
+                    failure = Some(code);
+                }
+                report_write_failure(ports.reporter, press, role, code);
+            }
+        }
+    }
+    let mut added = Vec::new();
+    if !add.is_empty() {
+        let items: Vec<GrantItem> = add
+            .iter()
+            .map(|role_id| GrantItem {
+                role_id: *role_id,
+                decision: crate::roles::eligibility::Decision::Allow,
+                already_held: false,
+            })
+            .collect();
+        let report = {
+            let mut sleeper = SleeperRef(ports.sleeper);
+            grant::apply(
+                &mut *ports.roles,
+                &mut sleeper,
+                &grant::GrantRequest {
+                    member_id: press.member_id,
+                    items: &items,
+                },
+            )
+        };
+        for result in &report.results {
+            match result.outcome {
+                RoleOutcome::Done => added.push(result.role_id),
+                RoleOutcome::NoOp => {}
+                RoleOutcome::Denied(_) => {
+                    if failure.is_none() {
+                        failure = Some(FailCode::Other);
+                    }
+                    report_write_failure(ports.reporter, press, result.role_id, FailCode::Other);
+                }
+                RoleOutcome::Failed(code) => {
+                    if failure.is_none() {
+                        failure = Some(code);
+                    }
+                    report_write_failure(ports.reporter, press, result.role_id, code);
+                }
+            }
+        }
+    }
+
+    let outcome = match failure {
+        Some(code) => {
+            // A failure is never reported as a success. A swap that added the
+            // new option but could not remove an old one says exactly that
+            // (the member holds both), and so does the other half: the old
+            // option is gone and the new one could not be added (the member
+            // holds neither).
+            if !added.is_empty() && !remove.is_empty() {
+                Outcome::with(Code::SwapPartial, code.code())
+            } else if !removed.is_empty() {
+                Outcome::with(Code::SwapPartialRemoved, code.code())
+            } else {
+                Outcome::with(Code::WriteFailed, code.code())
+            }
+        }
+        None => match refusal {
+            Some(outcome) => Outcome::with(Code::Partial, outcome.detail.unwrap_or("refused")),
+            None if added.is_empty() => Outcome::new(Code::Removed),
+            None if removed.is_empty() => Outcome::new(Code::Added),
+            None => Outcome::new(Code::Swapped),
+        },
+    };
+
+    let result = PressOutcome {
+        outcome,
+        added,
+        removed,
+        shadow: false,
+    };
+    finish(ports, &result);
+    result
 }
 
+/// The roles one press names.
+///
+/// A button names one option by its role id. A select names its options by
+/// the values it submitted: every value must be a role id that is still a
 /// stored option of this menu.
 fn collect_targets(
     press: &Press,
@@ -1397,21 +1709,25 @@ mod tests {
     #[test]
     fn a_value_is_parsed_strictly() {
         assert_eq!(parse_value("42"), Ok(42));
-        for raw in ["", "0", "01", "-1", "+1", "4 2", "42x", "\u{0661}", "999999999999999999999999"] {
+        for raw in [
+            "",
+            "0",
+            "01",
+            "-1",
+            "+1",
+            "4 2",
+            "42x",
+            "\u{0661}",
+            "999999999999999999999999",
+        ] {
             assert!(parse_value(raw).is_err(), "{raw:?} must not parse");
         }
     }
 
     #[test]
     fn a_custom_id_for_a_zero_id_is_refused() {
-        assert_eq!(
-            custom_id_for_option(0, ROLE_A),
-            Err(ParseError::BadNumber)
-        );
-        assert_eq!(
-            custom_id_for_option(1, 0),
-            Err(ParseError::BadNumber)
-        );
+        assert_eq!(custom_id_for_option(0, ROLE_A), Err(ParseError::BadNumber));
+        assert_eq!(custom_id_for_option(1, 0), Err(ParseError::BadNumber));
         assert_eq!(custom_id_for_select(0), Err(ParseError::BadNumber));
     }
 
@@ -1855,9 +2171,7 @@ mod tests {
     fn a_swap_whose_removal_fails_is_reported_as_partial_and_never_as_success() {
         let store = exclusive_menu();
         let mut roles = FakeRoles::new(MEMBER, &[ROLE_A]);
-        roles
-            .remove_failures
-            .insert(ROLE_A, vec![forbidden()]);
+        roles.remove_failures.insert(ROLE_A, vec![forbidden()]);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
         let result = harness.run(&settings(), &press_option(1, ROLE_B));
         assert_eq!(result.outcome.code, Code::SwapPartial);
@@ -2015,7 +2329,9 @@ mod tests {
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
             FakeRoles::new(MEMBER, &[]),
         );
-        let values: Vec<u64> = (0..=policy::SELECT_OPTION_LIMIT as u64).map(|i| 780_000 + i).collect();
+        let values: Vec<u64> = (0..=policy::SELECT_OPTION_LIMIT as u64)
+            .map(|i| 780_000 + i)
+            .collect();
         let result = harness.run(&settings(), &press_select(1, &values));
         assert_eq!(result.outcome.code, Code::TooManySelected);
         assert!(harness.roles.added().is_empty());
@@ -2073,7 +2389,11 @@ mod tests {
     #[test]
     fn a_select_for_a_deleted_option_is_refused_and_writes_nothing() {
         let mut store = multi_menu();
-        store.options.get_mut(&1).expect("options").retain(|o| o.role != ROLE_A);
+        store
+            .options
+            .get_mut(&1)
+            .expect("options")
+            .retain(|o| o.role != ROLE_A);
         let mut harness = Harness::new(
             store,
             FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]),
@@ -2340,7 +2660,9 @@ mod tests {
     fn a_forbidden_add_is_not_retried() {
         let store = multi_menu();
         let mut roles = FakeRoles::new(MEMBER, &[]);
-        roles.add_failures.insert(ROLE_A, vec![forbidden(), forbidden()]);
+        roles
+            .add_failures
+            .insert(ROLE_A, vec![forbidden(), forbidden()]);
         let mut harness = Harness::new(store, FakeFacts::new(&[ROLE_A, ROLE_B, ROLE_C]), roles);
         harness.run(&settings(), &press_option(1, ROLE_A));
         assert_eq!(harness.roles.add_call_count(ROLE_A), 1);
@@ -2784,7 +3106,10 @@ mod tests {
         );
         let result = harness.run(&settings(), &press(&old_button));
         assert_eq!(result.outcome.code, Code::OptionNotFound);
-        assert!(harness.roles.added().is_empty(), "the stale button granted a role");
+        assert!(
+            harness.roles.added().is_empty(),
+            "the stale button granted a role"
+        );
     }
 
     #[test]
