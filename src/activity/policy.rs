@@ -832,6 +832,245 @@ impl Ledger {
 }
 
 #[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_restart_matches_uninterrupted_self_deaf_stretches() {
+        let cfg = ActivityConfig::new(vec![], None, false).unwrap();
+        let mut ledger = Ledger::new();
+        for (at, old_channel, self_deaf) in
+            [(10, None, false), (20, Some(3), true), (30, Some(3), false)]
+        {
+            ledger.apply_voice(
+                &VoiceEvent {
+                    guild_id: 1,
+                    user_id: 2,
+                    old_channel,
+                    new_channel: Some(3),
+                    self_deaf,
+                    at,
+                },
+                &cfg,
+            );
+        }
+        let mut restored = Ledger::restore(ledger.snapshot_open()).unwrap();
+        let expected = ledger.note_restart(9_000, 40, &cfg);
+        assert_eq!(expected.sessions.iter().map(|s| s.seconds).sum::<u64>(), 20);
+        assert_eq!(restored.note_restart(9_000, 40, &cfg), expected);
+    }
+
+    #[test]
+    fn snapshot_restore_refuses_every_invalid_shape() {
+        let segment = SegmentSnapshot {
+            start: 0,
+            end: 1,
+            self_deaf: false,
+        };
+        let valid = OpenSnapshot {
+            guild_id: 1,
+            user_id: 2,
+            channel_id: 3,
+            segments: vec![segment],
+        };
+        let cases = [
+            (
+                vec![OpenSnapshot {
+                    guild_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    user_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    channel_id: 0,
+                    ..valid.clone()
+                }],
+                "snapshot_invalid_id",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![],
+                    ..valid.clone()
+                }],
+                "snapshot_empty",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![segment; MAX_SNAPSHOT_SEGMENTS + 1],
+                    ..valid.clone()
+                }],
+                "snapshot_too_many_segments",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![SegmentSnapshot { end: -1, ..segment }],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![segment, segment],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (
+                vec![OpenSnapshot {
+                    segments: vec![
+                        segment,
+                        SegmentSnapshot {
+                            start: -2,
+                            end: -1,
+                            ..segment
+                        },
+                    ],
+                    ..valid.clone()
+                }],
+                "snapshot_segment_order",
+            ),
+            (vec![valid.clone(), valid], "snapshot_duplicate_open"),
+        ];
+        for (snapshots, code) in cases {
+            assert_eq!(
+                Ledger::restore(snapshots).err().map(|e| e.code()),
+                Some(code)
+            );
+        }
+    }
+}
+
+/// Persistence limit per open session; does not change live AC1 accounting.
+pub const MAX_SNAPSHOT_SEGMENTS: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSnapshot {
+    pub start: i64,
+    pub end: i64,
+    pub self_deaf: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSnapshot {
+    pub guild_id: u64,
+    pub user_id: u64,
+    pub channel_id: u64,
+    pub segments: Vec<SegmentSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreError {
+    InvalidId,
+    Empty,
+    TooManySegments,
+    SegmentOrder,
+    DuplicateOpen,
+}
+
+impl RestoreError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidId => "snapshot_invalid_id",
+            Self::Empty => "snapshot_empty",
+            Self::TooManySegments => "snapshot_too_many_segments",
+            Self::SegmentOrder => "snapshot_segment_order",
+            Self::DuplicateOpen => "snapshot_duplicate_open",
+        }
+    }
+}
+
+impl Ledger {
+    /// Copies open sessions only, without changing the live accounting state.
+    pub fn snapshot_open(&self) -> Vec<OpenSnapshot> {
+        self.open
+            .iter()
+            .map(|(&(guild_id, user_id), session)| OpenSnapshot {
+                guild_id,
+                user_id,
+                channel_id: session.channel_id,
+                segments: session
+                    .segments
+                    .iter()
+                    .map(|segment| SegmentSnapshot {
+                        start: segment.start,
+                        end: segment.end,
+                        self_deaf: segment.self_deaf,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Drops open presence without credit when its channel is no longer in scope.
+    pub(super) fn discard_open(&mut self, guild_id: u64, user_id: u64) {
+        self.open.remove(&(guild_id, user_id));
+    }
+
+    /// If the wall clock moved backwards, even previously closed stretches in a
+    /// checkpoint must not extend beyond the restart. Keep at least the first
+    /// stretch so AC1 can still report the restart and close it for zero seconds.
+    pub(super) fn clamp_open_for_restart(&mut self, cutoff: i64) {
+        for session in self.open.values_mut() {
+            let count = session.segments.partition_point(|s| s.start <= cutoff);
+            session.segments.truncate(count.max(1));
+        }
+    }
+
+    /// Restores open sessions for restart reconciliation. Policy settings are applied
+    /// by `note_restart`, not by validation. Closed members are not snapshotted.
+    pub fn restore(
+        snapshots: impl IntoIterator<Item = OpenSnapshot>,
+    ) -> Result<Self, RestoreError> {
+        let mut ledger = Self::new();
+        for OpenSnapshot {
+            guild_id,
+            user_id,
+            channel_id,
+            segments,
+        } in snapshots
+        {
+            if guild_id == 0 || user_id == 0 || channel_id == 0 {
+                return Err(RestoreError::InvalidId);
+            }
+            let last = segments.last().ok_or(RestoreError::Empty)?;
+            if segments.len() > MAX_SNAPSHOT_SEGMENTS {
+                return Err(RestoreError::TooManySegments);
+            }
+            if segments.iter().any(|s| s.start > s.end)
+                || segments.windows(2).any(|w| w[0].end > w[1].start)
+            {
+                return Err(RestoreError::SegmentOrder);
+            }
+            let key = (guild_id, user_id);
+            let Entry::Vacant(slot) = ledger.open.entry(key) else {
+                return Err(RestoreError::DuplicateOpen);
+            };
+            ledger.last_seen.insert(key, last.end);
+            slot.insert(OpenSession {
+                channel_id,
+                segments: segments
+                    .into_iter()
+                    .map(|s| Segment {
+                        start: s.start,
+                        end: s.end,
+                        self_deaf: s.self_deaf,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(ledger)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

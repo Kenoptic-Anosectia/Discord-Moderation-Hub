@@ -15,7 +15,8 @@ Rules it enforces:
 - Self-deafened time counts only when `count_self_deafened` is true (wiring default false). A flag change mid-session splits the stretch, so only the deafened part is dropped.
 - A session crossing UTC midnight is split into one record per day; each record lies inside one day.
 - A closed session whose stretches touch more than `MAX_SESSION_RECORDS` (366) UTC days in total is not credited and is flagged `UnaccountedChannel`. The count is an upper bound computed by arithmetic, not a walk, so a refused span never allocates.
-- Duplicate join (`DuplicateUpdate`), out-of-order update (`OutOfOrderUpdate`), channel mismatch (`ChannelMismatch`) and missing old state (`MissingOldState`) raise an anomaly and credit nothing.
+- A channel mismatch raises `ChannelMismatch` and closes the session in the tracked channel on leave or move; duplicate join (`DuplicateUpdate`), out-of-order update (`OutOfOrderUpdate`) and missing old state (`MissingOldState`) raise an anomaly and credit nothing for the unobserved state.
+- AC2 snapshots open stretches with `Ledger::snapshot_open` and validates them with `Ledger::restore` before restart reconciliation.
 - Restart: every open session closes at `min(last_heartbeat_at, now_at)` - never past the restart instant, so a heartbeat that claims a moment after the restart credits nothing that had not happened yet. The difference is `RestartGap` and is not credited (crediting offline hours would inflate levels).
 - All time is injected. `day_start` and `next_day_start` saturate, so a timestamp at either edge of `i64` cannot panic; `utc_day` uses integer division only and clamps a timestamp outside `YYYY-MM-DD` to `9999-12-31`.
 
