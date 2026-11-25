@@ -4,8 +4,14 @@
 
 Rules enforced (each has a test):
 - Live: schedule `flash_delete_source` (due now+delay, key per message id) BEFORE posting the notice, then post, then schedule `flash_delete_notice` (same due time, key per notice id). The plan says post-then-schedule; scheduling first means a crash in between cannot leave the media without a deletion. A notice failure alerts and keeps the source job; a source job that cannot be scheduled posts no notice (alert). A replayed event (same key) posts no second notice.
-- Both kinds are `RunAgain` (PLAN 5.7). The card text says AtMostOnce for irreversible work, but a delete is idempotent and AtMostOnce would abandon a cut-off or overdue delete. Plan wins. Overdue jobs run at once after a restart; a job left `running` is requeued.
-- Delete: 404 = done. 403 = alert `flash_delete_forbidden` and a failed attempt; any other error = alert and a failed attempt. The handler API has no terminal fail, so the queue retries with its back-off until its max attempts, one alert per attempt, then the job is `failed`. The plan wants 3 bounded tries, no loop on 403 and deduplicated alerts; that needs a terminal handler error in the job runner, so enabling live requires KJ3 (jobs-lane follow-up card).
+- Both kinds are `RunAgain` (PLAN 5.7): overdue jobs can run at once and an interrupted job
+  can be requeued if it still has claims left. A delete is idempotent; AtMostOnce would abandon
+  an interrupted delete even if the runner had enough budget to confirm it.
+- Delete (KJ3): 404 is still done, without a 404 alert. A known 403 fails immediately with
+  `delete_forbidden`; known transient refusals use up to three claims, with 30 s then 60 s backoff
+  and a later Retry-After if supplied by the port. A 5xx or transport failure may leave the delete
+  unconfirmed; unresolved chains end `abandoned`, not `failed`. One best-effort code-only alert
+  after final acknowledgement, not per attempt (see JOB-RETRY.md).
 - Shadow: no send, delete, alert or job; it only reads (thread parent) and counts (`shadow_summary`). It reports `needs_core_db() == false`, so no database and no job kinds. Off does nothing.
 - Payloads hold ids only and are parsed strictly (object form, exactly two keys, non-zero). Alerts are `flash alert: <code>`. Notice mentions are the policy's (role, author, never everyone).
 - A flash event does not reach the cache or logger: tested through the real `route_event` and cache insert with the flash ids in a `LogExclusion::Scope` (what W2 must build); a control case shows it would be cached without them.

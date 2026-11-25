@@ -22,8 +22,10 @@
 use super::config::FlashSettings;
 use super::policy::{AllowedMentions, Decision, ExpirePlan, IgnoreReason, MessageFacts};
 use crate::features::{Feature, JobSignal};
-use crate::jobs::queue::{self, ClaimedJob, NewJob, RestartPolicy, ScheduleOutcome};
-use crate::jobs::runner::{BoxFuture, Clock, HandlerError, HandlerResult, Registry, RunnerError};
+use crate::jobs::queue::{self, ClaimedJob, NewJob, RestartPolicy, RetryPolicy, ScheduleOutcome};
+use crate::jobs::runner::{
+    BoxFuture, Clock, FinalOutcome, HandlerError, HandlerResult, Registry, RunnerError,
+};
 use crate::settings::Mode;
 use poise::serenity_prelude as serenity;
 use serde::Deserialize;
@@ -43,6 +45,15 @@ pub const JOB_KINDS: [(&str, RestartPolicy); 2] = [
     (KIND_DELETE_NOTICE, RestartPolicy::RunAgain),
 ];
 
+const DELETE_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 3,
+    ..RetryPolicy::DEFAULT
+};
+const DELETE_FORBIDDEN: &str = "delete_forbidden";
+const DELETE_UNAVAILABLE: &str = "delete_unavailable";
+const DELETE_RATE_LIMITED: &str = "delete_rate_limited";
+const PAYLOAD_INVALID: &str = "payload_invalid";
+
 /// Why a Discord call failed, reduced to what the runtime decides on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortError {
@@ -50,8 +61,12 @@ pub enum PortError {
     NotFound,
     /// HTTP 403: the bot may not do this.
     Forbidden,
+    /// The port surfaced a 429 with a known retry delay in whole seconds.
+    RateLimited { retry_after_secs: i64 },
     /// Anything else (429 after serenity's own wait, 5xx, transport).
     Unavailable,
+    /// The delete may have happened but was not confirmed.
+    OutcomeUnknown,
 }
 
 /// What a channel lookup says about a thread parent.
@@ -88,7 +103,7 @@ pub enum AlertCode {
     NoticeScheduleFailed,
     /// A delete was refused with 403.
     DeleteForbidden,
-    /// A delete failed for another reason and will be retried.
+    /// A delete chain encountered a transient failure and has finished.
     DeleteFailed,
     /// A delete job carried a payload that is not `{channel_id, message_id}`.
     PayloadInvalid,
@@ -195,7 +210,7 @@ pub fn notice_dedupe_key(notice_message_id: u64) -> String {
 pub enum DeleteVerdict {
     /// The message is gone (deleted now or already): the job is done.
     Done,
-    /// The message may still exist: alert and fail the attempt with `code`.
+    /// The message may still exist: fail the attempt with `code`.
     Failed {
         /// Alert to send.
         alert: AlertCode,
@@ -210,11 +225,19 @@ pub fn delete_verdict(result: Result<(), PortError>) -> DeleteVerdict {
         Ok(()) | Err(PortError::NotFound) => DeleteVerdict::Done,
         Err(PortError::Forbidden) => DeleteVerdict::Failed {
             alert: AlertCode::DeleteForbidden,
-            code: "delete_forbidden",
+            code: DELETE_FORBIDDEN,
         },
         Err(PortError::Unavailable) => DeleteVerdict::Failed {
             alert: AlertCode::DeleteFailed,
-            code: "delete_unavailable",
+            code: DELETE_UNAVAILABLE,
+        },
+        Err(PortError::RateLimited { .. }) => DeleteVerdict::Failed {
+            alert: AlertCode::DeleteFailed,
+            code: DELETE_RATE_LIMITED,
+        },
+        Err(PortError::OutcomeUnknown) => DeleteVerdict::Failed {
+            alert: AlertCode::DeleteFailed,
+            code: HandlerError::outcome_unknown().code(),
         },
     }
 }
@@ -535,8 +558,7 @@ impl Inner {
 
     async fn run_delete(&self, job: ClaimedJob) -> HandlerResult {
         let Ok(target) = parse_delete_payload(&job.payload_json) else {
-            self.alerts.alert(AlertCode::PayloadInvalid).await;
-            return Err(HandlerError::new("payload_invalid"));
+            return Err(HandlerError::terminal(PAYLOAD_INVALID));
         };
         let result = self
             .ports
@@ -544,11 +566,32 @@ impl Inner {
             .await;
         match delete_verdict(result) {
             DeleteVerdict::Done => Ok(()),
-            DeleteVerdict::Failed { alert, code } => {
-                self.alerts.alert(alert).await;
-                Err(HandlerError::new(code))
-            }
+            DeleteVerdict::Failed { code, .. } => Err(match result {
+                Err(PortError::Forbidden) => HandlerError::terminal(code),
+                Err(PortError::RateLimited { retry_after_secs }) => {
+                    HandlerError::retry_after(code, retry_after_secs)
+                }
+                Err(PortError::OutcomeUnknown) => HandlerError::outcome_unknown(),
+                _ => HandlerError::new(code),
+            }),
         }
+    }
+
+    async fn alert_after_ack(&self, outcome: FinalOutcome) {
+        let alert = match outcome {
+            FinalOutcome::Failed {
+                code: DELETE_FORBIDDEN,
+            } => AlertCode::DeleteForbidden,
+            FinalOutcome::Failed {
+                code: PAYLOAD_INVALID,
+            } => AlertCode::PayloadInvalid,
+            FinalOutcome::Failed { .. } | FinalOutcome::Abandoned { .. } => AlertCode::DeleteFailed,
+            FinalOutcome::Done { previous_error } => match previous_error.as_deref() {
+                Some(DELETE_UNAVAILABLE | DELETE_RATE_LIMITED) => AlertCode::DeleteFailed,
+                _ => return,
+            },
+        };
+        self.alerts.alert(alert).await;
     }
 }
 
@@ -582,9 +625,17 @@ impl FlashFeature {
         self.inner.process(facts, core_db).await
     }
 
-    /// Runs one delete job (both kinds share this handler).
-    pub async fn run_delete(&self, job: ClaimedJob) -> HandlerResult {
-        self.inner.run_delete(job).await
+    /// Executes one standalone delete and reports its failure. Queued deletes
+    /// instead alert after the runner acknowledges the final outcome.
+    #[cfg(test)]
+    async fn run_delete(&self, job: ClaimedJob) -> HandlerResult {
+        let result = self.inner.run_delete(job).await;
+        if let Err(error) = result {
+            self.inner
+                .alert_after_ack(FinalOutcome::Failed { code: error.code() })
+                .await;
+        }
+        result
     }
 
     /// Shadow-mode tally: `(code, count)` sorted by code.
@@ -598,13 +649,19 @@ impl FlashFeature {
             .collect()
     }
 
-    /// Registers the two job kinds with [`JOB_KINDS`]' restart policies.
+    /// Registers the two job kinds with their restart policies and retry cap.
     pub fn register_job_kinds(&self, registry: &mut Registry) -> Result<(), RunnerError> {
         for (kind, policy) in JOB_KINDS {
             let inner = self.inner.clone();
-            registry.register(kind, policy, move |job| {
+            registry.register_with_retry(kind, policy, DELETE_RETRY, move |job| {
                 let inner = inner.clone();
                 async move { inner.run_delete(job).await }
+            })?;
+            registry.track_uncertainty(kind)?;
+            let inner = self.inner.clone();
+            registry.observe_final(kind, move |outcome| {
+                let inner = inner.clone();
+                async move { inner.alert_after_ack(outcome).await }
             })?;
         }
         Ok(())
@@ -749,7 +806,14 @@ impl FlashPorts for SerenityFlashPorts {
                 Some("flash expiry"),
             )
             .await
-            .map_err(|e| port_error_from_serenity(&e))
+            .map_err(|e| match &e {
+                serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response))
+                    if !response.status_code.is_server_error() =>
+                {
+                    port_error_from_serenity(&e)
+                }
+                _ => PortError::OutcomeUnknown,
+            })
     }
 
     async fn thread_parent(&self, guild_id: u64, channel_id: u64) -> ParentLookup {
@@ -799,7 +863,7 @@ mod tests {
         self, Features, GuildFilter, JobStarter, ReportCounts, Settings, StartRequest, StartedJobs,
     };
     use crate::flash::config::load;
-    use crate::jobs::queue::{self, RetryPolicy};
+    use crate::jobs::queue;
     use crate::jobs::runner::{Runner, RunnerConfig, ShutdownHandle};
     use crate::storage;
     use crate::tickets;
@@ -2003,6 +2067,55 @@ mod tests {
 
     // ---------------------------------------------------- real runner, real DB
 
+    #[tokio::test]
+    async fn kj3_malformed_payload_through_the_real_queue_fails_once_and_alerts_once() {
+        let w = world("live");
+        // Plain JSON objects pass the queue's own claim check and reach the handler.
+        let raws = [
+            "{}",
+            r#"{"channel_id":0,"message_id":2}"#,
+            r#"{"channel_id":"1","message_id":2}"#,
+        ];
+        for (i, raw) in raws.iter().enumerate() {
+            let (key, raw, now) = (format!("bad-{i}"), raw.to_string(), w.clock.secs());
+            w.db.call(move |c| {
+                queue::schedule(
+                    c,
+                    &NewJob {
+                        kind: KIND_DELETE_SOURCE,
+                        dedupe_key: &key,
+                        payload_json: &raw,
+                        due_at: now,
+                    },
+                    now,
+                )
+            })
+            .await
+            .unwrap();
+        }
+        let up = boot(&w.db, &w.clock, &w.feat).await;
+        let net = w.net.clone();
+        eventually("one alert per failed job", move || net.alerts().len() == 3).await;
+        w.clock.advance(700);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        up.stop().await;
+        let rows: Vec<(String, i64, String)> =
+            w.db.call(|c| {
+                let mut st =
+                    c.prepare("SELECT state, attempts, last_error_code FROM jobs ORDER BY id")?;
+                let rows = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<_, _>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap();
+        let want = ("failed".to_string(), 1, "payload_invalid".to_string());
+        assert_eq!(rows, vec![want; 3], "terminal on the first attempt");
+        assert_eq!(w.net.alerts(), vec![AlertCode::PayloadInvalid; 3]);
+        assert!(w.net.deletes().is_empty());
+    }
+
     struct Up {
         shutdown: ShutdownHandle,
         task: tokio::task::JoinHandle<()>,
@@ -2022,11 +2135,7 @@ mod tests {
             max_poll: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(2),
             handler_timeout: Duration::from_secs(600),
-            retry: RetryPolicy {
-                base_secs: 30,
-                cap_secs: 600,
-                max_attempts: 3,
-            },
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -2191,7 +2300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_403_ends_as_a_failed_job_with_a_staff_alert_per_attempt() {
+    async fn a_403_ends_as_a_failed_job_with_one_staff_alert() {
         let db = mem_db();
         let net = Net::new();
         let clock = FakeClock::new();
@@ -2203,24 +2312,15 @@ mod tests {
             .insert(MESSAGE, PortError::Forbidden);
         clock.advance(180);
         let up = boot(&db, &clock, &feat).await;
-        // max_attempts is 3: back-offs of 30 s and 60 s.
-        for wait in [30, 60] {
-            eventually_rows(&db, "a failed attempt", |rows| {
-                rows.iter().any(|r| {
-                    r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.due > clock.secs()
-                })
-            })
-            .await;
-            clock.advance(wait);
-        }
-        eventually_rows(&db, "source failed", |rows| {
-            rows.iter()
-                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state == "failed")
+        eventually_rows(&db, "both first attempts acknowledged", |rows| {
+            rows.iter().all(|r| r.attempts == 1 && r.state != "running")
         })
         .await;
+        up.stop().await;
         let rows = jobs(&db).await;
         let src = rows.iter().find(|r| r.kind == KIND_DELETE_SOURCE).unwrap();
-        assert_eq!(src.attempts, 3);
+        assert_eq!(src.state, "failed");
+        assert_eq!(src.attempts, 1);
         let notice = rows.iter().find(|r| r.kind == KIND_DELETE_NOTICE).unwrap();
         assert_eq!(notice.state, "done", "the notice delete is independent");
         let forbidden = net
@@ -2228,12 +2328,82 @@ mod tests {
             .iter()
             .filter(|a| **a == AlertCode::DeleteForbidden)
             .count();
-        assert_eq!(forbidden, 3);
+        assert_eq!(forbidden, 1);
         assert!(net
             .alerts()
             .iter()
             .all(|a| *a == AlertCode::DeleteForbidden));
+        assert_eq!(
+            net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+            1
+        );
+        let code = db
+            .call(|c| {
+                c.query_row(
+                    "SELECT last_error_code FROM jobs WHERE kind = ?1",
+                    [KIND_DELETE_SOURCE],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(code, "delete_forbidden");
+        clock.advance(10_000);
+        for _ in 0..2 {
+            let up = boot(&db, &clock, &feat).await;
+            assert!(up.report.entries.is_empty());
+            up.stop().await;
+        }
+        assert_eq!(jobs(&db).await, rows);
+        assert_eq!(net.alerts(), vec![AlertCode::DeleteForbidden]);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_transient_delete_alerts_once_at_its_own_cap() {
+        let db = mem_db();
+        let net = Net::new();
+        let clock = FakeClock::new();
+        let feat = feature(&net, &clock, settings("live", &[]));
+        feat.process(facts(), Some(&db)).await;
+        net.delete_always
+            .lock()
+            .unwrap()
+            .insert(MESSAGE, PortError::Unavailable);
+        clock.advance(180);
+        let up = boot(&db, &clock, &feat).await;
+        for (attempt, delay) in [(1, 30), (2, 60)] {
+            eventually_rows(&db, "source pending with backoff", |rows| {
+                rows.iter().any(|r| {
+                    r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.attempts == attempt
+                })
+            })
+            .await;
+            assert_eq!(
+                net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+                attempt as usize
+            );
+            assert!(net.alerts().is_empty(), "do not alert while retrying");
+            clock.advance(delay);
+        }
+        eventually_rows(&db, "source acknowledged after the third attempt", |rows| {
+            rows.iter()
+                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state != "running" && r.attempts == 3)
+        })
+        .await;
         up.stop().await;
+        let rows = jobs(&db).await;
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.kind == KIND_DELETE_SOURCE)
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            net.deletes().iter().filter(|(_, m)| *m == MESSAGE).count(),
+            3
+        );
+        assert_eq!(net.alerts(), vec![AlertCode::DeleteFailed]);
     }
 
     #[tokio::test]
@@ -2256,9 +2426,108 @@ mod tests {
             rows.iter().all(|r| r.state == "done")
         })
         .await;
+        up.stop().await;
         assert_eq!(net.alerts(), vec![AlertCode::DeleteFailed]);
         assert!(net.deleted.lock().unwrap().contains(&MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn kj3_unknown_delete_is_not_relabelled_as_failed_by_later_refusal() {
+        let w = world("live");
+        w.feat.process(facts(), Some(&w.db)).await;
+        w.net
+            .script_delete_failures(MESSAGE, &[PortError::OutcomeUnknown, PortError::Forbidden]);
+        w.clock.advance(180);
+        let up = boot(&w.db, &w.clock, &w.feat).await;
+        eventually_rows(&w.db, "unknown outcome is pending", |rows| {
+            rows.iter()
+                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.attempts == 1)
+        })
+        .await;
+        assert!(w.net.alerts().is_empty());
+        w.clock.advance(30);
+        eventually_rows(&w.db, "terminal outcome", |rows| {
+            rows.iter()
+                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state != "running" && r.attempts == 2)
+        })
+        .await;
         up.stop().await;
+        let (state, code): (String, String) =
+            w.db.call(|c| {
+                c.query_row(
+                    "SELECT state, last_error_code FROM jobs WHERE kind = ?1",
+                    [KIND_DELETE_SOURCE],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), code.as_str()),
+            ("abandoned", "job_outcome_unknown")
+        );
+        assert_eq!(
+            w.net
+                .deletes()
+                .iter()
+                .filter(|(_, m)| *m == MESSAGE)
+                .count(),
+            2
+        );
+        assert_eq!(w.net.alerts(), vec![AlertCode::DeleteFailed]);
+    }
+
+    #[tokio::test]
+    async fn flash_rate_limit_delay_outlasts_backoff_and_survives_restart() {
+        let w = world("live");
+        w.feat.process(facts(), Some(&w.db)).await;
+        w.net.script_delete_failures(
+            MESSAGE,
+            &[PortError::RateLimited {
+                retry_after_secs: 701,
+            }],
+        );
+        w.clock.advance(180);
+        let first = boot(&w.db, &w.clock, &w.feat).await;
+        eventually_rows(&w.db, "rate-limited job is pending", |rows| {
+            rows.iter()
+                .any(|r| r.kind == KIND_DELETE_SOURCE && r.state == "pending" && r.attempts == 1)
+        })
+        .await;
+        first.stop().await;
+        let source = jobs(&w.db)
+            .await
+            .into_iter()
+            .find(|r| r.kind == KIND_DELETE_SOURCE)
+            .unwrap();
+        assert_eq!(source.due, w.clock.secs() + 701);
+        let up = boot(&w.db, &w.clock, &w.feat).await;
+        w.clock.advance(700);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            w.net
+                .deletes()
+                .iter()
+                .filter(|(_, m)| *m == MESSAGE)
+                .count(),
+            1
+        );
+        assert!(w.net.alerts().is_empty());
+        w.clock.advance(1);
+        eventually_rows(&w.db, "both done", |rows| {
+            rows.iter().all(|r| r.state == "done")
+        })
+        .await;
+        up.stop().await;
+        assert_eq!(
+            w.net
+                .deletes()
+                .iter()
+                .filter(|(_, m)| *m == MESSAGE)
+                .count(),
+            2
+        );
+        assert_eq!(w.net.alerts(), vec![AlertCode::DeleteFailed]);
     }
 
     // ------------------------------------------------ through the registry
@@ -2689,29 +2958,16 @@ mod tests {
         Forbidden,
     }
 
-    /// One model tick: claim what is due, run the real handler, acknowledge like a runner.
-    async fn tick(w: &World, claim_limit: u32) {
+    /// One model tick: drain the jobs currently due using the production runner.
+    async fn tick(w: &World) {
         let now = w.clock.secs();
-        let batch =
-            w.db.call(move |c| queue::claim_due(c, now, claim_limit))
-                .await
-                .unwrap();
-        for claimed in batch.claimed {
-            let id = claimed.id;
-            match w.feat.run_delete(claimed).await {
-                Ok(()) => {
-                    w.db.call(move |c| queue::complete(c, id, now))
-                        .await
-                        .unwrap();
-                }
-                Err(e) => {
-                    let code = e.code();
-                    w.db.call(move |c| queue::fail(c, id, code, now, &RetryPolicy::DEFAULT))
-                        .await
-                        .unwrap();
-                }
-            }
-        }
+        let up = boot(&w.db, &w.clock, &w.feat).await;
+        eventually_rows(&w.db, "drained due jobs", |rows| {
+            rows.iter()
+                .all(|r| r.state != "running" && (r.state != "pending" || r.due > now))
+        })
+        .await;
+        up.stop().await;
     }
 
     /// Random flashes, random Discord faults, random crashes: every flash that the runtime
@@ -2728,9 +2984,8 @@ mod tests {
             let mut notices_posted = 0usize;
             let mut crashes = 0;
             let mut next_message = MESSAGE;
-            // Transient (`Unavailable`) delete failures scripted: each yields exactly one
-            // `DeleteFailed` alert, so any more means something else was treated as a failure.
-            let mut transient_scripted = 0usize;
+            let mut scripted = HashMap::<u64, i64>::new();
+            let mut interrupted_recoveries = HashSet::new();
             // Claims lost to a simulated crash, per (kind, payload): they count as attempts.
             let mut crash_claims: HashMap<(String, String), i64> = HashMap::new();
             for _ in 0..60 {
@@ -2750,7 +3005,7 @@ mod tests {
                                     w.net.peek_next_notice(),
                                     &[PortError::Unavailable],
                                 );
-                                transient_scripted += 1;
+                                scripted.insert(w.net.peek_next_notice(), 1);
                             }
                         } else {
                             w.net.script_notice(Err(PortError::Unavailable));
@@ -2773,7 +3028,9 @@ mod tests {
                             }
                             Fate::Normal => {
                                 let transient = rng.below(3) as usize;
-                                transient_scripted += transient;
+                                if transient != 0 {
+                                    scripted.insert(next_message, transient as i64);
+                                }
                                 w.net.script_delete_failures(
                                     next_message,
                                     &[PortError::Unavailable; 2][..transient],
@@ -2796,7 +3053,7 @@ mod tests {
                         }
                     }
                     4 | 5 => w.clock.advance(rng.below(200) as i64),
-                    6 | 7 => tick(&w, 3).await,
+                    6 | 7 => tick(&w).await,
                     8 if crashes < 2 => {
                         crashes += 1;
                         // A runner claims up to two due jobs and dies before acknowledging.
@@ -2807,9 +3064,17 @@ mod tests {
                                 .unwrap();
                         // A claim counts as an attempt even though the runner died: remember it.
                         for lost in batch.claimed {
-                            *crash_claims
+                            let target = parse_delete_payload(&lost.payload_json).unwrap();
+                            let crashes = crash_claims
                                 .entry((lost.kind, lost.payload_json))
-                                .or_insert(0) += 1;
+                                .or_insert(0);
+                            *crashes += 1;
+                            if scripted.get(&target.message_id) == Some(&(lost.attempts - *crashes))
+                            {
+                                // Crash after the last transient, before confirming recovery:
+                                // legacy reconciliation clears the previous diagnostic.
+                                interrupted_recoveries.insert(target.message_id);
+                            }
                         }
                         let report =
                             w.db.call(move |c| {
@@ -2860,7 +3125,7 @@ mod tests {
                     break;
                 }
                 w.clock.advance(700);
-                tick(&w, 8).await;
+                tick(&w).await;
             }
             let rows = jobs(&w.db).await;
             assert!(
@@ -2923,16 +3188,15 @@ mod tests {
                     "seed {seed}: notice deletes only see transient faults"
                 );
             }
-            // Already-gone (404) sources raise no `DeleteFailed`: only the scripted transient
-            // faults do, one alert each.
+            // Already-gone (404) sources raise no `DeleteFailed`; only the transient chains do.
             assert_eq!(
                 w.net
                     .alerts()
                     .iter()
                     .filter(|a| **a == AlertCode::DeleteFailed)
                     .count(),
-                transient_scripted,
-                "seed {seed}: DeleteFailed alerts only for transient faults"
+                scripted.len() - interrupted_recoveries.len(),
+                "seed {seed}: one DeleteFailed alert per transient chain"
             );
         }
     }
