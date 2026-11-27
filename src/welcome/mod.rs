@@ -18,5 +18,6 @@
 #![allow(dead_code)]
 
 pub mod config;
+pub mod discord;
 pub mod render;
 pub mod runtime;

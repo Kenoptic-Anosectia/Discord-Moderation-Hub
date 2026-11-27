@@ -8,6 +8,7 @@ mod features;
 mod flash;
 mod jobs;
 mod preflight;
+mod preflight_wiring;
 mod privacy_scope;
 mod role_admin;
 mod role_menus;
@@ -1320,6 +1321,27 @@ mod tests {
             command_names(&framework_commands(false, &refused)),
             command_names(&configured_commands(false))
         );
+    }
+
+    #[test]
+    fn framework_commands_and_wiring_are_unchanged_by_welcome() {
+        let welcome = w2_plan(&[
+            ("WELCOME_MODE", "live"),
+            ("WELCOME_CHANNEL_ID", "770301"),
+            ("WELCOME_TEMPLATE_PATH", "welcome"),
+        ]);
+        assert!(welcome.welcome.is_some(), "the plan has welcome");
+        for tickets in [false, true] {
+            assert_eq!(
+                command_names(&framework_commands(tickets, &welcome)),
+                command_names(&configured_commands(tickets)),
+                "welcome adds no command (tickets={tickets})"
+            );
+        }
+        let wiring = app_wiring(&welcome, &|_| true, None);
+        assert!(wiring.flash_log_excluded.is_empty());
+        assert!(!wiring.wired.reaction_roles_owned);
+        assert!(wiring.wired.safeword.is_none());
     }
 
     #[test]
