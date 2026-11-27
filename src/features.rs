@@ -24,8 +24,11 @@ use crate::flash::runtime::{FlashDeps, FlashFeature, SerenityFlashPorts};
 use crate::jobs::queue::{self, ReconcileOutcome, Report};
 use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError, SystemClock};
 use crate::preflight;
+use crate::preflight_wiring::{startup_preflight, FactSource};
 use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
-use crate::role_menus::reactions::{self, ReactionEnv, ReactionRolesFeature, ReactionServices};
+use crate::role_menus::reactions::{
+    self, ReactionEnv, ReactionRolesFeature, ReactionServices, SafewordLookup,
+};
 use crate::roles::grant::{RoleWriter, Sleeper};
 use crate::roles::runtime::RoleSource;
 use crate::safeword::command::CommandConfig;
@@ -570,6 +573,8 @@ pub struct WelcomePlan {
     pub channel_id: u64,
     pub protected_role_ids: Vec<u64>,
     pub staff_alert_channel: Option<u64>,
+    /// The channels and roles a template may name (`{channel:KEY}`, `{role:KEY}`).
+    pub ids: IdMap,
 }
 
 impl FeaturePlan {
@@ -849,6 +854,7 @@ fn plan_welcome(
         channel_id,
         protected_role_ids: config.protected_role_ids.clone(),
         staff_alert_channel: config.staff_alert_channel_id,
+        ids: IdMap::default(),
     });
 }
 
@@ -1111,6 +1117,89 @@ pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
         )));
     }
     built
+}
+
+/// What [`start_gated`] needs.
+pub struct GatedStart<'a> {
+    pub plan: &'a FeaturePlan,
+    pub bot_user_id: u64,
+    pub http: Arc<serenity::Http>,
+    pub cache: Arc<serenity::Cache>,
+    pub facts: &'a dyn FactSource,
+    pub roles: &'a dyn RoleSource,
+    pub store: StoreSpec,
+    pub protected_role_ids: Vec<u64>,
+    /// Builds the reaction-role services; it gets the safeword lookup when the safeword runs.
+    pub reaction: &'a dyn Fn(Option<SafewordLookup>) -> Arc<dyn ReactionServices>,
+    pub read_template: &'a dyn Fn(&str) -> Option<String>,
+}
+
+/// What [`start_gated`] hands to `setup`.
+pub struct GatedFeatures<X, D> {
+    /// The features to register, in order.
+    pub features: Vec<Box<dyn Feature<X, D>>>,
+    /// The safeword runtime, present exactly when the safeword was planned AND passed.
+    pub safeword: Option<Arc<SafewordRuntime>>,
+    /// Preflight lines and the line of a welcome that could not be built. No id, path or value.
+    pub lines: Vec<String>,
+}
+
+/// Preflight, then build: the one place that turns "what the environment asked for" into "what
+/// is registered". RED STUB: builds from the plan as asked, ignoring the verdicts.
+pub async fn start_gated<X: Send + Sync + 'static, D: Send + Sync + 'static>(
+    request: GatedStart<'_>,
+) -> GatedFeatures<X, D> {
+    let gated = startup_preflight(
+        request.plan,
+        request.bot_user_id,
+        request.facts,
+        request.roles,
+    )
+    .await;
+    let mut lines = gated.lines;
+    let built_plan = request.plan.clone();
+    let safeword = safeword_runtime(
+        &built_plan,
+        SafewordParts {
+            http: request.http.clone(),
+            cache: request.cache.clone(),
+            bot_user_id: request.bot_user_id,
+            store: request.store,
+            protected_role_ids: request.protected_role_ids,
+        },
+    );
+    // Reaction roles ask the safeword store whether a member is under safeword.
+    let lookup: Option<SafewordLookup> = safeword.as_ref().map(|runtime| {
+        let runtime = runtime.clone();
+        Arc::new(move |guild: u64, member: u64| runtime.store().reaction_state(guild, member))
+            as SafewordLookup
+    });
+    let services = Services {
+        http: request.http.clone(),
+        cache: request.cache.clone(),
+        bot_user_id: request.bot_user_id,
+        reaction: (request.reaction)(lookup),
+        safeword: safeword.clone(),
+    };
+    let mut features: Vec<Box<dyn Feature<X, D>>> = production_features();
+    features.extend(build_features(&built_plan, &services));
+    if let Some(welcome) = &built_plan.welcome {
+        let ports = crate::welcome::discord::serenity_ports(
+            request.http.clone(),
+            request.cache.clone(),
+            welcome.home_guild,
+        );
+        match build_welcome(&built_plan, ports, request.bot_user_id, request.read_template) {
+            Ok(Some(feature)) => features.push(feature),
+            Ok(None) => {}
+            Err(line) => lines.push(line),
+        }
+    }
+    GatedFeatures {
+        features,
+        safeword,
+        lines,
+    }
 }
 
 /// The start-up decisions that depend on which planned features really started. Production
@@ -3667,6 +3756,7 @@ mod welcome_wiring_tests {
     const BOT_ROLE: u64 = 770_030;
     const FLASH_CH: u64 = 770_040;
     const SW_ROLE: u64 = 770_050;
+    const SW_RESTRICTED: u64 = 770_051;
 
     const TEMPLATE: &str = r#"{"embed":{"title":"Welcome {user_mention}","description":"You are our {member_ordinal} member."}}"#;
 
@@ -4080,7 +4170,7 @@ mod welcome_wiring_tests {
         let flash = find(preflight::Feature::Flash);
         assert_eq!(flash.channels, vec![FLASH_CH]);
         let safeword = find(preflight::Feature::Safeword);
-        assert_eq!(safeword.roles, vec![SW_ROLE]);
+        assert_eq!(safeword.roles, vec![SW_ROLE, SW_RESTRICTED]);
         assert_eq!(requests.len(), 3);
         // Shadow is requested as shadow: the gate never upgrades it.
         let shadow = plan_for(&welcome_keys("shadow"), &config());
@@ -4480,6 +4570,7 @@ mod welcome_wiring_tests {
             role(ROLE_MANAGED, 8, 0, true),
             role(ROLE_HIGH, 30, 0, false),
             role(SW_ROLE, 4, 0, false),
+            role(SW_RESTRICTED, 3, 0, false),
             role(GUILD, 0, 0, false),
         ]
     }
@@ -4911,5 +5002,317 @@ mod welcome_wiring_tests {
         fn remove_role(&mut self, _m: u64, _r: u64) -> Result<(), WriteError> {
             Ok(())
         }
+    }
+
+    // ---- W3a round 2: the production composition, the safeword rule, the id map -------------
+
+    fn names(composed: &GatedFeatures<u8, u16>) -> Vec<&'static str> {
+        composed.features.iter().map(|f| f.name()).collect()
+    }
+
+    async fn compose_with(
+        plan: &FeaturePlan,
+        facts: &FakeFacts,
+        roles: &FakeRoles,
+        read: &dyn Fn(&str) -> Option<String>,
+    ) -> GatedFeatures<u8, u16> {
+        start_gated::<u8, u16>(GatedStart {
+            plan,
+            bot_user_id: BOT,
+            http: Arc::new(serenity::Http::new("synthetic-token")),
+            cache: Arc::new(serenity::Cache::new()),
+            facts,
+            roles,
+            store: StoreSpec {
+                path: None,
+                reserved: vec![],
+            },
+            protected_role_ids: vec![],
+            reaction: &|_lookup| Arc::new(NoReaction),
+            read_template: read,
+        })
+        .await
+    }
+
+    async fn compose(plan: &FeaturePlan, facts: &FakeFacts, roles: &FakeRoles) -> GatedFeatures<u8, u16> {
+        compose_with(plan, facts, roles, &read_template).await
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_builds_only_what_the_preflight_lets_through() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut facts = healthy_facts();
+        facts.channels.insert(CHANNEL, Some(SEND_MESSAGES)); // welcome lacks EMBED_LINKS
+        let composed = compose(&plan, &facts, &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash", "safeword"]);
+        assert!(composed.safeword.is_some());
+        let text = composed.lines.join("\n");
+        assert!(
+            text.contains("Preflight welcome: disabled (missing_embed_links)"),
+            "{text}"
+        );
+        // And what is registered really starts: welcome opens no kind of its own.
+        let dir = scratch("compose-others-start");
+        let starter = Starter::default();
+        let f = start_welcome(composed.features, &dir, GuildFilter::Only(GUILD), &starter).await;
+        assert!(f.is_active("flash") && f.is_active("safeword"));
+        assert!(!f.is_active("welcome"));
+        assert!(!starter.kinds.lock().unwrap().join(" ").contains("welcome"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_safeword_leaves_no_runtime_and_takes_reaction_roles_with_it() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        let mut facts = healthy_facts();
+        facts.guild = Some(0); // no manage roles: the role features are refused
+        let composed = compose(&plan, &facts, &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash"]);
+        assert!(composed.safeword.is_none(), "no safeword runtime for a refused safeword");
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_builds_every_ready_feature_in_order() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        let composed = compose(&plan, &healthy_facts(), &healthy_roles()).await;
+        assert_eq!(
+            names(&composed),
+            vec!["flash", "safeword", reactions::FEATURE_NAME, "welcome"]
+        );
+        assert!(composed.safeword.is_some());
+        assert_eq!(
+            composed.lines,
+            vec![
+                "Preflight flash: ready".to_string(),
+                "Preflight safeword: ready".to_string(),
+                "Preflight welcome: ready".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_of_an_empty_plan_asks_builds_and_prints_nothing() {
+        let plan = plan_for(&[], &config());
+        let (facts, roles) = (FakeFacts::default(), FakeRoles::new(vec![], vec![]));
+        let composed = compose(&plan, &facts, &roles).await;
+        assert!(composed.features.is_empty() && composed.lines.is_empty());
+        assert!(composed.safeword.is_none());
+        assert_eq!(facts.calls() + roles.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_reports_a_template_it_cannot_use_by_code_only() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let composed = compose_with(
+            &plan,
+            &healthy_facts(),
+            &healthy_roles(),
+            &|_| Some("{\"secret\": 770010 not json".to_string()),
+        )
+        .await;
+        assert!(names(&composed).is_empty(), "no half-started welcome");
+        let text = composed.lines.join("\n");
+        assert!(text.contains("malformed_json"), "{text}");
+        assert!(!text.contains("secret") && !text.contains("770010"), "{text}");
+    }
+
+    // ---- welcome and the safeword restriction (K03 rule 6) ----------------------------------
+
+    #[test]
+    fn a_join_role_the_safeword_restricts_keeps_welcome_off_with_the_key_and_a_code() {
+        for roles in ["770051", "770050", "770020,770051", "770050,770020"] {
+            let mut pairs = all_keys();
+            pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+            pairs.push(("JOIN_ROLE_IDS", roles));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.safeword.is_some(), "{roles}");
+            assert!(plan.welcome.is_none(), "{roles}: welcome must not start");
+            let text = plan.lines.join("\n");
+            assert!(
+                text.contains("Feature welcome stays off: join role refused (JOIN_ROLE_IDS: safeword_restricted)"),
+                "{roles}: {text}"
+            );
+            assert!(!text.contains("7700"), "{roles}: no id in {text}");
+        }
+    }
+
+    #[test]
+    fn welcome_stays_off_while_a_requested_safeword_is_not_running() {
+        for mode in ["live", "shadow"] {
+            let mut pairs = all_keys();
+            pairs.retain(|(k, _)| *k != "SAFEWORD_ROLE_ID" && *k != "SAFEWORD_MODE");
+            pairs.push(("SAFEWORD_MODE", mode));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.safeword.is_none(), "{mode}: the safeword itself is refused");
+            assert!(plan.welcome.is_none(), "{mode}");
+            let text = plan.lines.join("\n");
+            assert!(
+                text.contains("Feature welcome stays off: safeword requested but not running (safeword_unavailable)"),
+                "{mode}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_safeword_requested_the_restricted_list_does_not_bind_welcome() {
+        let mut pairs = welcome_keys("live");
+        pairs.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "770020"));
+        pairs.push(("SAFEWORD_MODE", "off"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.welcome.is_some());
+        assert!(plan.lines.iter().all(|l| !l.contains("safeword")), "{:?}", plan.lines);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_join_role_never_starts_welcome_through_the_production_composition() {
+        let mut pairs = all_keys();
+        pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+        pairs.push(("JOIN_ROLE_IDS", "770051"));
+        let plan = plan_for(&pairs, &config());
+        let composed = compose(&plan, &healthy_facts(), &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash", "safeword"]);
+        // A member joining then reaches no welcome feature: nothing is granted or posted.
+        let dir = scratch("restricted-join");
+        let f = start_welcome(composed.features, &dir, GuildFilter::Only(GUILD), &Starter::default()).await;
+        assert!(!f.is_active("welcome"));
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_safeword_dropped_by_the_preflight_leaves_welcome_with_unrestricted_roles_only() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut entries = role_entries();
+        entries.retain(|e| e.id != SW_ROLE);
+        entries.push(RoleEntry {
+            id: SW_ROLE,
+            position: 30, // above the bot
+            managed: false,
+            permissions: 0,
+        });
+        let roles = FakeRoles::new(entries, vec![BOT_ROLE]);
+        let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
+        assert!(gated.plan.safeword.is_none());
+        let welcome = gated.plan.welcome.as_ref().expect("welcome still starts");
+        assert!(!welcome.config.join_role_ids.contains(&SW_RESTRICTED));
+        assert!(!welcome.config.join_role_ids.contains(&SW_ROLE));
+    }
+
+    // ---- the safeword preflight request names every role the swap writes -------------------
+
+    #[test]
+    fn the_safeword_request_names_its_role_and_each_restricted_role_once() {
+        let mut pairs = all_keys();
+        pairs.retain(|(k, _)| *k != "SAFEWORD_RESTRICTED_ROLE_IDS");
+        pairs.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "770051,770055,770051"));
+        let plan = plan_for(&pairs, &config());
+        let requests = preflight_requests(&plan);
+        let safeword = requests
+            .iter()
+            .find(|r| r.feature == preflight::Feature::Safeword)
+            .unwrap();
+        assert_eq!(safeword.roles, vec![SW_ROLE, 770_051, 770_055]);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_role_that_is_gone_or_above_the_bot_refuses_the_safeword_at_startup() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        // (the restricted role's entry in the guild, the code the line must carry)
+        let cases: Vec<(Option<u16>, &str)> = vec![(None, "role_missing"), (Some(21), "role_above_bot")];
+        for (position, code) in cases {
+            let mut entries = role_entries();
+            entries.retain(|e| e.id != SW_RESTRICTED);
+            if let Some(position) = position {
+                entries.push(RoleEntry {
+                    id: SW_RESTRICTED,
+                    position,
+                    managed: false,
+                    permissions: 0,
+                });
+            }
+            let roles = FakeRoles::new(entries, vec![BOT_ROLE]);
+            let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
+            let text = lines_text(&gated);
+            assert!(gated.plan.safeword.is_none(), "{code}: {text}");
+            assert!(gated.plan.reaction_roles.is_none(), "{code}: cascade");
+            assert!(text.contains("Preflight safeword: disabled"), "{code}: {text}");
+            assert!(text.contains(code), "{code}: {text}");
+            assert!(gated.plan.flash.is_some() && gated.plan.welcome.is_some());
+            assert!(!text.contains("770051"), "{code}: no id in {text}");
+        }
+    }
+
+    // ---- the id map of the template ----------------------------------------------------------
+
+    fn linked(mode: &'static str) -> Vec<(&'static str, &'static str)> {
+        let mut pairs = welcome_keys(mode);
+        pairs.push(("WELCOME_CHANNEL_LINKS", "rules=770060,tickets=770062"));
+        pairs.push(("WELCOME_ROLE_LINKS", "pings=770061"));
+        pairs
+    }
+
+    #[test]
+    fn the_template_links_are_planned_from_the_environment() {
+        let plan = plan_for(&linked("live"), &config());
+        let ids = &plan.welcome.as_ref().expect("planned").ids;
+        assert_eq!(ids.channel("rules"), Some(770_060));
+        assert_eq!(ids.channel("tickets"), Some(770_062));
+        assert_eq!(ids.role("pings"), Some(770_061));
+        assert_eq!(plan.lines.len(), 1, "{:?}", plan.lines);
+        assert!(!plan.lines[0].contains("7700"), "{:?}", plan.lines);
+    }
+
+    #[test]
+    fn a_bad_link_list_drops_welcome_with_its_key_and_a_code_and_a_mode_off_stays_silent() {
+        for (key, value) in [
+            ("WELCOME_CHANNEL_LINKS", "rules=0"),
+            ("WELCOME_CHANNEL_LINKS", "rules=770060,rules=770061"),
+            ("WELCOME_ROLE_LINKS", "../x=770061"),
+        ] {
+            let mut pairs = welcome_keys("live");
+            pairs.push((key, value));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.welcome.is_none(), "{key}={value}");
+            let text = plan.lines.join("\n");
+            assert!(text.contains(&format!("{key}: invalid_setting")), "{text}");
+            assert!(!text.contains("7700") && !text.contains("../x"), "{text}");
+            let mut off = welcome_keys("off");
+            off.push((key, value));
+            let plan = plan_for(&off, &config());
+            assert!(plan.lines.is_empty() && plan.welcome.is_none());
+        }
+    }
+
+    const LINK_TEMPLATE: &str = r#"{"embed":{"title":"Rules {channel:rules}","description":"Pick {role:pings}"}}"#;
+
+    #[tokio::test]
+    async fn a_template_that_links_a_channel_renders_the_linked_channel_for_a_joining_member() {
+        let log = Log::default();
+        let plan = plan_for(&linked("live"), &config());
+        let read = |key: &str| (key == "welcome").then(|| LINK_TEMPLATE.to_string());
+        let feature = build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports(&log), BOT, &read)
+            .ok()
+            .flatten()
+            .expect("built with its id map");
+        let dir = scratch("linked-template");
+        let f = start_welcome(vec![feature], &dir, GuildFilter::Only(GUILD), &Starter::default()).await;
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 1);
+        assert_eq!(
+            log.lines(),
+            vec![
+                format!("grant:{MEMBER}:{ROLE_LOW}"),
+                format!("send:{CHANNEL}:Rules <#770060>"),
+            ]
+        );
+        // Without the links in the environment the same template is refused at start.
+        let bare = plan_for(&welcome_keys("live"), &config());
+        let refused = build_welcome::<u8, u16, _, _, _, _, _, _>(&bare, ports(&log), BOT, &read);
+        let line = refused.err().expect("an unknown channel key is refused");
+        assert!(line.contains("template refused"), "{line}");
+        assert!(!line.contains("rules"), "no template text in {line}");
     }
 }
