@@ -22,6 +22,10 @@ release/
 .env.*
 !.env.example
 
+# Server-specific settings file (channel/role ids, modes). Never committed: copy
+# config.example.toml to config.toml and fill it in. Only the bot token stays in .env.
+/config.toml
+
 # Common secret/config variants
 *.secret
 *.secrets
