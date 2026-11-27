@@ -4052,16 +4052,43 @@ async fn main() -> Result<(), Error> {
                     for line in &plan.lines {
                         println!("{line}");
                     }
+                    // Startup preflight (W3a): the bot's real permissions and role positions are
+                    // checked for every planned feature; one that fails is not started. With
+                    // every feature off nothing is asked and nothing is printed.
+                    let bot_user_id = ready.user.id.get();
+                    let preflight_roles = roles::runtime::CachedRoleSource::new(
+                        roles::runtime::SerenityCacheSource {
+                            cache: ctx.cache.clone(),
+                        },
+                        roles::runtime::SerenityHttpSource {
+                            http: ctx.http.clone(),
+                        },
+                    );
+                    let gated = preflight_wiring::startup_preflight(
+                        &plan,
+                        bot_user_id,
+                        &preflight_wiring::SerenityFacts {
+                            http: ctx.http.clone(),
+                        },
+                        &preflight_roles,
+                    )
+                    .await;
+                    for line in &gated.lines {
+                        println!("{line}");
+                    }
+                    // What is built and started is the gated plan; what is wired (the log
+                    // exclusions, the legacy reaction arms) is still decided from `plan`.
+                    let built_plan = gated.plan;
                     let store = safeword::discord::StoreSpec {
                         path: feature_settings.core_db_path.clone(),
                         reserved: feature_settings.reserved_db_paths.clone(),
                     };
                     let safeword = features::safeword_runtime(
-                        &plan,
+                        &built_plan,
                         features::SafewordParts {
                             http: ctx.http.clone(),
                             cache: ctx.cache.clone(),
-                            bot_user_id: ready.user.id.get(),
+                            bot_user_id,
                             store,
                             protected_role_ids: config.protected_role_ids.clone(),
                         },
@@ -4077,7 +4104,7 @@ async fn main() -> Result<(), Error> {
                     let services = features::Services {
                         http: ctx.http.clone(),
                         cache: ctx.cache.clone(),
-                        bot_user_id: ready.user.id.get(),
+                        bot_user_id,
                         reaction: Arc::new(role_menus::reactions::SerenityReactionServices::new(
                             ctx.http.clone(),
                             ctx.cache.clone(),
@@ -4088,7 +4115,27 @@ async fn main() -> Result<(), Error> {
                         safeword: safeword.clone(),
                     };
                     let mut optional = features::production_features();
-                    optional.extend(features::build_features(&plan, &services));
+                    optional.extend(features::build_features(&built_plan, &services));
+                    if let Some(welcome_plan) = &built_plan.welcome {
+                        let ports = welcome::discord::serenity_ports(
+                            ctx.http.clone(),
+                            ctx.cache.clone(),
+                            welcome_plan.home_guild,
+                        );
+                        let read_template = |key: &str| {
+                            welcome::discord::read_template_file(
+                                std::path::Path::new(welcome::discord::TEMPLATE_DIR),
+                                key,
+                            )
+                        };
+                        match features::build_welcome(&built_plan, ports, bot_user_id, &read_template)
+                        {
+                            Ok(Some(feature)) => optional.push(feature),
+                            Ok(None) => {}
+                            // Welcome stays off: one line with a stable code, nothing else.
+                            Err(line) => println!("{line}"),
+                        }
+                    }
                     let features = Arc::new(
                         AppFeatures::start(
                             features::StartRequest {

@@ -8,28 +8,43 @@
 //! failure is reduced to a stable code before it leaves this file.
 
 use super::runtime::{
-    GuildFacts, GuildLookup, MessageSender, OutgoingMessage, SendError, StaffAlerter,
+    restart_policy, GuildFacts, GuildLookup, MessageSender, OutgoingMessage, SendError,
+    StaffAlerter, JOB_KIND_GRANT_ROLES, JOB_KIND_SEND_MESSAGE,
 };
 use crate::features::{Feature, JobSignal};
-use crate::jobs::runner::{BoxFuture, Registry, RunnerError};
+use crate::jobs::runner::{BoxFuture, HandlerError, Registry, RunnerError};
+use crate::role_menus::reactions::{alert_words, AlertThrottle};
+use crate::roles::runtime::{
+    drive_blocking, map_serenity_error, CachedRoleSource, SerenityCacheSource, SerenityHttpSource,
+    SerenityRoleWriter, TokioSleeper,
+};
 use poise::serenity_prelude as s;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
 /// The directory the template files are read from (relative to the working directory).
 pub const TEMPLATE_DIR: &str = "welcome_templates";
 
+/// The largest template file that is read, in bytes.
+pub const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
+
+/// The stable code of a job of a welcome kind: join handling is inline, nothing schedules one.
+pub const CODE_JOB_NOT_SCHEDULED: &str = "welcome_job_not_scheduled";
+
 /// The unix second now. A trait so the flood control can be tested with a fake clock.
 pub trait UnixClock: Send + Sync {
     fn now_secs(&self) -> i64;
 }
 
-/// The real clock.
+/// The real clock (0 if the system clock is before 1970).
 pub struct SystemUnixClock;
 
 impl UnixClock for SystemUnixClock {
     fn now_secs(&self) -> i64 {
-        0
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
     }
 }
 
@@ -38,66 +53,166 @@ pub trait AlertPost: Send + Sync {
     fn post(&self, channel_id: u64, text: &str);
 }
 
-/// Posts alerts over serenity with an empty allowed-mentions object.
+/// Posts alerts over serenity. The allowed-mentions object is empty, so no mention can fire.
 pub struct SerenityAlertPost {
     pub http: Arc<s::Http>,
 }
 
 impl AlertPost for SerenityAlertPost {
-    fn post(&self, _channel_id: u64, _text: &str) {}
+    fn post(&self, channel_id: u64, text: &str) {
+        if channel_id == 0 {
+            return;
+        }
+        let http = self.http.clone();
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let message = s::builder::CreateMessage::new()
+                .content(text)
+                .allowed_mentions(s::builder::CreateAllowedMentions::new());
+            let _ = s::ChannelId::new(channel_id)
+                .send_message(&http, message)
+                .await;
+        });
+    }
 }
 
-/// The production alerter: one alert per code per window across joins.
+/// The production alerter: one alert per code per 300 s, across joins.
+///
+/// It reuses the W2 reaction-role throttle (`AlertThrottle`, which is generic over the text), so
+/// a burst of joins that fail for the same reason raises one alert, and the same code is let
+/// through again once the window has passed. The key is the stable code: the text is built from
+/// its lower-case words only, so no id, name or number can reach the staff channel.
 pub struct FloodControlledAlerter<C, P> {
     clock: C,
     post: P,
+    throttle: AlertThrottle,
 }
 
 impl<C: UnixClock, P: AlertPost> FloodControlledAlerter<C, P> {
     pub fn new(clock: C, post: P) -> Self {
-        FloodControlledAlerter { clock, post }
+        FloodControlledAlerter {
+            clock,
+            post,
+            throttle: AlertThrottle::default(),
+        }
     }
 }
 
 impl<C: UnixClock, P: AlertPost> StaffAlerter for FloodControlledAlerter<C, P> {
     fn alert(&mut self, channel_id: u64, code: &str) {
-        let _ = &self.clock;
-        self.post.post(channel_id, code);
+        let text = format!("welcome alert: {}", alert_words(code));
+        if self.throttle.allow(&text, self.clock.now_secs()) {
+            self.post.post(channel_id, &text);
+        }
     }
 }
 
 /// The Discord message for one welcome, as a serenity builder.
-pub fn message_payload(_message: &OutgoingMessage) -> s::builder::CreateMessage {
-    s::builder::CreateMessage::new()
+///
+/// Only the listed users may be mentioned; `everyone` and roles never are, whatever the data
+/// says. An id of 0 is not an id and is dropped.
+pub fn message_payload(message: &OutgoingMessage) -> s::builder::CreateMessage {
+    let mut embed = s::builder::CreateEmbed::new();
+    if let Some(title) = &message.embed.title {
+        embed = embed.title(title);
+    }
+    if let Some(description) = &message.embed.description {
+        embed = embed.description(description);
+    }
+    for field in &message.embed.fields {
+        embed = embed.field(&field.name, &field.value, field.inline);
+    }
+    if let Some(footer) = &message.embed.footer_text {
+        embed = embed.footer(s::builder::CreateEmbedFooter::new(footer));
+    }
+    if let Some(author) = &message.embed.author_name {
+        embed = embed.author(s::builder::CreateEmbedAuthor::new(author));
+    }
+    let users: Vec<s::UserId> = message
+        .allowed_mentions
+        .users
+        .iter()
+        .filter(|id| **id != 0)
+        .map(|id| s::UserId::new(*id))
+        .collect();
+    let mut payload = s::builder::CreateMessage::new()
+        .embed(embed)
+        .allowed_mentions(s::builder::CreateAllowedMentions::new().users(users));
+    if let Some(content) = &message.content {
+        payload = payload.content(content);
+    }
+    payload
 }
 
-/// Posts the welcome over serenity.
+/// Posts the welcome over serenity. The call is driven like the role writer's.
 pub struct SerenityMessageSender {
     pub http: Arc<s::Http>,
     pub handle: tokio::runtime::Handle,
 }
 
 impl MessageSender for SerenityMessageSender {
-    fn send(&mut self, _channel_id: u64, _message: &OutgoingMessage) -> Result<(), SendError> {
-        Ok(())
+    fn send(&mut self, channel_id: u64, message: &OutgoingMessage) -> Result<(), SendError> {
+        if channel_id == 0 {
+            return Err(SendError {
+                status: 0,
+                api_code: None,
+            });
+        }
+        let http = self.http.clone();
+        let payload = message_payload(message);
+        let outcome = drive_blocking(&self.handle, async move {
+            s::ChannelId::new(channel_id)
+                .send_message(&http, payload)
+                .await
+        })
+        .map_err(|error| SendError {
+            status: error.status,
+            api_code: error.api_code,
+        })?;
+        outcome.map(|_| ()).map_err(|error| {
+            let failure = map_serenity_error(&error);
+            SendError {
+                status: failure.status,
+                api_code: failure.api_code,
+            }
+        })
     }
 }
 
-/// Guild facts from the serenity cache.
+/// Guild facts from the serenity cache. A guild the cache does not hold gives `None`, and the
+/// welcome is rendered without them.
 pub struct SerenityGuildLookup {
     pub cache: Arc<s::Cache>,
 }
 
 #[s::async_trait]
 impl GuildLookup for SerenityGuildLookup {
-    async fn guild_facts(&self, _guild_id: u64) -> Option<GuildFacts> {
-        None
+    async fn guild_facts(&self, guild_id: u64) -> Option<GuildFacts> {
+        if guild_id == 0 {
+            return None;
+        }
+        let guild = self.cache.guild(s::GuildId::new(guild_id))?;
+        Some(GuildFacts {
+            name: guild.name.clone(),
+            member_count: guild.member_count,
+        })
     }
 }
 
-/// Reads `<dir>/<key>.json`; `None` when it cannot be read or is too large.
-pub fn read_template_file(_dir: &Path, _key: &str) -> Option<String> {
-    None
+/// Reads `<dir>/<key>.json`.
+///
+/// `None` when the key is not plainly valid (the EM1 rule: one canonical spelling that cannot
+/// leave the directory), the file cannot be read, or it is larger than
+/// [`MAX_TEMPLATE_BYTES`].
+pub fn read_template_file(dir: &Path, key: &str) -> Option<String> {
+    crate::embeds::posts::validate_key(key).ok()?;
+    let file = std::fs::File::open(dir.join(format!("{key}.json"))).ok()?;
+    let mut text = String::new();
+    // One byte more than the limit is read, so a file over the limit is seen as such.
+    file.take(MAX_TEMPLATE_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= MAX_TEMPLATE_BYTES).then_some(text)
 }
 
 /// The collaborators of the welcome runtime.
@@ -110,7 +225,44 @@ pub struct WelcomePorts<S, W, P, M, A, G> {
     pub guilds: G,
 }
 
-/// The welcome feature as the registry sees it: adds the core database and the two job kinds.
+/// The production ports over serenity.
+pub type SerenityPorts = WelcomePorts<
+    CachedRoleSource<SerenityCacheSource, SerenityHttpSource>,
+    SerenityRoleWriter,
+    TokioSleeper,
+    SerenityMessageSender,
+    FloodControlledAlerter<SystemUnixClock, SerenityAlertPost>,
+    SerenityGuildLookup,
+>;
+
+/// Builds the production ports for the home guild. It must be called inside the tokio runtime
+/// (the writer, the sender and the sleeper keep its handle). Role facts come from the cache first
+/// and HTTP on a miss, the role write is serenity's `add_member_role`, and alerts go through the
+/// flood control.
+pub fn serenity_ports(http: Arc<s::Http>, cache: Arc<s::Cache>, home_guild: u64) -> SerenityPorts {
+    let handle = tokio::runtime::Handle::current();
+    WelcomePorts {
+        source: CachedRoleSource::new(
+            SerenityCacheSource {
+                cache: cache.clone(),
+            },
+            SerenityHttpSource { http: http.clone() },
+        ),
+        writer: SerenityRoleWriter::new(home_guild, http.clone(), handle.clone()),
+        sleeper: TokioSleeper::new(handle.clone()),
+        sender: SerenityMessageSender {
+            http: http.clone(),
+            handle,
+        },
+        alerter: FloodControlledAlerter::new(SystemUnixClock, SerenityAlertPost { http }),
+        guilds: SerenityGuildLookup { cache },
+    }
+}
+
+/// The welcome feature as the registry sees it.
+///
+/// It wraps the feature of `runtime.rs` and adds what the registry needs and that file does not
+/// say: the core database, the two job kinds, and a second guild check (the home guild only).
 pub struct WelcomeJobs<X, D> {
     inner: Box<dyn Feature<X, D>>,
     home_guild: u64,
@@ -131,7 +283,20 @@ impl<X: Send + Sync + 'static, D: Send + Sync + 'static> Feature<X, D> for Welco
         self.inner.enabled()
     }
 
-    fn register_jobs(&self, _registry: &mut Registry) -> Result<(), RunnerError> {
+    fn needs_core_db(&self) -> bool {
+        true
+    }
+
+    /// Registers `welcome_grant_roles` and `welcome_send_message`, both with the restart policy
+    /// of `runtime::restart_policy` (`AtMostOnce`: a crash abandons the job and never repeats
+    /// it). A join is handled inline, so nothing schedules these kinds yet: a job that does
+    /// exist fails terminally with [`CODE_JOB_NOT_SCHEDULED`] and claims no effect.
+    fn register_jobs(&self, registry: &mut Registry) -> Result<(), RunnerError> {
+        for kind in [JOB_KIND_GRANT_ROLES, JOB_KIND_SEND_MESSAGE] {
+            registry.register(kind, restart_policy(kind), |_job| async {
+                Err(HandlerError::terminal(CODE_JOB_NOT_SCHEDULED))
+            })?;
+        }
         Ok(())
     }
 
@@ -147,7 +312,9 @@ impl<X: Send + Sync + 'static, D: Send + Sync + 'static> Feature<X, D> for Welco
         guild: Option<u64>,
         core_db: Option<&'a tokio_rusqlite::Connection>,
     ) -> BoxFuture<'a, ()> {
-        let _ = self.home_guild;
+        if guild != Some(self.home_guild) {
+            return Box::pin(async {});
+        }
         self.inner.handle(ctx, event, data, guild, core_db)
     }
 }

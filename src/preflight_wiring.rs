@@ -6,9 +6,9 @@
 //! `RoleSource` (roles), so it is tested offline; only [`SerenityFacts`] touches Discord and it
 //! has never run against Discord. A failed lookup is an unknown fact, never a pass.
 
-use crate::features::{FeaturePlan, Gated};
-use crate::preflight::{FeatureRequest, PreflightInput};
-use crate::roles::runtime::RoleSource;
+use crate::features::{gate_plan, preflight_requests, FeaturePlan, Gated};
+use crate::preflight::{FeatureRequest, PermissionLookup, PreflightInput, RoleFactsEntry};
+use crate::roles::runtime::{bot_top_position, role_facts, FactsOutcome, RoleSource};
 use poise::serenity_prelude as s;
 use std::sync::Arc;
 
@@ -27,24 +27,63 @@ pub trait FactSource: Send + Sync {
     ) -> Option<u64>;
 }
 
-/// The facts over serenity's HTTP client.
+/// The facts over serenity's HTTP client: the guild, the bot's member and the channel are read
+/// and the bits computed by serenity's own permission functions. An id of 0 is not an id and is
+/// answered `None` before any call (serenity would panic on it).
 pub struct SerenityFacts {
     pub http: Arc<s::Http>,
 }
 
+impl SerenityFacts {
+    async fn guild_and_member(
+        &self,
+        guild_id: u64,
+        bot_user_id: u64,
+    ) -> Option<(s::PartialGuild, s::Member)> {
+        if guild_id == 0 || bot_user_id == 0 {
+            return None;
+        }
+        let guild_id = s::GuildId::new(guild_id);
+        let guild = self.http.get_guild(guild_id).await.ok()?;
+        let member = self
+            .http
+            .get_member(guild_id, s::UserId::new(bot_user_id))
+            .await
+            .ok()?;
+        Some((guild, member))
+    }
+}
+
 #[s::async_trait]
 impl FactSource for SerenityFacts {
-    async fn guild_permissions(&self, _guild_id: u64, _bot_user_id: u64) -> Option<u64> {
-        None
+    async fn guild_permissions(&self, guild_id: u64, bot_user_id: u64) -> Option<u64> {
+        let (guild, member) = self.guild_and_member(guild_id, bot_user_id).await?;
+        Some(guild.member_permissions(&member).bits())
     }
 
     async fn channel_permissions(
         &self,
-        _guild_id: u64,
-        _bot_user_id: u64,
-        _channel_id: u64,
+        guild_id: u64,
+        bot_user_id: u64,
+        channel_id: u64,
     ) -> Option<u64> {
-        None
+        if channel_id == 0 {
+            return None;
+        }
+        let (guild, member) = self.guild_and_member(guild_id, bot_user_id).await?;
+        let channel = self
+            .http
+            .get_channel(s::ChannelId::new(channel_id))
+            .await
+            .ok()?;
+        let s::Channel::Guild(channel) = channel else {
+            return None;
+        };
+        // A channel of another guild is not a fact about this one.
+        if channel.guild_id.get() != guild_id {
+            return None;
+        }
+        Some(guild.user_permissions_in(&channel, &member).bits())
     }
 }
 
@@ -55,30 +94,127 @@ pub struct Target {
     pub bot_user_id: u64,
 }
 
-/// Gathers the preflight input for these requests.
-pub async fn gather(
-    _target: Target,
-    requests: Vec<FeatureRequest>,
-    _facts: &dyn FactSource,
-    _roles: &dyn RoleSource,
-) -> PreflightInput {
-    PreflightInput {
-        features: requests,
-        ..PreflightInput::default()
+/// Pushes `id` once.
+fn push_unique(ids: &mut Vec<u64>, id: u64) {
+    if !ids.contains(&id) {
+        ids.push(id);
     }
 }
 
-/// Runs the startup preflight for a plan: gathers, evaluates and gates.
+/// Gathers the preflight input for these requests.
+///
+/// A permission lookup that fails is `None` for a channel (`permissions_unknown`) and zero bits
+/// for the guild level (no permission: `missing_manage_roles`). A role list that cannot be read
+/// makes every wanted role `Unavailable`; a bot whose own roles cannot be read has an unknown
+/// top position, never zero. A zero guild or bot id asks nobody and everything stays unknown.
+/// Roles are only looked up when some request names one.
+pub async fn gather(
+    target: Target,
+    requests: Vec<FeatureRequest>,
+    facts: &dyn FactSource,
+    roles: &dyn RoleSource,
+) -> PreflightInput {
+    let mut channels: Vec<u64> = Vec::new();
+    let mut wanted_roles: Vec<u64> = Vec::new();
+    for request in &requests {
+        for channel in &request.channels {
+            push_unique(&mut channels, *channel);
+        }
+        for role in &request.roles {
+            push_unique(&mut wanted_roles, *role);
+        }
+    }
+    let askable = target.guild_id != 0 && target.bot_user_id != 0;
+
+    let guild_permissions = if askable {
+        facts
+            .guild_permissions(target.guild_id, target.bot_user_id)
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut channel_permissions = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let bits = if askable {
+            facts
+                .channel_permissions(target.guild_id, target.bot_user_id, channel)
+                .await
+        } else {
+            None
+        };
+        channel_permissions.push(match bits {
+            Some(bits) => PermissionLookup::known(channel, bits),
+            None => PermissionLookup::unknown(channel),
+        });
+    }
+
+    let mut role_entries: Vec<RoleFactsEntry> = Vec::new();
+    let mut bot_top: Option<u16> = None;
+    let listed = if askable && !wanted_roles.is_empty() {
+        roles.roles(target.guild_id).await.ok()
+    } else {
+        None
+    };
+    match listed {
+        Some(list) => {
+            bot_top = roles
+                .member_roles(target.guild_id, target.bot_user_id)
+                .await
+                .ok()
+                .map(|held| bot_top_position(&list, &held));
+            for role_id in wanted_roles {
+                role_entries.push(RoleFactsEntry {
+                    role_id,
+                    outcome: role_facts(&list, role_id),
+                });
+            }
+        }
+        None => {
+            for role_id in wanted_roles {
+                role_entries.push(RoleFactsEntry {
+                    role_id,
+                    outcome: FactsOutcome::Unavailable,
+                });
+            }
+        }
+    }
+
+    PreflightInput {
+        features: requests,
+        guild_permissions,
+        channel_permissions,
+        category_permissions: Vec::new(),
+        role_facts: role_entries,
+        bot_top_position: bot_top,
+    }
+}
+
+/// Runs the startup preflight for a plan: gathers the facts, evaluates, and returns the plan
+/// with every feature that may not run removed, plus the lines to print.
+///
+/// With nothing requested (every feature off) nothing is asked of Discord, nothing is evaluated
+/// and no line is returned: the plan comes back unchanged.
 pub async fn startup_preflight(
     plan: &FeaturePlan,
-    _bot_user_id: u64,
-    _facts: &dyn FactSource,
-    _roles: &dyn RoleSource,
+    bot_user_id: u64,
+    facts: &dyn FactSource,
+    roles: &dyn RoleSource,
 ) -> Gated {
-    Gated {
-        plan: plan.clone(),
-        lines: Vec::new(),
+    let requests = preflight_requests(plan);
+    if requests.is_empty() {
+        return Gated {
+            plan: plan.clone(),
+            lines: Vec::new(),
+        };
     }
+    let target = Target {
+        guild_id: plan.home_guild.unwrap_or(0),
+        bot_user_id,
+    };
+    let input = gather(target, requests, facts, roles).await;
+    gate_plan(plan, &input)
 }
 
 #[cfg(test)]

@@ -26,6 +26,8 @@ use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError
 use crate::preflight;
 use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
 use crate::role_menus::reactions::{self, ReactionEnv, ReactionRolesFeature, ReactionServices};
+use crate::roles::grant::{RoleWriter, Sleeper};
+use crate::roles::runtime::RoleSource;
 use crate::safeword::command::CommandConfig;
 use crate::safeword::config::{self as safeword_config, SafewordConfig};
 use crate::safeword::discord::{
@@ -35,7 +37,12 @@ use crate::settings::{parse_id_list, parse_mode, Mode};
 use crate::storage;
 use crate::tickets::privacy::{ChannelLookup, Lookup};
 use crate::welcome::config::{self as welcome_config, WelcomeConfig};
-use crate::welcome::discord::WelcomePorts;
+use crate::welcome::discord::{WelcomeJobs, WelcomePorts};
+use crate::welcome::render::{IdMap, WelcomeTemplate};
+use crate::welcome::runtime::{
+    validate_join_roles, GrantPolicy, GuildLookup, MessageSender, StaffAlerter, WelcomeFeature,
+    WelcomeRuntime,
+};
 use poise::serenity_prelude as serenity;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -776,43 +783,260 @@ pub fn plan_features(lookup: &dyn Fn(&str) -> Option<String>, config: &Config) -
     plan
 }
 
-/// Plans the welcome feature. RED stub: plans nothing.
+/// Plans the welcome feature (`docs/verification/WIRING-C1.md`). A mode that is off is silent. A
+/// mode that is on but cannot run is dropped with one line naming a key or a stable code.
 fn plan_welcome(
-    _plan: &mut FeaturePlan,
-    _lookup: &dyn Fn(&str) -> Option<String>,
-    _config: &Config,
-    _home: Option<u64>,
+    plan: &mut FeaturePlan,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    config: &Config,
+    home: Option<u64>,
 ) {
+    if !mode_requested(lookup, welcome_config::KEY_MODE) {
+        return;
+    }
+    let Some(home_guild) = home else {
+        plan.lines.push(stays_off(
+            "welcome",
+            "home guild missing (home_guild_missing)",
+        ));
+        return;
+    };
+    // The join roles are checked against the protected-role rule; an unusable list cannot be
+    // read as "nothing is protected".
+    if config.invalid_core_keys.contains(&PROTECTED_ROLE_IDS_KEY) {
+        plan.lines.push(stays_off(
+            "welcome",
+            "protected role list unusable (protected_roles_invalid)",
+        ));
+        return;
+    }
+    let parsed = welcome_config::parse(|key| lookup(key).map(std::ffi::OsString::from));
+    if !parsed.invalid_keys.is_empty() {
+        let keys: Vec<String> = parsed
+            .invalid_keys
+            .iter()
+            .map(|key| format!("{key}: invalid_setting"))
+            .collect();
+        plan.lines.push(stays_off(
+            "welcome",
+            &format!("setting refused ({})", keys.join(", ")),
+        ));
+        return;
+    }
+    let Some(channel_id) = parsed.channel_id else {
+        plan.lines
+            .push(stays_off("welcome", "no channel set (no_channel)"));
+        return;
+    };
+    if parsed.template_path.is_none() {
+        plan.lines
+            .push(stays_off("welcome", "no template set (no_template)"));
+        return;
+    }
+    plan.lines.push(format!(
+        "Feature welcome on: mode={}; join roles={}; staff alerts={}.",
+        mode_word(parsed.mode),
+        parsed.join_role_ids.len(),
+        if config.staff_alert_channel_id.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    ));
+    plan.welcome = Some(WelcomePlan {
+        config: parsed,
+        home_guild,
+        channel_id,
+        protected_role_ids: config.protected_role_ids.clone(),
+        staff_alert_channel: config.staff_alert_channel_id,
+    });
 }
 
-/// What the preflight is asked about, for the planned features. RED stub: nothing.
-pub fn preflight_requests(_plan: &FeaturePlan) -> Vec<preflight::FeatureRequest> {
-    Vec::new()
+/// What the preflight is asked about: one request per planned feature that grants roles or posts
+/// into channels (flash, safeword, welcome), with that feature's own ids. Empty when none is
+/// planned, and then nothing is looked up and nothing is printed.
+pub fn preflight_requests(plan: &FeaturePlan) -> Vec<preflight::FeatureRequest> {
+    let mut requests = Vec::new();
+    if let Some(flash) = &plan.flash {
+        let mut request = preflight::FeatureRequest::new(preflight::Feature::Flash, flash.mode());
+        request.channels = flash.policy().channel_ids().to_vec();
+        requests.push(request);
+    }
+    if let Some(command) = &plan.safeword {
+        let mut request =
+            preflight::FeatureRequest::new(preflight::Feature::Safeword, command.safeword.mode);
+        request.roles = vec![command.safeword.role_id];
+        requests.push(request);
+    }
+    if let Some(welcome) = &plan.welcome {
+        let mut request =
+            preflight::FeatureRequest::new(preflight::Feature::Welcome, welcome.config.mode);
+        request.channels = vec![welcome.channel_id];
+        request.roles = welcome.config.join_role_ids.clone();
+        requests.push(request);
+    }
+    requests
 }
 
-/// The plan after the preflight gate, and the lines to print. RED stub: unchanged.
+/// The plan after the startup preflight, and the lines to print for it.
 #[derive(Clone, Debug)]
 pub struct Gated {
+    /// The plan with every feature that may not run removed.
     pub plan: FeaturePlan,
+    /// Feature names, statuses and stable codes only: never an id, a name, a path or a value.
     pub lines: Vec<String>,
 }
 
-/// Applies the preflight verdicts to a plan. RED stub: unchanged.
-pub fn gate_plan(plan: &FeaturePlan, _input: &preflight::PreflightInput) -> Gated {
-    Gated {
-        plan: plan.clone(),
-        lines: Vec::new(),
+/// The reason text of a feature the preflight does not let start, or `None` when it may start.
+/// A planned feature with no verdict at all does not start (fail closed).
+fn not_ready(report: &preflight::Report, feature: preflight::Feature) -> Option<String> {
+    match report.feature(feature) {
+        Some(entry) if entry.status == preflight::Status::Ready => None,
+        Some(entry) if entry.reasons.is_empty() => Some("preflight_not_ready".to_string()),
+        Some(entry) => Some(
+            entry
+                .reasons
+                .iter()
+                .map(|reason| reason.code())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        None => Some("preflight_no_verdict".to_string()),
     }
 }
 
-/// Builds the welcome feature from its plan. RED stub: builds nothing.
+/// Applies the preflight verdicts to a plan. Pure.
+///
+/// A planned feature whose verdict is not `ready` is removed from the plan (it is not started)
+/// with a line naming the reason codes. The welcome join roles are also checked against the role
+/// policy with the facts the preflight gathered (`validate_join_roles`): a refused role removes
+/// welcome with the key `JOIN_ROLE_IDS` and the policy code. A safeword that does not start takes
+/// reaction roles with it, as the plan already does for a safeword that cannot be planned.
+pub fn gate_plan(plan: &FeaturePlan, input: &preflight::PreflightInput) -> Gated {
+    let report = preflight::evaluate(input);
+    let mut gated = plan.clone();
+    let mut lines: Vec<String> = report
+        .render_lines()
+        .into_iter()
+        .map(|line| format!("Preflight {line}"))
+        .collect();
+    if gated.flash.is_some() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Flash) {
+            gated.flash = None;
+            lines.push(stays_off("flash", &format!("preflight disabled ({why})")));
+        }
+    }
+    if gated.safeword.is_some() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Safeword) {
+            gated.safeword = None;
+            lines.push(stays_off(
+                "safeword",
+                &format!("preflight disabled ({why})"),
+            ));
+            if gated.reaction_roles.take().is_some() {
+                lines.push(stays_off(
+                    "reaction_roles",
+                    "safeword requested but not running (safeword_unavailable)",
+                ));
+            }
+        }
+    }
+    if let Some(welcome) = gated.welcome.clone() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Welcome) {
+            gated.welcome = None;
+            lines.push(stays_off("welcome", &format!("preflight disabled ({why})")));
+        } else {
+            let refusals = validate_join_roles(
+                &welcome.config.join_role_ids,
+                welcome.home_guild,
+                &welcome.protected_role_ids,
+                input.bot_top_position,
+                &input.role_facts,
+            );
+            let mut codes: Vec<&'static str> = Vec::new();
+            for refusal in &refusals {
+                if !codes.contains(&refusal.reason) {
+                    codes.push(refusal.reason);
+                }
+            }
+            if !refusals.is_empty() {
+                gated.welcome = None;
+                let key = refusals[0].key;
+                for code in codes {
+                    lines.push(stays_off(
+                        "welcome",
+                        &format!("join role refused ({key}: {code})"),
+                    ));
+                }
+            }
+        }
+    }
+    Gated { plan: gated, lines }
+}
+
+/// Builds the welcome feature from its plan: reads and validates the template, wires the runtime
+/// to the given ports and wraps it for the registry (core database, two job kinds, home guild).
+/// `Ok(None)` when welcome is not planned. An unusable template stops welcome with one line that
+/// names a stable code (`template_unreadable`, or the template's own refusal code) and nothing
+/// from the file.
 pub fn build_welcome<X, D, S, W, P, M, A, G>(
-    _plan: &FeaturePlan,
-    _ports: WelcomePorts<S, W, P, M, A, G>,
-    _bot_user_id: u64,
-    _read_template: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<Box<dyn Feature<X, D>>>, String> {
-    Ok(None)
+    plan: &FeaturePlan,
+    ports: WelcomePorts<S, W, P, M, A, G>,
+    bot_user_id: u64,
+    read_template: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Box<dyn Feature<X, D>>>, String>
+where
+    X: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    S: RoleSource + Send + Sync + 'static,
+    W: RoleWriter + Send + Sync + 'static,
+    P: Sleeper + Send + Sync + 'static,
+    M: MessageSender + Send + Sync + 'static,
+    A: StaffAlerter + Send + Sync + 'static,
+    G: GuildLookup + 'static,
+{
+    let Some(welcome) = &plan.welcome else {
+        return Ok(None);
+    };
+    let key = welcome.config.template_path.as_deref().unwrap_or("");
+    let Some(source) = read_template(key) else {
+        return Err(stays_off(
+            "welcome",
+            "template unreadable (template_unreadable)",
+        ));
+    };
+    let ids = IdMap::default();
+    let template = WelcomeTemplate::load(&source, &ids).map_err(|error| {
+        stays_off(
+            "welcome",
+            &format!(
+                "template refused ({}: {})",
+                welcome_config::KEY_TEMPLATE_PATH,
+                error.kind().code()
+            ),
+        )
+    })?;
+    let runtime = WelcomeRuntime {
+        config: welcome.config.clone(),
+        template,
+        ids,
+        source: ports.source,
+        writer: ports.writer,
+        sleeper: ports.sleeper,
+        sender: ports.sender,
+        alerter: ports.alerter,
+        staff_alert_channel: welcome.staff_alert_channel,
+        bot_user_id,
+        grant_policy: GrantPolicy {
+            protected_role_ids: welcome.protected_role_ids.clone(),
+            ..GrantPolicy::default()
+        },
+    };
+    let feature = WelcomeFeature::new(runtime, ports.guilds);
+    Ok(Some(Box::new(WelcomeJobs::new(
+        Box::new(feature),
+        welcome.home_guild,
+    ))))
 }
 
 /// What building the features needs from Discord.
@@ -3443,7 +3667,6 @@ mod welcome_wiring_tests {
     const BOT_ROLE: u64 = 770_030;
     const FLASH_CH: u64 = 770_040;
     const SW_ROLE: u64 = 770_050;
-    const SW_RESTRICTED: u64 = 770_051;
 
     const TEMPLATE: &str = r#"{"embed":{"title":"Welcome {user_mention}","description":"You are our {member_ordinal} member."}}"#;
 
@@ -3769,7 +3992,7 @@ mod welcome_wiring_tests {
             }
             pairs
         };
-        let cases = vec![
+        let cases = [
             Case {
                 pairs: welcome_keys("live"),
                 config: no_home,
@@ -3876,6 +4099,23 @@ mod welcome_wiring_tests {
             &read_template,
         );
         assert!(matches!(built, Ok(None)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_production_ports_satisfy_the_build_without_any_call_to_discord() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let ports = crate::welcome::discord::serenity_ports(
+            Arc::new(serenity::Http::new("synthetic-token")),
+            Arc::new(serenity::Cache::new()),
+            GUILD,
+        );
+        let built = build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports, BOT, &read_template);
+        let feature = built
+            .ok()
+            .flatten()
+            .expect("built from the production ports");
+        assert_eq!(feature.name(), "welcome");
+        assert!(feature.needs_core_db());
     }
 
     #[test]
@@ -4343,7 +4583,7 @@ mod welcome_wiring_tests {
         let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
         assert!(gated.plan.welcome.is_none() && gated.plan.safeword.is_none());
         assert!(gated.plan.flash.is_some(), "flash grants no role");
-        assert!(lines_text(&gated).contains("role_facts_unavailable"));
+        assert!(lines_text(&gated).contains("bot_top_position_unknown"));
     }
 
     fn input_with_roles(plan: &FeaturePlan, role_facts: Vec<RoleFactsEntry>) -> PreflightInput {
