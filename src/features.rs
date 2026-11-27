@@ -4243,6 +4243,56 @@ mod welcome_wiring_tests {
     }
 
     #[tokio::test]
+    async fn a_crash_between_claim_and_completion_abandons_welcome_jobs_on_the_real_runner() {
+        use crate::jobs::queue::{self as jq, NewJob, ScheduleOutcome};
+        let log = Log::default();
+        let dir = scratch("crash-restart");
+        let path = dir.join("core.sqlite");
+        {
+            let mut conn = crate::storage::open(&path.to_string_lossy(), &[]).unwrap();
+            jq::init(&mut conn).unwrap();
+            let now = 1_700_000_000i64;
+            for (kind, key) in [
+                ("welcome_grant_roles", "join-1-roles"),
+                ("welcome_send_message", "join-1-message"),
+            ] {
+                let job = NewJob {
+                    kind,
+                    dedupe_key: key,
+                    payload_json: "{}",
+                    due_at: now,
+                };
+                let ScheduleOutcome::Created { id } = jq::schedule(&conn, &job, now).unwrap()
+                else {
+                    panic!("a fresh key is created");
+                };
+                // The worker claimed it and the process died before it finished.
+                assert!(jq::try_claim(&conn, id, now).unwrap());
+            }
+        }
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = Features::start(
+            StartRequest {
+                features: build_one(&plan, &log),
+                settings: &core_settings(&path, GuildFilter::Only(GUILD)),
+            },
+            &TokioJobStarter,
+        )
+        .await;
+        let started = f.lines().join("\n");
+        f.stop().await;
+        assert!(f.is_active("welcome"), "{started}");
+        assert!(
+            started.contains("requeued=0 abandoned_at_most_once=2 abandoned_unregistered=0"),
+            "both are abandoned, never repeated: {started}"
+        );
+        assert!(
+            log.lines().is_empty(),
+            "nothing was granted or posted by a restart"
+        );
+    }
+
+    #[tokio::test]
     async fn welcome_registers_only_its_two_job_kinds_and_opens_the_core_database() {
         let log = Log::default();
         let dir = scratch("kinds");
