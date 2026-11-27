@@ -816,9 +816,15 @@ fn plan_welcome(
         return;
     }
     let parsed = welcome_config::parse(|key| lookup(key).map(std::ffi::OsString::from));
-    if !parsed.invalid_keys.is_empty() {
-        let keys: Vec<String> = parsed
-            .invalid_keys
+    let (ids, link_keys) =
+        match welcome_config::parse_id_map(|key| lookup(key).map(std::ffi::OsString::from)) {
+            Ok(ids) => (ids, Vec::new()),
+            Err(keys) => (IdMap::default(), keys),
+        };
+    let mut invalid_keys = parsed.invalid_keys.clone();
+    invalid_keys.extend(link_keys);
+    if !invalid_keys.is_empty() {
+        let keys: Vec<String> = invalid_keys
             .iter()
             .map(|key| format!("{key}: invalid_setting"))
             .collect();
@@ -838,6 +844,32 @@ fn plan_welcome(
             .push(stays_off("welcome", "no template set (no_template)"));
         return;
     }
+    // K03 rule 6: a join role must never be one the safeword takes away or marks a member with.
+    // Safeword state survives a leave, so a member under safeword can rejoin; the join path
+    // does not look at that state, so such a role is refused here. A requested safeword that is
+    // not running cannot say what it restricts: welcome stays off (fail closed).
+    if mode_requested(lookup, safeword_config::KEY_MODE) {
+        let Some(command) = &plan.safeword else {
+            plan.lines.push(stays_off(
+                "welcome",
+                "safeword requested but not running (safeword_unavailable)",
+            ));
+            return;
+        };
+        let guarded = |id: &u64| {
+            *id == command.safeword.role_id || command.safeword.restricted_role_ids.contains(id)
+        };
+        if parsed.join_role_ids.iter().any(guarded) {
+            plan.lines.push(stays_off(
+                "welcome",
+                &format!(
+                    "join role refused ({}: safeword_restricted)",
+                    welcome_config::KEY_JOIN_ROLE_IDS
+                ),
+            ));
+            return;
+        }
+    }
     plan.lines.push(format!(
         "Feature welcome on: mode={}; join roles={}; staff alerts={}.",
         mode_word(parsed.mode),
@@ -854,7 +886,7 @@ fn plan_welcome(
         channel_id,
         protected_role_ids: config.protected_role_ids.clone(),
         staff_alert_channel: config.staff_alert_channel_id,
-        ids: IdMap::default(),
+        ids,
     });
 }
 
@@ -871,7 +903,15 @@ pub fn preflight_requests(plan: &FeaturePlan) -> Vec<preflight::FeatureRequest> 
     if let Some(command) = &plan.safeword {
         let mut request =
             preflight::FeatureRequest::new(preflight::Feature::Safeword, command.safeword.mode);
-        request.roles = vec![command.safeword.role_id];
+        // The swap writes the safeword role and removes and restores every restricted role,
+        // so the bot must be able to manage each of them.
+        let mut roles = vec![command.safeword.role_id];
+        for id in &command.safeword.restricted_role_ids {
+            if !roles.contains(id) {
+                roles.push(*id);
+            }
+        }
+        request.roles = roles;
         requests.push(request);
     }
     if let Some(welcome) = &plan.welcome {
@@ -1011,7 +1051,7 @@ where
             "template unreadable (template_unreadable)",
         ));
     };
-    let ids = IdMap::default();
+    let ids = welcome.ids.clone();
     let template = WelcomeTemplate::load(&source, &ids).map_err(|error| {
         stays_off(
             "welcome",
@@ -1130,8 +1170,8 @@ pub struct GatedStart<'a> {
     pub store: StoreSpec,
     pub protected_role_ids: Vec<u64>,
     /// Builds the reaction-role services; it gets the safeword lookup when the safeword runs.
-    pub reaction: &'a dyn Fn(Option<SafewordLookup>) -> Arc<dyn ReactionServices>,
-    pub read_template: &'a dyn Fn(&str) -> Option<String>,
+    pub reaction: &'a (dyn Fn(Option<SafewordLookup>) -> Arc<dyn ReactionServices> + Sync),
+    pub read_template: &'a (dyn Fn(&str) -> Option<String> + Sync),
 }
 
 /// What [`start_gated`] hands to `setup`.
@@ -1145,7 +1185,8 @@ pub struct GatedFeatures<X, D> {
 }
 
 /// Preflight, then build: the one place that turns "what the environment asked for" into "what
-/// is registered". RED STUB: builds from the plan as asked, ignoring the verdicts.
+/// is registered". Everything is built from the GATED plan: a feature the preflight refused has no
+/// runtime, no feature and no registration, and the others still start.
 pub async fn start_gated<X: Send + Sync + 'static, D: Send + Sync + 'static>(
     request: GatedStart<'_>,
 ) -> GatedFeatures<X, D> {
@@ -1157,7 +1198,7 @@ pub async fn start_gated<X: Send + Sync + 'static, D: Send + Sync + 'static>(
     )
     .await;
     let mut lines = gated.lines;
-    let built_plan = request.plan.clone();
+    let built_plan = gated.plan;
     let safeword = safeword_runtime(
         &built_plan,
         SafewordParts {
@@ -1189,7 +1230,12 @@ pub async fn start_gated<X: Send + Sync + 'static, D: Send + Sync + 'static>(
             request.cache.clone(),
             welcome.home_guild,
         );
-        match build_welcome(&built_plan, ports, request.bot_user_id, request.read_template) {
+        match build_welcome(
+            &built_plan,
+            ports,
+            request.bot_user_id,
+            request.read_template,
+        ) {
             Ok(Some(feature)) => features.push(feature),
             Ok(None) => {}
             Err(line) => lines.push(line),
@@ -5014,7 +5060,7 @@ mod welcome_wiring_tests {
         plan: &FeaturePlan,
         facts: &FakeFacts,
         roles: &FakeRoles,
-        read: &dyn Fn(&str) -> Option<String>,
+        read: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> GatedFeatures<u8, u16> {
         start_gated::<u8, u16>(GatedStart {
             plan,
@@ -5034,7 +5080,11 @@ mod welcome_wiring_tests {
         .await
     }
 
-    async fn compose(plan: &FeaturePlan, facts: &FakeFacts, roles: &FakeRoles) -> GatedFeatures<u8, u16> {
+    async fn compose(
+        plan: &FeaturePlan,
+        facts: &FakeFacts,
+        roles: &FakeRoles,
+    ) -> GatedFeatures<u8, u16> {
         compose_with(plan, facts, roles, &read_template).await
     }
 
@@ -5069,7 +5119,10 @@ mod welcome_wiring_tests {
         facts.guild = Some(0); // no manage roles: the role features are refused
         let composed = compose(&plan, &facts, &healthy_roles()).await;
         assert_eq!(names(&composed), vec!["flash"]);
-        assert!(composed.safeword.is_none(), "no safeword runtime for a refused safeword");
+        assert!(
+            composed.safeword.is_none(),
+            "no safeword runtime for a refused safeword"
+        );
     }
 
     #[tokio::test]
@@ -5106,17 +5159,17 @@ mod welcome_wiring_tests {
     #[tokio::test]
     async fn the_production_composition_reports_a_template_it_cannot_use_by_code_only() {
         let plan = plan_for(&welcome_keys("live"), &config());
-        let composed = compose_with(
-            &plan,
-            &healthy_facts(),
-            &healthy_roles(),
-            &|_| Some("{\"secret\": 770010 not json".to_string()),
-        )
+        let composed = compose_with(&plan, &healthy_facts(), &healthy_roles(), &|_| {
+            Some("{\"secret\": 770010 not json".to_string())
+        })
         .await;
         assert!(names(&composed).is_empty(), "no half-started welcome");
         let text = composed.lines.join("\n");
         assert!(text.contains("malformed_json"), "{text}");
-        assert!(!text.contains("secret") && !text.contains("770010"), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains("770010"),
+            "{text}"
+        );
     }
 
     // ---- welcome and the safeword restriction (K03 rule 6) ----------------------------------
@@ -5146,7 +5199,10 @@ mod welcome_wiring_tests {
             pairs.retain(|(k, _)| *k != "SAFEWORD_ROLE_ID" && *k != "SAFEWORD_MODE");
             pairs.push(("SAFEWORD_MODE", mode));
             let plan = plan_for(&pairs, &config());
-            assert!(plan.safeword.is_none(), "{mode}: the safeword itself is refused");
+            assert!(
+                plan.safeword.is_none(),
+                "{mode}: the safeword itself is refused"
+            );
             assert!(plan.welcome.is_none(), "{mode}");
             let text = plan.lines.join("\n");
             assert!(
@@ -5163,7 +5219,11 @@ mod welcome_wiring_tests {
         pairs.push(("SAFEWORD_MODE", "off"));
         let plan = plan_for(&pairs, &config());
         assert!(plan.welcome.is_some());
-        assert!(plan.lines.iter().all(|l| !l.contains("safeword")), "{:?}", plan.lines);
+        assert!(
+            plan.lines.iter().all(|l| !l.contains("safeword")),
+            "{:?}",
+            plan.lines
+        );
     }
 
     #[tokio::test]
@@ -5174,11 +5234,16 @@ mod welcome_wiring_tests {
         let plan = plan_for(&pairs, &config());
         let composed = compose(&plan, &healthy_facts(), &healthy_roles()).await;
         assert_eq!(names(&composed), vec!["flash", "safeword"]);
-        // A member joining then reaches no welcome feature: nothing is granted or posted.
+        // Welcome is not registered, so a member joining reaches no welcome feature.
         let dir = scratch("restricted-join");
-        let f = start_welcome(composed.features, &dir, GuildFilter::Only(GUILD), &Starter::default()).await;
+        let f = start_welcome(
+            composed.features,
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
         assert!(!f.is_active("welcome"));
-        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 0);
     }
 
     #[tokio::test]
@@ -5222,7 +5287,8 @@ mod welcome_wiring_tests {
         pairs.push(("REACTION_ROLES_MODE", "live"));
         let plan = plan_for(&pairs, &config());
         // (the restricted role's entry in the guild, the code the line must carry)
-        let cases: Vec<(Option<u16>, &str)> = vec![(None, "role_missing"), (Some(21), "role_above_bot")];
+        let cases: Vec<(Option<u16>, &str)> =
+            vec![(None, "role_missing"), (Some(21), "role_above_bot")];
         for (position, code) in cases {
             let mut entries = role_entries();
             entries.retain(|e| e.id != SW_RESTRICTED);
@@ -5239,7 +5305,10 @@ mod welcome_wiring_tests {
             let text = lines_text(&gated);
             assert!(gated.plan.safeword.is_none(), "{code}: {text}");
             assert!(gated.plan.reaction_roles.is_none(), "{code}: cascade");
-            assert!(text.contains("Preflight safeword: disabled"), "{code}: {text}");
+            assert!(
+                text.contains("Preflight safeword: disabled"),
+                "{code}: {text}"
+            );
             assert!(text.contains(code), "{code}: {text}");
             assert!(gated.plan.flash.is_some() && gated.plan.welcome.is_some());
             assert!(!text.contains("770051"), "{code}: no id in {text}");
@@ -5287,7 +5356,8 @@ mod welcome_wiring_tests {
         }
     }
 
-    const LINK_TEMPLATE: &str = r#"{"embed":{"title":"Rules {channel:rules}","description":"Pick {role:pings}"}}"#;
+    const LINK_TEMPLATE: &str =
+        r#"{"embed":{"title":"Rules {channel:rules}","description":"Pick {role:pings}"}}"#;
 
     #[tokio::test]
     async fn a_template_that_links_a_channel_renders_the_linked_channel_for_a_joining_member() {
@@ -5299,7 +5369,13 @@ mod welcome_wiring_tests {
             .flatten()
             .expect("built with its id map");
         let dir = scratch("linked-template");
-        let f = start_welcome(vec![feature], &dir, GuildFilter::Only(GUILD), &Starter::default()).await;
+        let f = start_welcome(
+            vec![feature],
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
         assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 1);
         assert_eq!(
             log.lines(),

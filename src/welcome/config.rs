@@ -188,14 +188,66 @@ pub const KEY_CHANNEL_LINKS: &str = "WELCOME_CHANNEL_LINKS";
 /// Environment key holding the role links a template may name (`name=id,name=id`).
 pub const KEY_ROLE_LINKS: &str = "WELCOME_ROLE_LINKS";
 
-/// The most links one list may hold. STUB (RED).
+/// The most links one list may hold.
 pub const MAX_LINKS: usize = 25;
 
-/// Reads the id map of a template. STUB (RED): reads nothing.
+/// Reads one `name=id,name=id` list. `None` when any entry is not plainly valid: no `=`, an id
+/// that is not plain decimal digits (a sign, a space, text, an overflow) or is zero, or more
+/// than [`MAX_LINKS`] entries. The key and duplicate rules are the id map's own.
+fn parse_link_list(raw: &str) -> Option<Vec<(&str, u64)>> {
+    if raw.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut pairs = Vec::new();
+    for entry in raw.split(',') {
+        let (name, id) = entry.split_once('=')?;
+        let (name, id) = (name.trim(), id.trim());
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let id: u64 = id.parse().ok()?;
+        pairs.push((name, id));
+        if pairs.len() > MAX_LINKS {
+            return None;
+        }
+    }
+    Some(pairs)
+}
+
+/// Reads the channels and roles a template may name from [`KEY_CHANNEL_LINKS`] and
+/// [`KEY_ROLE_LINKS`] (`name=id,name=id`). Unset or blank is an empty map. A list with any bad
+/// entry (see [`parse_link_list`]; a malformed or repeated name; a value that is not Unicode)
+/// is refused whole and only its KEY is named, in the order read; the value is never kept.
 pub fn parse_id_map(
-    _lookup: impl Fn(&str) -> Option<OsString>,
+    lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Result<crate::welcome::render::IdMap, Vec<&'static str>> {
-    Ok(crate::welcome::render::IdMap::default())
+    let mut invalid_keys: Vec<&'static str> = Vec::new();
+    let mut map = crate::welcome::render::IdMap::default();
+    for (key, is_channel) in [(KEY_CHANNEL_LINKS, true), (KEY_ROLE_LINKS, false)] {
+        let Some(text) = read_usable(&lookup, key, &mut invalid_keys) else {
+            continue;
+        };
+        let Some(pairs) = parse_link_list(&text) else {
+            invalid_keys.push(key);
+            continue;
+        };
+        for (name, id) in pairs {
+            let inserted = if is_channel {
+                map.insert_channel(name, id)
+            } else {
+                map.insert_role(name, id)
+            };
+            if !inserted {
+                invalid_keys.push(key);
+                break;
+            }
+        }
+    }
+    if invalid_keys.is_empty() {
+        Ok(map)
+    } else {
+        Err(invalid_keys)
+    }
 }
 
 impl fmt::Display for WelcomeConfig {
@@ -533,7 +585,10 @@ mod tests {
 
     #[test]
     fn an_unset_or_blank_link_list_is_an_empty_map() {
-        assert_eq!(map_of(&[]).unwrap(), crate::welcome::render::IdMap::default());
+        assert_eq!(
+            map_of(&[]).unwrap(),
+            crate::welcome::render::IdMap::default()
+        );
         let blank = map_of(&[(KEY_CHANNEL_LINKS, "  "), (KEY_ROLE_LINKS, "")]).unwrap();
         assert!(blank.channels().is_empty() && blank.roles().is_empty());
     }
@@ -548,31 +603,35 @@ mod tests {
         assert_eq!(map.channel("rules"), Some(810_010));
         assert_eq!(map.channel("tickets"), Some(810_011));
         assert_eq!(map.role("pings"), Some(820_010));
-        assert_eq!(map.channel("pings"), None, "a role key is not a channel key");
+        assert_eq!(
+            map.channel("pings"),
+            None,
+            "a role key is not a channel key"
+        );
         assert_eq!(map.role("rules"), None, "a channel key is not a role key");
     }
 
     #[test]
     fn a_link_list_with_any_bad_entry_is_refused_whole_and_names_only_its_key() {
         let bad = [
-            "rules",             // no id
-            "rules=",            // empty id
-            "=810010",           // no key
-            "rules=0",           // zero is not an id
-            "rules=-5",          // sign
-            "rules=+5",          // sign
-            "rules=0x10",        // not decimal
-            "rules=810010x",     // trailing text
-            "rules=8100 10",     // space inside
+            "rules",                         // no id
+            "rules=",                        // empty id
+            "=810010",                       // no key
+            "rules=0",                       // zero is not an id
+            "rules=-5",                      // sign
+            "rules=+5",                      // sign
+            "rules=0x10",                    // not decimal
+            "rules=810010x",                 // trailing text
+            "rules=8100 10",                 // space inside
             "rules=99999999999999999999999", // overflow
-            "ru les=810010",     // space in key
-            "ru-les=810010",     // dash in key
-            "../etc=810010",     // path
-            "file://x=810010",   // uri
-            "rules=810010,,tickets=810011", // empty entry
-            "rules=810010,rules=810011",    // duplicate key
-            "rules=810010,rules=810010",    // duplicate key, same id
-            "rules=810010,",     // trailing comma
+            "ru les=810010",                 // space in key
+            "ru-les=810010",                 // dash in key
+            "../etc=810010",                 // path
+            "file://x=810010",               // uri
+            "rules=810010,,tickets=810011",  // empty entry
+            "rules=810010,rules=810011",     // duplicate key
+            "rules=810010,rules=810010",     // duplicate key, same id
+            "rules=810010,",                 // trailing comma
         ];
         for value in bad {
             let got = map_of(&[(KEY_CHANNEL_LINKS, value), (KEY_ROLE_LINKS, "ok=820010")]);
