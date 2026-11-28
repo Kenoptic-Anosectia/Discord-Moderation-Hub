@@ -1,336 +1,437 @@
 # Architecture map of SKYNET // NETWORK_CORE
 
-This page is a picture of how the Rust code in `src/` fits together. It is written for a reader who is learning Rust. Every box, arrow and `file:line` reference was checked against commit `920c48b`. If you read this at a later commit, line numbers may have moved.
+This page is a map of the Rust code in `src/` at commit `42d176e`. It is written for a reader
+who knows some Rust and wants to learn how the bot is put together. Every section gives the
+plain-English story first, then a Mermaid diagram.
 
-The Mermaid diagrams render on GitHub. If you read this as plain text, each diagram is followed by a short list that says the same thing in words.
+Two conventions run through the whole codebase and explain most of its shape:
 
-## 1. How to read this
+- **Pure core, thin runtime.** The decision logic of a feature (what *should* happen) lives in
+  a module with no Discord types, no clock and no I/O. The runtime (what *does* happen) is a
+  thin layer that reaches Discord and SQLite through injected traits, so the decisions can be
+  tested offline.
+- **Off by default, fail closed.** A feature only runs when its `*_MODE` key says so, and
+  whenever a lookup, permission check or setting is missing or ambiguous, the bot refuses the
+  action rather than guessing.
 
-- A **box** is one real file or folder. A box name like `src/tickets/closer.rs` is the exact path.
-- A **solid arrow** `A --> B` means: code in A really uses or calls code in B (a `use` line or a call). The arrow points at the thing being used.
-- A **dashed arrow** `A -.-> B` means: A declares B with a `mod` line, but nothing calls B. A **dashed grey box** is a module that is NOT WIRED. A **dashed orange box** (section 5 only) is PLANNED: a design, not code. A solid arrow that starts at a dashed grey box is still a real `use`; it only says the unwired file uses something.
-- **WIRED** means the code is called from `main.rs` at startup, in a slash command or in an event handler today. **NOT WIRED** means the module exists and has tests, but only its own tests call it (no production caller). **PLANNED** means it exists only in `consolidation-plan/PLAN.md`, not in the code.
-- A *module* is Rust's word for a unit of code, usually one file or one folder with a `mod.rs`. A *pure* function does no I/O: same inputs always give the same output. *I/O* means touching Discord, SQLite, the disk or the clock.
+## 1. Module map
 
-## 2. Module map
+`src/main.rs:1-21` declares 21 top-level modules. They fall into three kinds:
 
-### 2a. All areas (tickets shown as one box)
+- **Pure logic** — no I/O, no clock, no Discord types: `settings`, `privacy_scope`,
+  `text_helpers`, `deletion_attribution`, `archive_safety`, and the `policy` / `config` /
+  `render` sub-modules of the feature folders.
+- **SQLite** — `storage` (the opener and the migration runner), `jobs::queue`, and the
+  `repository` sub-modules.
+- **Discord adapters and runtimes** — `main` (the Poise/Serenity glue), `features` (the
+  registry), the `runtime` / `command` sub-modules, and `jobs::runner`.
 
-```mermaid
-flowchart TB
-  subgraph SG_MAIN["Entry and config - WIRED"]
-    main["src/main.rs<br/>startup, commands, events"]
-    config["src/config.rs<br/>reads environment variables"]
-  end
-  subgraph SG_TICKETS["Tickets - WIRED"]
-    tickets["src/tickets/<br/>16 code files, see 2b"]
-  end
-  subgraph SG_ROLES["Roles"]
-    elig["src/roles/eligibility.rs<br/>not wired"]
-  end
-  subgraph SG_SAFEWORD["Safeword"]
-    sw["src/safeword/state.rs<br/>not wired"]
-  end
-  subgraph SG_FLASH["Flash"]
-    flash["src/flash/policy.rs<br/>not wired"]
-  end
-  subgraph SG_STORAGE["Storage"]
-    storage["src/storage.rs<br/>not wired"]
-  end
-  subgraph SG_HELPERS["Helpers - WIRED"]
-    text["src/text_helpers.rs<br/>pure text formatting"]
-    del["src/deletion_attribution.rs<br/>pure, who deleted a message"]
-    safety["src/archive_safety.rs<br/>pure URL and filename checks"]
-  end
-  subgraph SG_BACKUP["Backup tool"]
-    backup["tools/offline_sqlite_backup.py<br/>run by hand, no Rust caller"]
-  end
+Not every module is live. The wave-3 to wave-5 features are built and tested but have **no
+production caller**: their `mod.rs` still carries `#![allow(dead_code)]`, which is the marker
+the project uses for "not wired yet". Read the marker, not the folder name.
 
-  main -->|"Config::from_env, load_env"| config
-  main -->|"command and event entry points"| tickets
-  main -->|"embed text helpers"| text
-  main -->|"attribute_deletion"| del
-  config -->|"Settings, retention parser"| tickets
-  tickets -->|"archive.rs checks URLs"| safety
-  main -.->|"mod line only"| elig
-  main -.->|"mod line only"| sw
-  main -.->|"mod line only"| flash
-  main -.->|"mod line only"| storage
-
-  classDef unwired stroke-dasharray: 5 5,stroke:#888888,color:#555555
-  classDef tool stroke:#336699
-  class elig,sw,flash,storage unwired
-  class backup tool
-```
-
-In words:
-
-- `main.rs` is the root. It declares nine modules (`main.rs:1-9`) and is the only file that talks to the Poise framework and Serenity (the Discord library) directly.
-- `config.rs` reads environment variables into a `Config` value. It builds the ticket `Settings` through `src/tickets/`.
-- WIRED: `config`, `tickets`, `text_helpers`, `deletion_attribution`, `archive_safety`. Four are called from `main.rs`. `archive_safety` is called only by `tickets/archive.rs` (`archive.rs:11`).
-- NOT WIRED: `roles/eligibility.rs`, `safeword/state.rs`, `flash/policy.rs`, `storage.rs`. `main.rs` has a `mod` line for each, and no code anywhere outside their own tests uses them. Each carries `#![allow(dead_code)]` to silence the compiler warning about unused code (`roles/mod.rs:3`, `safeword/mod.rs:2`, `flash/mod.rs:14`, `storage.rs:11`).
-- The backup tool is a Python script, not Rust. No `.rs` file calls it. You run it yourself from a terminal.
-- Not drawn, to keep the picture readable: `config.rs`, `tickets/` and `deletion_attribution.rs` each `use crate::Error` or `crate::Context` or `crate::AUDIT_MATCH_WINDOW_MS` from `main.rs` (for example `deletion_attribution.rs:4`). These are arrows back up to `main.rs`.
-- Test-only: `tests/archive_input_safety.rs` and `tests/archive_input_properties.rs` pull `archive_safety.rs` in with `#[path]` (not a production caller).
-
-### 2b. Inside `src/tickets/`
-
-`policy.rs` (ticket settings and kinds) is used by almost every file here, so its arrows are left out. The three `*_tests.rs` files and `mod.rs` are also left out.
+| Module | Kind | Wired? |
+| --- | --- | --- |
+| `main`, `features`, `config`, `settings` | entry, registry, parsing | yes |
+| `tickets` | policy + SQLite + runtime | yes (opening stays gated) |
+| `safeword` | pure state + SQLite + Discord runtime | yes |
+| `flash` | pure policy + runtime | yes |
+| `role_menus::reactions` | SQLite + Discord | yes |
+| `roles` | pure policy + Discord adapter | yes (via `safeword::discord`) |
+| `jobs` | SQLite queue + async runner | yes (via `features`) |
+| `storage` | SQLite opener + migrations | yes |
+| `privacy_scope`, `text_helpers`, `deletion_attribution`, `archive_safety` | pure helpers | yes |
+| `activity`, `bump`, `embeds`, `preflight` | modules | **no** (`#![allow(dead_code)]`) |
+| `role_admin`, `voice_rooms`, `welcome` | modules | **no** (`#![allow(dead_code)]`) |
+| `role_menus::{command, interactions, policy, repository}` | sub-modules | **no** |
 
 ```mermaid
 flowchart TB
-  main["src/main.rs"]
-  safety["src/archive_safety.rs"]
-
-  subgraph SG_ENTRY["Command and event entry points - Discord I/O"]
-    runtime["runtime.rs<br/>ticket panel and open buttons"]
-    rclose["runtime_close.rs<br/>/ticket-close, /ticket-recover"]
-    rarch["runtime_archives.rs<br/>/ticket-archives"]
-    privacy["privacy.rs<br/>log privacy guard"]
+  subgraph WIRED["Wired into main.rs / features.rs"]
+    main["main.rs<br/>Poise commands, event handler"]
+    cfg["config.rs + settings.rs<br/>env parsing, Mode, id lists"]
+    feat["features.rs<br/>plan / build / wire / dispatch"]
+    pure["Pure helpers<br/>privacy_scope, text_helpers,<br/>deletion_attribution, archive_safety"]
+    tick["tickets/<br/>policy, privacy, runtime,<br/>SQLite"]
+    flash["flash/<br/>config + policy (pure), runtime"]
+    sw["safeword/<br/>config + state (pure),<br/>repository, runtime, discord"]
+    roles["roles/ + role_menus::reactions<br/>eligibility, grant, runtime, reactions"]
+    jobs["jobs/<br/>queue (SQLite), runner (async)"]
+    store["storage.rs<br/>opener + migrations"]
+  end
+  subgraph UNWIRED["Built and tested, not wired (#![allow(dead_code)])"]
+    w1["welcome, embeds, bump, preflight"]
+    w2["activity, voice_rooms,<br/>role_admin, role_menus menus"]
   end
 
-  subgraph SG_LOGIC["Decisions and flows"]
-    controller["controller.rs<br/>open-ticket flow"]
-    closer["closer.rs<br/>close, reconcile, recover"]
-    manage["archive_manage.rs<br/>list, health, retention, restore"]
-    index["archive_index.rs<br/>archive ids, listing"]
-  end
-
-  subgraph SG_ARCHIVE["Archive files on disk"]
-    archive["archive.rs<br/>fetch, publish, verify"]
-    scan["archive_scan.rs"]
-    restore["restore.rs"]
-    retention["retention.rs<br/>pure retention rules"]
-    remove["archive_remove.rs<br/>not wired"]
-  end
-
-  subgraph SG_DB["SQLite"]
-    repo["repository.rs<br/>open, tickets, panels"]
-    rclosedb["repository_close.rs<br/>close states, history"]
-  end
-
-  main --> runtime
-  main --> rclose
-  main --> rarch
-  main --> privacy
-  main --> repo
-  runtime --> controller
-  runtime --> repo
-  rclose --> closer
-  rclose --> archive
-  rclose --> repo
-  rarch --> manage
-  rarch --> closer
-  rarch --> rclose
-  rarch --> retention
-  controller --> repo
-  closer --> archive
-  closer --> controller
-  closer --> repo
-  closer --> rclosedb
-  manage --> archive
-  manage --> index
-  manage --> scan
-  manage --> restore
-  manage --> closer
-  manage --> retention
-  manage --> repo
-  index --> archive
-  index --> closer
-  index --> repo
-  scan --> archive
-  restore --> archive
-  privacy --> repo
-  repo -->|"migrate on open"| rclosedb
-  rclosedb --> repo
-  archive --> safety
-  remove -->|"uses verify, OwnedRoot"| archive
+  main -->|"Config::from_env"| cfg
+  main -->|"app_wiring, build_data, route_event"| feat
+  main -->|"ticket commands, privacy guard"| tick
+  main -->|"filters, attribution, text"| pure
+  feat -->|"plan + build + dispatch"| flash
+  feat -->|"plan + build + dispatch"| sw
+  feat -->|"plan + build + dispatch"| roles
+  feat -->|"open, migrate, start runner"| jobs
+  feat -->|"storage::open"| store
+  flash -->|"schedule delete jobs"| jobs
+  sw -->|"safeword_state"| store
+  jobs -->|"jobs table"| store
+  main -.->|"mod declaration only"| w1
+  main -.->|"mod declaration only"| w2
 
   classDef unwired stroke-dasharray: 5 5,stroke:#888888,color:#555555
-  class remove unwired
+  class w1,w2 unwired
 ```
 
-In words:
+## 2. Startup flow
 
-- **Entry points** are the files `main.rs` calls: `runtime.rs` (ticket panel and buttons), `runtime_close.rs` (`/ticket-close`, `/ticket-recover`, startup reconcile), `runtime_archives.rs` (`/ticket-archives`) and `privacy.rs` (a guard around the logger). `main.rs` also opens the `Repository` itself at startup (`main.rs:2971`).
-- **Logic** files hold the rules. `closer.rs` decides who may close a ticket and in what order the steps run. Discord work is hidden behind a trait (`CloseIo`, see glossary). `runtime_close.rs` supplies the real Discord version of that trait.
-- **Archive** files read and write the archive folder on disk. `retention.rs` is pure. `archive_remove.rs` is the one NOT WIRED file here: nothing calls `remove_archive_dir`, and `tickets/mod.rs:5` marks it `#[allow(dead_code)]`.
-- **SQLite** access is only in `repository.rs` and `repository_close.rs`. They are two files for one type: `Repository` is defined in `repository.rs`, and `repository_close.rs` adds more methods to it. Each file imports the other.
-- `config.rs` also uses `tickets/policy.rs` and `tickets/retention.rs` (see 2a).
+Startup is split into a **pure planning** phase and a **live** phase, so that the moment every
+optional feature is off (the shipped default) nothing extra happens at all.
 
-## 3. One wired path end to end: `/ticket-close`
-
-`/ticket-close` is a real slash command. It is registered only when ticket settings are valid and enabled (`main.rs:2922-2931`, called from `main.rs:2954`). Ticket *opening* is switched off by a compile-time constant (`runtime.rs:28`, `OPENING_APPROVED = false`), but close and archive are wired.
-
-In the diagram, a step marked **pure** does no I/O. A step marked **I/O** touches Discord, SQLite, the disk or the clock.
+1. `main` (`src/main.rs:3963`) loads the `.env` file if there is one and parses
+   `Config::from_env()` (`src/config.rs:156`). The bot token is the only secret, and `Config`'s
+   own `Debug` implementation replaces it with `<redacted>` (`src/config.rs:102`).
+2. `features::plan_features` (`src/features.rs:741`) reads the environment **once** and decides
+   which optional features are on. It is pure: no Discord, no I/O. With every `*_MODE` unset the
+   plan is empty. A feature that is requested but cannot run stays off and produces one line
+   naming the key and a stable code (`src/features.rs:585`).
+3. `framework_commands` (`src/main.rs:2446`) builds the slash-command list: the baseline
+   commands plus `/safeword` only when the plan has the safeword
+   (`src/main.rs:3952`). With an empty plan the list is exactly the baseline list.
+4. Inside Poise's `setup` callback (`src/main.rs:4001`), the bot opens the reaction-role
+   database, optionally opens the ticket database, reconciles interrupted tickets, builds the
+   planned features with `features::build_features` (`src/features.rs:795`) and hands them to
+   `Features::start` (`src/features.rs:937`).
+5. `Features::start` opens `core.sqlite` **only** when an enabled feature says it needs it
+   (`needs_core_db`), and starts the job runner **only** when a feature registered a job kind
+   (`src/features.rs:956`). That is where all-off parity is enforced: no database file, no
+   runner task, no job table.
+6. `app_wiring` (`src/main.rs:2429`) turns the plan plus "which features really started" into
+   the `Wiring` decisions (`src/features.rs:846`): does the new reaction-role path own the
+   reaction events (so the legacy arms stand down), is the safeword live, and which channels
+   must the logger skip.
+7. On shutdown, `features.stop()` (`src/features.rs:1049`) asks the runner to stop and waits
+   for it (`src/main.rs:4110`).
 
 ```mermaid
-sequenceDiagram
-  autonumber
-  actor Staff as Staff member in Discord
-  participant Poise as Poise framework
-  participant Cmd as main.rs ticket_close
-  participant RC as runtime_close.rs close
-  participant Closer as closer.rs close_ticket
-  participant Repo as Repository
-  participant DB as tokio-rusqlite thread and SQLite file
-  participant Disc as Discord API
+flowchart TB
+  main["main (main.rs:3963)<br/>dotenv + Config::from_env"]
+  plan["features::plan_features (features.rs:741)<br/>pure: reads the env once"]
+  cmds["framework_commands (main.rs:2446)<br/>baseline + /safeword when planned"]
+  setup["Poise setup (main.rs:4001)"]
+  build["build_features (features.rs:795)<br/>order: flash, safeword, reaction_roles"]
+  start["Features::start (features.rs:937)"]
+  need["any enabled feature needs_core_db?"]
+  alloff["All-off parity:<br/>no core.sqlite, no runner, no job table"]
+  open["storage::open (storage.rs:144)<br/>+ feature migrations + register_jobs"]
+  runner["TokioJobStarter::start (features.rs:1076)<br/>reconcile_after_restart + Runner"]
+  wiring["app_wiring (main.rs:2429) -> features::wire (features.rs:846)"]
+  stop["features.stop() (features.rs:1049)"]
 
-  Staff->>Poise: /ticket-close
-  Poise->>Cmd: ticket_close (main.rs:2887)
-  Cmd->>RC: close(ctx) (runtime_close.rs:190)
-  RC->>Disc: defer_ephemeral (I/O)
-  RC->>Disc: actor(ctx) reads guild owner and roles (I/O, runtime_close.rs:161)
-  RC->>Repo: ticket_by_channel (repository_close.rs:239)
-  Repo->>DB: db.call SELECT (I/O)
-  DB-->>Repo: Option of Ticket
-  RC->>RC: archive_root and Live::new (I/O: opens archive folder, builds HTTP client)
-  RC->>Closer: close_ticket(env, actor, id, token) (closer.rs:203)
-  Note over Closer: authorized (closer.rs:85) is pure
-  Closer->>Repo: claim_close (repository_close.rs:288)
-  Repo->>DB: transaction, UPDATE status=closing (I/O)
-  Closer->>Disc: CloseIo::freeze (I/O, runtime_close.rs:62)
-  Closer->>Repo: advance closing to archiving (repository_close.rs:358)
-  Closer->>Disc: archive::fetch_all reads history (I/O, archive.rs:109)
-  Closer->>Closer: archive::publish writes folder (I/O, archive.rs:722)
-  Closer->>Repo: record_archive then advance to verified (repository_close.rs:436)
-  Closer->>Closer: recorded_manifest re-reads the folder (I/O, closer.rs:162)
-  Closer->>Disc: CloseIo::delete channel (I/O, runtime_close.rs:86)
-  Closer->>Repo: finish advances to closed (closer.rs:473)
-  Closer-->>RC: CloseOutcome
-  Note over RC: CloseOutcome::reply (closer.rs:112) is pure
-  RC->>Disc: reply(ctx, text) ephemeral message (I/O, runtime_close.rs:177)
-  Disc-->>Staff: result message
+  main --> plan
+  plan --> cmds
+  cmds --> setup
+  setup --> build
+  build --> start
+  start --> need
+  need -->|"no"| alloff
+  need -->|"yes"| open
+  open --> runner
+  alloff --> wiring
+  runner --> wiring
+  wiring --> stop
 ```
 
-In words:
+## 3. Event flow
 
-1. **Poise to the command.** Poise matches `/ticket-close` to the function `ticket_close` (`main.rs:2886-2889`), which does nothing except call `tickets::runtime_close::close`.
-2. **Adapter (`runtime_close::close`).** Does I/O. It acknowledges the interaction, builds an `Actor` (who is asking) and reads the ticket row by channel. If settings or the repository are missing, it replies "unavailable" and stops.
-3. **Decision logic (`closer::close_ticket`).** Mostly a sequence of checks, then calls. `authorized` is pure. The ordering is the safety rule: authorize, claim, freeze, archive, re-read the archive from disk, re-check the live channel, only then delete. Any failure returns `Retained`, and the channel stays.
-4. **Repository.** Each method (`claim_close`, `advance`, `record_archive` and so on) runs one short SQLite transaction through `self.db.call(...)`. `db` is a `tokio_rusqlite::Connection`, which runs SQLite on its own thread so the async bot is not blocked. No transaction is held while waiting on Discord.
-5. **Reply.** `CloseOutcome::reply` turns the result into a fixed sentence (pure). `reply` sends it as a message only the user sees (I/O).
+One gateway event travels through two lanes in `route_event` (`src/main.rs:2551`): the
+**feature lane** first, then the **logger lane**. The order matters: a feature must never be
+skipped because the logger's privacy guard said no.
 
-## 4. Safeword state machine (`src/safeword/state.rs`) - NOT WIRED
+1. `Features::dispatch` (`src/features.rs:1024`) applies the home-guild filter:
+   `guild_filter` turns the configured `GUILD_ID` into `GuildFilter::Only`, `Any` or `Closed`
+   (`src/features.rs:79`), and `guild_allows` (`src/features.rs:94`) decides per event. With a
+   single guild configured, only an event that provably belongs to it passes; a `GUILD_ID` that
+   was set but unreadable closes the filter instead of widening it to every guild.
+2. Each surviving feature is awaited in registration order (`src/features.rs:1036`). Dispatch
+   never touches the message cache.
+3. The logger lane runs the ticket privacy guard first: `tickets::privacy::guarded`
+   (`src/tickets/privacy.rs:295`) decides whether the channel is private. The decision is
+   fail-closed: a channel that was ever linked to a ticket, a ticket category, or a lookup
+   that could not be resolved all mean *skip* (`src/tickets/privacy.rs:186`).
+4. Inside that guard, the log-exclusion gate (`features::message_gate`,
+   `src/features.rs:422`) drops the four message events from excluded channels and
+   categories, and from the flash channels. An exclusion list that could not be read blocks
+   every guild message rather than silently dropping the exclusion.
+5. Only when both gates allow does the sink run: `log_event` (`src/main.rs:2583`) first checks
+   that the event provably belongs to a guild (`guild_scope`, `src/main.rs:1515`), so a DM or
+   group DM can never reach the staff log channel, then `log_event_body`
+   (`src/main.rs:2599`) builds the embed and writes it.
+6. Inside `log_event_body`, the legacy reaction-role arms stand down when the new feature
+   owns the events (`legacy_reaction_roles_active`, `src/main.rs:2482`).
 
-The safeword is a feature that takes away a member's restricted roles (so NSFW areas are hidden) and gives them back later. The code here is only the **decision core**. It holds no state, does no I/O and uses no Discord types (`state.rs:1-6`). A future runtime would call `step(&State, Event, &Context) -> (State, Vec<Action>)` (`state.rs:478`), then carry out the returned `Action`s and report back with `ActionDone` or `ActionFailed`. Nothing calls `step` outside the tests today.
+```mermaid
+flowchart TB
+  ev["Serenity FullEvent"]
+  route["route_event (main.rs:2551)"]
+  disp["Features::dispatch (features.rs:1024)"]
+  filt["guild_allows (features.rs:94)<br/>home-guild filter"]
+  feats["each active feature in order<br/>(features.rs:1036)"]
+  priv["tickets::privacy::guarded<br/>(tickets/privacy.rs:295)"]
+  gate["features::message_gate (features.rs:422)<br/>excluded channels, categories, flash"]
+  scope["guarded_log (main.rs:1543)<br/>guild_scope: a DM never reaches the log channel"]
+  body["log_event_body (main.rs:2599)<br/>cache, embeds, log write"]
+  drop["Skip the event"]
+
+  ev --> route
+  route -->|"1. feature lane"| disp
+  disp --> filt
+  filt -->|"allowed"| feats
+  filt -->|"refused"| drop
+  route -->|"2. logger lane"| priv
+  priv -->|"Allow"| gate
+  priv -->|"Skip"| drop
+  gate -->|"Allow"| scope
+  gate -->|"Skip"| drop
+  scope -->|"guild event"| body
+  scope -->|"no guild id"| drop
+```
+
+## 4. Job queue and runner
+
+Durable timers live in the `jobs` table of `core.sqlite`. The queue (`src/jobs/queue.rs`) is
+synchronous and Discord-free: every function takes the connection and the current time from the
+caller, so no clock is read inside it and every result is reproducible.
+
+- **States** (`JobState`, `src/jobs/queue.rs:118`): `pending`, `running`, `done`, `failed`,
+  `abandoned`. The schema enforces exactly this set with a `CHECK` constraint
+  (`src/jobs/queue.rs:55`). `done`, `failed` and `abandoned` are terminal and never change
+  again (`src/jobs/queue.rs:149`).
+- **Claiming** is a compare-and-swap: one `UPDATE ... WHERE state = 'pending' AND due_at <= now`
+  moves the row to `running` and bumps `attempts` (`src/jobs/queue.rs:425`). Exactly one claimer
+  wins; the others see nothing.
+- **Retries**: `fail` (`src/jobs/queue.rs:522`) puts the row back to `pending` at
+  `now + backoff` while claims used are below `max_attempts`, and makes it terminally `failed`
+  when they are not. The backoff is `min(cap, base * 2^(attempts-1))`
+  (`src/jobs/queue.rs:212`). The default policy is base 30 s, cap 600 s, 5 attempts
+  (`src/jobs/queue.rs:196`).
+- **Per-kind retry policy**: a kind may register its own policy with
+  `Registry::register_with_retry` (`src/jobs/runner.rs:227`), which is also the policy used
+  when the kind is reconciled after a restart.
+- **Terminal errors**: a handler reports failure with a `&'static str` code
+  (`HandlerError`, `src/jobs/runner.rs:132`), so no runtime text can ride along. A code that is
+  not a plain token is stored as `invalid_error_code` (`src/jobs/queue.rs:564`).
+- **Final-ack observer**: `Registry::observe_final` (`src/jobs/runner.rs:246`) installs a
+  best-effort callback that fires **after** the final acknowledgement is committed, with
+  `FinalOutcome::Done`, `Failed` or `Abandoned` (`src/jobs/runner.rs:178`). It is for
+  reporting, not for deciding to retry (`src/jobs/runner.rs:705`).
+- **Restart reconciliation**: `reconcile_after_restart` (`src/jobs/queue.rs:663`) resolves the
+  rows a dead process left in `running`, once, before anything is claimed. A `RunAgain` kind
+  goes back to `pending`; a `RunAgain` kind whose attempts are used up becomes `failed`; an
+  `AtMostOnce` kind, or a kind that is not registered at all, becomes `abandoned` and is
+  reported (`src/jobs/queue.rs:695`).
+- **The rule**: the SQLite row is the truth and a queued job is a **disposable wake-up**. The
+  handler re-reads the state it depends on and does nothing if the state already advanced
+  (for example `src/voice_rooms/runtime.rs:9`, `src/bump/runtime.rs:11`).
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Inactive
-  Inactive --> Activating : ReactionAdded
-  Activating --> Active : ActionDone makes all 4 activation steps done
-  Activating --> Releasing : all activation steps done, then ReactionRemoved now or ActionDone with a release pending
-  Active --> Releasing : ReactionRemoved
-  Releasing --> Inactive : ActionDone makes all 4 release steps done
-  Releasing --> Activating : all release steps done, then ReactionAdded now or ActionDone with a re-activate pending
-
-  Activating --> Activating : ReactionAdded retry, Strike, RoleDeleted, GrantDuringActive, ActionFailed
-  Active --> Active : Strike, RoleDeleted, GrantDuringActive emit SaveSnapshot
-  Releasing --> Releasing : ReactionRemoved retry, Strike, RoleDeleted, GrantDuringActive, ActionFailed
-
-  note right of Inactive
-    NOT WIRED
-    no production caller
-  end note
+  [*] --> pending: schedule (dedupe_key is UNIQUE)
+  pending --> running: claim_due CAS, attempts + 1
+  pending --> failed: malformed payload or kind at claim
+  running --> done: handler Ok, complete()
+  running --> pending: retryable error, attempts < max_attempts
+  running --> failed: terminal error or attempts >= max_attempts
+  running --> abandoned: AtMostOnce interruption or unknown outcome
+  running --> pending: reconcile_after_restart, RunAgain kind
+  running --> failed: reconcile_after_restart, RunAgain, attempts used up
+  running --> abandoned: reconcile_after_restart, AtMostOnce or unregistered kind
+  done --> [*]: observe_final(Done)
+  failed --> [*]: observe_final(Failed)
+  abandoned --> [*]: observe_final(Abandoned) and reported
 ```
 
-In words:
+## 5. A feature end to end: `flash`
 
-- **Four states** (`State`, `state.rs:143-148`): `Inactive`, `Activating(Snapshot)`, `Active(Snapshot)`, `Releasing(Snapshot)`. `Snapshot` is the saved data: roles to restore, roles struck by staff, and a flag for each step (`Snapshot`, `state.rs:102`).
-- **Events** (`Event`, `state.rs:90`): `ReactionAdded`, `ReactionRemoved`, `Strike(role)`, `RoleDeleted(role)`, `GrantDuringActive(role)`, `ActionDone(id)`, `ActionFailed(id, code)`.
-- **Actions** the machine asks for (`Action`, `state.rs:62`): save a snapshot, remove roles, add the safeword role, send a DM, then the reverse on release.
-- Moving from `Activating` to `Active` needs all four activation steps acknowledged (`activation_complete`, `state.rs:250`). If the reaction was removed in the meantime (`pending_release`), it goes straight on to `Releasing`. `Releasing` back to `Inactive` works the same way with the four release steps.
-- `restart_action` (`state.rs:748`) says what to do after a restart. It is not drawn.
-- Do not confuse this with `SafewordState` in `roles/eligibility.rs:36`. That is a different, two-value enum (`Inactive`, `Active`) that the roles rules take as input. No code links the two today.
+The flash feature expires media posts in the configured flash channels after a delay. It is a
+good example because every layer is visible.
 
-## 5. PLANNED target flow (does not exist yet)
+1. **Config** — `flash::config::load` (`src/flash/config.rs:103`) parses `FLASH_MODE`,
+   `FLASH_CHANNEL_IDS`, `FLASH_PING_ROLE_ID`, `FLASH_DELAY_SECS` and `FLASH_INCLUDE_THREADS`
+   through the shared helpers in `settings`. A refused value switches the feature off and
+   names the key only; the value is never echoed (`src/flash/config.rs:175`).
+2. **Pure policy** — `flash::policy::decide` (`src/flash/policy.rs:391`) takes plain
+   `MessageFacts` and returns `Decision::Expire(ExpirePlan)` or
+   `Decision::Ignore(IgnoreReason)`. It reads no clock, looks up no id and holds no serenity
+   type. The notice text is rendered from the role id, the author id and the channel id only,
+   so the flashed message's content can never be quoted or inject a mention
+   (`src/flash/policy.rs:441`).
+3. **Runtime over traits** — `Inner::process` (`src/flash/runtime.rs:419`) runs the policy and
+   reacts to the mode: `off` does nothing, `shadow` only counts what it *would* do
+   (`src/flash/runtime.rs:458`), and `live` schedules the deletes and posts the notice
+   (`Inner::expire`, `src/flash/runtime.rs:469`). The source delete is scheduled **before** the
+   notice is posted, so a crash between the two steps cannot leave the media undeleted
+   (`src/flash/runtime.rs:14`).
+4. **Serenity adapter** — `SerenityFlashPorts` (`src/flash/runtime.rs:755`) implements both
+   `FlashPorts` (`src/flash/runtime.rs:765`) and `StaffAlerter`
+   (`src/flash/runtime.rs:844`) over serenity's HTTP client and cache:
+   `send_notice`, `delete_message` and `thread_parent`. A delete that returns 404 counts as
+   done (`delete_verdict`, `src/flash/runtime.rs:223`).
+5. **Alert** — the final-ack observer registered by `register_job_kinds`
+   (`src/flash/runtime.rs:653`) turns a terminal failure into one staff alert carrying a stable
+   code and nothing else (`alert_text`, `src/flash/runtime.rs:127`).
 
-**Everything in this diagram marked PLANNED is a design, not code.** It comes from `consolidation-plan/PLAN.md` section 5 (kept outside this repository, in the verification project). Boxes marked "exists, not wired" are real files from section 2.
+**Why the `Env` / ports-trait pattern exists.** The runtime never calls Discord or the clock
+directly; it goes through a trait, so a test can substitute a fake and drive every branch
+offline. Two shapes of the same idea are in the code:
+
+- A **ports trait** per side effect, injected as `Arc<dyn Trait>` into a deps struct
+  (`FlashPorts`, `StaffAlerter`, `Clock` — `src/flash/runtime.rs:133`, `:147`).
+- An **`Env` trait** that gathers the collaborators of one command
+  (`safeword::command::Env`, `src/safeword/command.rs:291`), implemented in production by
+  `RuntimeEnv` (`src/safeword/discord.rs:436`) and by a fake in the tests.
+
+```rust
+// Real code, src/safeword/command.rs:291
+pub trait Env {
+    /// The configuration.
+    fn config(&self) -> &CommandConfig;
+    /// The unix second the call happens in.
+    fn now(&self) -> i64;
+    /// The SW3 collaborators for the home guild.
+    fn ops(&mut self) -> &mut Ops;
+    /// The pending `clear` confirmations.
+    fn confirms(&mut self) -> &mut ConfirmBook;
+}
+```
 
 ```mermaid
 flowchart TB
-  subgraph SG_IN["Discord input - exists today"]
-    cmd["Poise slash commands"]
-    evt["event_handler, main.rs:1553"]
-  end
+  cfg["flash::config::load (flash/config.rs:103)"]
+  ev["FullEvent::Message -> Feature::handle<br/>(flash/runtime.rs:698)"]
+  pol["flash::policy::decide (pure)<br/>(flash/policy.rs:391)"]
+  thr["FlashPorts::thread_parent<br/>(flash/runtime.rs:437)"]
+  sh["Mode::Shadow:<br/>count only, no Discord call, no job"]
+  exp["Inner::expire, Mode::Live<br/>(flash/runtime.rs:469)"]
+  sched["schedule flash_delete_source<br/>then post the notice"]
+  jobs["jobs runner claims the due job<br/>(jobs/runner.rs:717)"]
+  ports["FlashPorts::delete_message<br/>prod: SerenityFlashPorts, test: Net fake"]
+  obs["observe_final -> alert_after_ack<br/>(flash/runtime.rs:653, 580)"]
+  alert["StaffAlerter::alert<br/>one stable code, no text"]
 
-  cfg["PLANNED: config.rs gets one field, features<br/>each feature mode is off, shadow or live"]
-  disp["PLANNED: features::dispatch<br/>runs before the logging privacy guard"]
-
-  subgraph SG_PURE["Pure cores - no I/O"]
-    elig["roles/eligibility.rs<br/>exists, not wired"]
-    sw["safeword/state.rs<br/>exists, not wired"]
-    fl["flash/policy.rs<br/>exists, not wired"]
-    more["PLANNED: bump, activity, voice rooms and others<br/>files do not exist"]
-  end
-
-  subgraph SG_GLUE["PLANNED: runtime glue"]
-    rt["per-feature runtime.rs<br/>Serenity calls behind injected traits"]
-    roles["shared role service, roles/grant.rs<br/>every role grant goes through it"]
-    jobs["jobs queue and runner<br/>timers survive a restart"]
-  end
-
-  subgraph SG_PERSIST["Persistence"]
-    prepo["PLANNED: per-feature repository.rs<br/>for example safeword/repository.rs"]
-    st["storage.rs: open and versioned migrations<br/>exists, not wired"]
-    db[("PLANNED: core.sqlite<br/>one shared file")]
-  end
-
-  disc["Discord API"]
-
-  cmd --> disp
-  evt --> disp
-  cfg -->|"mode gates each feature"| disp
-  disp -->|"plain facts in"| SG_PURE
-  SG_PURE -->|"decisions and actions out"| rt
-  rt --> roles
-  roles -->|"decide"| elig
-  roles -->|"defer grants while active"| sw
-  rt -->|"writes, shadow mode skips these"| disc
-  rt --> prepo
-  fl -->|"delete after delay"| jobs
-  jobs --> prepo
-  prepo --> st
-  st --> db
-
-  classDef planned stroke-dasharray: 3 3,stroke:#cc6600
-  classDef unwired stroke-dasharray: 5 5,stroke:#888888,color:#555555
-  class cfg,disp,more,rt,roles,jobs,prepo,db planned
-  class elig,sw,fl,st unwired
+  cfg --> pol
+  ev --> pol
+  pol -->|"channel unknown, maybe a thread"| thr
+  thr --> pol
+  pol -->|"Expire in shadow"| sh
+  pol -->|"Expire in live"| exp
+  exp --> sched
+  sched --> jobs
+  jobs --> ports
+  ports -->|"terminal Failed or Abandoned"| obs
+  obs --> alert
 ```
 
-In words:
+## 6. Data stores
 
-- The plan keeps the shape tickets already have: a pure `policy` core, a `repository` for SQLite, a `runtime` for Discord calls, then commands. Pure cores come first, and one dedicated "wiring" card connects them to `main.rs`.
-- Every feature reads a mode: `off`, `shadow` (log what it would do, make no Discord writes) or `live`. Any other value means off.
-- All new state goes into one new SQLite file, `core.sqlite`, opened by `storage.rs`. `tickets.sqlite` and `reaction_roles.sqlite` stay as they are.
-- Timers (flash delete, bump reminder, voice room cleanup) would move into one durable `jobs` table, so a restart does not lose them.
-- Every role grant would go through one shared service that uses `roles/eligibility.rs` and the safeword rules. The plan notes that today's reaction-role path has no such guard (PLAN.md section 5, item 6).
+Three SQLite files exist, each with one owner. `storage::open` (`src/storage.rs:144`)
+normalises the path and **refuses** any path that resolves to a reserved file, so the core
+database can never alias the ticket or reaction-role file
+(`StorageError::ReservedPath`, `src/storage.rs:21`).
 
-**Where the code and the plan disagree.** This page draws the code. At commit `920c48b`:
+- **`tickets.sqlite`** (`TICKET_DB_PATH`) — owned by `tickets::repository` and
+  `tickets::repository_close`. Opened only when the ticket settings are valid
+  (`src/main.rs:4016`). Holds `tickets` (`src/tickets/repository_close.rs:108`),
+  `ticket_panels`, `ticket_interactions`, `ticket_history`, `ticket_archives`, `ticket_audit`
+  and `ticket_dm` (`src/tickets/repository_close.rs:115-120`).
+- **`reaction_roles.sqlite`** (`REACTION_ROLE_DB_PATH`) — owned by `main` and
+  `role_menus::reactions`. Holds the `reaction_roles` table
+  (`src/main.rs:2002`, `src/role_menus/reactions.rs:26`).
+- **`core.sqlite`** (`CORE_DB_PATH`) — owned by `storage` and the features that migrate into
+  it. Opened **only** when an enabled feature needs the database
+  (`src/features.rs:956`). It holds `schema_versions` (the migration ledger,
+  `src/storage.rs:237`) plus the per-feature tables:
+  - `jobs` — the durable queue (`src/jobs/queue.rs:49`).
+  - `safeword_state` — the safeword snapshot per member (`src/safeword/repository.rs:24`).
 
-- The plan says each feature has `config.rs` and `command.rs` files, like tickets. The tickets folder has neither. Its settings parser is `ticket_settings` in `src/config.rs:152`, and its slash commands live in `main.rs:2878-2920`.
-- The plan says the "unwired" allow sits next to the `mod` line in `main.rs`. In the code each module carries its own `#![allow(dead_code)]` (lines listed in 2a). `archive_remove` has `#[allow(dead_code)]` at `tickets/mod.rs:5`.
-- The plan cites `main.rs:2592-2601` (command list), `main.rs:1247` (privacy guard) and `main.rs:2637` (global command registration). Today these are `main.rs:2922-2931`, `main.rs:1561` (the `tickets::privacy::guarded` call inside `event_handler`) and `main.rs:2967`.
-- `CORE_DB_PATH`, `features.rs`, `jobs` and the other planned modules appear nowhere in `src/`.
+  The wave-3 to wave-5 features also declare their migrations here, and those tables are
+  created **only when their feature is wired and switched on**: `managed_posts`
+  (`src/embeds/posts.rs:52`), `role_menus` and `role_menu_options`
+  (`src/role_menus/repository.rs:28`), `activity_daily` and `voice_sessions`
+  (`src/activity/repository.rs:12`, `:25`), `bump_state`
+  (`src/bump/repository.rs:29`), and `voice_rooms` and `voice_room_deputies`
+  (`src/voice_rooms/repository.rs:26`, `:40`).
 
-## 6. Rust glossary for this codebase
+```mermaid
+flowchart LR
+  subgraph TDB["tickets.sqlite - when tickets are enabled"]
+    t1["tickets, ticket_panels, ticket_interactions"]
+    t2["ticket_history, ticket_archives,<br/>ticket_audit, ticket_dm"]
+  end
+  subgraph RDB["reaction_roles.sqlite"]
+    r1["reaction_roles"]
+  end
+  subgraph CDB["core.sqlite - only when a feature needs it"]
+    c1["schema_versions"]
+    c2["jobs"]
+    c3["safeword_state"]
+    c4["unwired feature tables<br/>(managed_posts, role_menus,<br/>activity_daily, voice_sessions)"]
+  end
 
-Each entry points at a real example. Lines are at commit `920c48b`.
+  tm["tickets::repository*"] --> t1
+  tm --> t2
+  rm["main.rs + role_menus::reactions"] --> r1
+  sm["features.rs -> storage::open<br/>(refuses reserved paths)"] --> c1
+  qm["jobs::queue"] --> c2
+  swm["safeword::repository"] --> c3
+  um["unwired repositories"] -.-> c4
 
-1. **Enum with data**: a type that is one of several shapes, and some shapes carry values. `State::Activating(Snapshot)` holds a `Snapshot` (`src/safeword/state.rs:143-148`). `Action::RemoveRoles(Vec<RoleId>)` carries a list (`state.rs:62-64`).
-2. **`Result` and `?`**: `Result<T, E>` is "a value or an error". `?` returns the error early or unwraps the value. See `HttpDownloader::new(...)?` (`src/tickets/runtime_close.rs:34`) and `ctx.defer_ephemeral().await?` (`runtime_close.rs:191`).
-3. **Trait**: a list of methods a type promises to have. `CloseIo` (`src/tickets/closer.rs:69`) lists what the closer needs from Discord. `Live` implements it for real (`runtime_close.rs:61`), and tests can implement it with a fake.
-4. **`impl` block**: where a type's methods are written. `impl Repository` (`src/tickets/repository.rs:66`). A type may have several blocks, in several files: a second one is at `src/tickets/repository_close.rs:213`.
-5. **`Option`**: "a value, or nothing" (`Some(x)` or `None`). `ticket_by_id` returns `Result<Option<Ticket>, Error>`, so "database error" and "no such ticket" are different answers (`repository_close.rs:225`). `State::snapshot` returns `Option<&Snapshot>` (`state.rs:153`).
-6. **Ownership and borrowing**: every value has one owner. `&T` borrows it read-only, `&mut T` borrows it so you may change it. `step(state: &State, ...)` only reads the old state and returns a new one (`state.rs:478`). `retry_release_actions(&mut self)` changes the snapshot in place (`state.rs:301`).
-7. **`Arc`**: a shared, reference-counted pointer, so many tasks can hold one value safely. `Repository` holds `db: Arc<Connection>` (`src/tickets/repository.rs:24`). `Data` holds `config: Arc<Config>` (`src/main.rs:44`).
-8. **`async` / `.await`**: an `async fn` can pause while it waits (for Discord or SQLite) and let other work run. `.await` is the pause point. `pub async fn close(...)` (`runtime_close.rs:190`) awaits at its first line (`:191`).
-9. **`#[derive(...)]`**: asks the compiler to write common trait code for you (`Clone`, `Debug`, `PartialEq` and so on). `#[derive(Clone)]` on `Repository` (`repository.rs:22`). `#[derive(Clone, Debug, Default, PartialEq, Eq)]` on `State` (`state.rs:142`).
-10. **`mod` and `pub`**: `mod x;` declares a module, so the compiler reads `x.rs`. Without `pub`, things are private. A private item is visible inside its own module and everything nested under it. `mod archive_safety;` (`src/main.rs:1`) sits in the crate root, so every file in the crate can use it: `src/tickets/archive.rs:11` does, as `crate::archive_safety`. `pub` is what lets code *outside* the parent module reach in: `pub mod runtime_close;` (`src/tickets/mod.rs:22`) is why `main.rs:2888` can call `tickets::runtime_close::close`. `pub(super)` limits something to the parent module (`runtime_close.rs:161`).
-11. **Lifetimes and generics** (bonus): `Env<'a, I: CloseIo>` (`closer.rs:123`) borrows its parts for a lifetime `'a` and works with any type `I` that implements `CloseIo`.
+  classDef unwired stroke-dasharray: 5 5,stroke:#888888,color:#555555
+  class c4,um unwired
+```
 
-## How this page was checked
+## 7. Safety rules you can rely on
 
-See the review request on card `t_449a11fe` for the exact commands. Short version: `use`, `mod` and call edges were checked with `grep`. NOT WIRED claims were checked by grepping for the module name outside the module's own files. Line numbers were read back from the files. The author could not render the Mermaid blocks (no Mermaid CLI offline, network banned) and re-read them by hand. The independent reviewer (qa-3) reports rendering all five blocks offline with the Mermaid bundle that ships with VS Code, with no syntax errors. GitHub's Mermaid version may differ slightly.
+- **Shipped OFF by default.** An unset, blank or unrecognised `*_MODE` parses to `Mode::Off`
+  (`src/settings.rs:48`), and the plan is empty when every mode is unset
+  (`src/features.rs:741`).
+- **Fail closed.** An unreadable `GUILD_ID` closes the feature filter instead of widening it
+  (`src/features.rs:79`); an unresolvable channel is skipped by the ticket privacy guard
+  (`src/tickets/privacy.rs:262`); a refused setting leaves the feature off
+  (`src/features.rs:585`).
+- **Stable codes, never values, in logs and alerts.** Errors are fixed `snake_case` codes
+  (`StorageError::code`, `src/storage.rs:34`; `QueueError::code`, `src/jobs/queue.rs:82`;
+  `alert_text`, `src/flash/runtime.rs:127`), and the start-up lines carry counts and states
+  only (`ReportCounts::line`, `src/features.rs:214`).
+- **Home-guild scope.** The feature lane is limited by `guild_allows`
+  (`src/features.rs:94`), and a `GUILD_ID` that was set but unusable closes the filter
+  (`src/features.rs:79`).
+- **Staff-only commands.** `/age-verified` requires a member of the configured staff role
+  (`src/main.rs:2173`), the safeword write subcommands are staff-gated
+  (`gate_staff_write`, `src/safeword/command.rs:422`), and the ticket closer checks staff or
+  guild owner (`src/tickets/closer.rs:85`).
+- **No secrets.** The bot token is the only credential in `Config`, and `Config`'s `Debug`
+  implementation prints `<redacted>` in its place (`src/config.rs:102`).
+- **Private events never reach the staff log channel.** An event with no guild id (a DM or
+  group DM) is refused by `guild_scope` (`src/main.rs:1515`), and ticket-linked channels are
+  refused by the privacy guard (`src/tickets/privacy.rs:186`).
+
+## 8. Glossary
+
+- **Shadow mode** — a feature mode that runs the real policy on live events and only counts
+  what it would have done, making no Discord write and no database change
+  (`src/settings.rs:40`, `src/flash/runtime.rs:458`).
+- **Wiring lane** — the thin integration layer (`features.rs` and the `setup` block in
+  `main.rs`) that connects the independently tested feature modules to the environment, to
+  `core.sqlite`, to the job runner and to the event stream.
+- **Stable code** — a fixed `snake_case` identifier logged or alerted in place of a raw value
+  or a piece of user text (`src/jobs/queue.rs:82`).
+- **Fail closed** — the rule that a missing, ambiguous or failed lookup, permission check or
+  setting makes the bot refuse the action instead of guessing
+  (`src/tickets/privacy.rs:262`).
+- **Row is the truth** — the durability rule that the domain state lives in a SQLite row while
+  a queued job is a disposable wake-up: the handler re-reads the state and does nothing if it
+  already advanced (`src/voice_rooms/runtime.rs:9`).
+- **AtMostOnce** — the restart policy for an effect that must never be repeated: if the job is
+  interrupted, the row becomes `abandoned` and is reported instead of being run again
+  (`src/jobs/queue.rs:162`).
