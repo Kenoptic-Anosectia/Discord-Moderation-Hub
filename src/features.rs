@@ -23,8 +23,14 @@ use crate::flash::config::{self as flash_config, FlashConfigErrorKind, FlashSett
 use crate::flash::runtime::{FlashDeps, FlashFeature, SerenityFlashPorts};
 use crate::jobs::queue::{self, ReconcileOutcome, Report};
 use crate::jobs::runner::{BoxFuture, Registry, Runner, RunnerConfig, RunnerError, SystemClock};
+use crate::preflight;
+use crate::preflight_wiring::{startup_preflight, FactSource};
 use crate::privacy_scope::{self, ChannelFacts, LogDecision, ParentResolution, Scope};
-use crate::role_menus::reactions::{self, ReactionEnv, ReactionRolesFeature, ReactionServices};
+use crate::role_menus::reactions::{
+    self, ReactionEnv, ReactionRolesFeature, ReactionServices, SafewordLookup,
+};
+use crate::roles::grant::{RoleWriter, Sleeper};
+use crate::roles::runtime::RoleSource;
 use crate::safeword::command::CommandConfig;
 use crate::safeword::config::{self as safeword_config, SafewordConfig};
 use crate::safeword::discord::{
@@ -33,6 +39,13 @@ use crate::safeword::discord::{
 use crate::settings::{parse_id_list, parse_mode, Mode};
 use crate::storage;
 use crate::tickets::privacy::{ChannelLookup, Lookup};
+use crate::welcome::config::{self as welcome_config, WelcomeConfig};
+use crate::welcome::discord::{WelcomeJobs, WelcomePorts};
+use crate::welcome::render::{IdMap, WelcomeTemplate};
+use crate::welcome::runtime::{
+    validate_join_roles, GrantPolicy, GuildLookup, MessageSender, StaffAlerter, WelcomeFeature,
+    WelcomeRuntime,
+};
 use poise::serenity_prelude as serenity;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -543,9 +556,25 @@ pub struct FeaturePlan {
     pub flash: Option<FlashSettings>,
     pub safeword: Option<CommandConfig>,
     pub reaction_roles: Option<ReactionRolesPlan>,
+    pub welcome: Option<WelcomePlan>,
     pub staff_alert_channel: Option<u64>,
+    /// The home guild (`GUILD_ID`) when it is usable; every optional feature works there only.
+    pub home_guild: Option<u64>,
     /// Start-up lines: states, counts and stable codes. Never an id, a path or a value.
     pub lines: Vec<String>,
+}
+
+/// The welcome feature, as planned from the settings (W3a, `docs/verification/WIRING-C1.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WelcomePlan {
+    /// The parsed `WELCOME_*` and `JOIN_ROLE_IDS` keys. Usable: a channel and a template are set.
+    pub config: WelcomeConfig,
+    pub home_guild: u64,
+    pub channel_id: u64,
+    pub protected_role_ids: Vec<u64>,
+    pub staff_alert_channel: Option<u64>,
+    /// The channels and roles a template may name (`{channel:KEY}`, `{role:KEY}`).
+    pub ids: IdMap,
 }
 
 impl FeaturePlan {
@@ -747,13 +776,313 @@ pub fn plan_features(lookup: &dyn Fn(&str) -> Option<String>, config: &Config) -
         flash: None,
         safeword: None,
         reaction_roles: None,
+        welcome: None,
         staff_alert_channel: config.staff_alert_channel_id,
+        home_guild: home,
         lines: Vec::new(),
     };
     plan_flash(&mut plan, lookup, home);
     plan_safeword(&mut plan, lookup, config, home);
     plan_reaction_roles(&mut plan, lookup, config, home);
+    plan_welcome(&mut plan, lookup, config, home);
     plan
+}
+
+/// Plans the welcome feature (`docs/verification/WIRING-C1.md`). A mode that is off is silent. A
+/// mode that is on but cannot run is dropped with one line naming a key or a stable code.
+fn plan_welcome(
+    plan: &mut FeaturePlan,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    config: &Config,
+    home: Option<u64>,
+) {
+    if !mode_requested(lookup, welcome_config::KEY_MODE) {
+        return;
+    }
+    let Some(home_guild) = home else {
+        plan.lines.push(stays_off(
+            "welcome",
+            "home guild missing (home_guild_missing)",
+        ));
+        return;
+    };
+    // The join roles are checked against the protected-role rule; an unusable list cannot be
+    // read as "nothing is protected".
+    if config.invalid_core_keys.contains(&PROTECTED_ROLE_IDS_KEY) {
+        plan.lines.push(stays_off(
+            "welcome",
+            "protected role list unusable (protected_roles_invalid)",
+        ));
+        return;
+    }
+    let parsed = welcome_config::parse(|key| lookup(key).map(std::ffi::OsString::from));
+    let (ids, link_keys) =
+        match welcome_config::parse_id_map(|key| lookup(key).map(std::ffi::OsString::from)) {
+            Ok(ids) => (ids, Vec::new()),
+            Err(keys) => (IdMap::default(), keys),
+        };
+    let mut invalid_keys = parsed.invalid_keys.clone();
+    invalid_keys.extend(link_keys);
+    if !invalid_keys.is_empty() {
+        let keys: Vec<String> = invalid_keys
+            .iter()
+            .map(|key| format!("{key}: invalid_setting"))
+            .collect();
+        plan.lines.push(stays_off(
+            "welcome",
+            &format!("setting refused ({})", keys.join(", ")),
+        ));
+        return;
+    }
+    let Some(channel_id) = parsed.channel_id else {
+        plan.lines
+            .push(stays_off("welcome", "no channel set (no_channel)"));
+        return;
+    };
+    if parsed.template_path.is_none() {
+        plan.lines
+            .push(stays_off("welcome", "no template set (no_template)"));
+        return;
+    }
+    // K03 rule 6: a join role must never be one the safeword takes away or marks a member with.
+    // Safeword state survives a leave, so a member under safeword can rejoin; the join path
+    // does not look at that state, so such a role is refused here. A requested safeword that is
+    // not running cannot say what it restricts: welcome stays off (fail closed).
+    if mode_requested(lookup, safeword_config::KEY_MODE) {
+        let Some(command) = &plan.safeword else {
+            plan.lines.push(stays_off(
+                "welcome",
+                "safeword requested but not running (safeword_unavailable)",
+            ));
+            return;
+        };
+        let guarded = |id: &u64| {
+            *id == command.safeword.role_id || command.safeword.restricted_role_ids.contains(id)
+        };
+        if parsed.join_role_ids.iter().any(guarded) {
+            plan.lines.push(stays_off(
+                "welcome",
+                &format!(
+                    "join role refused ({}: safeword_restricted)",
+                    welcome_config::KEY_JOIN_ROLE_IDS
+                ),
+            ));
+            return;
+        }
+    }
+    plan.lines.push(format!(
+        "Feature welcome on: mode={}; join roles={}; staff alerts={}.",
+        mode_word(parsed.mode),
+        parsed.join_role_ids.len(),
+        if config.staff_alert_channel_id.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    ));
+    plan.welcome = Some(WelcomePlan {
+        config: parsed,
+        home_guild,
+        channel_id,
+        protected_role_ids: config.protected_role_ids.clone(),
+        staff_alert_channel: config.staff_alert_channel_id,
+        ids,
+    });
+}
+
+/// What the preflight is asked about: one request per planned feature that grants roles or posts
+/// into channels (flash, safeword, welcome), with that feature's own ids. Empty when none is
+/// planned, and then nothing is looked up and nothing is printed.
+pub fn preflight_requests(plan: &FeaturePlan) -> Vec<preflight::FeatureRequest> {
+    let mut requests = Vec::new();
+    if let Some(flash) = &plan.flash {
+        let mut request = preflight::FeatureRequest::new(preflight::Feature::Flash, flash.mode());
+        request.channels = flash.policy().channel_ids().to_vec();
+        requests.push(request);
+    }
+    if let Some(command) = &plan.safeword {
+        let mut request =
+            preflight::FeatureRequest::new(preflight::Feature::Safeword, command.safeword.mode);
+        // The swap writes the safeword role and removes and restores every restricted role,
+        // so the bot must be able to manage each of them.
+        let mut roles = vec![command.safeword.role_id];
+        for id in &command.safeword.restricted_role_ids {
+            if !roles.contains(id) {
+                roles.push(*id);
+            }
+        }
+        request.roles = roles;
+        requests.push(request);
+    }
+    if let Some(welcome) = &plan.welcome {
+        let mut request =
+            preflight::FeatureRequest::new(preflight::Feature::Welcome, welcome.config.mode);
+        request.channels = vec![welcome.channel_id];
+        request.roles = welcome.config.join_role_ids.clone();
+        requests.push(request);
+    }
+    requests
+}
+
+/// The plan after the startup preflight, and the lines to print for it.
+#[derive(Clone, Debug)]
+pub struct Gated {
+    /// The plan with every feature that may not run removed.
+    pub plan: FeaturePlan,
+    /// Feature names, statuses and stable codes only: never an id, a name, a path or a value.
+    pub lines: Vec<String>,
+}
+
+/// The reason text of a feature the preflight does not let start, or `None` when it may start.
+/// A planned feature with no verdict at all does not start (fail closed).
+fn not_ready(report: &preflight::Report, feature: preflight::Feature) -> Option<String> {
+    match report.feature(feature) {
+        Some(entry) if entry.status == preflight::Status::Ready => None,
+        Some(entry) if entry.reasons.is_empty() => Some("preflight_not_ready".to_string()),
+        Some(entry) => Some(
+            entry
+                .reasons
+                .iter()
+                .map(|reason| reason.code())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        None => Some("preflight_no_verdict".to_string()),
+    }
+}
+
+/// Applies the preflight verdicts to a plan. Pure.
+///
+/// A planned feature whose verdict is not `ready` is removed from the plan (it is not started)
+/// with a line naming the reason codes. The welcome join roles are also checked against the role
+/// policy with the facts the preflight gathered (`validate_join_roles`): a refused role removes
+/// welcome with the key `JOIN_ROLE_IDS` and the policy code. A safeword that does not start takes
+/// reaction roles with it, as the plan already does for a safeword that cannot be planned.
+pub fn gate_plan(plan: &FeaturePlan, input: &preflight::PreflightInput) -> Gated {
+    let report = preflight::evaluate(input);
+    let mut gated = plan.clone();
+    let mut lines: Vec<String> = report
+        .render_lines()
+        .into_iter()
+        .map(|line| format!("Preflight {line}"))
+        .collect();
+    if gated.flash.is_some() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Flash) {
+            gated.flash = None;
+            lines.push(stays_off("flash", &format!("preflight disabled ({why})")));
+        }
+    }
+    if gated.safeword.is_some() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Safeword) {
+            gated.safeword = None;
+            lines.push(stays_off(
+                "safeword",
+                &format!("preflight disabled ({why})"),
+            ));
+            if gated.reaction_roles.take().is_some() {
+                lines.push(stays_off(
+                    "reaction_roles",
+                    "safeword requested but not running (safeword_unavailable)",
+                ));
+            }
+        }
+    }
+    if let Some(welcome) = gated.welcome.clone() {
+        if let Some(why) = not_ready(&report, preflight::Feature::Welcome) {
+            gated.welcome = None;
+            lines.push(stays_off("welcome", &format!("preflight disabled ({why})")));
+        } else {
+            let refusals = validate_join_roles(
+                &welcome.config.join_role_ids,
+                welcome.home_guild,
+                &welcome.protected_role_ids,
+                input.bot_top_position,
+                &input.role_facts,
+            );
+            let mut codes: Vec<&'static str> = Vec::new();
+            for refusal in &refusals {
+                if !codes.contains(&refusal.reason) {
+                    codes.push(refusal.reason);
+                }
+            }
+            if !refusals.is_empty() {
+                gated.welcome = None;
+                let key = refusals[0].key;
+                for code in codes {
+                    lines.push(stays_off(
+                        "welcome",
+                        &format!("join role refused ({key}: {code})"),
+                    ));
+                }
+            }
+        }
+    }
+    Gated { plan: gated, lines }
+}
+
+/// Builds the welcome feature from its plan: reads and validates the template, wires the runtime
+/// to the given ports and wraps it for the registry (core database, two job kinds, home guild).
+/// `Ok(None)` when welcome is not planned. An unusable template stops welcome with one line that
+/// names a stable code (`template_unreadable`, or the template's own refusal code) and nothing
+/// from the file.
+pub fn build_welcome<X, D, S, W, P, M, A, G>(
+    plan: &FeaturePlan,
+    ports: WelcomePorts<S, W, P, M, A, G>,
+    bot_user_id: u64,
+    read_template: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Box<dyn Feature<X, D>>>, String>
+where
+    X: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    S: RoleSource + Send + Sync + 'static,
+    W: RoleWriter + Send + Sync + 'static,
+    P: Sleeper + Send + Sync + 'static,
+    M: MessageSender + Send + Sync + 'static,
+    A: StaffAlerter + Send + Sync + 'static,
+    G: GuildLookup + 'static,
+{
+    let Some(welcome) = &plan.welcome else {
+        return Ok(None);
+    };
+    let key = welcome.config.template_path.as_deref().unwrap_or("");
+    let Some(source) = read_template(key) else {
+        return Err(stays_off(
+            "welcome",
+            "template unreadable (template_unreadable)",
+        ));
+    };
+    let ids = welcome.ids.clone();
+    let template = WelcomeTemplate::load(&source, &ids).map_err(|error| {
+        stays_off(
+            "welcome",
+            &format!(
+                "template refused ({}: {})",
+                welcome_config::KEY_TEMPLATE_PATH,
+                error.kind().code()
+            ),
+        )
+    })?;
+    let runtime = WelcomeRuntime {
+        config: welcome.config.clone(),
+        template,
+        ids,
+        source: ports.source,
+        writer: ports.writer,
+        sleeper: ports.sleeper,
+        sender: ports.sender,
+        alerter: ports.alerter,
+        staff_alert_channel: welcome.staff_alert_channel,
+        bot_user_id,
+        grant_policy: GrantPolicy {
+            protected_role_ids: welcome.protected_role_ids.clone(),
+            ..GrantPolicy::default()
+        },
+    };
+    let feature = WelcomeFeature::new(runtime, ports.guilds);
+    Ok(Some(Box::new(WelcomeJobs::new(
+        Box::new(feature),
+        welcome.home_guild,
+    ))))
 }
 
 /// What building the features needs from Discord.
@@ -828,6 +1157,95 @@ pub fn build_features<X: Sync + 'static, D: Sync + 'static>(
         )));
     }
     built
+}
+
+/// What [`start_gated`] needs.
+pub struct GatedStart<'a> {
+    pub plan: &'a FeaturePlan,
+    pub bot_user_id: u64,
+    pub http: Arc<serenity::Http>,
+    pub cache: Arc<serenity::Cache>,
+    pub facts: &'a dyn FactSource,
+    pub roles: &'a dyn RoleSource,
+    pub store: StoreSpec,
+    pub protected_role_ids: Vec<u64>,
+    /// Builds the reaction-role services; it gets the safeword lookup when the safeword runs.
+    pub reaction: &'a (dyn Fn(Option<SafewordLookup>) -> Arc<dyn ReactionServices> + Sync),
+    pub read_template: &'a (dyn Fn(&str) -> Option<String> + Sync),
+}
+
+/// What [`start_gated`] hands to `setup`.
+pub struct GatedFeatures<X, D> {
+    /// The features to register, in order.
+    pub features: Vec<Box<dyn Feature<X, D>>>,
+    /// The safeword runtime, present exactly when the safeword was planned AND passed.
+    pub safeword: Option<Arc<SafewordRuntime>>,
+    /// Preflight lines and the line of a welcome that could not be built. No id, path or value.
+    pub lines: Vec<String>,
+}
+
+/// Preflight, then build: the one place that turns "what the environment asked for" into "what
+/// is registered". Everything is built from the GATED plan: a feature the preflight refused has no
+/// runtime, no feature and no registration, and the others still start.
+pub async fn start_gated<X: Send + Sync + 'static, D: Send + Sync + 'static>(
+    request: GatedStart<'_>,
+) -> GatedFeatures<X, D> {
+    let gated = startup_preflight(
+        request.plan,
+        request.bot_user_id,
+        request.facts,
+        request.roles,
+    )
+    .await;
+    let mut lines = gated.lines;
+    let built_plan = gated.plan;
+    let safeword = safeword_runtime(
+        &built_plan,
+        SafewordParts {
+            http: request.http.clone(),
+            cache: request.cache.clone(),
+            bot_user_id: request.bot_user_id,
+            store: request.store,
+            protected_role_ids: request.protected_role_ids,
+        },
+    );
+    // Reaction roles ask the safeword store whether a member is under safeword.
+    let lookup: Option<SafewordLookup> = safeword.as_ref().map(|runtime| {
+        let runtime = runtime.clone();
+        Arc::new(move |guild: u64, member: u64| runtime.store().reaction_state(guild, member))
+            as SafewordLookup
+    });
+    let services = Services {
+        http: request.http.clone(),
+        cache: request.cache.clone(),
+        bot_user_id: request.bot_user_id,
+        reaction: (request.reaction)(lookup),
+        safeword: safeword.clone(),
+    };
+    let mut features: Vec<Box<dyn Feature<X, D>>> = production_features();
+    features.extend(build_features(&built_plan, &services));
+    if let Some(welcome) = &built_plan.welcome {
+        let ports = crate::welcome::discord::serenity_ports(
+            request.http.clone(),
+            request.cache.clone(),
+            welcome.home_guild,
+        );
+        match build_welcome(
+            &built_plan,
+            ports,
+            request.bot_user_id,
+            request.read_template,
+        ) {
+            Ok(Some(feature)) => features.push(feature),
+            Ok(None) => {}
+            Err(line) => lines.push(line),
+        }
+    }
+    GatedFeatures {
+        features,
+        safeword,
+        lines,
+    }
 }
 
 /// The start-up decisions that depend on which planned features really started. Production
@@ -3344,5 +3762,1633 @@ mod wiring_tests {
             .is_empty());
         let off = plan_for(&[], &config());
         assert!(wire(&off, &on(&["flash"])).flash_log_excluded.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod welcome_wiring_tests {
+    //! W3a wiring (`docs/verification/WIRING-C1.md`): the welcome plan and build, the real
+    //! `WelcomeFeature` through `Features::dispatch`, and the startup preflight gate.
+    use super::*;
+    use crate::preflight::{
+        PermissionLookup, PreflightInput, RoleFactsEntry, ADMINISTRATOR, EMBED_LINKS,
+        MANAGE_MESSAGES, MANAGE_ROLES, SEND_MESSAGES,
+    };
+    use crate::preflight_wiring::fakes::{FakeFacts, FakeRoles};
+    use crate::preflight_wiring::startup_preflight;
+    use crate::roles::eligibility::RoleFacts;
+    use crate::roles::grant::{RoleWriter, Sleeper, WriteError};
+    use crate::roles::runtime::{RoleEntry, RoleSource, SourceError};
+    use crate::welcome::discord::{AlertPost, FloodControlledAlerter, UnixClock};
+    use crate::welcome::runtime::{
+        GuildFacts, GuildLookup, MessageSender, OutgoingMessage, SendError, StaffAlerter,
+    };
+    use ::serenity::all::FullEvent;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    // Synthetic ids. They are obviously made up and are not real Discord ids.
+    const GUILD: u64 = 770_001;
+    const OTHER_GUILD: u64 = 770_002;
+    const BOT: u64 = 770_003;
+    const MEMBER: u64 = 770_004;
+    const CHANNEL: u64 = 770_010;
+    const ALERT_CHANNEL: u64 = 770_011;
+    const ROLE_LOW: u64 = 770_020;
+    const ROLE_PRIV: u64 = 770_021;
+    const ROLE_PROT: u64 = 770_022;
+    const ROLE_MANAGED: u64 = 770_023;
+    const ROLE_HIGH: u64 = 770_024;
+    const BOT_ROLE: u64 = 770_030;
+    const FLASH_CH: u64 = 770_040;
+    const SW_ROLE: u64 = 770_050;
+    const SW_RESTRICTED: u64 = 770_051;
+
+    const TEMPLATE: &str = r#"{"embed":{"title":"Welcome {user_mention}","description":"You are our {member_ordinal} member."}}"#;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("w3a-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn config() -> Config {
+        Config {
+            discord_token: "synthetic-token".to_string(),
+            log_channel_id: 770_900,
+            age_role_1: 1,
+            age_role_2: 2,
+            reaction_role_db_path: "reaction-test.sqlite".to_string(),
+            staff_role_id: Some(770_005),
+            tickets: None,
+            ticket_archive_retention: crate::tickets::retention::RetentionPolicy::Disabled,
+            ticket_privacy_lockdown: false,
+            core_db_path: Some("core-test.sqlite".to_string()),
+            guild_id: Some(GUILD),
+            staff_alert_channel_id: Some(ALERT_CHANNEL),
+            log_excluded_channel_ids: vec![],
+            log_excluded_category_ids: vec![],
+            protected_role_ids: vec![ROLE_PROT],
+            invalid_core_keys: vec![],
+        }
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn plan_for(pairs: &[(&str, &str)], config: &Config) -> FeaturePlan {
+        plan_features(&lookup(pairs), config)
+    }
+
+    fn welcome_keys(mode: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("WELCOME_MODE", mode),
+            ("WELCOME_CHANNEL_ID", "770010"),
+            ("WELCOME_TEMPLATE_PATH", "welcome"),
+            ("JOIN_ROLE_IDS", "770020"),
+        ]
+    }
+
+    fn flash_keys() -> Vec<(&'static str, &'static str)> {
+        vec![("FLASH_MODE", "live"), ("FLASH_CHANNEL_IDS", "770040")]
+    }
+
+    fn safeword_keys() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("SAFEWORD_MODE", "live"),
+            ("SAFEWORD_ROLE_ID", "770050"),
+            ("SAFEWORD_CHANNEL_ID", "770052"),
+            ("SAFEWORD_MESSAGE_ID", "770053"),
+            ("SAFEWORD_EMOJI_ID", "770054"),
+            ("SAFEWORD_RESTRICTED_ROLE_IDS", "770051"),
+        ]
+    }
+
+    fn all_keys() -> Vec<(&'static str, &'static str)> {
+        let mut pairs = welcome_keys("live");
+        pairs.extend(flash_keys());
+        pairs.extend(safeword_keys());
+        pairs
+    }
+
+    // ---- fakes behind the welcome traits ----------------------------------------
+
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<String>>>);
+
+    impl Log {
+        fn push(&self, line: String) {
+            self.0.lock().unwrap().push(line);
+        }
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FSource;
+
+    #[::serenity::async_trait]
+    impl RoleSource for FSource {
+        async fn roles(&self, _g: u64) -> Result<Vec<RoleEntry>, SourceError> {
+            let role = |id, position| RoleEntry {
+                id,
+                position,
+                managed: false,
+                permissions: 0,
+            };
+            Ok(vec![role(BOT_ROLE, 20), role(ROLE_LOW, 5), role(GUILD, 0)])
+        }
+        async fn member_roles(&self, _g: u64, member: u64) -> Result<Vec<u64>, SourceError> {
+            Ok(if member == BOT {
+                vec![BOT_ROLE]
+            } else {
+                vec![]
+            })
+        }
+    }
+
+    struct FWriter {
+        log: Log,
+        fail_status: Option<u16>,
+    }
+
+    impl RoleWriter for FWriter {
+        fn add_role(&mut self, member: u64, role: u64) -> Result<(), WriteError> {
+            self.log.push(format!("grant:{member}:{role}"));
+            match self.fail_status {
+                Some(status) => Err(WriteError {
+                    status,
+                    api_code: None,
+                    retry_after_ms: None,
+                }),
+                None => Ok(()),
+            }
+        }
+    }
+
+    struct FSleeper;
+
+    impl Sleeper for FSleeper {
+        fn sleep_ms(&mut self, _ms: u64) {}
+    }
+
+    struct FSender(Log);
+
+    impl MessageSender for FSender {
+        fn send(&mut self, channel_id: u64, message: &OutgoingMessage) -> Result<(), SendError> {
+            let title = message.embed.title.clone().unwrap_or_default();
+            self.0.push(format!("send:{channel_id}:{title}"));
+            Ok(())
+        }
+    }
+
+    struct FAlerter(Log);
+
+    impl StaffAlerter for FAlerter {
+        fn alert(&mut self, channel_id: u64, code: &str) {
+            self.0.push(format!("alert:{channel_id}:{code}"));
+        }
+    }
+
+    struct FGuilds;
+
+    #[::serenity::async_trait]
+    impl GuildLookup for FGuilds {
+        async fn guild_facts(&self, _guild_id: u64) -> Option<GuildFacts> {
+            Some(GuildFacts {
+                name: "synthetic-server".to_string(),
+                member_count: 42,
+            })
+        }
+    }
+
+    type FakePorts = WelcomePorts<FSource, FWriter, FSleeper, FSender, FAlerter, FGuilds>;
+
+    fn ports(log: &Log) -> FakePorts {
+        WelcomePorts {
+            source: FSource,
+            writer: FWriter {
+                log: log.clone(),
+                fail_status: None,
+            },
+            sleeper: FSleeper,
+            sender: FSender(log.clone()),
+            alerter: FAlerter(log.clone()),
+            guilds: FGuilds,
+        }
+    }
+
+    fn read_template(key: &str) -> Option<String> {
+        (key == "welcome").then(|| TEMPLATE.to_string())
+    }
+
+    fn build_one(plan: &FeaturePlan, log: &Log) -> Vec<Box<dyn Feature<u8, u16>>> {
+        match build_welcome::<u8, u16, _, _, _, _, _, _>(plan, ports(log), BOT, &read_template) {
+            Ok(Some(feature)) => vec![feature],
+            other => panic!(
+                "expected a welcome feature, got {:?}",
+                other.map(|o| o.is_some())
+            ),
+        }
+    }
+
+    fn join(guild: u64, user: u64, bot: bool) -> FullEvent {
+        let mut member = ::serenity::all::Member::default();
+        member.user.id = ::serenity::all::UserId::new(user);
+        member.user.name = "synthetic-user".to_string();
+        member.user.bot = bot;
+        member.guild_id = ::serenity::all::GuildId::new(guild);
+        FullEvent::GuildMemberAddition { new_member: member }
+    }
+
+    fn leave(guild: u64) -> FullEvent {
+        FullEvent::GuildMemberRemoval {
+            guild_id: ::serenity::all::GuildId::new(guild),
+            user: ::serenity::all::User::default(),
+            member_data_if_available: None,
+        }
+    }
+
+    fn core_settings(path: &Path, guild: GuildFilter) -> Settings {
+        Settings {
+            guild,
+            core_db_path: Some(path.to_string_lossy().into_owned()),
+            reserved_db_paths: vec![],
+            staff_alert_channel: None,
+            protected_role_count: 0,
+            log_excluded_channels: 0,
+            log_excluded_categories: 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct Starter {
+        kinds: Mutex<Vec<String>>,
+    }
+
+    impl JobStarter for Starter {
+        fn start(
+            &self,
+            _db: tokio_rusqlite::Connection,
+            registry: Registry,
+        ) -> BoxFuture<'_, Result<StartedJobs, RunnerError>> {
+            Box::pin(async move {
+                self.kinds.lock().unwrap().push(format!("{registry:?}"));
+                Ok(StartedJobs {
+                    counts: ReportCounts::default(),
+                    wake: Arc::new(|| {}),
+                    shutdown: Arc::new(|| {}),
+                    finished: Box::pin(async {}),
+                })
+            })
+        }
+    }
+
+    async fn start_welcome(
+        features: Vec<Box<dyn Feature<u8, u16>>>,
+        dir: &Path,
+        guild: GuildFilter,
+        starter: &Starter,
+    ) -> Features<u8, u16> {
+        Features::start(
+            StartRequest {
+                features,
+                settings: &core_settings(&dir.join("core.sqlite"), guild),
+            },
+            starter,
+        )
+        .await
+    }
+
+    // ---- planning from the environment -------------------------------------------
+
+    #[test]
+    fn welcome_is_absent_and_silent_from_an_empty_environment() {
+        let plan = plan_for(&[], &config());
+        assert!(plan.welcome.is_none());
+        assert!(plan.lines.is_empty(), "{:?}", plan.lines);
+        assert!(preflight_requests(&plan).is_empty());
+    }
+
+    #[test]
+    fn welcome_keys_with_the_mode_off_or_unknown_change_nothing_even_when_bad() {
+        for mode in ["off", "", "bogus"] {
+            let mut pairs = welcome_keys(mode);
+            pairs.push(("WELCOME_CHANNEL_ID", "not-an-id"));
+            pairs.push(("JOIN_ROLE_IDS", "1,x"));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.welcome.is_none(), "{mode:?}");
+            assert!(plan.lines.is_empty(), "{mode:?}: {:?}", plan.lines);
+        }
+    }
+
+    #[test]
+    fn a_complete_environment_plans_welcome_live_or_shadow_and_names_no_value() {
+        for (word, mode) in [("live", Mode::Live), ("shadow", Mode::Shadow)] {
+            let plan = plan_for(&welcome_keys(word), &config());
+            let welcome = plan.welcome.as_ref().expect(word);
+            assert_eq!(welcome.config.mode, mode);
+            assert_eq!(welcome.home_guild, GUILD);
+            assert_eq!(welcome.channel_id, CHANNEL);
+            assert_eq!(welcome.config.join_role_ids, vec![ROLE_LOW]);
+            assert_eq!(welcome.protected_role_ids, vec![ROLE_PROT]);
+            assert_eq!(welcome.staff_alert_channel, Some(ALERT_CHANNEL));
+            assert_eq!(plan.lines.len(), 1, "{:?}", plan.lines);
+            let line = &plan.lines[0];
+            assert!(line.starts_with("Feature welcome on"), "{line}");
+            assert!(!line.contains("770"), "{line}");
+        }
+    }
+
+    #[test]
+    fn welcome_with_a_refused_setting_is_dropped_with_a_key_or_code_and_no_value() {
+        struct Case {
+            pairs: Vec<(&'static str, &'static str)>,
+            config: Config,
+            expect: &'static [&'static str],
+        }
+        let mut no_home = config();
+        no_home.guild_id = None;
+        let mut bad_protected = config();
+        bad_protected.invalid_core_keys = vec![crate::config::PROTECTED_ROLE_IDS_KEY];
+        let with = |key: &'static str, value: &'static str| {
+            let mut pairs = welcome_keys("live");
+            pairs.retain(|(k, _)| *k != key);
+            if !value.is_empty() {
+                pairs.push((key, value));
+            }
+            pairs
+        };
+        let cases = [
+            Case {
+                pairs: welcome_keys("live"),
+                config: no_home,
+                expect: &["home_guild_missing"],
+            },
+            Case {
+                pairs: welcome_keys("live"),
+                config: bad_protected,
+                expect: &["protected_roles_invalid"],
+            },
+            Case {
+                pairs: with("WELCOME_CHANNEL_ID", "770010,770011"),
+                config: config(),
+                expect: &["WELCOME_CHANNEL_ID", "invalid_setting"],
+            },
+            Case {
+                pairs: with("WELCOME_TEMPLATE_PATH", "../SECRET-VALUE"),
+                config: config(),
+                expect: &["WELCOME_TEMPLATE_PATH", "invalid_setting"],
+            },
+            Case {
+                pairs: with("JOIN_ROLE_IDS", "NOT-AN-ID-VALUE"),
+                config: config(),
+                expect: &["JOIN_ROLE_IDS", "invalid_setting"],
+            },
+            Case {
+                pairs: with("WELCOME_CHANNEL_ID", ""),
+                config: config(),
+                expect: &["no_channel"],
+            },
+            Case {
+                pairs: with("WELCOME_TEMPLATE_PATH", ""),
+                config: config(),
+                expect: &["no_template"],
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let plan = plan_for(&case.pairs, &case.config);
+            assert!(plan.welcome.is_none(), "case {index}");
+            assert_eq!(plan.lines.len(), 1, "case {index}: {:?}", plan.lines);
+            let line = &plan.lines[0];
+            assert!(
+                line.starts_with("Feature welcome stays off"),
+                "case {index}: {line}"
+            );
+            for word in case.expect {
+                assert!(line.contains(word), "case {index}: {line}");
+            }
+            for secret in ["SECRET-VALUE", "NOT-AN-ID-VALUE", "770010", "770020"] {
+                assert!(!line.contains(secret), "case {index}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn welcome_does_not_disturb_the_other_features_plans() {
+        let with = plan_for(&all_keys(), &config());
+        let mut without_welcome = all_keys();
+        without_welcome.retain(|(k, _)| !k.starts_with("WELCOME") && *k != "JOIN_ROLE_IDS");
+        let without = plan_for(&without_welcome, &config());
+        assert!(with.welcome.is_some() && without.welcome.is_none());
+        assert_eq!(
+            with.flash
+                .as_ref()
+                .map(|f| f.policy().channel_ids().to_vec()),
+            without
+                .flash
+                .as_ref()
+                .map(|f| f.policy().channel_ids().to_vec())
+        );
+        assert_eq!(with.safeword.is_some(), without.safeword.is_some());
+    }
+
+    // ---- what the preflight is asked about ------------------------------------------
+
+    #[test]
+    fn the_preflight_is_asked_about_each_planned_feature_with_its_own_ids() {
+        let plan = plan_for(&all_keys(), &config());
+        let requests = preflight_requests(&plan);
+        let find = |feature| requests.iter().find(|r| r.feature == feature).unwrap();
+        let welcome = find(preflight::Feature::Welcome);
+        assert_eq!(welcome.mode, Mode::Live);
+        assert_eq!(welcome.channels, vec![CHANNEL]);
+        assert_eq!(welcome.roles, vec![ROLE_LOW]);
+        let flash = find(preflight::Feature::Flash);
+        assert_eq!(flash.channels, vec![FLASH_CH]);
+        let safeword = find(preflight::Feature::Safeword);
+        assert_eq!(safeword.roles, vec![SW_ROLE, SW_RESTRICTED]);
+        assert_eq!(requests.len(), 3);
+        // Shadow is requested as shadow: the gate never upgrades it.
+        let shadow = plan_for(&welcome_keys("shadow"), &config());
+        assert_eq!(preflight_requests(&shadow)[0].mode, Mode::Shadow);
+    }
+
+    // ---- building ---------------------------------------------------------------------
+
+    #[test]
+    fn nothing_is_built_without_a_welcome_plan() {
+        let plan = plan_for(&[], &config());
+        let built = build_welcome::<u8, u16, _, _, _, _, _, _>(
+            &plan,
+            ports(&Log::default()),
+            BOT,
+            &read_template,
+        );
+        assert!(matches!(built, Ok(None)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_production_ports_satisfy_the_build_without_any_call_to_discord() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let ports = crate::welcome::discord::serenity_ports(
+            Arc::new(serenity::Http::new("synthetic-token")),
+            Arc::new(serenity::Cache::new()),
+            GUILD,
+        );
+        let built = build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports, BOT, &read_template);
+        let feature = built
+            .ok()
+            .flatten()
+            .expect("built from the production ports");
+        assert_eq!(feature.name(), "welcome");
+        assert!(feature.needs_core_db());
+    }
+
+    #[test]
+    fn a_planned_welcome_builds_a_feature_that_needs_the_core_database() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let features = build_one(&plan, &Log::default());
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name(), "welcome");
+        assert!(features[0].enabled());
+        assert!(features[0].needs_core_db());
+        let mut registry = Registry::new();
+        features[0].register_jobs(&mut registry).unwrap();
+        let listed = format!("{registry:?}");
+        assert!(listed.contains("welcome_grant_roles") && listed.contains("welcome_send_message"));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn a_template_that_cannot_be_used_stops_welcome_with_a_code_and_no_content() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let unreadable =
+            build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports(&Log::default()), BOT, &|_| {
+                None
+            });
+        let line = unreadable.err().expect("refused");
+        assert!(
+            line.contains("welcome") && line.contains("template_unreadable"),
+            "{line}"
+        );
+        let broken =
+            build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports(&Log::default()), BOT, &|_| {
+                Some("{\"secret\": 770010 not json".to_string())
+            });
+        let line = broken.err().expect("refused");
+        assert!(line.contains("malformed_json"), "{line}");
+        assert!(
+            !line.contains("secret") && !line.contains("770010"),
+            "{line}"
+        );
+        let unknown_field =
+            build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports(&Log::default()), BOT, &|_| {
+                Some("{\"embed\":{},\"zzz\":1}".to_string())
+            });
+        assert!(unknown_field
+            .err()
+            .expect("refused")
+            .contains("unknown_field"));
+    }
+
+    // ---- the real WelcomeFeature through Features::dispatch ----------------------------
+
+    #[tokio::test]
+    async fn a_human_join_grants_the_join_roles_and_posts_the_welcome() {
+        let log = Log::default();
+        let dir = scratch("human-join");
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = start_welcome(
+            build_one(&plan, &log),
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        assert!(f.is_active("welcome"));
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 1);
+        let lines = log.lines();
+        assert_eq!(
+            lines,
+            vec![
+                format!("grant:{MEMBER}:{ROLE_LOW}"),
+                format!("send:{CHANNEL}:Welcome <@{MEMBER}>"),
+            ],
+            "roles first, then the message, nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bot_account_joining_grants_nothing_and_posts_nothing() {
+        let log = Log::default();
+        let dir = scratch("bot-join");
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = start_welcome(
+            build_one(&plan, &log),
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        assert_eq!(f.dispatch(&1, &join(GUILD, BOT, true), &2).await, 1);
+        assert!(log.lines().is_empty(), "{:?}", log.lines());
+        // And a human right after still gets the welcome: the bot rule is per account.
+        f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await;
+        assert_eq!(log.lines().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_join_in_another_guild_is_ignored_at_both_layers() {
+        for (name, filter) in [
+            ("two-guild-only", GuildFilter::Only(GUILD)),
+            ("two-guild-any", GuildFilter::Any),
+        ] {
+            let log = Log::default();
+            let dir = scratch(name);
+            let plan = plan_for(&welcome_keys("live"), &config());
+            let f = start_welcome(build_one(&plan, &log), &dir, filter, &Starter::default()).await;
+            f.dispatch(&1, &join(OTHER_GUILD, MEMBER, false), &2).await;
+            assert!(log.lines().is_empty(), "{name}: {:?}", log.lines());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_member_join_event_reaches_welcome() {
+        let log = Log::default();
+        let dir = scratch("other-events");
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = start_welcome(
+            build_one(&plan, &log),
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        f.dispatch(&1, &leave(GUILD), &2).await;
+        assert!(log.lines().is_empty(), "{:?}", log.lines());
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_claim_and_completion_abandons_welcome_jobs_on_the_real_runner() {
+        use crate::jobs::queue::{self as jq, NewJob, ScheduleOutcome};
+        let log = Log::default();
+        let dir = scratch("crash-restart");
+        let path = dir.join("core.sqlite");
+        {
+            let mut conn = crate::storage::open(&path.to_string_lossy(), &[]).unwrap();
+            jq::init(&mut conn).unwrap();
+            let now = 1_700_000_000i64;
+            for (kind, key) in [
+                ("welcome_grant_roles", "join-1-roles"),
+                ("welcome_send_message", "join-1-message"),
+            ] {
+                let job = NewJob {
+                    kind,
+                    dedupe_key: key,
+                    payload_json: "{}",
+                    due_at: now,
+                };
+                let ScheduleOutcome::Created { id } = jq::schedule(&conn, &job, now).unwrap()
+                else {
+                    panic!("a fresh key is created");
+                };
+                // The worker claimed it and the process died before it finished.
+                assert!(jq::try_claim(&conn, id, now).unwrap());
+            }
+        }
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = Features::start(
+            StartRequest {
+                features: build_one(&plan, &log),
+                settings: &core_settings(&path, GuildFilter::Only(GUILD)),
+            },
+            &TokioJobStarter,
+        )
+        .await;
+        let started = f.lines().join("\n");
+        f.stop().await;
+        assert!(f.is_active("welcome"), "{started}");
+        assert!(
+            started.contains("requeued=0 abandoned_at_most_once=2 abandoned_unregistered=0"),
+            "both are abandoned, never repeated: {started}"
+        );
+        assert!(
+            log.lines().is_empty(),
+            "nothing was granted or posted by a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn welcome_registers_only_its_two_job_kinds_and_opens_the_core_database() {
+        let log = Log::default();
+        let dir = scratch("kinds");
+        let starter = Starter::default();
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let f = start_welcome(
+            build_one(&plan, &log),
+            &dir,
+            GuildFilter::Only(GUILD),
+            &starter,
+        )
+        .await;
+        assert!(f.is_active("welcome"));
+        assert!(dir.join("core.sqlite").exists());
+        let kinds = starter.kinds.lock().unwrap().clone();
+        assert_eq!(
+            kinds,
+            vec![r#"["welcome_grant_roles", "welcome_send_message"]"#.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_core_database_keeps_welcome_off_and_nothing_half_starts() {
+        let log = Log::default();
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let mut settings = core_settings(Path::new("unused"), GuildFilter::Only(GUILD));
+        settings.core_db_path = None;
+        let f = Features::start(
+            StartRequest {
+                features: build_one(&plan, &log),
+                settings: &settings,
+            },
+            &Starter::default(),
+        )
+        .await;
+        assert!(!f.is_active("welcome"));
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 0);
+        assert!(log.lines().is_empty());
+        assert!(f
+            .lines()
+            .iter()
+            .any(|l| l.contains("Core database unavailable")));
+    }
+
+    #[tokio::test]
+    async fn welcome_in_shadow_mode_grants_and_posts_nothing() {
+        let log = Log::default();
+        let dir = scratch("shadow-join");
+        let plan = plan_for(&welcome_keys("shadow"), &config());
+        let f = start_welcome(
+            build_one(&plan, &log),
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await;
+        assert!(log.lines().is_empty(), "{:?}", log.lines());
+    }
+
+    // ---- the production alerter on the real feature path -----------------------------
+
+    #[derive(Clone, Default)]
+    struct Clock(Arc<AtomicI64>);
+
+    impl UnixClock for Clock {
+        fn now_secs(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Posts(Arc<Mutex<Vec<String>>>);
+
+    impl AlertPost for Posts {
+        fn post(&self, channel_id: u64, text: &str) {
+            self.0.lock().unwrap().push(format!("{channel_id}:{text}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_failing_joins_alerts_staff_once_per_code_until_the_window_passes() {
+        let log = Log::default();
+        let (clock, posts) = (Clock::default(), Posts::default());
+        let mut p = ports(&log);
+        p.writer.fail_status = Some(403);
+        let welcome = WelcomePorts {
+            source: p.source,
+            writer: p.writer,
+            sleeper: p.sleeper,
+            sender: p.sender,
+            alerter: FloodControlledAlerter::new(clock.clone(), posts.clone()),
+            guilds: p.guilds,
+        };
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let feature =
+            build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, welcome, BOT, &read_template)
+                .ok()
+                .flatten()
+                .expect("built");
+        let dir = scratch("flood");
+        let f = start_welcome(
+            vec![feature],
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        clock.0.store(50_000, Ordering::SeqCst);
+        for user in 0..20u64 {
+            f.dispatch(&1, &join(GUILD, MEMBER + user, false), &2).await;
+        }
+        assert_eq!(
+            posts.0.lock().unwrap().len(),
+            1,
+            "{:?}",
+            posts.0.lock().unwrap()
+        );
+        assert!(posts.0.lock().unwrap()[0].starts_with(&format!("{ALERT_CHANNEL}:")));
+        clock.0.store(50_300, Ordering::SeqCst);
+        f.dispatch(&1, &join(GUILD, MEMBER + 99, false), &2).await;
+        assert_eq!(
+            posts.0.lock().unwrap().len(),
+            2,
+            "the alert comes back after the window"
+        );
+    }
+
+    // ---- ALL-OFF PARITY ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn from_an_empty_environment_nothing_is_asked_built_opened_or_printed() {
+        let plan = plan_for(&[], &config());
+        let (facts, roles) = (FakeFacts::default(), FakeRoles::new(vec![], vec![]));
+        let gated = startup_preflight(&plan, BOT, &facts, &roles).await;
+        assert!(gated.lines.is_empty(), "{:?}", gated.lines);
+        assert_eq!(
+            facts.calls() + roles.calls(),
+            0,
+            "nothing is asked of Discord"
+        );
+        assert!(gated.plan.flash.is_none() && gated.plan.safeword.is_none());
+        assert!(gated.plan.reaction_roles.is_none() && gated.plan.welcome.is_none());
+        let built = build_welcome::<u8, u16, _, _, _, _, _, _>(
+            &gated.plan,
+            ports(&Log::default()),
+            BOT,
+            &read_template,
+        );
+        assert!(matches!(built, Ok(None)));
+        let dir = scratch("all-off");
+        let starter = Starter::default();
+        let f = start_welcome(vec![], &dir, GuildFilter::Only(GUILD), &starter).await;
+        assert!(!dir.join("core.sqlite").exists(), "no core database");
+        assert!(starter.kinds.lock().unwrap().is_empty(), "no runner");
+        assert!(f.lines().is_empty());
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 0);
+    }
+
+    #[tokio::test]
+    async fn modes_off_with_every_key_set_still_ask_and_print_nothing() {
+        let mut pairs = welcome_keys("off");
+        pairs.extend([("FLASH_MODE", "off"), ("SAFEWORD_MODE", "off")]);
+        let plan = plan_for(&pairs, &config());
+        let (facts, roles) = (FakeFacts::default(), FakeRoles::new(vec![], vec![]));
+        let gated = startup_preflight(&plan, BOT, &facts, &roles).await;
+        assert!(gated.lines.is_empty() && plan.lines.is_empty());
+        assert_eq!(facts.calls() + roles.calls(), 0);
+    }
+
+    // ---- the preflight gate -------------------------------------------------------------
+
+    fn role_entries() -> Vec<RoleEntry> {
+        let role = |id, position, permissions: u64, managed| RoleEntry {
+            id,
+            position,
+            managed,
+            permissions,
+        };
+        vec![
+            role(BOT_ROLE, 20, 0, false),
+            role(ROLE_LOW, 5, 0, false),
+            role(ROLE_PRIV, 6, ADMINISTRATOR, false),
+            role(ROLE_PROT, 7, 0, false),
+            role(ROLE_MANAGED, 8, 0, true),
+            role(ROLE_HIGH, 30, 0, false),
+            role(SW_ROLE, 4, 0, false),
+            role(SW_RESTRICTED, 3, 0, false),
+            role(GUILD, 0, 0, false),
+        ]
+    }
+
+    fn healthy_facts() -> FakeFacts {
+        FakeFacts {
+            guild: Some(MANAGE_ROLES),
+            channels: [
+                (CHANNEL, Some(SEND_MESSAGES | EMBED_LINKS)),
+                (FLASH_CH, Some(MANAGE_MESSAGES)),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeFacts::default()
+        }
+    }
+
+    fn healthy_roles() -> FakeRoles {
+        FakeRoles::new(role_entries(), vec![BOT_ROLE])
+    }
+
+    fn lines_text(gated: &Gated) -> String {
+        gated.lines.join("\n")
+    }
+
+    #[tokio::test]
+    async fn every_ready_feature_starts_and_the_report_lists_each_one() {
+        let plan = plan_for(&all_keys(), &config());
+        let gated = startup_preflight(&plan, BOT, &healthy_facts(), &healthy_roles()).await;
+        assert!(gated.plan.flash.is_some());
+        assert!(gated.plan.safeword.is_some());
+        assert!(gated.plan.welcome.is_some());
+        assert_eq!(
+            gated.lines,
+            vec![
+                "Preflight flash: ready".to_string(),
+                "Preflight safeword: ready".to_string(),
+                "Preflight welcome: ready".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_verdict_stops_that_feature_while_the_others_still_start() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut facts = healthy_facts();
+        facts.channels.insert(CHANNEL, Some(SEND_MESSAGES)); // no EMBED_LINKS for welcome
+        let gated = startup_preflight(&plan, BOT, &facts, &healthy_roles()).await;
+        assert!(gated.plan.welcome.is_none(), "welcome is refused");
+        assert!(gated.plan.flash.is_some() && gated.plan.safeword.is_some());
+        let text = lines_text(&gated);
+        assert!(
+            text.contains("Preflight welcome: disabled (missing_embed_links)"),
+            "{text}"
+        );
+        assert!(text.contains("Feature welcome stays off"), "{text}");
+        // The features that are left really start; welcome never registers.
+        let log = Log::default();
+        let dir = scratch("gate-others-start");
+        let starter = Starter::default();
+        let mut built: Vec<Box<dyn Feature<u8, u16>>> = Vec::new();
+        let services = Services {
+            http: Arc::new(serenity::Http::new("synthetic-token")),
+            cache: Arc::new(serenity::Cache::new()),
+            bot_user_id: BOT,
+            reaction: Arc::new(NoReaction),
+            safeword: None,
+        };
+        built.extend(build_features::<u8, u16>(&gated.plan, &services));
+        if let Ok(Some(feature)) = build_welcome::<u8, u16, _, _, _, _, _, _>(
+            &gated.plan,
+            ports(&log),
+            BOT,
+            &read_template,
+        ) {
+            built.push(feature);
+        }
+        let f = start_welcome(built, &dir, GuildFilter::Only(GUILD), &starter).await;
+        assert!(f.is_active("flash"));
+        assert!(!f.is_active("welcome"));
+        let kinds = starter.kinds.lock().unwrap().join(" ");
+        assert!(!kinds.contains("welcome"), "{kinds}");
+    }
+
+    #[tokio::test]
+    async fn each_missing_permission_disables_the_feature_with_its_own_code() {
+        let plan = plan_for(&all_keys(), &config());
+        // (what to take away, [flash gone, safeword gone, welcome gone], the code it must name)
+        type Tweak = fn(&mut FakeFacts);
+        let cases: Vec<(Tweak, [bool; 3], &str)> = vec![
+            (
+                |f| f.guild = Some(0),
+                [false, true, true],
+                "missing_manage_roles",
+            ),
+            (
+                |f| {
+                    f.channels.insert(CHANNEL, Some(EMBED_LINKS));
+                },
+                [false, false, true],
+                "missing_send_messages",
+            ),
+            (
+                |f| {
+                    f.channels.insert(FLASH_CH, Some(SEND_MESSAGES));
+                },
+                [true, false, false],
+                "missing_manage_messages",
+            ),
+        ];
+        for (tweak, gone, code) in cases {
+            let mut facts = healthy_facts();
+            tweak(&mut facts);
+            let gated = startup_preflight(&plan, BOT, &facts, &healthy_roles()).await;
+            let text = lines_text(&gated);
+            assert!(text.contains(code), "{code}: {text}");
+            assert_eq!(gated.plan.flash.is_none(), gone[0], "{code}: {text}");
+            assert_eq!(gated.plan.safeword.is_none(), gone[1], "{code}: {text}");
+            assert_eq!(gated.plan.welcome.is_none(), gone[2], "{code}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_permission_lookup_disables_with_permissions_unknown() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut facts = healthy_facts();
+        facts.channels.insert(CHANNEL, None); // the lookup failed
+        facts.channels.remove(&FLASH_CH); // and one that was never answered
+        let gated = startup_preflight(&plan, BOT, &facts, &healthy_roles()).await;
+        assert!(gated.plan.welcome.is_none() && gated.plan.flash.is_none());
+        assert!(
+            gated.plan.safeword.is_some(),
+            "safeword needs no channel permission"
+        );
+        let text = lines_text(&gated);
+        assert!(
+            text.contains("welcome: disabled (permissions_unknown)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("flash: disabled (permissions_unknown)"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_role_lookups_disable_the_role_granting_features() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut roles = healthy_roles();
+        roles.roles = Err(SourceError::Unavailable);
+        let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
+        assert!(gated.plan.welcome.is_none() && gated.plan.safeword.is_none());
+        assert!(gated.plan.flash.is_some(), "flash grants no role");
+        assert!(lines_text(&gated).contains("bot_top_position_unknown"));
+    }
+
+    fn input_with_roles(plan: &FeaturePlan, role_facts: Vec<RoleFactsEntry>) -> PreflightInput {
+        PreflightInput {
+            features: preflight_requests(plan),
+            guild_permissions: MANAGE_ROLES,
+            channel_permissions: vec![
+                PermissionLookup::known(CHANNEL, SEND_MESSAGES | EMBED_LINKS),
+                PermissionLookup::known(FLASH_CH, MANAGE_MESSAGES),
+            ],
+            category_permissions: vec![],
+            role_facts,
+            bot_top_position: Some(20),
+        }
+    }
+
+    fn found(id: u64, position: u16, permissions: u64, managed: bool) -> RoleFactsEntry {
+        RoleFactsEntry::found(
+            id,
+            RoleFacts {
+                id,
+                position,
+                managed,
+                permissions,
+                exists: true,
+            },
+        )
+    }
+
+    #[test]
+    fn a_refused_join_role_drops_welcome_with_the_key_and_the_policy_code() {
+        // (the join role, its facts, the code the line must carry)
+        let cases: Vec<(u64, RoleFactsEntry, &str)> = vec![
+            (
+                ROLE_PRIV,
+                found(ROLE_PRIV, 6, ADMINISTRATOR, false),
+                "privileged_permission",
+            ),
+            (ROLE_PROT, found(ROLE_PROT, 7, 0, false), "protected_role"),
+            (
+                ROLE_MANAGED,
+                found(ROLE_MANAGED, 8, 0, true),
+                "managed_role",
+            ),
+            (GUILD, found(GUILD, 0, 0, false), "everyone_role"),
+        ];
+        for (role, entry, code) in cases {
+            let join_roles = role.to_string();
+            let mut pairs = welcome_keys("live");
+            pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+            pairs.push(("JOIN_ROLE_IDS", join_roles.as_str()));
+            let plan = plan_for(&pairs, &config());
+            assert!(
+                plan.welcome.is_some(),
+                "{code}: the plan itself accepts the ids"
+            );
+            let gated = gate_plan(&plan, &input_with_roles(&plan, vec![entry]));
+            assert!(gated.plan.welcome.is_none(), "{code}");
+            let text = lines_text(&gated);
+            assert!(
+                text.contains("Preflight welcome: ready"),
+                "preflight alone passes: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Feature welcome stays off: join role refused (JOIN_ROLE_IDS: {code})"
+                )),
+                "{code}: {text}"
+            );
+            assert!(!text.contains(&role.to_string()), "{code}: no id in {text}");
+        }
+    }
+
+    #[test]
+    fn a_join_role_that_is_missing_unknown_or_above_the_bot_is_refused_too() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let cases = vec![
+            (vec![RoleFactsEntry::missing(ROLE_LOW)], "role_missing"),
+            (
+                vec![RoleFactsEntry::unavailable(ROLE_LOW)],
+                "role_facts_unavailable",
+            ),
+            (vec![], "role_facts_unavailable"),
+            (vec![found(ROLE_LOW, 20, 0, false)], "role_above_bot"),
+            (vec![found(ROLE_LOW, 21, 0, false)], "role_above_bot"),
+        ];
+        for (facts, code) in cases {
+            let gated = gate_plan(&plan, &input_with_roles(&plan, facts));
+            assert!(gated.plan.welcome.is_none(), "{code}");
+            assert!(
+                lines_text(&gated).contains(code),
+                "{code}: {}",
+                lines_text(&gated)
+            );
+        }
+        // An unknown bot top is refused with its code, never read as zero.
+        let mut input = input_with_roles(&plan, vec![found(ROLE_LOW, 5, 0, false)]);
+        input.bot_top_position = None;
+        let gated = gate_plan(&plan, &input);
+        assert!(gated.plan.welcome.is_none());
+        assert!(lines_text(&gated).contains("bot_top_position_unknown"));
+        // And the same role just below the bot passes.
+        let ok = gate_plan(
+            &plan,
+            &input_with_roles(&plan, vec![found(ROLE_LOW, 19, 0, false)]),
+        );
+        assert!(ok.plan.welcome.is_some());
+    }
+
+    #[test]
+    fn welcome_without_join_roles_still_needs_manage_roles_and_channel_permissions() {
+        let mut pairs = welcome_keys("live");
+        pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+        let plan = plan_for(&pairs, &config());
+        let ok = gate_plan(&plan, &input_with_roles(&plan, vec![]));
+        assert!(ok.plan.welcome.is_some());
+        let mut input = input_with_roles(&plan, vec![]);
+        input.guild_permissions = 0;
+        assert!(gate_plan(&plan, &input).plan.welcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_safeword_that_cannot_start_takes_reaction_roles_down_with_it() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.reaction_roles.is_some(), "planned before the gate");
+        let mut facts = healthy_facts();
+        facts.guild = Some(0);
+        let gated = startup_preflight(&plan, BOT, &facts, &healthy_roles()).await;
+        assert!(gated.plan.safeword.is_none());
+        assert!(
+            gated.plan.reaction_roles.is_none(),
+            "fail closed, as the plan rule says"
+        );
+        let text = lines_text(&gated);
+        assert!(text.contains("Feature reaction_roles stays off"), "{text}");
+        assert!(text.contains("safeword_unavailable"), "{text}");
+        // A healthy bot leaves reaction roles alone.
+        let healthy = startup_preflight(&plan, BOT, &healthy_facts(), &healthy_roles()).await;
+        assert!(healthy.plan.reaction_roles.is_some() && healthy.plan.safeword.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_flash_keeps_its_channels_out_of_the_log() {
+        let plan = plan_for(&flash_keys(), &config());
+        let mut facts = healthy_facts();
+        facts.channels.insert(FLASH_CH, Some(0));
+        let gated = startup_preflight(&plan, BOT, &facts, &healthy_roles()).await;
+        assert!(gated.plan.flash.is_none());
+        // The wiring is decided from the ORIGINAL plan: privacy is not given back.
+        assert_eq!(wire(&plan, &|_| false).flash_log_excluded, vec![FLASH_CH]);
+    }
+
+    // ---- no value in any line ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn preflight_and_startup_lines_never_carry_an_id_a_path_or_a_value() {
+        // Large sentinel ids: any leak of one is a 15-digit run.
+        const BIG_GUILD: u64 = 987_654_321_012_001;
+        const BIG_CHANNEL: u64 = 987_654_321_012_002;
+        const BIG_ROLE: u64 = 987_654_321_012_003;
+        const BIG_FLASH: u64 = 987_654_321_012_004;
+        const BIG_BOT_ROLE: u64 = 987_654_321_012_005;
+        let mut cfg = config();
+        cfg.guild_id = Some(BIG_GUILD);
+        cfg.protected_role_ids = vec![];
+        let ids: Vec<(String, String)> = vec![
+            ("WELCOME_MODE".into(), "live".into()),
+            ("WELCOME_CHANNEL_ID".into(), BIG_CHANNEL.to_string()),
+            ("WELCOME_TEMPLATE_PATH".into(), "sentinel-template".into()),
+            ("JOIN_ROLE_IDS".into(), BIG_ROLE.to_string()),
+            ("FLASH_MODE".into(), "live".into()),
+            ("FLASH_CHANNEL_IDS".into(), BIG_FLASH.to_string()),
+        ];
+        let owned = ids.clone();
+        let lookup = move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        let plan = plan_features(&lookup, &cfg);
+        let role = |id, position| RoleEntry {
+            id,
+            position,
+            managed: false,
+            permissions: 0,
+        };
+        let roles = FakeRoles::new(
+            vec![role(BIG_BOT_ROLE, 20), role(BIG_ROLE, 5)],
+            vec![BIG_BOT_ROLE],
+        );
+        let scenarios: Vec<FakeFacts> = vec![
+            FakeFacts {
+                guild: Some(MANAGE_ROLES),
+                channels: [
+                    (BIG_CHANNEL, Some(SEND_MESSAGES | EMBED_LINKS)),
+                    (BIG_FLASH, Some(MANAGE_MESSAGES)),
+                ]
+                .into_iter()
+                .collect(),
+                ..FakeFacts::default()
+            },
+            FakeFacts::default(),
+        ];
+        let mut all_lines: Vec<String> = plan.lines.clone();
+        for facts in &scenarios {
+            let gated = startup_preflight(&plan, BIG_BOT_ROLE, facts, &roles).await;
+            all_lines.extend(gated.lines);
+        }
+        assert!(
+            all_lines.iter().any(|l| l.contains("ready")),
+            "{all_lines:?}"
+        );
+        assert!(
+            all_lines.iter().any(|l| l.contains("disabled")),
+            "{all_lines:?}"
+        );
+        for line in &all_lines {
+            let mut run = 0;
+            for c in line.chars() {
+                run = if c.is_ascii_digit() { run + 1 } else { 0 };
+                assert!(run < 5, "an id-like number in {line:?}");
+            }
+            for forbidden in [
+                "sentinel-template",
+                "welcome_templates",
+                "/",
+                "\\",
+                ".json",
+                "987654",
+            ] {
+                assert!(!line.contains(forbidden), "{forbidden}: {line:?}");
+            }
+        }
+    }
+
+    struct NoReaction;
+
+    #[::serenity::async_trait]
+    impl ReactionServices for NoReaction {
+        async fn bound_roles(
+            &self,
+            _message: u64,
+            _key: &str,
+        ) -> Result<Vec<u64>, crate::role_menus::reactions::StorageCode> {
+            Ok(vec![])
+        }
+        fn role_source(&self) -> &dyn RoleSource {
+            &FSource
+        }
+        async fn user_is_bot(&self, _g: u64, _u: u64) -> Option<bool> {
+            Some(false)
+        }
+        fn safeword_state(&self, _g: u64, _u: u64) -> crate::roles::eligibility::SafewordState {
+            crate::roles::eligibility::SafewordState::Inactive
+        }
+        fn role_writer(&self, _g: u64) -> Box<dyn RoleWriter + Send> {
+            Box::new(FWriter {
+                log: Log::default(),
+                fail_status: None,
+            })
+        }
+        fn role_remover(
+            &self,
+            _g: u64,
+        ) -> Box<dyn crate::role_menus::reactions::RoleRemover + Send> {
+            Box::new(NoRemover)
+        }
+        fn sleeper(&self) -> Box<dyn Sleeper + Send> {
+            Box::new(FSleeper)
+        }
+        fn report(&self, _line: &str) {}
+    }
+
+    struct NoRemover;
+
+    impl crate::role_menus::reactions::RoleRemover for NoRemover {
+        fn remove_role(&mut self, _m: u64, _r: u64) -> Result<(), WriteError> {
+            Ok(())
+        }
+    }
+
+    // ---- W3a round 2: the production composition, the safeword rule, the id map -------------
+
+    fn names(composed: &GatedFeatures<u8, u16>) -> Vec<&'static str> {
+        composed.features.iter().map(|f| f.name()).collect()
+    }
+
+    async fn compose_with(
+        plan: &FeaturePlan,
+        facts: &FakeFacts,
+        roles: &FakeRoles,
+        read: &(dyn Fn(&str) -> Option<String> + Sync),
+    ) -> GatedFeatures<u8, u16> {
+        start_gated::<u8, u16>(GatedStart {
+            plan,
+            bot_user_id: BOT,
+            http: Arc::new(serenity::Http::new("synthetic-token")),
+            cache: Arc::new(serenity::Cache::new()),
+            facts,
+            roles,
+            store: StoreSpec {
+                path: None,
+                reserved: vec![],
+            },
+            protected_role_ids: vec![],
+            reaction: &|_lookup| Arc::new(NoReaction),
+            read_template: read,
+        })
+        .await
+    }
+
+    async fn compose(
+        plan: &FeaturePlan,
+        facts: &FakeFacts,
+        roles: &FakeRoles,
+    ) -> GatedFeatures<u8, u16> {
+        compose_with(plan, facts, roles, &read_template).await
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_builds_only_what_the_preflight_lets_through() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut facts = healthy_facts();
+        facts.channels.insert(CHANNEL, Some(SEND_MESSAGES)); // welcome lacks EMBED_LINKS
+        let composed = compose(&plan, &facts, &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash", "safeword"]);
+        assert!(composed.safeword.is_some());
+        let text = composed.lines.join("\n");
+        assert!(
+            text.contains("Preflight welcome: disabled (missing_embed_links)"),
+            "{text}"
+        );
+        // And what is registered really starts: welcome opens no kind of its own.
+        let dir = scratch("compose-others-start");
+        let starter = Starter::default();
+        let f = start_welcome(composed.features, &dir, GuildFilter::Only(GUILD), &starter).await;
+        assert!(f.is_active("flash") && f.is_active("safeword"));
+        assert!(!f.is_active("welcome"));
+        assert!(!starter.kinds.lock().unwrap().join(" ").contains("welcome"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_safeword_leaves_no_runtime_and_takes_reaction_roles_with_it() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        let mut facts = healthy_facts();
+        facts.guild = Some(0); // no manage roles: the role features are refused
+        let composed = compose(&plan, &facts, &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash"]);
+        assert!(
+            composed.safeword.is_none(),
+            "no safeword runtime for a refused safeword"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_builds_every_ready_feature_in_order() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        let composed = compose(&plan, &healthy_facts(), &healthy_roles()).await;
+        assert_eq!(
+            names(&composed),
+            vec!["flash", "safeword", reactions::FEATURE_NAME, "welcome"]
+        );
+        assert!(composed.safeword.is_some());
+        assert_eq!(
+            composed.lines,
+            vec![
+                "Preflight flash: ready".to_string(),
+                "Preflight safeword: ready".to_string(),
+                "Preflight welcome: ready".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_of_an_empty_plan_asks_builds_and_prints_nothing() {
+        let plan = plan_for(&[], &config());
+        let (facts, roles) = (FakeFacts::default(), FakeRoles::new(vec![], vec![]));
+        let composed = compose(&plan, &facts, &roles).await;
+        assert!(composed.features.is_empty() && composed.lines.is_empty());
+        assert!(composed.safeword.is_none());
+        assert_eq!(facts.calls() + roles.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_production_composition_reports_a_template_it_cannot_use_by_code_only() {
+        let plan = plan_for(&welcome_keys("live"), &config());
+        let composed = compose_with(&plan, &healthy_facts(), &healthy_roles(), &|_| {
+            Some("{\"secret\": 770010 not json".to_string())
+        })
+        .await;
+        assert!(names(&composed).is_empty(), "no half-started welcome");
+        let text = composed.lines.join("\n");
+        assert!(text.contains("malformed_json"), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains("770010"),
+            "{text}"
+        );
+    }
+
+    // ---- welcome and the safeword restriction (K03 rule 6) ----------------------------------
+
+    #[test]
+    fn a_join_role_the_safeword_restricts_keeps_welcome_off_with_the_key_and_a_code() {
+        for roles in ["770051", "770050", "770020,770051", "770050,770020"] {
+            let mut pairs = all_keys();
+            pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+            pairs.push(("JOIN_ROLE_IDS", roles));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.safeword.is_some(), "{roles}");
+            assert!(plan.welcome.is_none(), "{roles}: welcome must not start");
+            let text = plan.lines.join("\n");
+            assert!(
+                text.contains("Feature welcome stays off: join role refused (JOIN_ROLE_IDS: safeword_restricted)"),
+                "{roles}: {text}"
+            );
+            assert!(!text.contains("7700"), "{roles}: no id in {text}");
+        }
+    }
+
+    #[test]
+    fn welcome_stays_off_while_a_requested_safeword_is_not_running() {
+        for mode in ["live", "shadow"] {
+            let mut pairs = all_keys();
+            pairs.retain(|(k, _)| *k != "SAFEWORD_ROLE_ID" && *k != "SAFEWORD_MODE");
+            pairs.push(("SAFEWORD_MODE", mode));
+            let plan = plan_for(&pairs, &config());
+            assert!(
+                plan.safeword.is_none(),
+                "{mode}: the safeword itself is refused"
+            );
+            assert!(plan.welcome.is_none(), "{mode}");
+            let text = plan.lines.join("\n");
+            assert!(
+                text.contains("Feature welcome stays off: safeword requested but not running (safeword_unavailable)"),
+                "{mode}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_safeword_requested_the_restricted_list_does_not_bind_welcome() {
+        let mut pairs = welcome_keys("live");
+        pairs.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "770020"));
+        pairs.push(("SAFEWORD_MODE", "off"));
+        let plan = plan_for(&pairs, &config());
+        assert!(plan.welcome.is_some());
+        assert!(
+            plan.lines.iter().all(|l| !l.contains("safeword")),
+            "{:?}",
+            plan.lines
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restricted_join_role_never_starts_welcome_through_the_production_composition() {
+        let mut pairs = all_keys();
+        pairs.retain(|(k, _)| *k != "JOIN_ROLE_IDS");
+        pairs.push(("JOIN_ROLE_IDS", "770051"));
+        let plan = plan_for(&pairs, &config());
+        let composed = compose(&plan, &healthy_facts(), &healthy_roles()).await;
+        assert_eq!(names(&composed), vec!["flash", "safeword"]);
+        // Welcome is not registered, so a member joining reaches no welcome feature.
+        let dir = scratch("restricted-join");
+        let f = start_welcome(
+            composed.features,
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        assert!(!f.is_active("welcome"));
+    }
+
+    #[tokio::test]
+    async fn a_safeword_dropped_by_the_preflight_leaves_welcome_with_unrestricted_roles_only() {
+        let plan = plan_for(&all_keys(), &config());
+        let mut entries = role_entries();
+        entries.retain(|e| e.id != SW_ROLE);
+        entries.push(RoleEntry {
+            id: SW_ROLE,
+            position: 30, // above the bot
+            managed: false,
+            permissions: 0,
+        });
+        let roles = FakeRoles::new(entries, vec![BOT_ROLE]);
+        let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
+        assert!(gated.plan.safeword.is_none());
+        let welcome = gated.plan.welcome.as_ref().expect("welcome still starts");
+        assert!(!welcome.config.join_role_ids.contains(&SW_RESTRICTED));
+        assert!(!welcome.config.join_role_ids.contains(&SW_ROLE));
+    }
+
+    // ---- the safeword preflight request names every role the swap writes -------------------
+
+    #[test]
+    fn the_safeword_request_names_its_role_and_each_restricted_role_once() {
+        let mut pairs = all_keys();
+        pairs.retain(|(k, _)| *k != "SAFEWORD_RESTRICTED_ROLE_IDS");
+        pairs.push(("SAFEWORD_RESTRICTED_ROLE_IDS", "770051,770055,770051"));
+        let plan = plan_for(&pairs, &config());
+        let requests = preflight_requests(&plan);
+        let safeword = requests
+            .iter()
+            .find(|r| r.feature == preflight::Feature::Safeword)
+            .unwrap();
+        assert_eq!(safeword.roles, vec![SW_ROLE, 770_051, 770_055]);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_role_that_is_gone_or_above_the_bot_refuses_the_safeword_at_startup() {
+        let mut pairs = all_keys();
+        pairs.push(("REACTION_ROLES_MODE", "live"));
+        let plan = plan_for(&pairs, &config());
+        // (the restricted role's entry in the guild, the code the line must carry)
+        let cases: Vec<(Option<u16>, &str)> =
+            vec![(None, "role_missing"), (Some(21), "role_above_bot")];
+        for (position, code) in cases {
+            let mut entries = role_entries();
+            entries.retain(|e| e.id != SW_RESTRICTED);
+            if let Some(position) = position {
+                entries.push(RoleEntry {
+                    id: SW_RESTRICTED,
+                    position,
+                    managed: false,
+                    permissions: 0,
+                });
+            }
+            let roles = FakeRoles::new(entries, vec![BOT_ROLE]);
+            let gated = startup_preflight(&plan, BOT, &healthy_facts(), &roles).await;
+            let text = lines_text(&gated);
+            assert!(gated.plan.safeword.is_none(), "{code}: {text}");
+            assert!(gated.plan.reaction_roles.is_none(), "{code}: cascade");
+            assert!(
+                text.contains("Preflight safeword: disabled"),
+                "{code}: {text}"
+            );
+            assert!(text.contains(code), "{code}: {text}");
+            assert!(gated.plan.flash.is_some() && gated.plan.welcome.is_some());
+            assert!(!text.contains("770051"), "{code}: no id in {text}");
+        }
+    }
+
+    // ---- the id map of the template ----------------------------------------------------------
+
+    fn linked(mode: &'static str) -> Vec<(&'static str, &'static str)> {
+        let mut pairs = welcome_keys(mode);
+        pairs.push(("WELCOME_CHANNEL_LINKS", "rules=770060,tickets=770062"));
+        pairs.push(("WELCOME_ROLE_LINKS", "pings=770061"));
+        pairs
+    }
+
+    #[test]
+    fn the_template_links_are_planned_from_the_environment() {
+        let plan = plan_for(&linked("live"), &config());
+        let ids = &plan.welcome.as_ref().expect("planned").ids;
+        assert_eq!(ids.channel("rules"), Some(770_060));
+        assert_eq!(ids.channel("tickets"), Some(770_062));
+        assert_eq!(ids.role("pings"), Some(770_061));
+        assert_eq!(plan.lines.len(), 1, "{:?}", plan.lines);
+        assert!(!plan.lines[0].contains("7700"), "{:?}", plan.lines);
+    }
+
+    #[test]
+    fn a_bad_link_list_drops_welcome_with_its_key_and_a_code_and_a_mode_off_stays_silent() {
+        for (key, value) in [
+            ("WELCOME_CHANNEL_LINKS", "rules=0"),
+            ("WELCOME_CHANNEL_LINKS", "rules=770060,rules=770061"),
+            ("WELCOME_ROLE_LINKS", "../x=770061"),
+        ] {
+            let mut pairs = welcome_keys("live");
+            pairs.push((key, value));
+            let plan = plan_for(&pairs, &config());
+            assert!(plan.welcome.is_none(), "{key}={value}");
+            let text = plan.lines.join("\n");
+            assert!(text.contains(&format!("{key}: invalid_setting")), "{text}");
+            assert!(!text.contains("7700") && !text.contains("../x"), "{text}");
+            let mut off = welcome_keys("off");
+            off.push((key, value));
+            let plan = plan_for(&off, &config());
+            assert!(plan.lines.is_empty() && plan.welcome.is_none());
+        }
+    }
+
+    const LINK_TEMPLATE: &str =
+        r#"{"embed":{"title":"Rules {channel:rules}","description":"Pick {role:pings}"}}"#;
+
+    #[tokio::test]
+    async fn a_template_that_links_a_channel_renders_the_linked_channel_for_a_joining_member() {
+        let log = Log::default();
+        let plan = plan_for(&linked("live"), &config());
+        let read = |key: &str| (key == "welcome").then(|| LINK_TEMPLATE.to_string());
+        let feature = build_welcome::<u8, u16, _, _, _, _, _, _>(&plan, ports(&log), BOT, &read)
+            .ok()
+            .flatten()
+            .expect("built with its id map");
+        let dir = scratch("linked-template");
+        let f = start_welcome(
+            vec![feature],
+            &dir,
+            GuildFilter::Only(GUILD),
+            &Starter::default(),
+        )
+        .await;
+        assert_eq!(f.dispatch(&1, &join(GUILD, MEMBER, false), &2).await, 1);
+        assert_eq!(
+            log.lines(),
+            vec![
+                format!("grant:{MEMBER}:{ROLE_LOW}"),
+                format!("send:{CHANNEL}:Rules <#770060>"),
+            ]
+        );
+        // Without the links in the environment the same template is refused at start.
+        let bare = plan_for(&welcome_keys("live"), &config());
+        let refused = build_welcome::<u8, u16, _, _, _, _, _, _>(&bare, ports(&log), BOT, &read);
+        let line = refused.err().expect("an unknown channel key is refused");
+        assert!(line.contains("template refused"), "{line}");
+        assert!(!line.contains("rules"), "no template text in {line}");
     }
 }

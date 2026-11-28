@@ -13,10 +13,12 @@
 //! through the role service and posts the rendered welcome. [`config`] parses the
 //! four configuration keys of the feature.
 //!
-//! Unwired building block: no production caller exists yet. Wiring card W3 removes this
-//! allow once the runtime calls into the module.
+//! Wiring card W3a registers the runtime (`discord.rs` holds its serenity side), but unused items
+//! remain (see `docs/verification/WIRING-C1.md`), so the allow below stays until they are used or
+//! removed.
 #![allow(dead_code)]
 
 pub mod config;
+pub mod discord;
 pub mod render;
 pub mod runtime;

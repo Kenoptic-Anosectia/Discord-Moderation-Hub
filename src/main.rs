@@ -8,6 +8,7 @@ mod features;
 mod flash;
 mod jobs;
 mod preflight;
+mod preflight_wiring;
 mod privacy_scope;
 mod role_admin;
 mod role_menus;
@@ -1320,6 +1321,27 @@ mod tests {
             command_names(&framework_commands(false, &refused)),
             command_names(&configured_commands(false))
         );
+    }
+
+    #[test]
+    fn framework_commands_and_wiring_are_unchanged_by_welcome() {
+        let welcome = w2_plan(&[
+            ("WELCOME_MODE", "live"),
+            ("WELCOME_CHANNEL_ID", "770301"),
+            ("WELCOME_TEMPLATE_PATH", "welcome"),
+        ]);
+        assert!(welcome.welcome.is_some(), "the plan has welcome");
+        for tickets in [false, true] {
+            assert_eq!(
+                command_names(&framework_commands(tickets, &welcome)),
+                command_names(&configured_commands(tickets)),
+                "welcome adds no command (tickets={tickets})"
+            );
+        }
+        let wiring = app_wiring(&welcome, &|_| true, None);
+        assert!(wiring.flash_log_excluded.is_empty());
+        assert!(!wiring.wired.reaction_roles_owned);
+        assert!(wiring.wired.safeword.is_none());
     }
 
     #[test]
@@ -4030,43 +4052,59 @@ async fn main() -> Result<(), Error> {
                     for line in &plan.lines {
                         println!("{line}");
                     }
-                    let store = safeword::discord::StoreSpec {
-                        path: feature_settings.core_db_path.clone(),
-                        reserved: feature_settings.reserved_db_paths.clone(),
-                    };
-                    let safeword = features::safeword_runtime(
-                        &plan,
-                        features::SafewordParts {
-                            http: ctx.http.clone(),
+                    // Startup preflight (W3a): the bot's real permissions and role positions are
+                    // checked for every planned feature and only the features that pass are
+                    // built and started (`features::start_gated`, tested offline). With every
+                    // feature off nothing is asked and nothing is printed. What is wired (the
+                    // log exclusions, the legacy reaction arms) is still decided from `plan`.
+                    let bot_user_id = ready.user.id.get();
+                    let preflight_roles = roles::runtime::CachedRoleSource::new(
+                        roles::runtime::SerenityCacheSource {
                             cache: ctx.cache.clone(),
-                            bot_user_id: ready.user.id.get(),
-                            store,
-                            protected_role_ids: config.protected_role_ids.clone(),
+                        },
+                        roles::runtime::SerenityHttpSource {
+                            http: ctx.http.clone(),
                         },
                     );
-                    // Reaction roles ask the safeword store whether a member is under safeword.
-                    let safeword_lookup: Option<role_menus::reactions::SafewordLookup> =
-                        safeword.as_ref().map(|runtime| {
-                            let runtime = runtime.clone();
-                            Arc::new(move |guild: u64, member: u64| {
-                                runtime.store().reaction_state(guild, member)
-                            }) as role_menus::reactions::SafewordLookup
-                        });
-                    let services = features::Services {
+                    let preflight_facts = preflight_wiring::SerenityFacts {
                         http: ctx.http.clone(),
-                        cache: ctx.cache.clone(),
-                        bot_user_id: ready.user.id.get(),
-                        reaction: Arc::new(role_menus::reactions::SerenityReactionServices::new(
+                    };
+                    let read_template = |key: &str| {
+                        welcome::discord::read_template_file(
+                            std::path::Path::new(welcome::discord::TEMPLATE_DIR),
+                            key,
+                        )
+                    };
+                    let reaction = |lookup: Option<role_menus::reactions::SafewordLookup>| {
+                        Arc::new(role_menus::reactions::SerenityReactionServices::new(
                             ctx.http.clone(),
                             ctx.cache.clone(),
                             rr_db.clone(),
                             config.staff_alert_channel_id,
-                            safeword_lookup,
-                        )),
-                        safeword: safeword.clone(),
+                            lookup,
+                        )) as Arc<dyn role_menus::reactions::ReactionServices>
                     };
-                    let mut optional = features::production_features();
-                    optional.extend(features::build_features(&plan, &services));
+                    let composed = features::start_gated(features::GatedStart {
+                        plan: &plan,
+                        bot_user_id,
+                        http: ctx.http.clone(),
+                        cache: ctx.cache.clone(),
+                        facts: &preflight_facts,
+                        roles: &preflight_roles,
+                        store: safeword::discord::StoreSpec {
+                            path: feature_settings.core_db_path.clone(),
+                            reserved: feature_settings.reserved_db_paths.clone(),
+                        },
+                        protected_role_ids: config.protected_role_ids.clone(),
+                        reaction: &reaction,
+                        read_template: &read_template,
+                    })
+                    .await;
+                    for line in &composed.lines {
+                        println!("{line}");
+                    }
+                    let optional = composed.features;
+                    let safeword = composed.safeword;
                     let features = Arc::new(
                         AppFeatures::start(
                             features::StartRequest {
